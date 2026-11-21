@@ -75,8 +75,7 @@ examples/                hello.html（浅色卡片页） boxes.html（盒模型/
                          timers.html（querySelector/querySelectorAll/setTimeout/setInterval/rAF）
 copyResource/            真实参考页面（aim.html：思维导图，用 Chrome 渲染做逐区域对齐基准）— 当前不在工作区
 docs/                    design.md（设计文档）、需求.md（需求清单）、AI代码生成规范.md、
-                         run_tests.sh（回归入口：逐字节像素基线 + js-modern/js-builtins 断言 + headless ES 模块）、
-                         渲染截图（preview.bmp / layout-verify.bmp 等）
+                         run_tests.sh（回归入口：逐字节像素基线 + js-modern/js-builtins 断言 + headless ES 模块）
 ```
 
 ## 构建与运行
