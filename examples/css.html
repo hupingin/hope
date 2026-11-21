@@ -1,0 +1,74 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body { font-family: sans-serif; font-size: 15px; }
+
+  /* child combinator: only direct children */
+  .parent .child   { color: #2980b9; }
+  .parent > .child { color: #c0392b; font-weight: bold; }
+
+  /* descendant only (for comparison) */
+  .parent .deep { color: #16a085; }
+
+  /* adjacent sibling */
+  h2 + p { background: #eef0f2; padding: 4px 8px; }
+
+  /* general sibling */
+  .note ~ .note { border-left: 4px solid #e67e22; padding-left: 8px; }
+
+  /* attribute presence */
+  [data-x] { color: #8e44ad; }
+
+  /* attribute exact value */
+  a[href="#top"] { color: #d35400; font-weight: bold; }
+
+  /* attribute substring vs word */
+  [class*="key"]  { text-decoration: none; color: #27ae60; }
+  [class~="key"]  { color: #2c3e50; font-weight: bold; }
+
+  /* white-space */
+  pre.code { white-space: pre; background: #1e1e1e; color: #dcdcdc; padding: 10px; }
+  .nowrap  { white-space: nowrap;  width: 220px; background: #f4f4f4; padding: 6px; }
+  .pw      { white-space: pre-wrap; width: 220px; background: #f4f4f4; padding: 6px; }
+
+  /* font families */
+  .mono  { font-family: monospace, "Courier New"; }
+  .serif { font-family: serif, "Times New Roman"; }
+</style>
+</head>
+<body>
+  <h1>CSS Engine Tests</h1>
+
+  <div class="parent">
+    <div class="child">direct child &rarr; red bold (.parent &gt; .child)</div>
+    <div class="wrapper"><div class="child">nested child &rarr; blue (.parent .child only)</div></div>
+    <div class="deep">deep descendant &rarr; teal</div>
+  </div>
+
+  <h2>Adjacent sibling</h2>
+  <p>this p follows h2 &rarr; gray background (h2 + p)</p>
+  <p>this p does not &rarr; no background</p>
+
+  <p class="note">note #1 (no left border: first sibling)</p>
+  <p class="note">note #2 &rarr; orange left border (.note ~ .note)</p>
+
+  <div data-x="yes" class="whatever">attribute presence [data-x] &rarr; purple</div>
+  <a href="#top">exact attr a[href=&quot;#top&quot;] &rarr; orange bold</a>
+  <div class="keyword">class*=&quot;key&quot; matches &quot;keyword&quot; &rarr; green</div>
+  <div class="key item">class~=&quot;key&quot; word match &rarr; dark bold (also *=&quot;key&quot; but ~= wins)</div>
+
+  <pre class="code mono">line1    spaces preserved
+line2
+    indented line
+  pre: no wrap, source newlines break</pre>
+
+  <div class="nowrap">nowrap: this sentence must stay on a single line even though it is very long indeed</div>
+
+  <div class="pw">pre-wrap:    keeps   spaces and wraps at width like this long sentence that should wrap onto multiple lines</div>
+
+  <p class="serif">serif family text sample</p>
+  <p class="mono">mono family text sample (0O1lIi)</p>
+</body>
+</html>

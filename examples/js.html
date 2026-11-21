@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Hope Engine - javascript</title>
+  <style>
+    body { margin: 0; background-color: #10141b; color: #e6e9ef; font-size: 15px; line-height: 1.5; }
+    .wrap { width: 660px; margin: 28px auto; }
+    .card { background-color: #1a2029; border: 1px solid #333d4d; padding: 16px 20px; margin: 0 0 16px 0; }
+    h3 { font-size: 17px; margin: 0 0 8px 0; color: #7ab7ff; }
+    #hello { color: #ffd166; font-size: 20px; font-weight: bold; }
+    li { margin: 2px 0; }
+    .code { color: #9ad1a4; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h3>textContent</h3>
+      <div id="hello">placeholder</div>
+    </div>
+
+    <div class="card">
+      <h3>innerHTML + loop + array</h3>
+      <ul id="list"></ul>
+    </div>
+
+    <div class="card">
+      <h3>inline style from js</h3>
+      <p id="styled">this paragraph is restyled by script</p>
+    </div>
+
+    <div class="card">
+      <h3>functions &amp; closures</h3>
+      <p id="fib"></p>
+    </div>
+  </div>
+
+  <script>
+    // textContent
+    var el = document.getElementById("hello");
+    el.textContent = "Hello from Hope JS! 6 * 7 = " + 6 * 7;
+
+    // innerHTML built with a loop, array push and join
+    var items = [];
+    var names = ["lexer", "parser", "AST", "interpreter", "DOM bridge"];
+    for (var i = 0; i < names.length; i++) {
+      items.push("<li>stage " + (i + 1) + ": <span class='code'>" + names[i] + "</span></li>");
+    }
+    document.getElementById("list").innerHTML = items.join("");
+
+    // inline styles through el.style
+    var p = document.getElementById("styled");
+    p.style.color = "#f28b82";
+    p.style.fontSize = "18px";
+    p.style.fontWeight = "bold";
+    p.style.textAlign = "center";
+
+    // functions, recursion, math
+    function fib(n) {
+      if (n < 2) return n;
+      return fib(n - 1) + fib(n - 2);
+    }
+    var seq = [];
+    for (var k = 0; k < 12; k++) seq.push(fib(k));
+    document.getElementById("fib").textContent =
+      "fib: " + seq.join(", ") + "  |  max(3,9)=" + Math.max(3, 9) +
+      "  |  floor(2.7)=" + Math.floor(2.7);
+  </script>
+</body>
+</html>

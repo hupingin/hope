@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Hope - events</title>
+<style>
+  body { background: #161b26; color: #e6e6e6; font-family: sans-serif; margin: 28px; }
+  h1 { color: #ffd479; font-size: 24px; }
+  button {
+    font-size: 15px; padding: 8px 14px; margin: 6px 4px; border-radius: 6px;
+    border: 1px solid #3a6ea5; background: #2c4a73; color: #fff; cursor: pointer;
+  }
+  button:active { background: #3a6ea5; }
+  #box {
+    margin-top: 18px; padding: 14px; border: 1px solid #44a06a; border-radius: 8px;
+    background: #10231a;
+  }
+  #boxmsg { color: #7fe0a0; }
+  #log {
+    margin-top: 18px; height: 150px; overflow: auto; padding: 10px;
+    background: #0c0f16; border: 1px solid #2a3242; border-radius: 8px;
+    font-family: monospace; font-size: 13px; color: #9fe8a6; white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+  <h1>Event System</h1>
+
+  <div>
+    <button id="inc">Click me</button>
+    <span id="count">count: 0</span>
+  </div>
+
+  <!-- bubbling: clicking the button inside #box should also trigger #box's listener -->
+  <div id="box">
+    Bubbling demo:
+    <button id="hi">inner button</button>
+    <span id="boxmsg">no clicks yet</span>
+  </div>
+
+  <div>
+    <button id="toggle">toggle panel</button>
+  </div>
+  <div id="panel" style="margin-top:12px; padding:10px; background:#222b3a; border:1px solid #3a6ea5;">
+    panel is visible
+  </div>
+
+  <div id="log">event log:</div>
+
+<script>
+  function log(msg) {
+    var el = document.getElementById("log");
+    el.textContent = el.textContent + "\n" + msg;
+  }
+
+  // 1. onclick property (assignment form)
+  var n = 0;
+  document.getElementById("inc").onclick = function (e) {
+    n++;
+    document.getElementById("count").textContent = "count: " + n;
+    log("onclick count -> " + n + "  (at " + e.clientX + "," + e.clientY + ")");
+  };
+
+  // 2. addEventListener on the inner button
+  document.getElementById("hi").addEventListener("click", function (e) {
+    document.getElementById("boxmsg").textContent = "button clicked, target=" + e.target.tagName;
+    log("inner button click, target=" + e.target.tagName);
+  });
+
+  // 3. same event bubbles up to #box (parent) listener
+  document.getElementById("box").addEventListener("click", function (e) {
+    log("box caught a click (bubbled from " + e.target.id + ")");
+  });
+
+  // 4. mousedown vs click are both delivered
+  document.getElementById("inc").addEventListener("mousedown", function () {
+    log("inc mousedown fired before click");
+  });
+
+  // 5. toggle panel via style -> needs relayout (engine re-lays out after handlers)
+  document.getElementById("toggle").onclick = function () {
+    var p = document.getElementById("panel");
+    if (p.style.display === "none") {
+      p.style.display = "block";
+      log("panel shown");
+    } else {
+      p.style.display = "none";
+      log("panel hidden");
+    }
+  };
+</script>
+</body>
+</html>

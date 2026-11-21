@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>hover demo</title>
+<style>
+body { font-family: sans-serif; background: #f4f6f8; margin: 0; padding: 24px; }
+h2 { color: #334455; }
+.btn {
+  display: inline-block; background: #4a90d9; color: #ffffff;
+  padding: 10px 22px; margin: 6px 8px 18px 0; font-size: 16px;
+  border: 1px solid #2c6cb0;
+}
+.btn:hover { background: #e4573d; border-color: #a03020; }
+.card {
+  width: 260px; background: #ffffff; border: 1px solid #ccccdd;
+  padding: 12px; margin-bottom: 12px;
+}
+.card:hover { background: #fff7d6; }
+ul.menu { padding: 0; margin: 0; }
+ul.menu li { padding: 6px 10px; background: #e8ecf2; margin-bottom: 4px; }
+ul.menu li:hover { background: #2f9e63; color: #ffffff; }
+</style>
+</head>
+<body>
+<h2>Hover demo</h2>
+<p>Pointer at: <span id="pos">-</span></p>
+<span class="btn" id="b1">Button A</span><span class="btn" id="b2">Button B</span>
+<div class="card">Card 1 - hover me</div>
+<div class="card">Card 2 - not hovered</div>
+<ul class="menu">
+  <li>Item one</li>
+  <li>Item two</li>
+  <li>Item three</li>
+</ul>
+<script>
+document.getElementById("b1").addEventListener("mousemove", function (e) {
+  document.getElementById("pos").textContent = "" + e.clientX + "," + e.clientY;
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Hope Engine - box model</title>
+  <style>
+    body { margin: 0; background-color: #20242c; color: #e8eaed; font-size: 15px; line-height: 1.5; }
+    .wrap { width: 640px; margin: 24px auto; }
+    .row { margin: 0 0 16px 0; }
+    .box { background-color: #2d333d; border: 1px solid #4a5361; padding: 12px 16px; }
+    .box h3 { font-size: 16px; margin: 0 0 6px 0; color: #8ab4f8; }
+    .pct { width: 60%; background-color: #3a4250; }
+    .centered { text-align: center; }
+    .right { text-align: right; color: #f28b82; }
+    .tight { width: 260px; padding: 8px; font-size: 13px; background-color: #313845; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="box row">
+      <h3>Percentage width</h3>
+      <div class="pct">This block is 60% of its containing block, so it shrinks when the window resizes.</div>
+    </div>
+
+    <div class="box row centered">
+      <h3>Centered text</h3>
+      <p>text-align: center is inherited by this paragraph, and each line box is offset by its own width.</p>
+      <p class="right">This line is right aligned.</p>
+    </div>
+
+    <div class="box row">
+      <h3>Nested boxes</h3>
+      <div class="tight">
+        Inner box with a fixed width of 260px and 8px padding. Long content should wrap inside the narrow column instead of overflowing past the right edge of the box.
+      </div>
+    </div>
+
+    <div class="box row">
+      <h3>Scroll test</h3>
+      <p>Row one of filler text to make the document taller than the viewport.</p>
+      <p>Row two of filler text so the wheel has something to scroll.</p>
+      <p>Row three of filler text.</p>
+      <p>Row four of filler text.</p>
+      <p>Row five of filler text.</p>
+      <p>Row six of filler text.</p>
+      <p>Row seven ends the document.</p>
+    </div>
+  </div>
+</body>
+</html>

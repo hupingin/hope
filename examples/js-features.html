@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Hope Engine - js features</title>
+  <style>
+    body { margin: 0; background-color: #171b21; color: #dfe3ea; font-size: 14px; }
+    .wrap { width: 680px; margin: 24px auto; }
+    pre { background-color: #222932; padding: 14px; font-size: 13px; color: #98d9a3; }
+    h3 { color: #8ab4f8; font-size: 16px; margin: 0 0 8px 0; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h3>interpreter feature probe</h3>
+    <pre id="out">running...</pre>
+  </div>
+
+  <script>
+    var lines = [];
+    function log(s) { lines.push(s); }
+
+    // closures
+    function counter() {
+      var n = 0;
+      return function () { n = n + 1; return n; };
+    }
+    var c1 = counter();
+    c1(); c1();
+    log("closure: " + c1() + " (expect 3)");
+
+    // while / do-while / continue / break
+    var i = 0, acc = 0;
+    while (i < 10) {
+      i++;
+      if (i % 2 === 0) continue;
+      if (i > 7) break;
+      acc += i;
+    }
+    log("while odd sum(1..7)=" + acc + " (expect 16)");
+
+    var d = 0;
+    do { d++; } while (d < 4);
+    log("do-while: " + d + " (expect 4)");
+
+    // objects
+    var o = { name: "hope", ver: 1, nested: { deep: true } };
+    o.ver = o.ver + 1;
+    log("object: " + o.name + " v" + o.ver + " deep=" + o.nested.deep);
+
+    // strings
+    var s = "Hello World";
+    log("string: len=" + s.length + " upper=" + s.toUpperCase() +
+        " idx=" + s.indexOf("World") + " at0=" + s.charAt(0) +
+        " sub=" + s.substring(6, 11));
+
+    // typeof / ternary / comparisons
+    log("typeof: " + typeof 1 + "," + typeof "a" + "," + typeof true + "," +
+        typeof undefined + "," + typeof null);
+    log("ternary: " + (3 > 2 ? "yes" : "no") + " loose==: " + ("5" == 5) +
+        " strict===: " + ("5" === 5));
+
+    // functions as values + array accumulation
+    var nums = [4, 9, 16];
+    var fn = function (x) { return Math.sqrt(x); };
+    var roots = [];
+    for (var k = 0; k < nums.length; k++) roots.push(fn(nums[k]));
+    log("map: " + roots.join("/"));
+
+    // Math
+    log("math: " + Math.round(2.5) + "," + Math.abs(-7) + "," +
+        Math.pow(2, 10) + ", random<1:" + (Math.random() < 1));
+
+    document.getElementById("out").textContent = lines.join("\n");
+  </script>
+</body>
+</html>

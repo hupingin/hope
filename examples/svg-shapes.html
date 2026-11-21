@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>SVG painter - v0.11 batch</title>
+<style>
+  body { margin: 0; padding: 12px; font-family: sans-serif; font-size: 12px;
+         color: #222222; background-color: #ffffff; }
+  svg { display: block; margin-bottom: 8px; }
+</style>
+</head>
+<body>
+  <!-- 1. new primitives: ellipse / polygon / polyline / line -->
+  <svg width="360" height="90" viewBox="0 0 360 90">
+    <ellipse cx="45" cy="45" rx="40" ry="28" fill="#d93025"/>
+    <polygon points="110,15 180,15 145,75" fill="#188038"/>
+    <polyline points="210,15 245,75 280,15 315,75" fill="none" stroke="#1a73e8"
+              stroke-width="4"/>
+    <line x1="330" y1="15" x2="330" y2="75" stroke="#f9ab00" stroke-width="6"/>
+  </svg>
+
+  <!-- 2. transform: translate / scale / rotate / skewX / matrix -->
+  <svg width="360" height="90" viewBox="0 0 360 90">
+    <rect x="0" y="0" width="50" height="26" fill="#1a73e8"
+          transform="translate(15,15) rotate(18)"/>
+    <rect x="0" y="0" width="50" height="26" fill="#188038"
+          transform="translate(95,15) scale(1.6,1.2)"/>
+    <rect x="0" y="0" width="50" height="26" fill="#d93025"
+          transform="translate(200,15) skewX(-20)"/>
+    <rect x="0" y="0" width="50" height="26" fill="#7b1fa2"
+          transform="matrix(1,0.3,-0.3,1,290,20)"/>
+    <rect x="0" y="0" width="50" height="26" fill="#f9ab00"
+          transform="translate(15,58) rotate(45)"/>
+  </svg>
+
+  <!-- 3. gradients (linear userSpace + objectBoundingBox, radial) as fill and stroke -->
+  <svg width="360" height="90" viewBox="0 0 360 90">
+    <defs>
+      <linearGradient id="lgA" x1="0" y1="0" x2="1" y2="0">
+        <stop offset="0" stop-color="#1a73e8"/>
+        <stop offset="0.5" stop-color="#ffffff"/>
+        <stop offset="1" stop-color="#d93025"/>
+      </linearGradient>
+      <linearGradient id="lgB" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0" stop-color="#188038"/>
+        <stop offset="1" stop-color="#f9ab00"/>
+      </linearGradient>
+      <radialGradient id="rgA">
+        <stop offset="0" stop-color="#ffffff"/>
+        <stop offset="1" stop-color="#7b1fa2"/>
+      </radialGradient>
+    </defs>
+    <rect x="10" y="10" width="150" height="70" fill="url(#lgA)"/>
+    <circle cx="215" cy="45" r="35" fill="url(#rgA)"/>
+    <rect x="270" y="10" width="80" height="70" fill="tan" stroke="url(#lgB)"
+          stroke-width="10"/>
+  </svg>
+
+  <!-- 4. path: cubic / smooth S / quad Q / smooth T / arc A / close Z -->
+  <svg width="360" height="90" viewBox="0 0 360 90">
+    <path d="M10 70 C 30 10, 60 10, 80 70 Z" fill="#1a73e8"/>
+    <path d="M100 70 C 115 20, 130 20, 145 70 S 175 120 190 70" fill="none"
+          stroke="#d93025" stroke-width="4"/>
+    <path d="M210 70 Q 235 10 260 70 T 310 70" fill="none" stroke="#188038"
+          stroke-width="4"/>
+    <path d="M320 40 A 20 20 0 0 1 355 40" fill="none" stroke="#f9ab00"
+          stroke-width="4"/>
+  </svg>
+
+  <!-- 5. defs / use and g inheritance -->
+  <svg width="360" height="70" viewBox="0 0 360 70">
+    <defs>
+      <g id="chip">
+        <rect x="0" y="0" width="54" height="26" rx="6" fill="#1a73e8"/>
+        <circle cx="46" cy="13" r="5" fill="#ffffff"/>
+      </g>
+    </defs>
+    <use href="#chip" x="10" y="8"/>
+    <use href="#chip" x="90" y="8"/>
+    <g fill="#ffffff" stroke="#188038" stroke-width="2">
+      <circle cx="230" cy="35" r="22" fill="#188038"/>
+      <rect x="270" y="13" width="60" height="44" rx="10"/>
+    </g>
+  </svg>
+
+  <!-- 6. text: font-size / text-anchor / dominant-baseline / textLength -->
+  <svg width="360" height="80" viewBox="0 0 360 80">
+    <text x="10" y="30" font-size="18" fill="#222222">start anchor</text>
+    <text x="345" y="30" font-size="18" text-anchor="end" fill="#1a73e8">end</text>
+    <text x="180" y="30" font-size="18" text-anchor="middle" fill="#d93025">mid</text>
+    <text x="10" y="62" font-size="16" textLength="330" lengthAdjust="spacing"
+          fill="#188038">textLength stretches this single run to fill the width</text>
+  </svg>
+</body>
+</html>

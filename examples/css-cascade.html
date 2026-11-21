@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>CSS cascade / @media / inheritance - v0.10 batch</title>
+<style>
+  body { margin: 0; padding: 16px; font-family: sans-serif; font-size: 14px;
+         color: #222222; background-color: #f5f6f8; }
+
+  .row { margin-bottom: 6px; }
+  .box { width: 150px; height: 26px; line-height: 26px; text-align: center;
+         border: 1px solid #999999; color: #ffffff; font-size: 12px; }
+
+  /* ------------------------------------------------------------------ */
+  /* 1. specificity + source order + UA + inline                         */
+  /* ------------------------------------------------------------------ */
+  /* element 0,1,0 beats class 0,1,0 on equal order is decided by order */
+  p.spec { color: #1a73e8; }             /* 0,1,1 */
+  .spec  { color: #188038; }             /* 0,1,0 -> loses to p.spec */
+  p.spec { color: #d93025; }             /* same 0,1,1, later -> wins  */
+  #spec-id { }                           /* unused id, keeps parser honest */
+
+  /* ------------------------------------------------------------------ */
+  /* 2. !important participates in the cascade                           */
+  /* ------------------------------------------------------------------ */
+  /* (A) stylesheet important beats an inline normal declaration         */
+  #imp-a { background-color: #188038 !important; }
+  /* (B) inline important beats a stylesheet important                   */
+  #imp-b { background-color: #1a73e8 !important; }
+  /* (C) two stylesheet importants at equal specificity: later wins      */
+  #imp-c { background-color: #d93025 !important; }
+  #imp-c { background-color: #f9ab00 !important; }
+  /* (D) a normal inline declaration beats any normal stylesheet rule    */
+  #imp-d { background-color: #188038; }
+
+  /* ------------------------------------------------------------------ */
+  /* 3. @media conditional evaluation                                    */
+  /* ------------------------------------------------------------------ */
+  /* viewport for the regression is 400x600 */
+  #mq { background-color: #888888; }
+  @media (min-width: 380px) { #mq { background-color: #1a73e8; } }
+  @media (min-width: 500px) { #mq { background-color: #d93025; } }   /* no match */
+  @media screen and (max-width: 500px) { #mq { border-color: #188038; } }
+  @media print { #mq { background-color: #000000; } }                /* excluded */
+  @media (min-width: 900px), (max-width: 450px) {
+    #mq2 { background-color: #f9ab00; }                              /* OR: 2nd alt */
+  }
+  #mq3 { background-color: #d93025; }                                /* base */
+  @media not print { #mq3 { background-color: #1a73e8; } }           /* must win */
+  @media (min-width: 380px) {
+    @media (max-width: 420px) { #mq4 { background-color: #188038; } }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* 4. inherited properties                                             */
+  /* ------------------------------------------------------------------ */
+  .inh { letter-spacing: 4px; word-spacing: 10px; color: #7b1fa2;
+         text-align: right; }
+  .inh .ls { background: #eeeeee; }            /* inherits spacing + colour */
+  .ind { text-indent: 48px; background: #e8f0fe; width: 200px; }
+
+  /* visibility inherits but a descendant may flip it back on */
+  .hide-host { visibility: hidden; }
+  .hide-host .reveal { visibility: visible; background: #d93025;
+                       width: 60px; height: 18px; }
+  .hide-host .stay { background: #188038; width: 60px; height: 18px; }
+
+  /* list-style-* inherit through the list tree */
+  .ls-ul { list-style-type: square; list-style-position: inside; }
+  .ls-ul li { background: #ffffff; }
+</style>
+</head>
+<body>
+  <!-- 1. specificity / order -->
+  <p class="spec row">specificity + source order</p>
+
+  <!-- 2. !important -->
+  <div id="imp-a" class="box row"
+       style="background-color: #d93025;">important beats inline normal</div>
+  <div id="imp-b" class="box row"
+       style="background-color: #7b1fa2 !important;">inline important wins</div>
+  <div id="imp-c" class="box row">later important wins</div>
+  <div id="imp-d" class="box row"
+       style="background-color: #7b1fa2;">inline normal beats rule</div>
+
+  <!-- 3. @media -->
+  <div id="mq" class="box row">media min-width 380</div>
+  <div id="mq2" class="box row">media OR list</div>
+  <div id="mq3" class="box row">media not print</div>
+  <div id="mq4" class="box row">nested media</div>
+
+  <!-- 4. inheritance -->
+  <div class="inh row"><span class="ls">inherited letter and word spacing</span></div>
+  <p class="ind row">Indented first line that wraps onto a second line so the
+     indent is applied only before the very first line of text.</p>
+
+  <div class="hide-host row">
+    <div class="stay"></div>
+    <div class="reveal"></div>
+  </div>
+
+  <ul class="ls-ul row">
+    <li>squared marker</li>
+    <li>inherited from the list</li>
+  </ul>
+</body>
+</html>

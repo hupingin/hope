@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>float demo</title>
+<style>
+body { font-family: sans-serif; font-size: 15px; margin: 0; padding: 16px; background: #fafafa; }
+.wrap { background: #fff7d6; padding: 10px; margin-bottom: 16px; }
+.box { width: 120px; height: 80px; background: #4a90d9; color: #ffffff; text-align: center; }
+.fl { float: left; margin: 0 12px 12px 0; }
+.fr { float: right; margin: 0 0 12px 12px; background: #e4573d; }
+p { margin: 0 0 4px 0; }
+.clear { clear: both; background: #2f9e63; color: #ffffff; padding: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="box fl" id="f1">FLOAT L</div>
+  <p>This paragraph wraps around the left float. Early lines are pushed to the right of the blue box, then the text continues at full width once it clears the float bottom.</p>
+</div>
+<div class="wrap">
+  <div class="box fl" id="f2">L2</div>
+  <div class="box fr" id="f3">R3</div>
+  <p>One float on each side, text flows in the middle column and then below both.</p>
+</div>
+<div class="clear">cleared below all floats</div>
+</body>
+</html>

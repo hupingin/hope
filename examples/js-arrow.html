@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Hope - arrow functions</title>
+<style>
+  body { background: #1d2333; color: #d8dee9; font-family: sans-serif; margin: 32px; }
+  h1 { color: #ffd479; font-size: 26px; }
+  h2 { color: #82c4e8; font-size: 18px; margin-top: 22px; }
+  #out {
+    background: #11151f; border: 1px solid #34405a; border-radius: 6px;
+    padding: 14px;
+  }
+  .row { color: #9fe8a6; font-family: monospace; font-size: 14px; padding: 3px 0; }
+</style>
+<script>
+  // 1. single param, expression body
+  var double = x => x * 2;
+
+  // 2. multi params, expression body
+  var add = (a, b) => a + b;
+
+  // 3. zero params
+  var five = () => 5;
+
+  // 4. block body with return
+  var clamp = (v, lo, hi) => {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+  };
+
+  // 5. closure over outer scope (counter)
+  function makeCounter(start) {
+    var n = start;
+    return () => ++n;
+  }
+
+  // 6. arrow returning an arrow (currying)
+  var makeAdder = a => b => a + b;
+
+  // 7. arrow as callback-style helper
+  function map(arr, fn) {
+    var out = [];
+    for (var i = 0; i < arr.length; i++)
+      out.push(fn(arr[i], i));
+    return out;
+  }
+
+  // 8. arrow body containing object/array literals
+  var pair = (a, b) => ({ first: a, second: b });
+
+  // 9. arrow with comparison in expression body (lexer check: => vs >=)
+  var isBig = x => x >= 100;
+
+  var lines = [];
+  lines.push("double(21) = " + double(21));
+  lines.push("add(2, 40) = " + add(2, 40));
+  lines.push("five() = " + five());
+  lines.push("clamp(150, 0, 100) = " + clamp(150, 0, 100) + ", clamp(-3, 0, 100) = " + clamp(-3, 0, 100));
+  var c = makeCounter(10);
+  c(); c();
+  lines.push("counter after 2 calls = " + c());
+  lines.push("makeAdder(3)(4) = " + makeAdder(3)(4));
+  var squares = map([1, 2, 3, 4], x => x * x);
+  lines.push("map squares = " + squares.join(","));
+  var p = pair("hope", 42);
+  lines.push("pair = " + p.first + "/" + p.second);
+  lines.push("isBig(150) = " + isBig(150) + ", isBig(15) = " + isBig(15));
+  // nested arrow chains
+  var pipeline = x => y => z => x + y * z;
+  lines.push("pipeline(1)(2)(3) = " + pipeline(1)(2)(3));
+  // arrow inside expression: reuse an outer arrow as callback
+  var arr2 = map([1, 2, 3], x => double(x) + 1);
+
+  // 10. parenthesized single param
+  var triple = (x) => x * 3;
+
+  // 11. immediately invoked
+  var iife = ((x, y) => x * y)(6, 7);
+
+  // 12. arrow stored on an object literal
+  var tools = { inc: n => n + 1, dec: n => n - 1 };
+
+  // 13. lexer guard: "=>" vs ">=" / "<=", and parenthesized arithmetic still intact
+  var cmpA = 5 >= 5;
+  var cmpB = 4 <= 3;
+  var parenMath = (1 + 2) * 3;
+
+  lines.push("triple(7) = " + triple(7));
+  lines.push("iife (x,y)=>x*y with 6,7 = " + iife);
+  lines.push("tools.inc(41) = " + tools.inc(41) + ", tools.dec(41) = " + tools.dec(41));
+  lines.push("5 >= 5 = " + cmpA + ", 4 <= 3 = " + cmpB + ", (1 + 2) * 3 = " + parenMath);
+  var total = 0;
+  lines.push("map with outer arrow = " + arr2.join(","));
+
+  var el = document.getElementById("out");
+  for (var i = 0; i < lines.length; i++) {
+    var row = document.createElement("div");
+    row.className = "row";
+    row.textContent = lines[i];
+    el.appendChild(row);
+  }
+</script>
+</head>
+<body>
+  <h1>Arrow Functions</h1>
+  <div id="out"></div>
+</body>
+</html>

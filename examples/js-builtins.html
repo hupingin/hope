@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Hope Engine - builtins</title>
+  <style>
+    body {
+      margin: 0;
+      background-color: #f5f6f8;
+      color: #202124;
+      font-size: 15px;
+      line-height: 1.55;
+      font-family: sans-serif;
+    }
+    .page { width: 720px; margin: 24px auto; }
+    h1 { font-size: 26px; margin: 0 0 6px 0; color: #14213d; }
+    .subtitle { color: #5f6368; font-size: 13px; margin: 0 0 18px 0; }
+    .card {
+      background-color: #ffffff;
+      border: 1px solid #dcdfe4;
+      padding: 12px 18px;
+      margin: 0 0 14px 0;
+    }
+    .card h2 { font-size: 16px; margin: 0 0 8px 0; color: #1a73e8; }
+    .row { font-family: monospace; font-size: 13px; white-space: pre; }
+    .fail { color: #d93025; font-weight: bold; }
+    .ok { color: #188038; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <h1>Builtin library</h1>
+    <p class="subtitle">Date &middot; JSON &middot; Map/Set iteration &middot; Array &middot; String &middot; Number &middot; Math &middot; Object</p>
+    <div class="card"><h2>Results</h2><div id="out"></div></div>
+  </div>
+<script>
+  var lines = [];
+  function check(label, got, want) {
+    var pass = String(got) === String(want);
+    lines.push((pass ? "  ok   " : "  FAIL ") + label + " = " + got + (pass ? "" : "   (want " + want + ")"));
+    return pass;
+  }
+  var passCount = 0, total = 0;
+
+  // ---- 1. Date: construction, fields, formatting, statics ----
+  total++; if (check("new Date(0)",
+        new Date(0).toISOString(), "1970-01-01T00:00:00.000Z")) passCount++;
+  var dd = new Date(2024, 0, 2, 3, 4, 5, 678);
+  total++; if (check("Date fields",
+        [dd.getFullYear(), dd.getMonth(), dd.getDate(), dd.getDay(),
+         dd.getHours(), dd.getMinutes(), dd.getSeconds(), dd.getMilliseconds()].join(","),
+        "2024,0,2,2,3,4,5,678")) passCount++;
+  total++; if (check("Date.parse == Date.UTC",
+        Date.parse("2024-01-02T03:04:05.678Z") === Date.UTC(2024, 0, 2, 3, 4, 5, 678),
+        "true")) passCount++;
+  total++; if (check("toDateString", dd.toDateString(), "Tue Jan 02 2024")) passCount++;
+  var roll = new Date(2024, 0, 2); roll.setMonth(12);
+  total++; if (check("month rollover", roll.getFullYear() + "-" + roll.getMonth(), "2025-0")) passCount++;
+  total++; if (check("invalid date", String(new Date("nonsense")), "Invalid Date")) passCount++;
+  total++; if (check("Date.now is number", typeof Date.now(), "number")) passCount++;
+  total++; if (check("date arithmetic", (dd - 0) === dd.getTime(), "true")) passCount++;
+  total++; if (check("JSON.stringify(date)",
+        JSON.stringify({ t: new Date(1000) }), '{"t":"1970-01-01T00:00:01.000Z"}')) passCount++;
+  total++; if (check("toISOString throws on invalid",
+        (function () { try { new Date("x").toISOString(); return "no"; }
+                       catch (e) { return e.name; } })(), "RangeError")) passCount++;
+
+  // ---- 2. Map / Set: iteration protocol ----
+  total++; if (check("Set spread + dedup",
+        [...new Set([1, 2, 2, 3])].join(","), "1,2,3")) passCount++;
+  var setSum = 0;
+  for (var x of new Set([1, 2, 3])) setSum += x;
+  total++; if (check("Set for-of", setSum, 6)) passCount++;
+  total++; if (check("Set entries", JSON.stringify([...new Set([7]).entries()]), "[[7,7]]")) passCount++;
+  var mp = new Map([["a", 1], ["b", 2]]);
+  total++; if (check("Map keys", JSON.stringify([...mp.keys()]), '["a","b"]')) passCount++;
+  total++; if (check("Map values", JSON.stringify([...mp.values()]), "[1,2]")) passCount++;
+  total++; if (check("Map entries",
+        JSON.stringify([...mp.entries()]), '[["a",1],["b",2]]')) passCount++;
+  var mstr = "";
+  for (var kv of mp) mstr += kv[0] + "=" + kv[1] + ";";
+  total++; if (check("Map for-of", mstr, "a=1;b=2;")) passCount++;
+  total++; if (check("Array.from(Set)",
+        JSON.stringify(Array.from(new Set([9, 8]))), "[9,8]")) passCount++;
+
+  // ---- 3. Array ----
+  total++; if (check("lastIndexOf", [1, 2, 1, 3].lastIndexOf(1), 2)) passCount++;
+  total++; if (check("reduceRight",
+        ["a", "b", "c"].reduceRight(function (acc, x) { return acc + x; }, ""), "cba")) passCount++;
+  total++; if (check("findLast / findLastIndex",
+        [1, 2, 3, 4].findLast(function (x) { return x % 2 === 0; }) + "," +
+        [1, 2, 3, 4].findLastIndex(function (x) { return x % 2 === 0; }), "4,3")) passCount++;
+  total++; if (check("copyWithin",
+        JSON.stringify([1, 2, 3, 4, 5].copyWithin(0, 3)), "[4,5,3,4,5]")) passCount++;
+  total++; if (check("entries", JSON.stringify([...["x", "y"].entries()]), '[[0,"x"],[1,"y"]]')) passCount++;
+  total++; if (check("Symbol.iterator", typeof [][Symbol.iterator], "function")) passCount++;
+
+  // ---- 4. String ----
+  total++; if (check("trimStart/trimEnd",
+        "  hi  ".trimStart() + "|" + "  hi  ".trimEnd(), "hi  |  hi")) passCount++;
+  total++; if (check("replaceAll",
+        "a-b-c".replaceAll("-", "+") + " " + "aaa".replaceAll("a", "b"), "a+b+c bbb")) passCount++;
+  total++; if (check("fromCharCode/fromCodePoint",
+        String.fromCharCode(72, 105) + String.fromCodePoint(0x4F60, 0x597D), "Hi你好")) passCount++;
+  total++; if (check("codePointAt", "你".codePointAt(0), 20320)) passCount++;
+  total++; if (check("localeCompare",
+        "a".localeCompare("b") + "," + "a".localeCompare("a"), "-1,0")) passCount++;
+  total++; if (check("matchAll",
+        [...("a1b2".matchAll(/\d/g))].map(function (m) { return m[0]; }).join(","), "1,2")) passCount++;
+
+  // ---- 5. Number / Math ----
+  total++; if (check("toFixed/toString radix",
+        (3.14159).toFixed(2) + " " + (255).toString(16), "3.14 ff")) passCount++;
+  total++; if (check("Number statics",
+        [Number.isInteger(5), Number.isInteger(5.5), Number.isFinite(Infinity),
+         Number.isNaN(NaN), Number.isSafeInteger(Math.pow(2, 53))].join(","),
+        "true,false,false,true,false")) passCount++;
+  total++; if (check("Math.clz32/imul/fround",
+        Math.clz32(1) + "," + Math.imul(3, 4) + "," + Math.fround(1.5), "31,12,1.5")) passCount++;
+  total++; if (check("Math.random in range",
+        (function () { var r = Math.random(); return r >= 0 && r < 1; })(), "true")) passCount++;
+
+  // ---- 6. Object ----
+  total++; if (check("fromEntries",
+        JSON.stringify(Object.fromEntries([["a", 1], ["b", 2]])), '{"a":1,"b":2}')) passCount++;
+  total++; if (check("getOwnPropertyNames",
+        JSON.stringify(Object.getOwnPropertyNames({ x: 1 })), '["x"]')) passCount++;
+  total++; if (check("seal/freeze flags",
+        Object.isFrozen(Object.freeze({})) + "," + Object.isSealed(Object.seal({})) + "," +
+        Object.isSealed({}), "true,true,false")) passCount++;
+
+  lines.unshift((passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total + " checks");
+  var cls = passCount === total ? "ok" : "fail";
+
+  var el = document.getElementById("out");
+  for (var li = 0; li < lines.length; li++) {
+    var row = document.createElement("div");
+    row.className = "row " + (li === 0 ? cls : "");
+    row.textContent = lines[li];
+    el.appendChild(row);
+  }
+  document.title = (passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total;
+</script>
+</body>
+</html>

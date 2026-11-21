@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Hope Engine - modern JS</title>
+  <style>
+    body {
+      margin: 0;
+      background-color: #f5f6f8;
+      color: #202124;
+      font-size: 15px;
+      line-height: 1.55;
+      font-family: sans-serif;
+    }
+    .page { width: 720px; margin: 24px auto; }
+    h1 { font-size: 26px; margin: 0 0 6px 0; color: #14213d; }
+    .subtitle { color: #5f6368; font-size: 13px; margin: 0 0 18px 0; }
+    .card {
+      background-color: #ffffff;
+      border: 1px solid #dcdfe4;
+      padding: 12px 18px;
+      margin: 0 0 14px 0;
+    }
+    .card h2 { font-size: 16px; margin: 0 0 8px 0; color: #1a73e8; }
+    .row { font-family: monospace; font-size: 13px; white-space: pre; }
+    .fail { color: #d93025; font-weight: bold; }
+    .ok { color: #188038; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <h1>Modern JavaScript</h1>
+    <p class="subtitle">try/catch &middot; class/extends/super &middot; this + call/apply/bind &middot; destructuring &middot; spread/rest &middot; template literals &middot; labels &middot; optional chaining &middot; getters &middot; regex &middot; Promise/async &middot; generators &middot; Set/Map</p>
+    <div class="card"><h2>Results</h2><div id="out"></div></div>
+  </div>
+<script>
+  var lines = [];
+  function check(label, got, want) {
+    var pass = String(got) === String(want);
+    lines.push((pass ? "  ok   " : "  FAIL ") + label + " = " + got + (pass ? "" : "   (want " + want + ")"));
+    return pass;
+  }
+  var passCount = 0, total = 0;
+
+  // ---- 1. try / catch / finally / throw / Error ----
+  var caught = "";
+  try { throw new Error("kaboom"); } catch (e) { caught = e.name + ":" + e.message; }
+  total++; if (check("throw/catch Error", caught, "Error:kaboom")) passCount++;
+  var fin = [];
+  try { fin.push("t"); } finally { fin.push("f"); }
+  total++; if (check("finally runs", fin.join(""), "tf")) passCount++;
+  total++; if (check("instanceof TypeError",
+        (function () { try { throw new TypeError("x"); } catch (e) { return e instanceof TypeError && e instanceof Error; } })(),
+        "true")) passCount++;
+
+  // ---- 2. class / extends / super / instanceof / getter+setter ----
+  class Animal {
+    constructor(name) { this.name = name; }
+    speak() { return this.name + " makes a sound"; }
+    get kind() { return "animal"; }
+  }
+  class Dog extends Animal {
+    constructor(name, breed) { super(name); this.breed = breed; }
+    speak() { return super.speak() + " (woof)"; }
+    get kind() { return "dog:" + this.breed; }
+    set kind(v) { this.breed = v; }
+    static create(n) { return new Dog(n, "mutt"); }
+  }
+  var d = new Dog("Rex", "lab");
+  total++; if (check("super.speak", d.speak(), "Rex makes a sound (woof)")) passCount++;
+  total++; if (check("instanceof both", d instanceof Dog && d instanceof Animal, "true")) passCount++;
+  total++; if (check("getter override", d.kind, "dog:lab")) passCount++;
+  d.kind = "pug";
+  total++; if (check("setter", d.breed, "pug")) passCount++;
+  total++; if (check("static method", Dog.create("Zip") instanceof Dog, "true")) passCount++;
+
+  // ---- 3. this / call / apply / bind / arrow capture ----
+  var o = { v: 42, get() { return this.v; } };
+  var det = o.get;
+  total++; if (check("call/apply/bind", det.call(o) + "," + o.get.apply(o) + "," + o.get.bind(o)(), "42,42,42")) passCount++;
+  var ctr = { n: 0, inc() { this.n++; return this.n; } };
+  var b = ctr.inc.bind(ctr);
+  b(); b();
+  total++; if (check("bound this", ctr.n, 2)) passCount++;
+  var holder = { n: 7, make() { return () => this.n; } };
+  total++; if (check("arrow captures this", holder.make()(), 7)) passCount++;
+
+  // ---- 4. destructuring / spread / default / rest / template ----
+  var [a1, , a3 = 9, ...restA] = [1, 2, undefined, 4, 5];
+  total++; if (check("array destructure", a1 + "|" + a3 + "|" + restA.join(","), "1|9|4,5")) passCount++;
+  var { p, q: alias = "dq", ...restO } = { p: 1, x: 2, y: 3 };
+  total++; if (check("object destructure", p + "|" + alias + "|" + JSON.stringify(restO), '1|dq|{"x":2,"y":3}')) passCount++;
+  function defs(x = 10, ...more) { return x + "/" + more.length; }
+  total++; if (check("default + rest params", defs() + " " + defs(1, 2, 3), "10/0 1/2")) passCount++;
+  var sp = [0, ...[1, 2], 3];
+  total++; if (check("spread + Math.max", sp.join(",") + " " + Math.max(...sp), "0,1,2,3 3")) passCount++;
+  var who = "world";
+  total++; if (check("template literal", `hi ${who} ${1 + 1} ${`in${""}ner`}`, "hi world 2 inner")) passCount++;
+
+  // ---- 5. for-in / for-of / switch / labels / bitwise / optional ----
+  var ks = []; for (var k in { a: 1, b: 2 }) ks.push(k);
+  total++; if (check("for-in keys", ks.join(","), "a,b")) passCount++;
+  var vs = []; for (var v of [10, 20, 30]) vs.push(v);
+  total++; if (check("for-of values", vs.join(","), "10,20,30")) passCount++;
+  var cs = []; for (var c of "abc") cs.push(c);
+  total++; if (check("for-of string (utf8)", cs.join(","), "a,b,c")) passCount++;
+  function sw(x) { switch (x) { case 1: return "one"; case 2: case 3: return "mid"; default: return "other"; } }
+  total++; if (check("switch fallthrough", sw(1) + sw(2) + sw(3) + sw(9), "onemidmidother")) passCount++;
+  var sum = 0;
+  outer:
+  for (var i = 0; i < 3; i++) {
+    for (var j = 0; j < 3; j++) {
+      if (j === 2) continue outer;
+      sum += i * 10 + j;
+    }
+  }
+  total++; if (check("continue <label>", sum, 63)) passCount++;
+  var walked = [];
+  brk:
+  for (var i2 = 0; i2 < 3; i2++) {
+    for (var j2 = 0; j2 < 3; j2++) {
+      if (i2 === 1 && j2 === 1) break brk;
+      walked.push(i2 + "" + j2);
+    }
+  }
+  total++; if (check("break <label>", walked.join(","), "00,01,02,10")) passCount++;
+  total++; if (check("bitwise", [5 & 3, 5 | 3, 5 ^ 3, ~5, 1 << 4, -16 >> 2, -16 >>> 28].join(","),
+        "1,7,6,-6,16,-4,15")) passCount++;
+  var opt = { a: { b: { c: 5 } } };
+  total++; if (check("?. and ??", opt?.a?.b?.c + " " + (opt?.z?.b ?? "fb") + " " + (0 ?? 1), "5 fb 0")) passCount++;
+
+  // ---- 6. regex literals / capturing groups / flags ----
+  total++; if (check("regex test + group", /a(b+)c/.test("abbbc") + " " + "abc".match(/a(b+)c/)[1], "true b")) passCount++;
+  total++; if (check("regex replace $n", "2024-01-02".replace(/(\d+)-(\d+)-(\d+)/, "$3/$2/$1"), "02/01/2024")) passCount++;
+  total++; if (check("regex global + split", "aaa".replace(/a/g, "b") + " " + "a1b22c".split(/\d+/).join("|"), "bbb a|b|c")) passCount++;
+  total++; if (check("lookaround + \\b", /x(?=y)/.test("xy") + " " + /(?<=a)b/.test("ab") + " " + /\bcat\b/.test("a cat!"), "true true true")) passCount++;
+
+  // ---- 7. Promise / async await / generator ----
+  var order = [];
+  Promise.resolve(1).then(function (x) { order.push("p" + x); return x + 1; }).then(function (x) { order.push("p" + x); });
+  async function asyncAdd(x, y) { var r = await Promise.resolve(x + y); return r * 2; }
+  asyncAdd(3, 4).then(function (x) { order.push("a" + x); });
+  total++; if (check("promise chain + await", order.join(","), "p1,p2,a14")) passCount++;
+  function* gen() { yield 1; yield 2; yield 3; }
+  total++; if (check("generator", [...gen()].join(","), "1,2,3")) passCount++;
+
+  // ---- 8. Set / Map / private fields ----
+  var st = new Set([1, 2, 2, 3]);
+  st.add(4);
+  total++; if (check("Set dedup", st.size + " " + st.has(2) + " " + [...st.values()].join(","), "4 true 1,2,3,4")) passCount++;
+  var mp = new Map([["a", 1]]);
+  mp.set("b", 2);
+  total++; if (check("Map", mp.size + " " + mp.get("a") + " " + mp.has("b"), "2 1 true")) passCount++;
+  class Priv { #n = 0; bump() { this.#n = this.#n + 1; return this.#n; } }
+  var pr = new Priv();
+  total++; if (check("private field #n", pr.bump() + "," + pr.bump(), "1,2")) passCount++;
+
+  lines.unshift((passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total + " checks");
+  var cls = passCount === total ? "ok" : "fail";
+
+  var el = document.getElementById("out");
+  for (var li = 0; li < lines.length; li++) {
+    var row = document.createElement("div");
+    row.className = "row " + (li === 0 ? cls : "");
+    row.textContent = lines[li];
+    el.appendChild(row);
+  }
+  document.title = (passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total;
+</script>
+</body>
+</html>

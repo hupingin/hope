@@ -1,0 +1,58 @@
+# ---- Hope UI Engine :: .gitignore ----
+# 只纳入源码（src/）、示例（examples/）、文档（docs/ 的 .md）与根级工程文件。
+# 构建输出、AI 工作目录、编辑器/系统临时文件一律忽略。
+
+# ---- AI 工作目录（对话记忆 / 项目数据，不纳入代码版本控制）----
+.workbuddy/
+
+# ---- 构建输出目录（CMake 生成，含大量调试 BMP/PNG/JS/TXT 产物）----
+build/
+cmake-build-*/
+out/
+bin/
+obj/
+
+# ---- C 编译产物 ----
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+
+# ---- CMake 生成物 ----
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+compile_commands.json
+
+# ---- 调试 / 临时文件 ----
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+*~
+*.stackdump
+
+# ---- 编辑器 / IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+*.user
+*.suo
+
+# ---- 操作系统 ----
+.DS_Store
+._*
+Thumbs.db
+desktop.ini

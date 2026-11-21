@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Layout features</title>
+<style>
+  body { margin: 0; padding-top: 30px; font-size: 14px; color: #222; }
+  h3 { margin: 14px 0 6px; font-size: 15px; }
+  .card {
+    display: inline-block; width: 100px; height: 60px; background: #cce0ff;
+    border: 1px solid #3366cc; vertical-align: top; text-align: center;
+  }
+  .rel {
+    position: relative; top: 14px; left: 24px; background: #ffe0cc;
+    border: 1px solid #996633; width: 160px; height: 40px;
+  }
+  .container {
+    position: relative; height: 90px; background: #eeeeee;
+    border: 1px solid #999999; margin: 6px 0;
+  }
+  .badge {
+    position: absolute; top: 4px; right: 4px; background: #ff3333; color: #fff;
+    padding: 2px 6px; font-size: 12px;
+  }
+  .fixedbar {
+    position: fixed; top: 0; left: 0; right: 0; height: 24px; background: #333333;
+    color: #ffffff; font-size: 13px; text-align: center;
+  }
+  .stack1 {
+    position: absolute; width: 80px; height: 80px; background: #33aa33; z-index: 1;
+  }
+  .stack2 {
+    position: absolute; top: 30px; left: 30px; width: 80px; height: 80px;
+    background: #aa3333; z-index: 2;
+  }
+  .m1 { margin: 20px 0; background: #ccffcc; border: 1px solid #339933; padding: 4px; }
+  .m2 { margin: 20px 0; background: #ffcccc; border: 1px solid #993333; padding: 4px; }
+</style>
+</head>
+<body>
+  <div class="fixedbar">fixed header bar</div>
+
+  <h3>inline-block row</h3>
+  <div class="card">A</div>
+  <div class="card">B</div>
+  <div class="card">C</div>
+
+  <h3>position: relative (offset by 14px/24px)</h3>
+  <div class="rel">shifted box</div>
+
+  <h3>absolute badge inside relative container</h3>
+  <div class="container">container text<div class="badge">NEW</div></div>
+
+  <h3>z-index stacking (red on top of green)</h3>
+  <div class="container">
+    <div class="stack1">z=1</div>
+    <div class="stack2">z=2</div>
+  </div>
+
+  <h3>margin collapse (20 + 20 -&gt; 20, not 40)</h3>
+  <div class="m1">block 1, margin 20</div>
+  <div class="m2">block 2, margin 20</div>
+</body>
+</html>

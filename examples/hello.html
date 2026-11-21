@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Hope Engine - smoke test</title>
+  <style>
+    body {
+      margin: 0;
+      background-color: #f5f6f8;
+      color: #202124;
+      font-size: 16px;
+      line-height: 1.6;
+    }
+    .page {
+      width: 720px;
+      margin: 32px auto;
+    }
+    h1 {
+      font-size: 34px;
+      margin: 0 0 8px 0;
+      color: #14213d;
+    }
+    .subtitle {
+      color: #5f6368;
+      font-size: 15px;
+      margin: 0 0 28px 0;
+    }
+    .card {
+      background-color: #ffffff;
+      border: 1px solid #dcdfe4;
+      padding: 20px 24px;
+      margin: 0 0 20px 0;
+    }
+    .card h2 {
+      font-size: 20px;
+      margin: 0 0 12px 0;
+      color: #1a73e8;
+    }
+    .tags {
+      margin: 12px 0 0 0;
+    }
+    .tag {
+      display: inline;
+      background-color: #e8f0fe;
+      color: #1a73e8;
+      padding: 2px 8px;
+      margin: 0 6px 0 0;
+      font-size: 13px;
+    }
+    .accent {
+      color: #d93025;
+      font-weight: bold;
+    }
+    .center {
+      text-align: center;
+      color: #5f6368;
+      font-size: 13px;
+      margin: 24px 0 0 0;
+    }
+    li {
+      margin: 4px 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <h1>Hope &mdash; 希望</h1>
+    <p class="subtitle">A pure-C UI engine that parses local HTML + CSS and renders it with its own software rasterizer.</p>
+
+    <div class="card">
+      <h2>Pipeline</h2>
+      <p>Every frame walks the same stages as a browser engine: <span class="accent">parse</span> &rarr; style &rarr; layout &rarr; paint &rarr; composite.</p>
+      <ul>
+        <li>HTML tokenizer and tree builder</li>
+        <li>CSS selector matching with cascade and inheritance</li>
+        <li>Block layout with inline text flow and word wrapping</li>
+        <li>Antialiased text composited by an 8-bit coverage rasterizer</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <h2>Inline 滴滴滴formatting</h2>
+      <p>Mixed runs keep their own colors and weights: <b>bold text</b>, <span class="accent">red accent</span>, and plain text all flow inside one paragraph. 中文换行也在这里测试：引擎对中日韩字符按单字断行，对拉丁文本按单词断行，这样可以避免长单词提前折行导致的排版空隙。</p>
+      <p class="tags">
+        <span class="tag">html</span>
+        <span class="tag">css</span>
+        <span class="tag">layout</span>
+        <span class="tag">raster</span>
+      </p>
+    </div>
+
+    <div class="card center">
+      F5 reload &middot; wheel to scroll &middot; Esc to quit
+    </div>
+  </div>
+</body>
+</html>
