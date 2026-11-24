@@ -37,13 +37,27 @@ typedef struct {
     float a, b, c, d, e, f;
 } Mat;
 
+/**
+ * @brief 返回单位仿射矩阵 / Return the identity affine matrix
+ *
+ * @note 该矩阵为 {1,0,0,1,0,0}，点映射为恒等 / The matrix is `{1,0,0,1,0,0}`, mapping points unchanged
+ */
 static Mat mat_identity(void)
 {
     Mat m = {1, 0, 0, 1, 0, 0};
     return m;
 }
 
-/* M = A * B : A is applied after B */
+/**
+ * @brief 矩阵相乘 / Multiply two affine matrices
+ *
+ * @param[in]     A 左矩阵 / Left matrix
+ * @param[in]     B 右矩阵 / Right matrix
+ *
+ * @return 乘积 A*B / The product `A*B`
+ *
+ * @note 结果等价于先应用 B 再应用 A / The result applies B first and then A
+ */
 static Mat mat_mul(Mat A, Mat B)
 {
     Mat r;
@@ -56,13 +70,28 @@ static Mat mat_mul(Mat A, Mat B)
     return r;
 }
 
+/**
+ * @brief 用矩阵变换一个点 / Transform a point by a matrix
+ *
+ * @param[in]     m 仿射矩阵 / Affine matrix
+ * @param[in]     x 输入 X / Input X
+ * @param[in]     y 输入 Y / Input Y
+ * @param[out]    ox 变换后 X / Transformed X
+ * @param[out]    oy 变换后 Y / Transformed Y
+ */
 static void mat_apply(Mat m, float x, float y, float *ox, float *oy)
 {
     *ox = m.a * x + m.c * y + m.e;
     *oy = m.b * x + m.d * y + m.f;
 }
 
-/* inverse of an affine matrix; identity when singular */
+/**
+ * @brief 求仿射矩阵的逆 / Invert an affine matrix
+ *
+ * @param[in]     m 仿射矩阵 / Affine matrix
+ *
+ * @return 逆矩阵；行列式接近 0 时返回单位矩阵 / The inverse, or the identity matrix when the determinant is near zero
+ */
 static Mat mat_invert(Mat m)
 {
     float det = m.a * m.d - m.b * m.c;
@@ -78,7 +107,15 @@ static Mat mat_invert(Mat m)
     return r;
 }
 
-/* nominal uniform scale factor (used for stroke widths / font sizes) */
+/**
+ * @brief 求矩阵的名义均匀缩放系数 / Nominal uniform scale factor of a matrix
+ *
+ * @param[in]     m 仿射矩阵 / Affine matrix
+ *
+ * @return 缩放系数，下限钳到 1.0 / Scale factor, floored at 1.0
+ *
+ * @note 用于描边宽度与字号 / Used for stroke widths and font sizes
+ */
 static float mat_scale(Mat m)
 {
     float det = m.a * m.d - m.b * m.c;
@@ -114,7 +151,17 @@ typedef struct SvgCtx {
     int cov_cap;
 } SvgCtx;
 
-/* ---------------- raster primitives ---------------- */
+/**
+ * @brief 按覆盖率混合一个设备像素 / Blend one device pixel with a coverage value
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     x 设备 X / Device X
+ * @param[in]     y 设备 Y / Device Y
+ * @param[in]     c 源颜色 / Source colour
+ * @param[in]     cov 覆盖率 0..1 / Coverage in 0..1
+ *
+ * @note 超出裁剪区、图像外或覆盖率非正的像素直接跳过 / Pixels outside the clip, outside the image, or with non-positive coverage are skipped
+ */
 
 static void blend_px(HpePixmap *pm, int x, int y, HpeColor c, float cov)
 {
@@ -152,7 +199,19 @@ static void blend_px(HpePixmap *pm, int x, int y, HpeColor c, float cov)
     }
 }
 
-/* resolves the colour of a gradient (or a flat colour) at device pixel (px,py) */
+/**
+ * @brief 求渐变（或纯色回退）在设备像素处的颜色 / Resolve the colour of a gradient (or a flat fallback) at a device pixel
+ *
+ * @param[in]     grad 渐变描述，可为 `NULL` / Gradient description, may be `NULL`
+ * @param[in]     ctm 用户空间到设备空间的矩阵 / User-to-device matrix
+ * @param[in]     flat 无渐变时的纯色 / Flat colour used when there is no gradient
+ * @param[in]     px 设备 X / Device X
+ * @param[in]     py 设备 Y / Device Y
+ *
+ * @return 该像素处的颜色 / The colour at that pixel
+ *
+ * @note 线性渐变按沿轴的投影参数采样，径向渐变按到中心的距离采样 / A linear gradient samples the axial projection parameter; a radial one samples the distance to the centre
+ */
 static HpeColor grad_color_at(const SvgGrad *grad, Mat ctm, HpeColor flat, float px, float py)
 {
     HpeColor c;
@@ -186,7 +245,21 @@ static HpeColor grad_color_at(const SvgGrad *grad, Mat ctm, HpeColor flat, float
     }
 }
 
-/* stroke a single segment as a capsule of `width` in device space */
+/**
+ * @brief 以胶囊形描边一条线段 / Stroke one segment as a capsule
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     x0 起点设备 X / Start device X
+ * @param[in]     y0 起点设备 Y / Start device Y
+ * @param[in]     x1 终点设备 X / End device X
+ * @param[in]     y1 终点设备 Y / End device Y
+ * @param[in]     width 描边宽度（设备像素）/ Stroke width in device pixels
+ * @param[in]     c 纯色回退 / Flat colour fallback
+ * @param[in]     grad 渐变描述，可为 `NULL` / Gradient description, may be `NULL`
+ * @param[in]     ctm 用户空间到设备空间的矩阵 / User-to-device matrix
+ *
+ * @note 每条线段各自绘制，端点为圆头；宽度非正时直接返回 / Each segment is drawn separately with round caps; returns early when the width is not positive
+ */
 static void stroke_capsule(HpePixmap *pm, float x0, float y0, float x1, float y1, float width,
                            HpeColor c, const SvgGrad *grad, Mat ctm)
 {
@@ -234,6 +307,15 @@ typedef struct {
     int cap;
 } Polys;
 
+/**
+ * @brief 向子路径追加一个顶点 / Append a vertex to a subpath
+ *
+ * @param[in,out] sp 子路径 / Subpath
+ * @param[in]     x X 坐标 / X coordinate
+ * @param[in]     y Y 坐标 / Y coordinate
+ *
+ * @note 必要时按倍增扩容顶点数组 / Grows the vertex array by doubling when needed
+ */
 static void sub_push(SubPath *sp, float x, float y)
 {
     if (sp->count + 1 >= sp->cap) {
@@ -245,6 +327,13 @@ static void sub_push(SubPath *sp, float x, float y)
     sp->count++;
 }
 
+/**
+ * @brief 在多边形列表中新建一个空子路径 / Create an empty subpath in a polygon list
+ *
+ * @param[in,out] p 多边形列表 / Polygon list
+ *
+ * @return 新分配的子路径 / The newly allocated subpath
+ */
 static SubPath *polys_new(Polys *p)
 {
     SubPath *sp;
@@ -257,6 +346,13 @@ static SubPath *polys_new(Polys *p)
     return sp;
 }
 
+/**
+ * @brief 释放多边形列表及其全部子路径 / Free a polygon list and all its subpaths
+ *
+ * @param[in,out] p 多边形列表 / Polygon list
+ *
+ * @note 释放后把列表重置为空 / The list is reset to empty afterwards
+ */
 static void polys_free(Polys *p)
 {
     int i;
@@ -267,7 +363,18 @@ static void polys_free(Polys *p)
     p->count = p->cap = 0;
 }
 
-/* distribute `w` of horizontal coverage across the pixel bins spanned by [a,b) */
+/**
+ * @brief 把一段水平覆盖按像素分箱累加 / Distribute a horizontal coverage span across pixel bins
+ *
+ * @param[in,out] cov 逐像素覆盖率数组 / Per-pixel coverage array
+ * @param[in]     x0 数组首列的设备 X / Device X of the array's first column
+ * @param[in]     x1 数组列数 / Number of columns
+ * @param[in]     a 区间起点 X / Span start X
+ * @param[in]     b 区间终点 X / Span end X
+ * @param[in]     w 该段的权重 / Weight of the span
+ *
+ * @note 区间为空（b<=a）时无操作 / No-op when the span is empty (`b <= a`)
+ */
 static void add_span(float *cov, int x0, int x1, float a, float b, float w)
 {
     int ia = (int)floorf(a), ib = (int)ceilf(b);
@@ -284,8 +391,20 @@ static void add_span(float *cov, int x0, int x1, float a, float b, float w)
 }
 
 /* even-odd scanline fill of every subpath; solid colour or gradient */
-/* device-space bounding box of every subpath, intersected with the clip rect
- * and the caller's bbox limit */
+/**
+ * @brief 求所有子路径的设备包围盒并夹紧到裁剪与限界 / Device bounding box of every subpath, clipped to the clip rect and a caller limit
+ *
+ * @param[in]     p 多边形列表 / Polygon list
+ * @param[in]     pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     bx0 限界左 / Limit left
+ * @param[in]     by0 限界上 / Limit top
+ * @param[in]     bx1 限界右 / Limit right
+ * @param[in]     by1 限界下 / Limit bottom
+ * @param[out]    ox0 裁剪后左边界 / Clipped left edge
+ * @param[out]    oy0 裁剪后上边界 / Clipped top edge
+ * @param[out]    ox1 裁剪后右边界 / Clipped right edge
+ * @param[out]    oy1 裁剪后下边界 / Clipped bottom edge
+ */
 static void polys_bbox_clipped(Polys *p, HpePixmap *pm, float bx0, float by0, float bx1, float by1,
                                int *ox0, int *oy0, int *ox1, int *oy1)
 {
@@ -328,8 +447,15 @@ static void polys_bbox_clipped(Polys *p, HpePixmap *pm, float bx0, float by0, fl
         *oy1 = pm->clip_y1;
 }
 
-/* gather the x-intersections of every edge with the horizontal line y = sy.
- * `xs`/`ncap` are carried across calls so the scratch buffer is reused. */
+/**
+ * @brief 收集所有边与水平线 y = sy 的交点 / Gather the x-intersections of every edge with the horizontal line `y = sy`
+ *
+ * @param[in]     p 多边形列表 / Polygon list
+ * @param[in]     sy 扫描线 y / Scanline y
+ * @param[in,out] pxs 交点数组，跨调用复用 / Intersection array, reused across calls
+ * @param[out]    pnx 交点个数 / Number of intersections
+ * @param[in,out] pncap 交点数组容量 / Intersection array capacity
+ */
 static void polys_scanline(Polys *p, float sy, float **pxs, int *pnx, int *pncap)
 {
     float *xs = *pxs;
@@ -356,6 +482,12 @@ static void polys_scanline(Polys *p, float sy, float **pxs, int *pnx, int *pncap
     *pncap = ncap;
 }
 
+/**
+ * @brief 对浮点数组做升序插入排序 / Sort a float array ascending (insertion sort)
+ *
+ * @param[in,out] xs 待排序数组 / Array to sort
+ * @param[in]     nx 元素个数 / Element count
+ */
 static void sort_floats(float *xs, int nx)
 {
     int i;
@@ -370,8 +502,14 @@ static void sort_floats(float *xs, int nx)
     }
 }
 
-/* linear gradient: device-space origin (lin[0],lin[1]) and direction
- * (lin[2],lin[3]) with squared length len2 */
+/**
+ * @brief 求线性渐变在设备空间的原点、方向与长度平方 / Device-space origin, direction and squared length of a linear gradient
+ *
+ * @param[in]     ctm 用户空间到设备空间的矩阵 / User-to-device matrix
+ * @param[in]     grad 渐变描述 / Gradient description
+ * @param[out]    lin 原点与方向（lin[0..1] 为原点，lin[2..3] 为方向）/ Origin and direction: `lin[0..1]` origin, `lin[2..3]` direction
+ * @param[out]    len2 方向长度的平方 / Squared length of the direction
+ */
 static void grad_linear_proj(Mat ctm, const SvgGrad *grad, float lin[4], float *len2)
 {
     float gx0, gy0, gx1, gy1, dx, dy;
@@ -386,13 +524,36 @@ static void grad_linear_proj(Mat ctm, const SvgGrad *grad, float lin[4], float *
     *len2 = dx * dx + dy * dy;
 }
 
+/**
+ * @brief 求径向渐变在设备空间的中心与半径 / Device-space centre and radius of a radial gradient
+ *
+ * @param[in]     ctm 用户空间到设备空间的矩阵 / User-to-device matrix
+ * @param[in]     grad 渐变描述 / Gradient description
+ * @param[out]    pcx 中心设备 X / Centre device X
+ * @param[out]    pcy 中心设备 Y / Centre device Y
+ * @param[out]    pr 半径（已缩放）/ Radius, scaled
+ */
 static void grad_radial_proj(Mat ctm, const SvgGrad *grad, float *pcx, float *pcy, float *pr)
 {
     mat_apply(ctm, grad->cx, grad->cy, pcx, pcy);
     *pr = grad->r * mat_scale(ctm);
 }
 
-/* resolve the fill colour at device pixel centre (dcx,dcy) */
+/**
+ * @brief 求设备像素中心处的填充颜色 / Resolve the fill colour at a device pixel centre
+ *
+ * @param[in]     grad 渐变描述，可为 `NULL` / Gradient description, may be `NULL`
+ * @param[in]     color 纯色回退 / Flat colour fallback
+ * @param[in]     dcx 设备像素中心 X / Device pixel centre X
+ * @param[in]     dcy 设备像素中心 Y / Device pixel centre Y
+ * @param[in]     lin 线性渐变原点与方向 / Linear gradient origin and direction
+ * @param[in]     len2 线性渐变方向长度平方 / Squared direction length of the linear gradient
+ * @param[in]     rcx 径向渐变中心 X / Radial gradient centre X
+ * @param[in]     rcy 径向渐变中心 Y / Radial gradient centre Y
+ * @param[in]     rr 径向渐变半径 / Radial gradient radius
+ *
+ * @return 该处的颜色 / The colour at that point
+ */
 static HpeColor fill_grad_color(const SvgGrad *grad, HpeColor color, float dcx, float dcy,
                                 const float *lin, float len2, float rcx, float rcy, float rr)
 {
@@ -418,7 +579,21 @@ static HpeColor fill_grad_color(const SvgGrad *grad, HpeColor color, float dcx, 
     return color;
 }
 
-/* even-odd scanline fill of every subpath; solid colour or gradient */
+/**
+ * @brief 对所有子路径做奇偶规则扫描线填充 / Even-odd scanline fill of every subpath
+ *
+ * @param[in,out] ctx SVG 上下文 / SVG context
+ * @param[in]     p 多边形列表 / Polygon list
+ * @param[in]     color 纯色回退 / Flat colour fallback
+ * @param[in]     grad 渐变描述，可为 `NULL` / Gradient description, may be `NULL`
+ * @param[in]     ctm 用户空间到设备空间的矩阵 / User-to-device matrix
+ * @param[in]     bx0 限界左 / Limit left
+ * @param[in]     by0 限界上 / Limit top
+ * @param[in]     bx1 限界右 / Limit right
+ * @param[in]     by1 限界下 / Limit bottom
+ *
+ * @note 每行取四个子扫描线并按 0.25 权重累加覆盖率；支持纯色与渐变 / Each row uses four sub-scanlines accumulated with 0.25 weight; supports solid colour and gradients
+ */
 static void fill_polys(SvgCtx *ctx, Polys *p, HpeColor color, const SvgGrad *grad, Mat ctm,
                        float bx0, float by0, float bx1, float by1)
 {
@@ -471,6 +646,17 @@ static void fill_polys(SvgCtx *ctx, Polys *p, HpeColor color, const SvgGrad *gra
     }
 }
 
+/**
+ * @brief 沿所有子路径逐段描边 / Stroke every subpath segment by segment
+ *
+ * @param[in,out] ctx SVG 上下文 / SVG context
+ * @param[in]     p 多边形列表 / Polygon list
+ * @param[in]     color 纯色回退 / Flat colour fallback
+ * @param[in]     width 描边宽度 / Stroke width
+ * @param[in]     grad 渐变描述，可为 `NULL` / Gradient description, may be `NULL`
+ *
+ * @note 闭合子路径额外补画首尾相连的一段以保持视觉连续 / A closed subpath also draws the wrap-around segment for visual continuity
+ */
 static void stroke_polys(SvgCtx *ctx, Polys *p, HpeColor color, float width, const SvgGrad *grad)
 {
     int i, k;
@@ -488,7 +674,14 @@ static void stroke_polys(SvgCtx *ctx, Polys *p, HpeColor color, float width, con
     }
 }
 
-/* ---------------- attribute helpers ---------------- */
+/**
+ * @brief 读取非空属性值 / Read a non-empty attribute value
+ *
+ * @param[in]     n DOM 元素 / DOM element
+ * @param[in]     name 属性名 / Attribute name
+ *
+ * @return 属性值；缺失或为空时返回 `NULL` / The value, or `NULL` when absent or empty
+ */
 
 static const char *attr(HpeDomNode *n, const char *name)
 {
@@ -496,6 +689,15 @@ static const char *attr(HpeDomNode *n, const char *name)
     return (v && *v) ? v : NULL;
 }
 
+/**
+ * @brief 把数值属性读入浮点数 / Parse a numeric attribute into a float
+ *
+ * @param[in]     n DOM 元素 / DOM element
+ * @param[in]     name 属性名 / Attribute name
+ * @param[out]    out 解析结果 / Parsed value
+ *
+ * @return 解析成功返回 1，否则 0 / 1 on success, else 0
+ */
 static int attr_num(HpeDomNode *n, const char *name, float *out)
 {
     const char *v = attr(n, name);
@@ -510,7 +712,17 @@ static int attr_num(HpeDomNode *n, const char *name, float *out)
     return 1;
 }
 
-/* returns 1 when the attribute exists; "none" yields a fully transparent colour */
+/**
+ * @brief 解析颜色属性 / Parse a colour attribute
+ *
+ * @param[in]     n DOM 元素 / DOM element
+ * @param[in]     name 属性名 / Attribute name
+ * @param[out]    out 解析出的颜色 / Parsed colour
+ *
+ * @return 属性存在返回 1，否则 0 / 1 when the attribute exists, else 0
+ *
+ * @note `none` 得到全透明色；无法解析时回退为不透明黑 / `none` yields a fully transparent colour; an unparsable value falls back to opaque black
+ */
 static int attr_color(HpeDomNode *n, const char *name, HpeColor *out)
 {
     const char *v = attr(n, name);
@@ -527,6 +739,14 @@ static int attr_color(HpeDomNode *n, const char *name, HpeColor *out)
     return 1;
 }
 
+/**
+ * @brief 把元素上的绘制属性应用到上下文 / Apply a node's paint attributes to the context
+ *
+ * @param[in,out] ctx SVG 上下文 / SVG context
+ * @param[in]     n DOM 元素 / DOM element
+ *
+ * @note 读取 fill、stroke、stroke-width、fill-opacity、stroke-opacity / Reads fill, stroke, stroke-width, fill-opacity and stroke-opacity
+ */
 static void ctx_apply_style(SvgCtx *ctx, HpeDomNode *n)
 {
     HpeColor c;
@@ -549,7 +769,17 @@ static void ctx_apply_style(SvgCtx *ctx, HpeDomNode *n)
 
 /* ---------------- transform parsing ---------------- */
 
-/* the rotation about a point, when a 3-argument rotate() supplies one */
+/**
+ * @brief 构造绕点旋转（rotate 三参数形式）的矩阵 / Build the matrix for a rotation about a point (3-argument `rotate`)
+ *
+ * @param[in]     ang_deg 旋转角度（度）/ Rotation angle in degrees
+ * @param[in]     v 参数数组 / Argument array
+ * @param[in]     vn 参数个数 / Argument count
+ *
+ * @return 旋转矩阵 / The rotation matrix
+ *
+ * @note 参数至少 3 个时以 v[1],v[2] 为旋转中心 / When at least three arguments are given, `v[1]` and `v[2]` are the rotation centre
+ */
 static Mat transform_rotate(float ang_deg, const float *v, int vn)
 {
     float ang = ang_deg * 3.14159265f / 180.0f;
@@ -571,8 +801,17 @@ static Mat transform_rotate(float ang_deg, const float *v, int vn)
     return r;
 }
 
-/* maps one transform name + its parsed arguments to a matrix (identity when
- * the name is unknown or the argument count is short) */
+/**
+ * @brief 把变换名与参数映射为矩阵 / Map a transform name and its arguments to a matrix
+ *
+ * @param[in]     name 变换名 / Transform name
+ * @param[in]     v 参数数组 / Argument array
+ * @param[in]     vn 参数个数 / Argument count
+ *
+ * @return 对应的矩阵 / The corresponding matrix
+ *
+ * @note 支持 translate/scale/rotate/skewX/skewY/matrix；名称未知或参数不足时返回单位矩阵 / Supports translate, scale, rotate, skewX, skewY and matrix; returns the identity when the name is unknown or the argument count is short
+ */
 static Mat transform_from_name(const char *name, const float *v, int vn)
 {
     Mat t = mat_identity();
@@ -599,7 +838,13 @@ static Mat transform_from_name(const char *name, const float *v, int vn)
     return t;
 }
 
-/* reads the transform name at *pp into `name`; advances past it */
+/**
+ * @brief 读取变换名并前移游标 / Read a transform name and advance the cursor
+ *
+ * @param[in,out] pp 解析游标指针 / Parse cursor pointer
+ * @param[out]    name 接收变换名 / Receives the transform name
+ * @param[in]     cap `name` 缓冲区容量 / Capacity of the `name` buffer
+ */
 static void transform_read_name(const char **pp, char *name, size_t cap)
 {
     const char *p = *pp;
@@ -611,7 +856,17 @@ static void transform_read_name(const char **pp, char *name, size_t cap)
     *pp = p;
 }
 
-/* reads up to `cap` numeric arguments between the parentheses at *pp */
+/**
+ * @brief 读取括号内最多 cap 个数值参数 / Read up to `cap` numeric arguments inside the parentheses
+ *
+ * @param[in,out] pp 解析游标指针 / Parse cursor pointer
+ * @param[out]    v 接收参数值 / Receives the argument values
+ * @param[in]     cap 参数数组容量 / Capacity of the argument array
+ *
+ * @return 实际解析到的参数个数 / Number of arguments actually parsed
+ *
+ * @note 会跳过逗号与空白，并至少前进到右括号之后 / Skips commas and whitespace and always advances past the closing parenthesis
+ */
 static int transform_read_args(const char **pp, float *v, int cap)
 {
     const char *p = *pp;
@@ -637,7 +892,13 @@ static int transform_read_args(const char **pp, float *v, int cap)
     return vn;
 }
 
-/* skips a malformed entry's parenthesised argument list (avoids an endless loop) */
+/**
+ * @brief 跳过一段括号参数（避免死循环）/ Skip a parenthesised argument list to avoid an endless loop
+ *
+ * @param[in]     p 起始指针 / Start pointer
+ *
+ * @return 右括号之后的指针 / Pointer past the closing parenthesis
+ */
 static const char *transform_skip_parens(const char *p)
 {
     while (*p && *p != ')')
@@ -647,6 +908,15 @@ static const char *transform_skip_parens(const char *p)
     return p;
 }
 
+/**
+ * @brief 解析 transform 属性为累积矩阵 / Parse a `transform` attribute into an accumulated matrix
+ *
+ * @param[in]     s transform 属性文本 / The `transform` attribute text
+ *
+ * @return 累积后的变换矩阵 / The accumulated transform matrix
+ *
+ * @note 多个变换按出现顺序左乘累加；`s` 为 `NULL` 时返回单位矩阵 / Multiple transforms accumulate left to right; returns the identity when `s` is `NULL`
+ */
 static Mat parse_transform(const char *s)
 {
     Mat acc = mat_identity();
@@ -677,7 +947,14 @@ static Mat parse_transform(const char *s)
     return acc;
 }
 
-/* ---------------- gradient lookup ---------------- */
+/**
+ * @brief 在子树中按 id 查找元素 / Find an element by id within a subtree
+ *
+ * @param[in]     root 子树根 / Subtree root
+ * @param[in]     id 目标 id / Target id
+ *
+ * @return 匹配的元素；未找到时返回 `NULL` / The matching element, or `NULL` when not found
+ */
 
 static HpeDomNode *find_by_id(HpeDomNode *root, const char *id)
 {
@@ -696,6 +973,13 @@ static HpeDomNode *find_by_id(HpeDomNode *root, const char *id)
     return NULL;
 }
 
+/**
+ * @brief 解析渐变色标偏移 / Parse a gradient stop offset
+ *
+ * @param[in]     s 偏移文本 / Offset text
+ *
+ * @return 归一化偏移；带 `%` 时除以 100 / The normalised offset, divided by 100 when it carries a `%`
+ */
 static float parse_offset(const char *s)
 {
     char *end = NULL;
@@ -707,7 +991,14 @@ static float parse_offset(const char *s)
     return (float)d;
 }
 
-/* reads the geometry attributes of a linear (kind 1) or radial (kind 2) gradient */
+/**
+ * @brief 读取线性/径向渐变的几何属性 / Read the geometry attributes of a linear or radial gradient
+ *
+ * @param[in]     n 渐变元素 / Gradient element
+ * @param[out]    g 渐变描述，被写入 / Gradient description, written to
+ *
+ * @note 线性读 x1/y1/x2/y2，径向读 cx/cy/r / Linear reads x1/y1/x2/y2; radial reads cx/cy/r
+ */
 static void parse_gradient_geometry(HpeDomNode *n, SvgGrad *g)
 {
     const char *v;
@@ -730,7 +1021,14 @@ static void parse_gradient_geometry(HpeDomNode *n, SvgGrad *g)
     }
 }
 
-/* appends one <stop> child to the gradient's stop list */
+/**
+ * @brief 把一个 `<stop>` 子元素追加到色标列表 / Append one `<stop>` child to the gradient's stop list
+ *
+ * @param[in]     c `<stop>` 元素 / The `<stop>` element
+ * @param[out]    g 渐变描述 / Gradient description
+ *
+ * @note 读取 offset、stop-color、stop-opacity / Reads offset, stop-color and stop-opacity
+ */
 static void parse_gradient_stop(HpeDomNode *c, SvgGrad *g)
 {
     HpeColor col = hpe_rgb(0, 0, 0);
@@ -747,7 +1045,16 @@ static void parse_gradient_stop(HpeDomNode *c, SvgGrad *g)
     g->stop_count++;
 }
 
-/* fills `g` from a <linearGradient>/<radialGradient> element */
+/**
+ * @brief 从 `<linearGradient>`/`<radialGradient>` 元素填充渐变描述 / Fill a gradient description from a `<linearGradient>`/`<radialGradient>` element
+ *
+ * @param[in]     n 渐变元素 / Gradient element
+ * @param[out]    g 渐变描述 / Gradient description
+ *
+ * @return 有色标返回 1，否则 0 / 1 when the gradient has stops, else 0
+ *
+ * @note 标签不匹配时返回 0；色标最多收集 SVG_MAX_STOPS 个 / Returns 0 when the tag does not match; collects at most SVG_MAX_STOPS stops
+ */
 static int parse_gradient(HpeDomNode *n, SvgGrad *g)
 {
     HpeDomNode *c;
@@ -780,7 +1087,22 @@ static int parse_gradient(HpeDomNode *n, SvgGrad *g)
     return g->stop_count > 0;
 }
 
-/* resolves fill="url(#id)" into a gradient; returns 1 on success */
+/**
+ * @brief 把 `fill`/`stroke` 的 `url(#id)` 解析为渐变 / Resolve a `fill`/`stroke` `url(#id)` into a gradient
+ *
+ * @param[in,out] ctx SVG 上下文 / SVG context
+ * @param[in]     n DOM 元素 / DOM element
+ * @param[in]     which 属性名（fill 或 stroke）/ Attribute name, `fill` or `stroke`
+ * @param[out]    out 解析出的渐变 / Resolved gradient
+ * @param[in]     ux0 形状用户空间包围盒左 / Shape user-space bbox left
+ * @param[in]     uy0 形状用户空间包围盒上 / Shape user-space bbox top
+ * @param[in]     ux1 形状用户空间包围盒右 / Shape user-space bbox right
+ * @param[in]     uy1 形状用户空间包围盒下 / Shape user-space bbox bottom
+ *
+ * @return 解析成功返回 1，否则 0 / 1 on success, else 0
+ *
+ * @note objectBoundingBox 单位下把分数坐标映射到形状的用户包围盒 / For objectBoundingBox units the fractional coordinates are mapped onto the shape's user bbox
+ */
 static int resolve_gradient(SvgCtx *ctx, HpeDomNode *n, const char *which, SvgGrad *out,
                             float ux0, float uy0, float ux1, float uy1)
 {
@@ -828,6 +1150,16 @@ static int resolve_gradient(SvgCtx *ctx, HpeDomNode *n, const char *which, SvgGr
 
 #define MAX_FLAT 8192
 
+/**
+ * @brief 开启新子路径并落到设备空间起点 / Open a new subpath at a device-space point
+ *
+ * @param[in,out] p 多边形列表 / Polygon list
+ * @param[in]     ctx SVG 上下文 / SVG context
+ * @param[in]     ux 用户空间 X / User-space X
+ * @param[in]     uy 用户空间 Y / User-space Y
+ *
+ * @note 用户坐标经 CTM 变换后再入队 / User coordinates are mapped by the CTM before being stored
+ */
 static void dev_move(Polys *p, SvgCtx *ctx, float ux, float uy)
 {
     SubPath *sp = polys_new(p);
@@ -836,6 +1168,16 @@ static void dev_move(Polys *p, SvgCtx *ctx, float ux, float uy)
     sub_push(sp, dx, dy);
 }
 
+/**
+ * @brief 在当前子路径追加一条线段 / Append a line segment to the current subpath
+ *
+ * @param[in,out] p 多边形列表 / Polygon list
+ * @param[in]     ctx SVG 上下文 / SVG context
+ * @param[in]     ux 用户空间 X / User-space X
+ * @param[in]     uy 用户空间 Y / User-space Y
+ *
+ * @note 尚无子路径时退化为 dev_move / Degrades to dev_move when no subpath exists yet
+ */
 static void dev_line(Polys *p, SvgCtx *ctx, float ux, float uy)
 {
     SubPath *sp;
@@ -847,6 +1189,22 @@ static void dev_line(Polys *p, SvgCtx *ctx, float ux, float uy)
     sub_push(sp, dx, dy);
 }
 
+/**
+ * @brief 把三次贝塞尔曲线展平为线段 / Flatten a cubic Bezier curve into line segments
+ *
+ * @param[in,out] p 多边形列表 / Polygon list
+ * @param[in]     ctx SVG 上下文 / SVG context
+ * @param[in]     x0 起点 X / Start X
+ * @param[in]     y0 起点 Y / Start Y
+ * @param[in]     x1 第一控制点 X / First control point X
+ * @param[in]     y1 第一控制点 Y / First control point Y
+ * @param[in]     x2 第二控制点 X / Second control point X
+ * @param[in]     y2 第二控制点 Y / Second control point Y
+ * @param[in]     x3 终点 X / End X
+ * @param[in]     y3 终点 Y / End Y
+ *
+ * @note 按控制多边形长度与缩放估算步数，上限 200 / The step count is estimated from the control polygon length and the scale, capped at 200
+ */
 static void flatten_cubic(Polys *p, SvgCtx *ctx, float x0, float y0, float x1, float y1, float x2,
                           float y2, float x3, float y3)
 {
@@ -865,6 +1223,20 @@ static void flatten_cubic(Polys *p, SvgCtx *ctx, float x0, float y0, float x1, f
     }
 }
 
+/**
+ * @brief 把二次贝塞尔曲线展平为线段 / Flatten a quadratic Bezier curve into line segments
+ *
+ * @param[in,out] p 多边形列表 / Polygon list
+ * @param[in]     ctx SVG 上下文 / SVG context
+ * @param[in]     x0 起点 X / Start X
+ * @param[in]     y0 起点 Y / Start Y
+ * @param[in]     x1 控制点 X / Control point X
+ * @param[in]     y1 控制点 Y / Control point Y
+ * @param[in]     x2 终点 X / End X
+ * @param[in]     y2 终点 Y / End Y
+ *
+ * @note 按控制多边形长度与缩放估算步数，上限 200 / The step count is estimated from the control polygon length and the scale, capped at 200
+ */
 static void flatten_quad(Polys *p, SvgCtx *ctx, float x0, float y0, float x1, float y1, float x2,
                          float y2)
 {
@@ -882,8 +1254,26 @@ static void flatten_quad(Polys *p, SvgCtx *ctx, float x0, float y0, float x1, fl
     }
 }
 
-/* endpoint->center parameterisation of an SVG elliptical arc (spec note F.6.5).
- * Fills the centre (cx,cy), the rotation trig, the start angle and the sweep. */
+/**
+ * @brief 把椭圆弧的端点式参数化为中心式 / Endpoint-to-centre parameterisation of an SVG elliptical arc
+ *
+ * @param[in]     x0 起点 X / Start X
+ * @param[in]     y0 起点 Y / Start Y
+ * @param[in,out] rx X 半径，过大时被放大 / X radius, scaled up when too small
+ * @param[in,out] ry Y 半径，过大时被放大 / Y radius, scaled up when too small
+ * @param[in]     phi X 轴旋转角（度）/ X-axis rotation in degrees
+ * @param[in]     large 大弧标志 / Large-arc flag
+ * @param[in]     sweep 扫描方向标志 / Sweep flag
+ * @param[in]     x1 终点 X / End X
+ * @param[in]     y1 终点 Y / End Y
+ * @param[out]    trig 旋转角的 cos/sin / Cosine and sine of the rotation angle
+ * @param[out]    out_cx 中心 X / Centre X
+ * @param[out]    out_cy 中心 Y / Centre Y
+ * @param[out]    out_theta1 起始角（弧度）/ Start angle in radians
+ * @param[out]    out_dtheta 扫过角（弧度）/ Swept angle in radians
+ *
+ * @note 按 SVG 规范 F.6.5 实现 / Follows the SVG spec's implementation notes F.6.5
+ */
 static void arc_center_params(float x0, float y0, float *rx, float *ry, float phi, int large,
                               int sweep, float x1, float y1, float trig[2], float *out_cx,
                               float *out_cy, float *out_theta1, float *out_dtheta)
@@ -929,8 +1319,23 @@ static void arc_center_params(float x0, float y0, float *rx, float *ry, float ph
     trig[1] = sinp;
 }
 
-/* endpoint->center parameterisation of an SVG elliptical arc, per the spec's
- * implementation notes; flattens the arc into line segments */
+/**
+ * @brief 把椭圆弧展平为线段 / Flatten an elliptical arc into line segments
+ *
+ * @param[in,out] p 多边形列表 / Polygon list
+ * @param[in]     ctx SVG 上下文 / SVG context
+ * @param[in]     x0 起点 X / Start X
+ * @param[in]     y0 起点 Y / Start Y
+ * @param[in]     rx X 半径 / X radius
+ * @param[in]     ry Y 半径 / Y radius
+ * @param[in]     phi X 轴旋转角（度）/ X-axis rotation in degrees
+ * @param[in]     large 大弧标志 / Large-arc flag
+ * @param[in]     sweep 扫描方向标志 / Sweep flag
+ * @param[in]     x1 终点 X / End X
+ * @param[in]     y1 终点 Y / End Y
+ *
+ * @note 半径之一为 0 时退化为直线；步数按扫过角与半径估算，上限 200 / Degrades to a straight line when either radius is zero; the step count is estimated from the sweep and radius, capped at 200
+ */
 static void flatten_arc(Polys *p, SvgCtx *ctx, float x0, float y0, float rx, float ry, float phi,
                         int large, int sweep, float x1, float y1)
 {
@@ -973,6 +1378,13 @@ typedef struct {
     int started;           /* a subpath has been opened */
 } PathBuild;
 
+/**
+ * @brief 查路径命令所需的参数个数 / Look up the argument count a path command needs
+ *
+ * @param[in]     upper 大写命令字母 / Uppercased command letter
+ *
+ * @return 参数个数；未知命令返回 -1 / The argument count, or -1 for an unknown command
+ */
 static int path_cmd_argc(char upper)
 {
     static const struct {
@@ -989,18 +1401,38 @@ static int path_cmd_argc(char upper)
     return -1;
 }
 
+/**
+ * @brief 判断字符是否为路径分隔空白 / Test whether a character is a path separator
+ *
+ * @param[in]     c 字符 / Character
+ *
+ * @return 是空格/逗号/制表/换行返回 1 / 1 for space, comma, tab or newline
+ */
 static int path_isspace(char c)
 {
     return c == ' ' || c == ',' || c == '\t' || c == '\n' || c == '\r';
 }
 
+/**
+ * @brief 跳过当前位置的分隔符 / Skip separators at the current position
+ *
+ * @param[in,out] pb 路径构建状态 / Path build state
+ */
 static void path_skip_sep(PathBuild *pb)
 {
     while (path_isspace(*pb->q))
         pb->q++;
 }
 
-/* read up to `want` numbers; returns how many were actually parsed */
+/**
+ * @brief 读取最多 want 个数字参数 / Read up to `want` numeric arguments
+ *
+ * @param[in,out] pb 路径构建状态 / Path build state
+ * @param[out]    a 接收参数值 / Receives the argument values
+ * @param[in]     want 期望的参数个数 / Desired argument count
+ *
+ * @return 实际解析到的个数 / Number actually parsed
+ */
 static int path_read_args(PathBuild *pb, float *a, int want)
 {
     int i, n = 0;
@@ -1017,6 +1449,13 @@ static int path_read_args(PathBuild *pb, float *a, int want)
     return n;
 }
 
+/**
+ * @brief 闭合当前子路径 / Close the current subpath
+ *
+ * @param[in,out] pb 路径构建状态 / Path build state
+ *
+ * @note 标记子路径闭合并把当前点移回子路径起点 / Marks the subpath closed and moves the current point back to the subpath start
+ */
 static void path_cmd_z(PathBuild *pb)
 {
     if (pb->started) {
@@ -1028,7 +1467,15 @@ static void path_cmd_z(PathBuild *pb)
     pb->cmd = 0;
 }
 
-/* M: move; subsequent coordinate pairs are implicit line-tos per the spec */
+/**
+ * @brief 执行 M 移动命令 / Execute an `M` move command
+ *
+ * @param[in,out] pb 路径构建状态 / Path build state
+ * @param[in]     a 参数数组 / Argument array
+ * @param[in]     rel 相对命令为 1 / 1 for a relative command
+ *
+ * @note 按规范，紧随的坐标对被视为隐式 lineto / Per the spec, following coordinate pairs are treated as implicit line-tos
+ */
 static void path_cmd_move(PathBuild *pb, float *a, int rel)
 {
     float nx = rel ? pb->cx + a[0] : a[0];
@@ -1040,6 +1487,15 @@ static void path_cmd_move(PathBuild *pb, float *a, int rel)
     pb->cmd = rel ? 'l' : 'L';
 }
 
+/**
+ * @brief 执行 L 直线命令 / Execute an `L` line command
+ *
+ * @param[in,out] pb 路径构建状态 / Path build state
+ * @param[in]     a 参数数组 / Argument array
+ * @param[in]     rel 相对命令为 1 / 1 for a relative command
+ *
+ * @note 尚无子路径时以该点为起点 / Uses the point as the new subpath start when none exists
+ */
 static void path_cmd_line(PathBuild *pb, float *a, int rel)
 {
     float nx = rel ? pb->cx + a[0] : a[0];
@@ -1056,6 +1512,13 @@ static void path_cmd_line(PathBuild *pb, float *a, int rel)
     pb->cy = ny;
 }
 
+/**
+ * @brief 执行 H 水平线命令 / Execute an `H` horizontal line command
+ *
+ * @param[in,out] pb 路径构建状态 / Path build state
+ * @param[in]     a 参数数组 / Argument array
+ * @param[in]     rel 相对命令为 1 / 1 for a relative command
+ */
 static void path_cmd_h(PathBuild *pb, float *a, int rel)
 {
     float nx = rel ? pb->cx + a[0] : a[0];
@@ -1063,6 +1526,13 @@ static void path_cmd_h(PathBuild *pb, float *a, int rel)
     pb->cx = nx;
 }
 
+/**
+ * @brief 执行 V 垂直线命令 / Execute a `V` vertical line command
+ *
+ * @param[in,out] pb 路径构建状态 / Path build state
+ * @param[in]     a 参数数组 / Argument array
+ * @param[in]     rel 相对命令为 1 / 1 for a relative command
+ */
 static void path_cmd_v(PathBuild *pb, float *a, int rel)
 {
     float ny = rel ? pb->cy + a[0] : a[0];
@@ -1070,6 +1540,15 @@ static void path_cmd_v(PathBuild *pb, float *a, int rel)
     pb->cy = ny;
 }
 
+/**
+ * @brief 执行 C 三次贝塞尔命令 / Execute a `C` cubic curve command
+ *
+ * @param[in,out] pb 路径构建状态 / Path build state
+ * @param[in]     a 参数数组 / Argument array
+ * @param[in]     rel 相对命令为 1 / 1 for a relative command
+ *
+ * @note 记录第二控制点供后续 S 反射使用 / Records the second control point for a following `S` reflection
+ */
 static void path_cmd_cubic(PathBuild *pb, float *a, int rel)
 {
     float x1 = rel ? pb->cx + a[0] : a[0], y1 = rel ? pb->cy + a[1] : a[1];
@@ -1082,6 +1561,15 @@ static void path_cmd_cubic(PathBuild *pb, float *a, int rel)
     pb->cy = y3;
 }
 
+/**
+ * @brief 执行 S 平滑三次贝塞尔命令 / Execute an `S` smooth cubic curve command
+ *
+ * @param[in,out] pb 路径构建状态 / Path build state
+ * @param[in]     a 参数数组 / Argument array
+ * @param[in]     rel 相对命令为 1 / 1 for a relative command
+ *
+ * @note 首个控制点由前一控制点关于当前点反射得到 / The first control point is the previous control point reflected about the current point
+ */
 static void path_cmd_smooth_cubic(PathBuild *pb, float *a, int rel)
 {
     float x2 = rel ? pb->cx + a[0] : a[0], y2 = rel ? pb->cy + a[1] : a[1];
@@ -1094,6 +1582,15 @@ static void path_cmd_smooth_cubic(PathBuild *pb, float *a, int rel)
     pb->cy = y3;
 }
 
+/**
+ * @brief 执行 Q 二次贝塞尔命令 / Execute a `Q` quadratic curve command
+ *
+ * @param[in,out] pb 路径构建状态 / Path build state
+ * @param[in]     a 参数数组 / Argument array
+ * @param[in]     rel 相对命令为 1 / 1 for a relative command
+ *
+ * @note 记录控制点供后续 T 反射使用 / Records the control point for a following `T` reflection
+ */
 static void path_cmd_quad(PathBuild *pb, float *a, int rel)
 {
     float x1 = rel ? pb->cx + a[0] : a[0], y1 = rel ? pb->cy + a[1] : a[1];
@@ -1105,6 +1602,15 @@ static void path_cmd_quad(PathBuild *pb, float *a, int rel)
     pb->cy = y2;
 }
 
+/**
+ * @brief 执行 T 平滑二次贝塞尔命令 / Execute a `T` smooth quadratic curve command
+ *
+ * @param[in,out] pb 路径构建状态 / Path build state
+ * @param[in]     a 参数数组 / Argument array
+ * @param[in]     rel 相对命令为 1 / 1 for a relative command
+ *
+ * @note 控制点由前一控制点关于当前点反射得到 / The control point is the previous control point reflected about the current point
+ */
 static void path_cmd_smooth_quad(PathBuild *pb, float *a, int rel)
 {
     float x2 = rel ? pb->cx + a[0] : a[0], y2 = rel ? pb->cy + a[1] : a[1];
@@ -1116,6 +1622,13 @@ static void path_cmd_smooth_quad(PathBuild *pb, float *a, int rel)
     pb->cy = y2;
 }
 
+/**
+ * @brief 执行 A 椭圆弧命令 / Execute an `A` elliptical arc command
+ *
+ * @param[in,out] pb 路径构建状态 / Path build state
+ * @param[in]     a 参数数组 / Argument array
+ * @param[in]     rel 相对命令为 1 / 1 for a relative command
+ */
 static void path_cmd_arc(PathBuild *pb, float *a, int rel)
 {
     float rx = a[0], ry = a[1], phi = a[2];
@@ -1126,6 +1639,13 @@ static void path_cmd_arc(PathBuild *pb, float *a, int rel)
     pb->cy = y2;
 }
 
+/**
+ * @brief 跳过一个无法识别的命令 / Skip one unrecognised command
+ *
+ * @param[in,out] pb 路径构建状态 / Path build state
+ *
+ * @note 若当前位置不含数字则只前进一个字符 / Advances just one character when the current position holds no number
+ */
 static void path_skip_unknown(PathBuild *pb)
 {
     char *end = NULL;
@@ -1133,9 +1653,16 @@ static void path_skip_unknown(PathBuild *pb)
     pb->q = (end == pb->q) ? pb->q + 1 : end;
 }
 
-/* dispatch one command's argument list to its handler. Kept as a small if/else
- * chain because each branch passes a different arity to a differently-typed
- * fixpoint helper; a table of function pointers would need a common signature. */
+/**
+ * @brief 把一个命令的参数分派给对应处理器 / Dispatch one command's arguments to its handler
+ *
+ * @param[in,out] pb 路径构建状态 / Path build state
+ * @param[in]     upper 大写命令字母 / Uppercased command letter
+ * @param[in]     a 参数数组 / Argument array
+ * @param[in]     rel 相对命令为 1 / 1 for a relative command
+ *
+ * @note 默认分支按 A（椭圆弧）处理 / The default branch handles `A` (elliptical arc)
+ */
 static void path_apply(PathBuild *pb, char upper, float *a, int rel)
 {
     switch (upper) {
@@ -1169,7 +1696,13 @@ static void path_apply(PathBuild *pb, char upper, float *a, int rel)
     }
 }
 
-/* consume the argument list of the current command and apply it */
+/**
+ * @brief 消费当前命令的参数并执行 / Consume the current command's argument list and apply it
+ *
+ * @param[in,out] pb 路径构建状态 / Path build state
+ *
+ * @note 参数不足时清空游标以停止扫描；Z 直接闭合 / Clears the cursor to stop the scan when arguments run short; `Z` closes directly
+ */
 static void path_run_command(PathBuild *pb)
 {
     char upper = (char)(pb->cmd >= 'a' && pb->cmd <= 'z' ? pb->cmd - 'a' + 'A' : pb->cmd);
@@ -1194,6 +1727,15 @@ static void path_run_command(PathBuild *pb)
     path_apply(pb, upper, a, rel);
 }
 
+/**
+ * @brief 解析路径 `d` 数据构建设备空间多边形 / Parse path `d` data into device-space polygons
+ *
+ * @param[out]    p 接收几何的多边形列表 / Polygon list receiving the geometry
+ * @param[in]     ctx SVG 上下文 / SVG context
+ * @param[in]     d 路径数据 / Path data
+ *
+ * @note `d` 为 `NULL` 时无操作；命令字母切换当前命令，其余交给 path_run_command / No-op when `d` is `NULL`; command letters switch the current command and the rest goes to path_run_command
+ */
 static void build_path(Polys *p, SvgCtx *ctx, const char *d)
 {
     PathBuild pb;
@@ -1217,7 +1759,16 @@ static void build_path(Polys *p, SvgCtx *ctx, const char *d)
     }
 }
 
-/* ---------------- text ---------------- */
+/**
+ * @brief 收集元素子树内的文本 / Collect the text inside an element's subtree
+ *
+ * @param[in]     n 元素 / Element
+ * @param[out]    buf 接收文本的缓冲区 / Buffer receiving the text
+ * @param[in]     cap 缓冲区容量 / Buffer capacity
+ * @param[in,out] len 已写入长度，被累加 / Length written so far, accumulated
+ *
+ * @note 跳过 title/desc 子元素；缓冲区满时不再追加 / Skips `title`/`desc` children; stops appending when the buffer is full
+ */
 
 static void collect_text(HpeDomNode *n, char *buf, size_t cap, size_t *len)
 {
@@ -1249,7 +1800,17 @@ typedef struct {
     int baseline; /* 0 none, 1 middle, 2 hanging, 3 after-edge */
 } TextDraw;
 
-/* reads the text/anchor attributes into `dt`; returns 0 when there is no text */
+/**
+ * @brief 读取 `<text>` 的文本与锚点属性 / Read a `<text>` element's text and anchor attributes
+ *
+ * @param[in]     n `<text>` 元素 / The `<text>` element
+ * @param[in]     ctx SVG 上下文 / SVG context
+ * @param[out]    dt 文本绘制参数 / Text draw parameters
+ *
+ * @return 有文本返回 1，否则 0 / 1 when there is text, else 0
+ *
+ * @note 解析 x/y/font-size/textLength/font-weight/fill 与 text-anchor、dominant-baseline / Parses x/y/font-size/textLength/font-weight/fill plus text-anchor and dominant-baseline
+ */
 static int draw_text_read_attrs(HpeDomNode *n, SvgCtx *ctx, TextDraw *dt)
 {
     const char *anchor, *baseline;
@@ -1292,8 +1853,22 @@ static int draw_text_read_attrs(HpeDomNode *n, SvgCtx *ctx, TextDraw *dt)
     return 1;
 }
 
-/* stretch the run by advancing each codepoint so the total matches textLength
- * (lengthAdjust="spacing"); glyphs are drawn individually */
+/**
+ * @brief 按 textLength 拉伸 advanc 逐字绘制文本 / Draw text glyph by glyph with advances stretched to match `textLength`
+ *
+ * @param[in]     ctx SVG 上下文 / SVG context
+ * @param[in]     font 字体 / Font
+ * @param[in]     buf 文本缓冲区 / Text buffer
+ * @param[in]     len 文本字节长度 / Text byte length
+ * @param[in]     dev_x 设备起点 X / Device start X
+ * @param[in]     dev_y 设备基线 Y / Device baseline Y
+ * @param[in]     w 自然宽度 / Natural width
+ * @param[in]     text_len 目标 textLength / Target `textLength`
+ * @param[in]     scale CTM 缩放系数 / CTM scale factor
+ * @param[in]     color 文本颜色 / Text colour
+ *
+ * @note 对应 lengthAdjust="spacing" / Corresponds to `lengthAdjust="spacing"`
+ */
 static void draw_text_stretched(SvgCtx *ctx, HpeFont *font, const char *buf, int len, float dev_x,
                                 float dev_y, float w, float text_len, float scale, HpeColor color)
 {
@@ -1317,6 +1892,14 @@ static void draw_text_stretched(SvgCtx *ctx, HpeFont *font, const char *buf, int
     }
 }
 
+/**
+ * @brief 绘制一个 `<text>` 元素 / Draw a `<text>` element
+ *
+ * @param[in]     ctx SVG 上下文 / SVG context
+ * @param[in]     n `<text>` 元素 / The `<text>` element
+ *
+ * @note 锚点与基线关键字修正绘制起点；给出 textLength 且多字符时走拉伸绘制 / Anchor and baseline keywords adjust the origin; a `textLength` with more than one character goes through the stretched path
+ */
 static void draw_text(SvgCtx *ctx, HpeDomNode *n)
 {
     TextDraw dt;
@@ -1358,7 +1941,18 @@ static void draw_text(SvgCtx *ctx, HpeDomNode *n)
     }
 }
 
-/* ---------------- shape builders (user space) ---------------- */
+/**
+ * @brief 构建椭圆/圆的多边形路径（用户空间）/ Build an ellipse/circle polygon path in user space
+ *
+ * @param[out]    p 多边形列表 / Polygon list
+ * @param[in]     ctx SVG 上下文 / SVG context
+ * @param[in]     cx 中心 X / Centre X
+ * @param[in]     cy 中心 Y / Centre Y
+ * @param[in]     rx X 半径 / X radius
+ * @param[in]     ry Y 半径 / Y radius
+ *
+ * @note 用 64 段采样逼近，路径闭合 / Approximated with 64 samples and closed
+ */
 
 static void ellipse_path(Polys *p, SvgCtx *ctx, float cx, float cy, float rx, float ry)
 {
@@ -1377,6 +1971,19 @@ static void ellipse_path(Polys *p, SvgCtx *ctx, float cx, float cy, float rx, fl
     sp->closed = 1;
 }
 
+/**
+ * @brief 构建圆角矩形多边形路径 / Build a rounded-rectangle polygon path
+ *
+ * @param[out]    p 多边形列表 / Polygon list
+ * @param[in]     ctx SVG 上下文 / SVG context
+ * @param[in]     x 左边界 X / Left X
+ * @param[in]     y 上边界 Y / Top Y
+ * @param[in]     w 宽度 / Width
+ * @param[in]     h 高度 / Height
+ * @param[in]     r 圆角半径 / Corner radius
+ *
+ * @note 半径夹紧到半宽/半高；每个圆角用 8 段采样，路径闭合 / The radius is clamped to half the width and height; each corner is sampled with 8 segments and the path is closed
+ */
 static void round_rect_path(Polys *p, SvgCtx *ctx, float x, float y, float w, float h, float r)
 {
     SubPath *sp;
@@ -1414,6 +2021,16 @@ static void round_rect_path(Polys *p, SvgCtx *ctx, float x, float y, float w, fl
     sp->closed = 1;
 }
 
+/**
+ * @brief 从 points 属性构建多边形/折线 / Build a polygon/polyline from a `points` attribute
+ *
+ * @param[out]    p 多边形列表 / Polygon list
+ * @param[in]     ctx SVG 上下文 / SVG context
+ * @param[in]     pts 顶点串 / Point list string
+ * @param[in]     closed 闭合为 1 / 1 for a closed path
+ *
+ * @note `pts` 为 `NULL` 时无操作；顶点成对解析 / No-op when `pts` is `NULL`; points are parsed in pairs
+ */
 static void points_path(Polys *p, SvgCtx *ctx, const char *pts, int closed)
 {
     SubPath *sp = NULL;
@@ -1450,7 +2067,15 @@ static void points_path(Polys *p, SvgCtx *ctx, const char *pts, int closed)
         sp->closed = closed;
 }
 
-/* user-space bbox of a points="..." list */
+/**
+ * @brief 求 points 串的用户空间包围盒 / User-space bbox of a `points` list
+ *
+ * @param[in]     pts 顶点串 / Point list string
+ * @param[out]    x0 左边界 / Left edge
+ * @param[out]    y0 上边界 / Top edge
+ * @param[out]    x1 右边界 / Right edge
+ * @param[out]    y1 下边界 / Bottom edge
+ */
 static void points_bbox(const char *pts, float *x0, float *y0, float *x1, float *y1)
 {
     const char *q = pts;
@@ -1493,8 +2118,17 @@ static void points_bbox(const char *pts, float *x0, float *y0, float *x1, float 
     }
 }
 
-/* user-space bbox of a path string, evaluated with an identity matrix (used to
- * map objectBoundingBox gradients onto paths) */
+/**
+ * @brief 求路径串的用户空间包围盒 / User-space bbox of a path string
+ *
+ * @param[in]     d 路径数据 / Path data
+ * @param[out]    x0 左边界 / Left edge
+ * @param[out]    y0 上边界 / Top edge
+ * @param[out]    x1 右边界 / Right edge
+ * @param[out]    y1 下边界 / Bottom edge
+ *
+ * @note 用单位矩阵求值，用于把 objectBoundingBox 渐变映射到路径上 / Evaluated with an identity matrix so objectBoundingBox gradients can map onto paths
+ */
 static void path_bbox(const char *d, float *x0, float *y0, float *x1, float *y1)
 {
     Polys p;
@@ -1529,7 +2163,13 @@ static void path_bbox(const char *d, float *x0, float *y0, float *x1, float *y1)
 
 /* paint one shape: compute its user-space bbox for gradient mapping, build the
  * geometry, then fill and/or stroke */
-/* scales every gradient stop's alpha by `op` (percentage fill/stroke opacity) */
+
+/**
+ * @brief 按给定系数缩放所有色标的 alpha / Scale every gradient stop's alpha by a factor
+ *
+ * @param[in,out] grad 渐变描述 / Gradient description
+ * @param[in]     op 透明度系数 / Opacity factor
+ */
 static void grad_scale_alpha(SvgGrad *grad, float op)
 {
     int i;
@@ -1537,7 +2177,21 @@ static void grad_scale_alpha(SvgGrad *grad, float op)
         grad->stops[i].color.a = (uint8_t)(grad->stops[i].color.a * op);
 }
 
-/* fill with a solid colour or gradient (gradient wins when resolve succeeded) */
+/**
+ * @brief 用纯色或渐变填充一个形状 / Fill a shape with a solid colour or a gradient
+ *
+ * @param[in,out] ctx SVG 上下文 / SVG context
+ * @param[in]     n DOM 元素 / DOM element
+ * @param[in]     p 多边形列表 / Polygon list
+ * @param[in]     fill 纯色回退 / Flat colour fallback
+ * @param[in]     fop 填充不透明度 / Fill opacity
+ * @param[in]     ux0 用户空间包围盒左 / User-space bbox left
+ * @param[in]     uy0 用户空间包围盒上 / User-space bbox top
+ * @param[in]     ux1 用户空间包围盒右 / User-space bbox right
+ * @param[in]     uy1 用户空间包围盒下 / User-space bbox bottom
+ *
+ * @note 渐变解析成功时优先使用并缩放其 alpha / When the gradient resolves it is used and its alpha is scaled
+ */
 static void paint_shape_fill(SvgCtx *ctx, HpeDomNode *n, Polys *p, HpeColor fill, float fop,
                              float ux0, float uy0, float ux1, float uy1)
 {
@@ -1550,7 +2204,21 @@ static void paint_shape_fill(SvgCtx *ctx, HpeDomNode *n, Polys *p, HpeColor fill
     fill_polys(ctx, p, fill, have_grad ? &grad : NULL, ctx->ctm, 0, 0, 1e9f, 1e9f);
 }
 
-/* stroke with a solid colour or gradient */
+/**
+ * @brief 用纯色或渐变描边一个形状 / Stroke a shape with a solid colour or a gradient
+ *
+ * @param[in,out] ctx SVG 上下文 / SVG context
+ * @param[in]     n DOM 元素 / DOM element
+ * @param[in]     p 多边形列表 / Polygon list
+ * @param[in]     stroke 纯色回退 / Flat colour fallback
+ * @param[in]     sop 描边不透明度 / Stroke opacity
+ * @param[in]     ux0 用户空间包围盒左 / User-space bbox left
+ * @param[in]     uy0 用户空间包围盒上 / User-space bbox top
+ * @param[in]     ux1 用户空间包围盒右 / User-space bbox right
+ * @param[in]     uy1 用户空间包围盒下 / User-space bbox bottom
+ *
+ * @note 描边宽度按 CTM 缩放 / The stroke width is scaled by the CTM
+ */
 static void paint_shape_stroke(SvgCtx *ctx, HpeDomNode *n, Polys *p, HpeColor stroke, float sop,
                                float ux0, float uy0, float ux1, float uy1)
 {
@@ -1566,8 +2234,21 @@ static void paint_shape_stroke(SvgCtx *ctx, HpeDomNode *n, Polys *p, HpeColor st
     }
 }
 
-/* paint one shape: compute its user-space bbox for gradient mapping, build the
- * geometry, then fill and/or stroke */
+/**
+ * @brief 填充并/或描边一个已构建的形状 / Fill and/or stroke an already-built shape
+ *
+ * @param[in,out] ctx SVG 上下文 / SVG context
+ * @param[in]     n DOM 元素 / DOM element
+ * @param[in]     p 多边形列表 / Polygon list
+ * @param[in]     ux0 用户空间包围盒左 / User-space bbox left
+ * @param[in]     uy0 用户空间包围盒上 / User-space bbox top
+ * @param[in]     ux1 用户空间包围盒右 / User-space bbox right
+ * @param[in]     uy1 用户空间包围盒下 / User-space bbox bottom
+ * @param[in]     fillable 允许填充为 1 / 1 when fillable
+ * @param[in]     strokable 允许描边为 1 / 1 when strokable
+ *
+ * @note 元素自身的 fill/stroke/opacity 属性覆盖继承状态 / The element's own fill/stroke/opacity attributes override the inherited state
+ */
 static void paint_shape(SvgCtx *ctx, HpeDomNode *n, Polys *p, float ux0, float uy0, float ux1,
                         float uy1, int fillable, int strokable)
 {
@@ -1605,6 +2286,15 @@ static void paint_shape(SvgCtx *ctx, HpeDomNode *n, Polys *p, float ux0, float u
 
 static void draw_element(SvgCtx *ctx, HpeDomNode *n, Mat ctm);
 
+/**
+ * @brief 绘制父元素的所有元素子节点 / Draw all element children of a parent
+ *
+ * @param[in]     ctx SVG 上下文 / SVG context
+ * @param[in]     parent 父元素 / Parent element
+ * @param[in]     ctm 当前变换矩阵 / Current transformation matrix
+ *
+ * @note 非元素子节点被跳过 / Non-element children are skipped
+ */
 static void draw_children(SvgCtx *ctx, HpeDomNode *parent, Mat ctm)
 {
     HpeDomNode *n;
@@ -1617,7 +2307,15 @@ static void draw_children(SvgCtx *ctx, HpeDomNode *parent, Mat ctm)
 
 static int use_ref_id(HpeDomNode *node, char *id, size_t cap); /* defined in hit testing */
 
-/* container tags that are never painted and whose content is metadata only */
+/**
+ * @brief 判断标签是否只承载元数据、不直接绘制 / Test whether a tag carries metadata only and is never painted directly
+ *
+ * @param[in]     tag 标签名 / Tag name
+ *
+ * @return 是元数据标签返回 1，否则 0 / 1 for a metadata tag, else 0
+ *
+ * @note title、desc、defs、linearGradient、radialGradient、stop / `title`, `desc`, `defs`, `linearGradient`, `radialGradient`, `stop`
+ */
 static int svg_is_metadata_tag(const char *tag)
 {
     return !strcmp(tag, "title") || !strcmp(tag, "desc") || !strcmp(tag, "defs") ||
@@ -1625,6 +2323,16 @@ static int svg_is_metadata_tag(const char *tag)
            !strcmp(tag, "stop");
 }
 
+/**
+ * @brief 绘制 `<use>` 引用的元素 / Draw the element referenced by a `<use>`
+ *
+ * @param[in]     ctx SVG 上下文 / SVG context
+ * @param[out]    sub 派生子上下文 / Derived sub-context
+ * @param[in]     n `<use>` 元素 / The `<use>` element
+ * @param[in]     ctm 当前变换矩阵 / Current transformation matrix
+ *
+ * @note 按 x/y 平移并应用 use 的样式，随后递归绘制引用元素 / Translated by x/y, applies the `use` style, then recursively draws the referenced element
+ */
 static void draw_use_ref(SvgCtx *ctx, SvgCtx *sub, HpeDomNode *n, Mat ctm)
 {
     HpeDomNode *ref;
@@ -1651,7 +2359,17 @@ static void draw_use_ref(SvgCtx *ctx, SvgCtx *sub, HpeDomNode *n, Mat ctm)
     draw_element(sub, ref, sub->ctm);
 }
 
-/* <g>/<svg>: push style and recurse; <svg> also offsets by its x/y */
+/**
+ * @brief 绘制 `<g>`/`<svg>` 容器 / Draw a `<g>`/`<svg>` container
+ *
+ * @param[in]     ctx SVG 上下文 / SVG context
+ * @param[out]    sub 派生子上下文 / Derived sub-context
+ * @param[in]     n 容器元素 / Container element
+ * @param[in]     ctm 当前变换矩阵 / Current transformation matrix
+ * @param[in]     tag 标签名 / Tag name
+ *
+ * @note 压入样式后递归；`<svg>` 额外按其 x/y 偏移 / Pushes the style and recurses; `<svg>` is additionally offset by its x/y
+ */
 static void draw_container(SvgCtx *ctx, SvgCtx *sub, HpeDomNode *n, Mat ctm, const char *tag)
 {
     *sub = *ctx;
@@ -1669,6 +2387,14 @@ static void draw_container(SvgCtx *ctx, SvgCtx *sub, HpeDomNode *n, Mat ctm, con
     draw_children(sub, n, sub->ctm);
 }
 
+/**
+ * @brief 绘制 `<rect>` 元素 / Draw a `<rect>` element
+ *
+ * @param[in,out] sub SVG 子上下文 / SVG sub-context
+ * @param[in]     n `<rect>` 元素 / The `<rect>` element
+ *
+ * @note rx 缺失时回退到 ry；宽或高非正时不绘制 / Falls back to `ry` when `rx` is absent; draws nothing when the width or height is not positive
+ */
 static void draw_rect_node(SvgCtx *sub, HpeDomNode *n)
 {
     float x = 0.0f, y = 0.0f, w = 0.0f, h = 0.0f, r = 0.0f;
@@ -1688,6 +2414,15 @@ static void draw_rect_node(SvgCtx *sub, HpeDomNode *n)
     polys_free(&p);
 }
 
+/**
+ * @brief 绘制 `<circle>`/`<ellipse>` 元素 / Draw a `<circle>`/`<ellipse>` element
+ *
+ * @param[in,out] sub SVG 子上下文 / SVG sub-context
+ * @param[in]     n 元素 / Element
+ * @param[in]     tag 标签名 / Tag name
+ *
+ * @note 圆形取 r 作为两半径；半径非正时不绘制 / A circle uses `r` for both radii; draws nothing when a radius is not positive
+ */
 static void draw_ellipse_node(SvgCtx *sub, HpeDomNode *n, const char *tag)
 {
     float cx = 0.0f, cy = 0.0f, rx = 0.0f, ry = 0.0f;
@@ -1709,6 +2444,14 @@ static void draw_ellipse_node(SvgCtx *sub, HpeDomNode *n, const char *tag)
     polys_free(&p);
 }
 
+/**
+ * @brief 绘制 `<line>` 元素 / Draw a `<line>` element
+ *
+ * @param[in,out] sub SVG 子上下文 / SVG sub-context
+ * @param[in]     n `<line>` 元素 / The `<line>` element
+ *
+ * @note 只描边不填充 / Stroked only, never filled
+ */
 static void draw_line_node(SvgCtx *sub, HpeDomNode *n)
 {
     float x1 = 0.0f, y1 = 0.0f, x2 = 0.0f, y2 = 0.0f;
@@ -1729,6 +2472,15 @@ static void draw_line_node(SvgCtx *sub, HpeDomNode *n)
     polys_free(&p);
 }
 
+/**
+ * @brief 绘制 `<polygon>`/`<polyline>` 元素 / Draw a `<polygon>`/`<polyline>` element
+ *
+ * @param[in,out] sub SVG 子上下文 / SVG sub-context
+ * @param[in]     n 元素 / Element
+ * @param[in]     tag 标签名 / Tag name
+ *
+ * @note polygon 填充并描边，polyline 只描边 / `polygon` is filled and stroked while `polyline` is stroked only
+ */
 static void draw_poly_node(SvgCtx *sub, HpeDomNode *n, const char *tag)
 {
     Polys p;
@@ -1743,6 +2495,14 @@ static void draw_poly_node(SvgCtx *sub, HpeDomNode *n, const char *tag)
     polys_free(&p);
 }
 
+/**
+ * @brief 绘制 `<path>` 元素 / Draw a `<path>` element
+ *
+ * @param[in,out] sub SVG 子上下文 / SVG sub-context
+ * @param[in]     n `<path>` 元素 / The `<path>` element
+ *
+ * @note 以单位矩阵求包围盒供渐变映射 / The bbox for gradient mapping is computed with an identity matrix
+ */
 static void draw_path_node(SvgCtx *sub, HpeDomNode *n)
 {
     Polys p;
@@ -1755,7 +2515,16 @@ static void draw_path_node(SvgCtx *sub, HpeDomNode *n)
     polys_free(&p);
 }
 
-/* a leaf shape in its own styled sub-context (fill/stroke/etc. inherited) */
+/**
+ * @brief 在独立样式的子上下文中绘制一个叶子形状 / Draw a leaf shape in its own styled sub-context
+ *
+ * @param[in]     ctx SVG 上下文 / SVG context
+ * @param[in]     n DOM 元素 / DOM element
+ * @param[in]     ctm 当前变换矩阵 / Current transformation matrix
+ * @param[in]     tag 标签名 / Tag name
+ *
+ * @note 按标签分派到 text/rect/circle/ellipse/line/polygon/polyline/path；未知元素递归子节点以免内容丢失 / Dispatches on the tag to text/rect/circle/ellipse/line/polygon/polyline/path; an unknown element recurses into its children so nested content is not lost
+ */
 static void draw_shape(SvgCtx *ctx, HpeDomNode *n, Mat ctm, const char *tag)
 {
     SvgCtx sub;
@@ -1778,6 +2547,15 @@ static void draw_shape(SvgCtx *ctx, HpeDomNode *n, Mat ctm, const char *tag)
         draw_children(&sub, n, sub.ctm);
 }
 
+/**
+ * @brief 绘制一个 SVG 元素 / Draw one SVG element
+ *
+ * @param[in]     ctx SVG 上下文 / SVG context
+ * @param[in]     n DOM 元素 / DOM element
+ * @param[in]     ctm 当前变换矩阵 / Current transformation matrix
+ *
+ * @note 元数据标签跳过；先累积元素的 transform，再按标签分派到容器/use/形状 / Metadata tags are skipped; the element transform is accumulated first, then dispatch goes to container, `use` or shape
+ */
 static void draw_element(SvgCtx *ctx, HpeDomNode *n, Mat ctm)
 {
     const char *tag = n->tag;
@@ -1799,8 +2577,17 @@ static void draw_element(SvgCtx *ctx, HpeDomNode *n, Mat ctm)
     draw_shape(ctx, n, ctm, tag);
 }
 
-/* seeds the SVG drawing context from the <svg> box: device-space CTM origin,
- * viewport size and default paint state */
+/**
+ * @brief 从 `<svg>` 盒初始化 SVG 绘制上下文 / Seed the SVG drawing context from the `<svg>` box
+ *
+ * @param[out]    ctx SVG 上下文 / SVG context
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     box `<svg>` 盒 / The `<svg>` box
+ * @param[in]     node `<svg>` DOM 节点 / The `<svg>` DOM node
+ * @param[in]     y_dev 盒子顶边的设备 y / Device y of the box top edge
+ *
+ * @note 设置设备空间 CTM 原点、视口尺寸与默认绘制状态 / Sets the device-space CTM origin, viewport size and default paint state
+ */
 static void svg_ctx_init(SvgCtx *ctx, HpePixmap *pm, HpeBox *box, HpeDomNode *node, float y_dev)
 {
     memset(ctx, 0, sizeof(*ctx));
@@ -1818,8 +2605,16 @@ static void svg_ctx_init(SvgCtx *ctx, HpePixmap *pm, HpeBox *box, HpeDomNode *no
     ctx->root = node;
 }
 
-/* applies the viewBox transform (uniform scale + centring); `vw`/`vh` receive the
- * viewBox extent when present */
+/**
+ * @brief 应用 viewBox 变换 / Apply the viewBox transform
+ *
+ * @param[in,out] ctx SVG 上下文 / SVG context
+ * @param[in]     node `<svg>` DOM 节点 / The `<svg>` DOM node
+ * @param[out]    vw viewBox 宽度（存在时）/ viewBox width when present
+ * @param[out]    vh viewBox 高度（存在时）/ viewBox height when present
+ *
+ * @note 取均匀缩放并居中；无 viewBox 或格式非法时不变换 / Uses a uniform scale plus centring; does nothing when there is no viewBox or it is malformed
+ */
 static void svg_apply_viewbox(SvgCtx *ctx, HpeDomNode *node, float *vw, float *vh)
 {
     const char *vbs = attr(node, "viewBox");
@@ -1841,6 +2636,15 @@ static void svg_apply_viewbox(SvgCtx *ctx, HpeDomNode *node, float *vw, float *v
     ctx->ctm.d = scale;
 }
 
+/**
+ * @brief 绘制 `<svg>` 子树 / Paint the `<svg>` subtree
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     box `<svg>` 盒 / The `<svg>` box
+ * @param[in]     y_dev 盒子顶边的设备 y / Device y of the box top edge
+ *
+ * @note 裁剪到 SVG 视口并与已激活的损伤矩形求交，避免半透明描边在滚动中被重复混合而变暗 / Clips to the SVG viewport and intersects the already-active damage rect so translucent strokes are not blended twice and darkened on scroll
+ */
 void hpe_svg_paint(HpePixmap *pm, HpeBox *box, float y_dev)
 {
     SvgCtx ctx;
@@ -1888,7 +2692,15 @@ void hpe_svg_paint(HpePixmap *pm, HpeBox *box, float y_dev)
     hpe_free(ctx.cov_scratch);
 }
 
-/* ---------------- hit testing ---------------- */
+/**
+ * @brief 读取数值属性，缺失时返回默认值 / Read a numeric attribute, returning a default when absent
+ *
+ * @param[in]     n DOM 元素 / DOM element
+ * @param[in]     name 属性名 / Attribute name
+ * @param[in]     def 默认值 / Default value
+ *
+ * @return 属性值或默认值 / The attribute value, or the default
+ */
 
 static float attr_f(HpeDomNode *n, const char *name, float def)
 {
@@ -1896,6 +2708,15 @@ static float attr_f(HpeDomNode *n, const char *name, float def)
     return attr_num(n, name, &f) ? f : def;
 }
 
+/**
+ * @brief 用奇偶规则判断点是否在多边形内 / Test whether a point is inside the polygons using the even-odd rule
+ *
+ * @param[in]     p 多边形列表 / Polygon list
+ * @param[in]     x X 坐标 / X coordinate
+ * @param[in]     y Y 坐标 / Y coordinate
+ *
+ * @return 在内部返回 1，否则 0 / 1 when inside, else 0
+ */
 static int point_in_polys(Polys *p, float x, float y)
 {
     int inside = 0, i, k;
@@ -1920,7 +2741,15 @@ static int point_in_polys(Polys *p, float x, float y)
 
 static HpeDomNode *hit_walk(SvgCtx *ctx, HpeDomNode *node, float dx, float dy);
 
-/* fragment id from a <use> href / xlink:href; returns 1 on success */
+/**
+ * @brief 从 `<use>` 的 href/xlink:href 取片段 id / Extract the fragment id from a `<use>` `href`/`xlink:href`
+ *
+ * @param[in]     node `<use>` 元素 / The `<use>` element
+ * @param[out]    id 接收片段 id / Receives the fragment id
+ * @param[in]     cap `id` 缓冲区容量 / Capacity of the `id` buffer
+ *
+ * @return 解析成功返回 1，否则 0 / 1 on success, else 0
+ */
 static int use_ref_id(HpeDomNode *node, char *id, size_t cap)
 {
     const char *href = attr(node, "href");
@@ -1942,7 +2771,18 @@ static int use_ref_id(HpeDomNode *node, char *id, size_t cap)
     return 1;
 }
 
-/* last matching child wins so later siblings paint on top */
+/**
+ * @brief 命中测试所有元素子节点 / Hit test all element children
+ *
+ * @param[in]     ctx SVG 上下文 / SVG context
+ * @param[in]     node 父节点 / Parent node
+ * @param[in]     dx 设备点 X / Device point X
+ * @param[in]     dy 设备点 Y / Device point Y
+ *
+ * @return 最深命中子节点，未命中返回 `NULL` / The deepest hit child, or `NULL` when nothing is hit
+ *
+ * @note 后出现的兄弟覆盖先出现的，因此取最后一个命中 / Later siblings paint on top, so the last hit wins
+ */
 static HpeDomNode *hit_children(SvgCtx *ctx, HpeDomNode *node, float dx, float dy)
 {
     HpeDomNode *c, *best = NULL;
@@ -1954,6 +2794,15 @@ static HpeDomNode *hit_children(SvgCtx *ctx, HpeDomNode *node, float dx, float d
     return best;
 }
 
+/**
+ * @brief 命中测试一个 `<rect>` / Hit test a `<rect>`
+ *
+ * @param[in]     n `<rect>` 元素 / The `<rect>` element
+ * @param[in]     ux 用户空间 X / User-space X
+ * @param[in]     uy 用户空间 Y / User-space Y
+ *
+ * @return 命中则返回该元素，否则 `NULL` / The element when hit, else `NULL`
+ */
 static HpeDomNode *hit_rect(HpeDomNode *n, float ux, float uy)
 {
     float x = attr_f(n, "x", 0.0f), y = attr_f(n, "y", 0.0f);
@@ -1963,6 +2812,17 @@ static HpeDomNode *hit_rect(HpeDomNode *n, float ux, float uy)
     return NULL;
 }
 
+/**
+ * @brief 命中测试一个 `<circle>`/`<ellipse>` / Hit test a `<circle>`/`<ellipse>`
+ *
+ * @param[in]     n 元素 / Element
+ * @param[in]     ux 用户空间 X / User-space X
+ * @param[in]     uy 用户空间 Y / User-space Y
+ *
+ * @return 命中则返回该元素，否则 `NULL` / The element when hit, else `NULL`
+ *
+ * @note 把点归一化到单位圆判断 / The point is normalised against the unit circle
+ */
 static HpeDomNode *hit_ellipse(HpeDomNode *n, float ux, float uy)
 {
     float cx = attr_f(n, "cx", 0.0f), cy = attr_f(n, "cy", 0.0f);
@@ -1978,7 +2838,17 @@ static HpeDomNode *hit_ellipse(HpeDomNode *n, float ux, float uy)
     return (nx * nx + ny * ny <= 1.0f) ? n : NULL;
 }
 
-/* ~3px tolerance around the segment */
+/**
+ * @brief 命中测试一条 `<line>` / Hit test a `<line>`
+ *
+ * @param[in]     n `<line>` 元素 / The `<line>` element
+ * @param[in]     ux 用户空间 X / User-space X
+ * @param[in]     uy 用户空间 Y / User-space Y
+ *
+ * @return 命中则返回该元素，否则 `NULL` / The element when hit, else `NULL`
+ *
+ * @note 线段周围约 3px 容差 / About 3 px tolerance around the segment
+ */
 static HpeDomNode *hit_line(HpeDomNode *n, float ux, float uy)
 {
     float x1 = attr_f(n, "x1", 0.0f), y1 = attr_f(n, "y1", 0.0f);
@@ -1996,7 +2866,18 @@ static HpeDomNode *hit_line(HpeDomNode *n, float ux, float uy)
     return ((ux - px) * (ux - px) + (uy - py) * (uy - py) <= 9.0f) ? n : NULL;
 }
 
-/* build the polygon/polyline geometry in identity space, then test the point */
+/**
+ * @brief 命中测试 `<polygon>`/`<polyline>` / Hit test a `<polygon>`/`<polyline>`
+ *
+ * @param[in]     ctx SVG 上下文 / SVG context
+ * @param[in]     n 元素 / Element
+ * @param[in]     ux 用户空间 X / User-space X
+ * @param[in]     uy 用户空间 Y / User-space Y
+ *
+ * @return 命中则返回该元素，否则 `NULL` / The element when hit, else `NULL`
+ *
+ * @note 在单位矩阵空间构建几何后测点 / The geometry is built in identity space before the point test
+ */
 static HpeDomNode *hit_points(SvgCtx *ctx, HpeDomNode *n, float ux, float uy)
 {
     Polys pp;
@@ -2012,6 +2893,18 @@ static HpeDomNode *hit_points(SvgCtx *ctx, HpeDomNode *n, float ux, float uy)
     return hit ? n : NULL;
 }
 
+/**
+ * @brief 命中测试一个 `<path>` / Hit test a `<path>`
+ *
+ * @param[in]     ctx SVG 上下文 / SVG context
+ * @param[in]     n `<path>` 元素 / The `<path>` element
+ * @param[in]     ux 用户空间 X / User-space X
+ * @param[in]     uy 用户空间 Y / User-space Y
+ *
+ * @return 命中则返回该元素，否则 `NULL` / The element when hit, else `NULL`
+ *
+ * @note 在单位矩阵空间构建几何后测点 / The geometry is built in identity space before the point test
+ */
 static HpeDomNode *hit_path(SvgCtx *ctx, HpeDomNode *n, float ux, float uy)
 {
     Polys pp;
@@ -2027,6 +2920,17 @@ static HpeDomNode *hit_path(SvgCtx *ctx, HpeDomNode *n, float ux, float uy)
     return hit ? n : NULL;
 }
 
+/**
+ * @brief 命中测试一个 `<text>` / Hit test a `<text>`
+ *
+ * @param[in]     n `<text>` 元素 / The `<text>` element
+ * @param[in]     ux 用户空间 X / User-space X
+ * @param[in]     uy 用户空间 Y / User-space Y
+ *
+ * @return 命中则返回该元素，否则 `NULL` / The element when hit, else `NULL`
+ *
+ * @note 以锚点与字号估算文本框 / The text box is estimated from the anchor point and the font size
+ */
 static HpeDomNode *hit_text(HpeDomNode *n, float ux, float uy)
 {
     float x = attr_f(n, "x", 0.0f), y = attr_f(n, "y", 0.0f);
@@ -2036,7 +2940,19 @@ static HpeDomNode *hit_text(HpeDomNode *n, float ux, float uy)
     return NULL;
 }
 
-/* a shape carries its own transform; hit point is mapped into user space */
+/**
+ * @brief 命中测试一个叶子形状 / Hit test a leaf shape
+ *
+ * @param[in,out] ctx SVG 上下文 / SVG context
+ * @param[in]     node 元素 / Element
+ * @param[in]     tag 标签名 / Tag name
+ * @param[in]     dx 设备点 X / Device point X
+ * @param[in]     dy 设备点 Y / Device point Y
+ *
+ * @return 命中则返回该元素，否则 `NULL` / The element when hit, else `NULL`
+ *
+ * @note 先把设备点经逆矩阵映射到用户空间 / The device point is inverse-mapped into user space first
+ */
 static HpeDomNode *hit_shape(SvgCtx *ctx, HpeDomNode *node, const char *tag, float dx, float dy)
 {
     Mat inv;
@@ -2059,6 +2975,18 @@ static HpeDomNode *hit_shape(SvgCtx *ctx, HpeDomNode *node, const char *tag, flo
     return NULL;
 }
 
+/**
+ * @brief 命中测试一个 `<use>` / Hit test a `<use>`
+ *
+ * @param[in,out] ctx SVG 上下文 / SVG context
+ * @param[in]     node `<use>` 元素 / The `<use>` element
+ * @param[in]     dx 设备点 X / Device point X
+ * @param[in]     dy 设备点 Y / Device point Y
+ *
+ * @return 最深命中节点，未命中返回 `NULL` / The deepest hit node, or `NULL`
+ *
+ * @note 把 use 的 transform 与 x/y 压入 CTM 后递归引用元素 / Pushes the `use` transform and x/y onto the CTM, then recurses into the referenced element
+ */
 static HpeDomNode *hit_use(SvgCtx *ctx, HpeDomNode *node, float dx, float dy)
 {
     HpeDomNode *ref, *best;
@@ -2079,6 +3007,18 @@ static HpeDomNode *hit_use(SvgCtx *ctx, HpeDomNode *node, float dx, float dy)
     return best;
 }
 
+/**
+ * @brief 递归遍历 SVG 树做命中测试 / Walk the SVG tree recursively for hit testing
+ *
+ * @param[in,out] ctx SVG 上下文 / SVG context
+ * @param[in]     node 当前节点 / Current node
+ * @param[in]     dx 设备点 X / Device point X
+ * @param[in]     dy 设备点 Y / Device point Y
+ *
+ * @return 最深命中节点，未命中返回 `NULL` / The deepest hit node, or `NULL`
+ *
+ * @note defs/title/desc 不参与命中；g/svg 压入 transform 后递归子节点，use 与形状各自处理 / `defs`/`title`/`desc` never hit; `g`/`svg` push their transform and recurse while `use` and shapes are handled separately
+ */
 static HpeDomNode *hit_walk(SvgCtx *ctx, HpeDomNode *node, float dx, float dy)
 {
     const char *tag;
@@ -2100,6 +3040,17 @@ static HpeDomNode *hit_walk(SvgCtx *ctx, HpeDomNode *node, float dx, float dy)
     return hit_shape(ctx, node, tag, dx, dy);
 }
 
+/**
+ * @brief 对 `<svg>` 子树做命中测试 / Hit test an `<svg>` subtree
+ *
+ * @param[in]     box `<svg>` 盒 / The `<svg>` box
+ * @param[in]     x 文档坐标 X / Document-space X
+ * @param[in]     y 文档坐标 Y / Document-space Y
+ *
+ * @return 最深的包含该点的 SVG 元素，未命中返回 `NULL` / The deepest SVG element containing the point, or `NULL`
+ *
+ * @note 以盒内容盒左上角为原点，并按 viewBox 缩放居中；路径目前尚未参与命中测试 / The origin is the box's content-box top-left with viewBox scaling and centring applied; paths are not hit tested yet
+ */
 HpeDomNode *hpe_svg_hit_test(HpeBox *box, float x, float y)
 {
     SvgCtx ctx;

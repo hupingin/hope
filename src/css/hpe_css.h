@@ -404,28 +404,172 @@ typedef struct HpeStylesheet {
     float vh;
 } HpeStylesheet;
 
+/**
+ * @brief 初始化样式表并载入内置 UA 样式 / Initialise a stylesheet and load the built-in UA stylesheet
+ *
+ * @details 先把整个结构清零，再把视口默认设为 800x600，最后解析 `hpe_ua_stylesheet()` 的文本，因此新样式表一开始就带有浏览器默认样式。
+ *          The struct is zeroed, the viewport defaults to 800x600, and the text from `hpe_ua_stylesheet()` is parsed, so a fresh sheet already carries the user-agent defaults.
+ *
+ * @param[in,out] sheet 目标样式表 / Target stylesheet
+ *
+ * @note 传 `NULL` 时直接返回 / Returns immediately when `NULL` is passed
+ *
+ * @see hpe_css_free hpe_css_parse
+ */
 void hpe_css_init(HpeStylesheet *sheet);
+
+/**
+ * @brief 释放样式表持有的全部规则 / Release every rule held by a stylesheet
+ *
+ * @param[in,out] sheet 目标样式表 / Target stylesheet
+ *
+ * @note 逐条释放规则后把整个结构清零，可安全重复调用 / Rules are released one by one and the struct is then zeroed, so repeated calls are safe
+ *
+ * @see hpe_css_init
+ */
 void hpe_css_free(HpeStylesheet *sheet);
+
+/**
+ * @brief 解析一段 CSS 文本并追加到样式表 / Parse CSS text and append it to a stylesheet
+ *
+ * @details 在栈上分配一个媒体查询栈后调用 `css_parse_into` 从第 0 层开始递归解析，规则按出现顺序追加，不会清空已有规则。
+ *          A media-query stack is allocated on the stack and `css_parse_into` recurses from depth 0; rules are appended in source order and existing rules are kept.
+ *
+ * @param[in,out] sheet 目标样式表 / Target stylesheet
+ * @param[in]     css 待解析的 CSS 文本 / CSS text to parse
+ * @param[in]     length `css` 的字节长度 / Byte length of `css`
+ *
+ * @see css_parse_into hpe_css_init
+ */
 void hpe_css_parse(HpeStylesheet *sheet, const char *css, size_t length);
-/* sets the viewport used to evaluate @media queries (call before a re-cascade) */
+
+/**
+ * @brief 设置用于求值 @media 的视口尺寸 / Set the viewport size used to evaluate @media
+ *
+ * @details 只写入宽高两个字段，不重新解析样式表；规则的 `@media` 条件在层叠时按此尺寸即时求值，因此在重新层叠前调用即可让媒体查询随窗口变化生效。
+ *          Only the width and height fields are written and the sheet is not re-parsed; each rule's `@media` conditions are evaluated against this size at cascade time, so calling it before a re-cascade makes media queries follow the window.
+ *
+ * @param[in,out] sheet 目标样式表 / Target stylesheet
+ * @param[in]     vw 视口宽度（像素）/ Viewport width in pixels
+ * @param[in]     vh 视口高度（像素）/ Viewport height in pixels
+ *
+ * @note 传 `NULL` 时直接返回 / Returns immediately when `NULL` is passed
+ *
+ * @see hpe_css_compute
+ */
 void hpe_css_set_viewport(HpeStylesheet *sheet, float vw, float vh);
 
-/* parses a standalone selector (possibly comma-separated) and tests it against
- * `node`; combinators walk node's ancestors/siblings. used by querySelector. */
+/**
+ * @brief 测试单个选择器是否匹配给定节点 / Test whether a standalone selector matches a node
+ *
+ * @details 把 `sel` 当作可能含逗号的完整选择器文本解析成规则，任一选择器命中即算匹配；组合符会沿节点的祖先与兄弟链回溯。
+ *          `sel` is parsed as a full selector list that may contain commas and a hit on any one selector counts as a match; combinators walk the node's ancestors and siblings.
+ *
+ * @param[in]     node 待测试的 DOM 节点 / DOM node to test
+ * @param[in]     sel 选择器文本（可含逗号）/ Selector text, possibly comma-separated
+ * @param[in]     len `sel` 的字节长度 / Byte length of `sel`
+ *
+ * @return 匹配返回 1，否则返回 0 / 1 on a match, 0 otherwise
+ *
+ * @note 供 `querySelector` 一类接口使用 / Used by interfaces such as `querySelector`
+ *
+ * @see selector_matches compound_matches
+ */
 int hpe_css_selector_matches(const HpeDomNode *node, const char *sel, size_t len);
 
+/**
+ * @brief 返回一份填好 CSS 初始值的默认样式 / Return a default style seeded with CSS initial values
+ *
+ * @details 先 `memset` 清零，再依次调用 `style_init_box` 与 `style_init_scalars`，因此所有非零初值（如 `auto`、透明色、单位变换、`font-size: 16px`）都已就位。
+ *          The struct is zeroed first, then `style_init_box` and `style_init_scalars` fill in every non-zero initial value such as `auto`, transparent colours, the identity transform and `font-size: 16px`.
+ *
+ * @return 初始化完毕的样式值（按值返回）/ A fully initialised style returned by value
+ *
+ * @see style_init_box style_init_scalars
+ */
 HpeStyle hpe_style_default(void);
-/* parses a declaration block (the content of a style="" attribute) */
+
+/**
+ * @brief 解析声明块并写入样式 / Parse a declaration block into a style
+ *
+ * @details 输入通常是 `style=""` 属性的内容；按 `;` 切分后逐条解析 `属性: 值`，识别并记录 `!important`，非法或空声明被忽略。
+ *          The input is normally the content of a `style=""` attribute; it is split on `;` and each `property: value` pair is parsed, `!important` is detected and recorded, and malformed or empty declarations are skipped.
+ *
+ * @param[in]     text 声明块文本 / Declaration block text
+ * @param[in]     length `text` 的字节长度 / Byte length of `text`
+ * @param[out]    decl 接收解析结果的样式 / Receives the parsed style
+ *
+ * @note 进入时先清空 `decl`；`text` 为空时只做清零 / `decl` is cleared on entry; when `text` is empty only the clear happens
+ *
+ * @see apply_property strip_important
+ */
 void hpe_css_parse_declarations(const char *text, size_t length, HpeStyle *decl);
-/* computes the style of `node`, inheriting from `parent` (may be NULL) */
+
+/**
+ * @brief 计算节点的最终样式（两趟层叠）/ Compute a node's final style with a two-pass cascade
+ *
+ * @details 第一趟从 `hpe_style_default` 出发并按 `parent` 继承可继承属性，收集所有媒体条件通过且选择器匹配的规则，按（specificity, 源码顺序）排序后依次应用，最后叠加内联 `style=""`（胜过普通样式表声明）。
+ *          Pass one starts from `hpe_style_default`, inherits the inheritable properties from `parent`, gathers every rule whose media conditions pass and whose selectors match, applies them sorted by (specificity, source order), and finally overlays the inline `style=""`, which beats a normal stylesheet declaration.
+ *          第二趟只处理 `!important` 声明：把它们（含内联）按同一种键排序后仅应用被标记为 important 的位；在 important 层内内联仍胜过样式表，其余由源码顺序决定。
+ *          Pass two handles `!important` declarations only: they are sorted by the same key and only the bits flagged important are applied; within the important origin an inline `style=""` still beats a stylesheet, otherwise source order decides.
+ *
+ * @param[in,out] sheet 样式表；为 `NULL` 时跳过规则匹配 / Stylesheet; rule matching is skipped when `NULL`
+ * @param[in]     node 待计算样式的 DOM 节点 / DOM node whose style is computed
+ * @param[in]     parent 父节点样式，用于继承；可为 `NULL` / Parent style used for inheritance; may be `NULL`
+ * @param[out]    out 接收计算后的样式 / Receives the computed style
+ *
+ * @note 计算得到的样式保留“已声明”位（`set`/`set2`），供绘制阶段区分显式值与继承值 / The computed style keeps the "declared" bits (`set`/`set2`) so later stages can tell an explicit value from an inherited one
+ *
+ * @see apply_decl apply_decl_important inherit_parent_style
+ */
 void hpe_css_compute(HpeStylesheet *sheet, const HpeDomNode *node, const HpeStyle *parent,
                      HpeStyle *out);
 
+/**
+ * @brief 返回内置的用户代理默认样式表文本 / Return the built-in user-agent stylesheet text
+ *
+ * @details 这份常量文本为 `html`/`body`、标题、列表、表格、表单控件等元素提供 `display`、`margin`、`font-size` 等浏览器默认值，在 `hpe_css_init` 时被解析进样式表。
+ *          This constant text supplies browser-default `display`, `margin`, `font-size` and similar values for `html`/`body`, headings, lists, tables and form controls; it is parsed into the sheet by `hpe_css_init`.
+ *
+ * @return 以 NUL 结尾的 UA 样式表 CSS 文本 / NUL-terminated CSS text of the user-agent stylesheet
+ *
+ * @see hpe_css_init
+ */
 const char *hpe_ua_stylesheet(void);
 
-/* inline style="..." helpers used by the javascript DOM bridge.
- * `prop` must be the css property name (lowercase, dashed). */
+/**
+ * @brief 在元素的内联 `style` 属性中设置一个属性 / Set one property in an element's inline `style` attribute
+ *
+ * @details 扫描现有 `style` 属性，遇到同名属性就替换其值（值为空则删除），其余声明原样保留；没有同名属性时在末尾追加 `prop: value;`，最后整体写回属性。
+ *          The existing `style` attribute is scanned; a declaration with the same name has its value replaced (or removed when the new value is empty) while other declarations are kept verbatim, and when no match exists `prop: value;` is appended before writing the attribute back.
+ *
+ * @param[in,out] node 目标 DOM 元素 / Target DOM element
+ * @param[in]     prop CSS 属性名（小写、带连字符）/ CSS property name, lowercase and dashed
+ * @param[in]     value 属性值；空串或 `NULL` 表示删除该属性 / Property value; an empty string or `NULL` removes the property
+ *
+ * @note 供 JavaScript DOM 桥使用 / Used by the JavaScript DOM bridge
+ *
+ * @see hpe_css_inline_get inline_append
+ */
 void hpe_css_inline_set(HpeDomNode *node, const char *prop, const char *value);
+
+/**
+ * @brief 读取元素内联 `style` 属性中的一个属性值 / Read one property value from an element's inline `style` attribute
+ *
+ * @details 按 `;` 切分内联样式，逐个比较小写的属性名，命中后把去除首尾空白的值写入 `out` 并返回 1。
+ *          The inline style is split on `;` and property names are compared case-insensitively; on a hit the trimmed value is written to `out` and 1 is returned.
+ *
+ * @param[in]     node 目标 DOM 元素 / Target DOM element
+ * @param[in]     prop 要查询的 CSS 属性名 / CSS property name to look up
+ * @param[out]    out 接收属性值的缓冲区 / Buffer that receives the property value
+ * @param[in]     out_size 接收缓冲区容量（字节）/ Capacity of the output buffer in bytes
+ *
+ * @return 找到返回 1，否则返回 0 / 1 when found, 0 otherwise
+ *
+ * @note 属性值以去空白后的文本原样返回，不做规范化 / The value is returned as trimmed text without normalisation
+ *
+ * @see hpe_css_inline_set
+ */
 int hpe_css_inline_get(const HpeDomNode *node, const char *prop, char *out, size_t out_size);
 
 #endif /* HPE_CSS_H */

@@ -69,20 +69,53 @@ typedef struct HpeBox {
     HpeFloatBand floats; /* floated children of this block container */
 } HpeBox;
 
-/* builds the box tree for a document and lays it out into `viewport_width` */
+/**
+ * @brief 为文档构建并排版盒子树 / Build and lay out the box tree for a document
+ *
+ * @param[in]     document 文档根节点 / Document root node
+ * @param[in]     sheet 样式表 / Stylesheet
+ * @param[in]     viewport_width 视口宽度 / Viewport width
+ * @param[in]     viewport_height 视口高度 / Viewport height
+ *
+ * @return 盒子树根；无文档或 `<html>` 时返回 `NULL` / Box tree root, or `NULL` when there is no document or no `<html>`
+ *
+ * @note 视口即初始包含块 / The viewport is the initial containing block
+ */
 HpeBox *hpe_layout_build(HpeDomNode *document, HpeStylesheet *sheet, float viewport_width,
                          float viewport_height);
-/* incremental counterpart used after a DOM mutation. `old_root` is the box tree
- * of the previous pass and `reflow_root` the highest DOM node whose subtree
- * changed. Boxes outside that subtree are reused verbatim (their styles cannot
- * have changed because the stylesheet did not); only the path from the root down
- * to `reflow_root` is rebuilt. Falls back to a full build when the inputs do not
- * allow it. The ordering/positioning pass always runs, so the geometry is
- * identical to hpe_layout_build(). */
+
+/**
+ * @brief DOM 变更后的增量重建 / Incremental rebuild after a DOM mutation
+ *
+ * @param[in]     document 文档根节点 / Document root node
+ * @param[in]     sheet 样式表 / Stylesheet
+ * @param[in]     viewport_width 视口宽度 / Viewport width
+ * @param[in]     viewport_height 视口高度 / Viewport height
+ * @param[in,out] old_root 上一轮的盒子树 / Previous pass's box tree
+ * @param[in]     reflow_root 子树发生变更的最高 DOM 节点 / Highest DOM node whose subtree changed
+ *
+ * @return 成功时返回复用的 old_root；输入不允许局部重建时返回 `NULL` / The reused `old_root` on success, or `NULL` when the inputs do not permit a partial pass
+ *
+ * @note 变更子树之外的盒原样复用，几何结果与 hpe_layout_build 一致 / Boxes outside the changed subtree are reused verbatim and the geometry matches hpe_layout_build
+ */
 HpeBox *hpe_layout_rebuild(HpeDomNode *document, HpeStylesheet *sheet, float viewport_width,
                            float viewport_height, HpeBox *old_root,
                            HpeDomNode *reflow_root);
+
+/**
+ * @brief 释放整棵盒子树 / Free an entire box tree
+ *
+ * @param[in,out] box 待释放的盒；可为 `NULL` / Box to free, may be `NULL`
+ */
 void hpe_layout_free(HpeBox *box);
+
+/**
+ * @brief 求根盒的总内容高度 / Total content height of the root box
+ *
+ * @param[in]     root 根盒 / Root box
+ *
+ * @return 根盒边框盒底边的文档 y；root 为 `NULL` 时返回 0 / Document y of the root's border-box bottom, or 0 when `root` is `NULL`
+ */
 float hpe_layout_content_height(HpeBox *root);
 
 #endif /* HPE_LAYOUT_H */

@@ -11,6 +11,7 @@ cmake-build-*/
 out/
 bin/
 obj/
+tools/
 
 # ---- C 编译产物 ----
 *.o

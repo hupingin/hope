@@ -11,6 +11,17 @@
 
 #define JS_BLOCK_SIZE (512 * 1024)
 
+/**
+ * @brief 向 arena 追加一个新的内存块 / Append a new memory block to the arena
+ *
+ * @details 块首挂在 `js->blocks` 链头部，实际可用区紧跟在 `JsBlock` 头之后。
+ *          The block is pushed onto the head of the `js->blocks` chain and its usable area follows the `JsBlock` header.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     size 请求的块容量，小于 `JS_BLOCK_SIZE` 时按 512 KiB 申请 / Requested block size, raised to 512 KiB when smaller
+ *
+ * @note 分配失败直接打印到 stderr 并 `abort()` / Allocation failure is reported to stderr and the process is aborted
+ */
 static void block_new(HpeJs *js, size_t size)
 {
     JsBlock *b;
@@ -28,6 +39,16 @@ static void block_new(HpeJs *js, size_t size)
     js->blocks = b;
 }
 
+/**
+ * @brief 从 arena 分配 8 字节对齐的已清零内存 / Allocate 8-byte-aligned zeroed memory from the arena
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     size 请求字节数，向上对齐到 8 的倍数 / Requested byte count, rounded up to a multiple of 8
+ *
+ * @return 指向已清零内存的指针 / Pointer to the zeroed memory
+ *
+ * @note 当前块剩余空间不足时自动追加新块；分配的内存不能单独释放，随 arena 整体回收 / A new block is appended when the current one is full; individual allocations cannot be freed and are reclaimed with the whole arena
+ */
 void *hpe_js_alloc(HpeJs *js, size_t size)
 {
     JsBlock *b = js->blocks;
@@ -44,6 +65,17 @@ void *hpe_js_alloc(HpeJs *js, size_t size)
     }
 }
 
+/**
+ * @brief 在 arena 中复制指定长度的字符串 / Copy a string of the given length into the arena
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     s 源字符串，可为 `NULL` / Source string, may be `NULL`
+ * @param[in]     n 复制的字节数 / Number of bytes to copy
+ *
+ * @return 以 NUL 结尾的新字符串 / The new NUL-terminated string
+ *
+ * @note `s` 为 `NULL` 时按空串处理，结果始终以 NUL 结尾 / `NULL` is treated as the empty string and the result is always NUL-terminated
+ */
 char *hpe_js_strndup(HpeJs *js, const char *s, size_t n)
 {
     char *p = (char *)hpe_js_alloc(js, n + 1);
@@ -53,13 +85,34 @@ char *hpe_js_strndup(HpeJs *js, const char *s, size_t n)
     return p;
 }
 
+/**
+ * @brief 在 arena 中复制以 NUL 结尾的字符串 / Duplicate a NUL-terminated string into the arena
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     s 源字符串，可为 `NULL` / Source string, may be `NULL`
+ *
+ * @return 复制的以 NUL 结尾的字符串 / The duplicated NUL-terminated string
+ *
+ * @note `s` 为 `NULL` 时产生空串 / A `NULL` input yields the empty string
+ */
 char *hpe_js_strdup(HpeJs *js, const char *s)
 {
     return hpe_js_strndup(js, s, s ? strlen(s) : 0);
 }
 
-/* grows an arena-allocated array: allocates a new region and copies (the old
- * region becomes arena garbage until the arena is released) */
+/**
+ * @brief 扩容 arena 数组：另分配并拷贝旧元素 / Grow an arena-allocated array by allocating anew and copying the old elements
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] ptr 旧数组，可为 `NULL` / The old array, may be `NULL`
+ * @param[in]     old_count 旧元素个数 / Previous element count
+ * @param[in]     new_count 新元素个数 / New element count
+ * @param[in]     elem 单个元素字节数 / Byte size of one element
+ *
+ * @return 新数组的起始地址 / Start of the new array
+ *
+ * @note 旧区域成为 arena 垃圾，待 arena 释放时一并回收 / The old region becomes arena garbage and is reclaimed when the arena is released
+ */
 static void *arena_grow(HpeJs *js, void *ptr, size_t old_count, size_t new_count, size_t elem)
 {
     void *np = hpe_js_alloc(js, new_count * elem);
@@ -68,6 +121,18 @@ static void *arena_grow(HpeJs *js, void *ptr, size_t old_count, size_t new_count
     return np;
 }
 
+/**
+ * @brief 按新字节数重分配 arena 数组 / Reallocate an arena-allocated array to a new byte size
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] ptr 旧数组，可为 `NULL` / The old array, may be `NULL`
+ * @param[in]     n 要保留的元素个数 / Number of elements to preserve
+ * @param[in]     elem 单个元素字节数 / Byte size of one element
+ *
+ * @return 新数组的起始地址 / Start of the new array
+ *
+ * @note 先按 `n * elem` 分配再原样拷贝，若 `n` 小于原长度会截断 / Allocates `n * elem` bytes and copies verbatim, truncating when `n` is smaller than the old length
+ */
 static void *arena_realloc(HpeJs *js, void *ptr, size_t n, size_t elem)
 {
     void *np = hpe_js_alloc(js, n * elem);
@@ -76,7 +141,11 @@ static void *arena_realloc(HpeJs *js, void *ptr, size_t n, size_t elem)
     return np;
 }
 
-/* ---------------- values ---------------- */
+/**
+ * @brief 构造 `undefined` 值 / Build an `undefined` value
+ *
+ * @return 类型为 `JS_UNDEF` 的值 / A value of type `JS_UNDEF`
+ */
 
 JsValue js_undef(void)
 {
@@ -86,6 +155,11 @@ JsValue js_undef(void)
     return v;
 }
 
+/**
+ * @brief 构造 `null` 值 / Build a `null` value
+ *
+ * @return 类型为 `JS_NULL` 的值 / A value of type `JS_NULL`
+ */
 JsValue js_null(void)
 {
     JsValue v = js_undef();
@@ -93,6 +167,13 @@ JsValue js_null(void)
     return v;
 }
 
+/**
+ * @brief 由 C 布尔值构造 JS 布尔值 / Build a JS boolean from a C boolean
+ *
+ * @param[in]     b 非零为 `true` / Non-zero means `true`
+ *
+ * @return 类型为 `JS_BOOL` 的值 / A value of type `JS_BOOL`
+ */
 JsValue js_bool(int b)
 {
     JsValue v = js_undef();
@@ -101,6 +182,13 @@ JsValue js_bool(int b)
     return v;
 }
 
+/**
+ * @brief 构造 JS 数值 / Build a JS number
+ *
+ * @param[in]     x 数值（可为 `NaN`/`Infinity`）/ Numeric value, may be `NaN` or `Infinity`
+ *
+ * @return 类型为 `JS_NUM` 的值 / A value of type `JS_NUM`
+ */
 JsValue js_num(double x)
 {
     JsValue v = js_undef();
@@ -109,6 +197,17 @@ JsValue js_num(double x)
     return v;
 }
 
+/**
+ * @brief 由定长字节构造 JS 字符串 / Build a JS string from a byte range
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     s 源字节，`NULL` 视为空 / Source bytes, `NULL` treated as empty
+ * @param[in]     n 字节数 / Byte count
+ *
+ * @return 类型为 `JS_STR` 的值 / A value of type `JS_STR`
+ *
+ * @note 字符串拷贝进 arena，不持有 `s` / The bytes are copied into the arena; `s` is not retained
+ */
 JsValue js_string_len(HpeJs *js, const char *s, size_t n)
 {
     JsValue v = js_undef();
@@ -117,11 +216,26 @@ JsValue js_string_len(HpeJs *js, const char *s, size_t n)
     return v;
 }
 
+/**
+ * @brief 由以 NUL 结尾字符串构造 JS 字符串 / Build a JS string from a NUL-terminated string
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     s 源字符串，可为 `NULL` / Source string, may be `NULL`
+ *
+ * @return 类型为 `JS_STR` 的值 / A value of type `JS_STR`
+ */
 JsValue js_string(HpeJs *js, const char *s)
 {
     return js_string_len(js, s, s ? strlen(s) : 0);
 }
 
+/**
+ * @brief 把对象指针包装成 JS 值 / Wrap an object pointer as a JS value
+ *
+ * @param[in,out] o 目标对象 / Target object
+ *
+ * @return 类型为 `JS_OBJ` 的值 / A value of type `JS_OBJ`
+ */
 JsValue js_objval(JsObj *o)
 {
     JsValue v = js_undef();
@@ -130,7 +244,15 @@ JsValue js_objval(JsObj *o)
     return v;
 }
 
-/* ---------------- plain objects ---------------- */
+/**
+ * @brief 分配一个无原型的普通对象 / Allocate a plain object with no prototype
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ *
+ * @return 新对象（`kind=JS_OBJ_PLAIN`、类名 `Object`、`proto` 为 `NULL`）/ The new object with `kind=JS_OBJ_PLAIN`, class `Object` and a `NULL` prototype
+ *
+ * @see js_object_new
+ */
 
 JsObj *js_object_raw(HpeJs *js)
 {
@@ -140,6 +262,15 @@ JsObj *js_object_raw(HpeJs *js)
     return o;
 }
 
+/**
+ * @brief 创建一个原型为 `Object.prototype` 的普通对象 / Create a plain object whose prototype is `Object.prototype`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ *
+ * @return 新普通对象 / The new plain object
+ *
+ * @see js_object_raw
+ */
 JsObj *js_object_new(HpeJs *js)
 {
     JsObj *o = js_object_raw(js);
@@ -147,6 +278,15 @@ JsObj *js_object_new(HpeJs *js)
     return o;
 }
 
+/**
+ * @brief 创建一个 JS 数组对象 / Create a JS array object
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ *
+ * @return 新数组（类名 `Array`，`length` 初始化为 0）/ The new array with class `Array` and `length` set to 0
+ *
+ * @note 原型取 `Array.prototype`，缺失时回退到 `Object.prototype` / The prototype is `Array.prototype`, falling back to `Object.prototype`
+ */
 JsObj *js_array_new(HpeJs *js)
 {
     JsObj *o = js_object_raw(js);
@@ -157,6 +297,18 @@ JsObj *js_array_new(HpeJs *js)
     return o;
 }
 
+/**
+ * @brief 由 AST 函数节点创建用户函数对象 / Create a user function object from an AST function node
+ *
+ * @details 从形参列表（遇到剩余参数为止）推出 `length`，写入 `name`；非箭头函数还会生成带 `constructor` 的 `.prototype` 对象。
+ *          `length` is derived from the parameter list up to the first rest parameter and `name` is set; non-arrow functions also get a `.prototype` object carrying `constructor`.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] code 函数声明的 AST 节点（取自 `JsNode`）/ AST node of the function declaration
+ * @param[in,out] closure 创建时捕获的词法环境 / Lexical environment captured at creation
+ *
+ * @return 新的函数对象 / The new function object
+ */
 JsObj *js_func_new(HpeJs *js, struct JsNode *code, JsEnv *closure)
 {
     JsObj *o = js_object_raw(js);
@@ -189,6 +341,15 @@ JsObj *js_func_new(HpeJs *js, struct JsNode *code, JsEnv *closure)
     return o;
 }
 
+/**
+ * @brief 创建原生（C 实现）函数对象 / Create a native (C-implemented) function object
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     fn 原生函数指针 / Native function pointer
+ * @param[in,out] ud 透传给原生函数的用户数据 / User data passed through to the native function
+ *
+ * @return 类名为 `Function` 的原生函数对象 / The new native function object with class `Function`
+ */
 JsObj *js_native_new(HpeJs *js, JsNativeFn fn, void *ud)
 {
     JsObj *o = js_object_raw(js);
@@ -200,6 +361,18 @@ JsObj *js_native_new(HpeJs *js, JsNativeFn fn, void *ud)
     return o;
 }
 
+/**
+ * @brief 创建宿主对象，把 C 指针暴露给脚本 / Create a host object exposing a C pointer to scripts
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] ptr 宿主指针 / Host pointer
+ * @param[in]     type 宿主类型标记（`HPE_HOST_*`）/ Host type tag
+ * @param[in]     vt 可选的属性拦截虚表 / Optional property-access vtable
+ *
+ * @return 类名为 `Host` 的宿主对象 / The new host object with class `Host`
+ *
+ * @see js_make_host js_host_ptr
+ */
 JsObj *js_host_new(HpeJs *js, void *ptr, int type, const HpeJsHostVt *vt)
 {
     JsObj *o = js_object_raw(js);
@@ -212,11 +385,31 @@ JsObj *js_host_new(HpeJs *js, void *ptr, int type, const HpeJsHostVt *vt)
     return o;
 }
 
+/**
+ * @brief 创建宿主对象并包装为 JS 值 / Create a host object and wrap it as a JS value
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] ptr 宿主指针 / Host pointer
+ * @param[in]     type 宿主类型标记（`HPE_HOST_*`）/ Host type tag
+ * @param[in]     vt 可选的属性拦截虚表 / Optional property-access vtable
+ *
+ * @return 包装宿主对象的 `JS_OBJ` 值 / A `JS_OBJ` value wrapping the host object
+ *
+ * @see js_host_new
+ */
 JsValue js_make_host(HpeJs *js, void *ptr, int type, const HpeJsHostVt *vt)
 {
     return js_objval(js_host_new(js, ptr, type, vt));
 }
 
+/**
+ * @brief 取回宿主对象内的 C 指针 / Retrieve the C pointer held by a host object
+ *
+ * @param[in]     v 待检查的值 / Value to inspect
+ * @param[in]     type 期望的宿主类型标记 / Expected host type tag
+ *
+ * @return 类型匹配时返回宿主指针，否则返回 `NULL` / The host pointer when the type matches, otherwise `NULL`
+ */
 void *js_host_ptr(JsValue v, int type)
 {
     if (v.t == JS_OBJ && v.obj && v.obj->kind == JS_OBJ_HOST && v.obj->host_type == type)
@@ -224,6 +417,13 @@ void *js_host_ptr(JsValue v, int type)
     return NULL;
 }
 
+/**
+ * @brief 创建一个处于 pending 状态的 Promise / Create a Promise in the pending state
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ *
+ * @return 类名为 `Promise`、`promise_state` 为 0 的对象 / The new object with class `Promise` and `promise_state` 0
+ */
 JsObj *js_promise_new(HpeJs *js)
 {
     JsObj *o = js_object_raw(js);
@@ -234,6 +434,14 @@ JsObj *js_promise_new(HpeJs *js)
     return o;
 }
 
+/**
+ * @brief 创建模块命名空间对象 / Create a module namespace object
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] mod 该命名空间所属的模块 / The module this namespace belongs to
+ *
+ * @return 类名为 `Module`、无原型的对象 / The new object with class `Module` and no prototype
+ */
 JsObj *js_module_ns_new(HpeJs *js, JsModule *mod)
 {
     JsObj *o = js_object_raw(js);
@@ -244,7 +452,16 @@ JsObj *js_module_ns_new(HpeJs *js, JsModule *mod)
     return o;
 }
 
-/* ---------------- property access ---------------- */
+/**
+ * @brief 查找对象自身的属性记录 / Look up an own property record of an object
+ *
+ * @param[in,out] obj JS 对象，可为 `NULL` / JS object, may be `NULL`
+ * @param[in]     key 键名，可为 `NULL` / Key name, may be `NULL`
+ *
+ * @return 命中的属性指针，未找到返回 `NULL` / Pointer to the property, or `NULL` when absent
+ *
+ * @note 只查自身属性，不沿原型链 / Only own properties are searched; the prototype chain is not walked
+ */
 
 JsProp *js_obj_own_prop(JsObj *obj, const char *key)
 {
@@ -258,6 +475,16 @@ JsProp *js_obj_own_prop(JsObj *obj, const char *key)
     return NULL;
 }
 
+/**
+ * @brief 沿原型链查找属性记录 / Find a property record along the prototype chain
+ *
+ * @param[in,out] obj 起始对象 / Starting object
+ * @param[in]     key 键名 / Key name
+ *
+ * @return 命中的属性指针，未找到返回 `NULL` / Pointer to the property, or `NULL` when not found
+ *
+ * @note 原型链最多上溯 100 层，防止自引用造成死循环 / The chain is walked at most 100 levels to guard against cycles
+ */
 JsProp *js_obj_find_prop(JsObj *obj, const char *key)
 {
     JsObj *o = obj;
@@ -271,16 +498,44 @@ JsProp *js_obj_find_prop(JsObj *obj, const char *key)
     return NULL;
 }
 
+/**
+ * @brief 判断对象自身是否有某属性 / Test whether an object has an own property
+ *
+ * @param[in,out] obj JS 对象 / JS object
+ * @param[in]     key 键名 / Key name
+ *
+ * @return 自身存在该属性返回 1 / 1 when the own property exists
+ */
 int js_obj_own_has(JsObj *obj, const char *key)
 {
     return js_obj_own_prop(obj, key) != NULL;
 }
 
+/**
+ * @brief 判断对象（含原型链）是否有某属性 / Test whether an object has a property, prototype chain included
+ *
+ * @param[in,out] obj JS 对象 / JS object
+ * @param[in]     key 键名 / Key name
+ *
+ * @return 自身或原型链上存在返回 1 / 1 when found on the object or its prototype chain
+ */
 int js_obj_has(JsObj *obj, const char *key)
 {
     return js_obj_find_prop(obj, key) != NULL;
 }
 
+/**
+ * @brief 为对象追加一条新属性记录 / Append a new property record to an object
+ *
+ * @details 属性数组按需倍增扩容；新记录的值为 `undefined`、enumerable 为 1。
+ *          The property array doubles on demand; the new record starts with an `undefined` value and `enumerable` 1.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] obj 目标对象 / Target object
+ * @param[in]     key 新属性键名 / Key of the new property
+ *
+ * @return 新属性记录 / The new property record
+ */
 static JsProp *obj_add_prop(HpeJs *js, JsObj *obj, const char *key)
 {
     JsProp *p;
@@ -301,6 +556,16 @@ static JsProp *obj_add_prop(HpeJs *js, JsObj *obj, const char *key)
     return p;
 }
 
+/**
+ * @brief 设置对象属性，不存在则创建 / Set an object property, creating it when absent
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] obj 目标对象，可为 `NULL` / Target object, may be `NULL`
+ * @param[in]     key 属性键名，可为 `NULL` / Property key, may be `NULL`
+ * @param[in]     v 要写入的值 / Value to store
+ *
+ * @note 数组的 `length` 与 `Symbol.*` 前缀键会被置为非枚举 / Array `length` and `Symbol.*`-prefixed keys are marked non-enumerable
+ */
 void js_obj_set(HpeJs *js, JsObj *obj, const char *key, JsValue v)
 {
     JsProp *p;
@@ -315,6 +580,17 @@ void js_obj_set(HpeJs *js, JsObj *obj, const char *key, JsValue v)
         p->enumerable = 0;
 }
 
+/**
+ * @brief 为属性安装 getter/setter 访问器 / Install getter/setter accessors on a property
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] obj 目标对象 / Target object
+ * @param[in]     key 属性键名 / Property key
+ * @param[in]     getter 读取器函数值 / Getter function value
+ * @param[in]     setter 写入器函数值 / Setter function value
+ *
+ * @note 传入 `undefined` 的一侧保持不变 / A side passed as `undefined` is left unchanged
+ */
 void js_obj_set_accessor(HpeJs *js, JsObj *obj, const char *key, JsValue getter, JsValue setter)
 {
     JsProp *p = js_obj_own_prop(obj, key);
@@ -326,6 +602,17 @@ void js_obj_set_accessor(HpeJs *js, JsObj *obj, const char *key, JsValue getter,
         p->setter = setter;
 }
 
+/**
+ * @brief 删除对象的自身属性 / Delete an own property of an object
+ *
+ * @param[in,out] js JS 运行时上下文（未使用）/ JS runtime context (unused)
+ * @param[in,out] obj 目标对象，可为 `NULL` / Target object, may be `NULL`
+ * @param[in]     key 属性键名，可为 `NULL` / Property key, may be `NULL`
+ *
+ * @return 总是返回 1 / Always returns 1
+ *
+ * @note 删除时用 `memmove` 保持其余属性的相对顺序 / Remaining properties keep their order via `memmove`
+ */
 int js_obj_delete(HpeJs *js, JsObj *obj, const char *key)
 {
     int i;
@@ -343,11 +630,29 @@ int js_obj_delete(HpeJs *js, JsObj *obj, const char *key)
     return 1;
 }
 
+/**
+ * @brief 返回对象自身属性个数 / Return the number of own properties
+ *
+ * @param[in,out] obj JS 对象，可为 `NULL` / JS object, may be `NULL`
+ *
+ * @return 自身属性个数，`obj` 为 `NULL` 时返回 0 / The own property count, or 0 when `obj` is `NULL`
+ */
 int js_obj_prop_count(JsObj *obj)
 {
     return obj ? obj->prop_count : 0;
 }
 
+/**
+ * @brief 收集对象的可枚举自身键名 / Collect the enumerable own keys of an object
+ *
+ * @param[in,out] obj JS 对象，可为 `NULL` / JS object, may be `NULL`
+ * @param[out]    out 接收以 `NULL` 结尾的键名数组 / Receives a `NULL`-terminated key array
+ * @param[out]    count 键名个数 / Receives the number of keys
+ *
+ * @return 键名个数 / The number of keys
+ *
+ * @note 键名数组用 `malloc` 分配，调用方需 `free`；仅枚举 `enumerable` 为真的属性 / The array is `malloc`ed and must be freed by the caller; only `enumerable` properties are included
+ */
 int js_obj_own_keys(JsObj *obj, char ***out, int *count)
 {
     char **keys;
@@ -373,6 +678,17 @@ int js_obj_own_keys(JsObj *obj, char ***out, int *count)
     return n;
 }
 
+/**
+ * @brief 读取属性值（含原型链） / Read a property value, walking the prototype chain
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] obj 目标对象 / Target object
+ * @param[in]     key 属性键名 / Property key
+ *
+ * @return 属性值；未找到或该属性是访问器时返回 `undefined` / The property value, or `undefined` when absent or when it is an accessor
+ *
+ * @note 访问器属性需由 `js_get_prop()` 调用读取 / Accessor properties must be read by calling `js_get_prop()`
+ */
 JsValue js_obj_get(HpeJs *js, JsObj *obj, const char *key)
 {
     JsProp *p = js_obj_find_prop(obj, key);
@@ -383,7 +699,14 @@ JsValue js_obj_get(HpeJs *js, JsObj *obj, const char *key)
     return p->val;
 }
 
-/* numbers-as-keys helper: array index / length */
+/**
+ * @brief 把数值下标格式化为属性键字符串 / Format a numeric index as a property-key string
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     idx 数值下标（截断为整数）/ Numeric index, truncated to an integer
+ *
+ * @return arena 中的十进制键名字符串 / A decimal key string in the arena
+ */
 static char *key_from_index(HpeJs *js, double idx)
 {
     char buf[32];
@@ -391,7 +714,17 @@ static char *key_from_index(HpeJs *js, double idx)
     return hpe_js_strdup(js, buf);
 }
 
-/* ---------------- iterator helpers ---------------- */
+/**
+ * @brief 求可迭代值的元素个数 / Get the element count of an iterable value
+ *
+ * @details 字符串按码点计数；Set 用后备存储的键数、Map 用其 `length`、数组用元素的 `length`；类数组（NodeList、arguments 等）取 `length` 属性。
+ *          Strings count code points; a Set uses the size of its backing store, a Map its `length`, an array the element `length`; array-likes such as NodeList or `arguments` use their `length`.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     v 字符串、数组、Map/Set 或类数组对象 / A string, array, Map/Set or array-like object
+ *
+ * @return 元素个数，无法迭代时返回 0 / The element count, or 0 when not iterable
+ */
 
 int js_iter_len(HpeJs *js, JsValue v)
 {
@@ -432,7 +765,15 @@ int js_iter_len(HpeJs *js, JsValue v)
     return 0;
 }
 
-/* i-th value of a Set's backing store (own enumerable values, insertion order) */
+/**
+ * @brief 取 Set 后备存储中第 i 个值 / Read the i-th value of a Set's backing store
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] o Set 对象 / The Set object
+ * @param[in]     i 元素下标 / Element index
+ *
+ * @return 第 i 个可枚举值，越界或无后备存储时返回 `undefined` / The i-th enumerable value, or `undefined` when out of range or without a backing store
+ */
 static JsValue set_value_at(HpeJs *js, JsObj *o, int i)
 {
     char **keys;
@@ -447,6 +788,18 @@ static JsValue set_value_at(HpeJs *js, JsObj *o, int i)
     return out;
 }
 
+/**
+ * @brief 取可迭代值第 i 个元素 / Get the i-th element of an iterable value
+ *
+ * @details 字符串按码点返回单码点子串；Set 返回其第 i 个值；Map 返回 `[键, 值]` 二元数组；数组与类数组用键名下标读取。
+ *          A string yields the single-code-point substring; a Set yields its i-th value; a Map yields a `[key, value]` pair; arrays and array-likes are read by numeric key.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     v 可迭代值 / The iterable value
+ * @param[in]     i 元素下标 / Element index
+ *
+ * @return 第 i 个元素，越界或不可迭代时返回 `undefined` / The i-th element, or `undefined` when out of range or not iterable
+ */
 JsValue js_iter_at(HpeJs *js, JsValue v, int i)
 {
     if (v.t == JS_STR) {
@@ -491,7 +844,16 @@ JsValue js_iter_at(HpeJs *js, JsValue v, int i)
     return js_undef();
 }
 
-/* ---------------- conversions ---------------- */
+/**
+ * @brief 把数值格式化为 JS 风格字符串 / Format a number as a JS-style string
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     v 待格式化的数值 / Number to format
+ *
+ * @return arena 中的字符串：`NaN`、`Infinity`、`-Infinity`、`0` 或十进制表示 / A string in the arena: `NaN`, `Infinity`, `-Infinity`, `0` or the decimal form
+ *
+ * @note 整数值用 `%lld`，其余用 `%.14g` / Integer values use `%lld`, others use `%.14g`
+ */
 
 char *js_num_to_string(HpeJs *js, double v)
 {
@@ -509,12 +871,28 @@ char *js_num_to_string(HpeJs *js, double v)
     return hpe_js_strdup(js, buf);
 }
 
+/**
+ * @brief 取对象的类名，缺省为 `Object` / Get an object's class name, defaulting to `Object`
+ *
+ * @param[in,out] o JS 对象，可为 `NULL` / JS object, may be `NULL`
+ *
+ * @return 类名字符串 / The class-name string
+ */
 static const char *obj_class_name(JsObj *o)
 {
     return (o && o->class_name) ? o->class_name : "Object";
 }
 
-/* Array#toString: comma-joined elements, skipping null/undefined holes. */
+/**
+ * @brief 数组的 `toString`：逗号连接元素 / `Array#toString`: join elements with commas
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     v 要转换的数组值 / The array value to convert
+ *
+ * @return arena 中的逗号连接字符串 / The comma-joined string in the arena
+ *
+ * @note `null`/`undefined` 元素被当作空洞跳过（不产生空槽分隔） / `null` and `undefined` elements are treated as holes and skipped
+ */
 static char *js_array_to_string(HpeJs *js, JsValue v)
 {
     int i, len = js_iter_len(js, v);
@@ -543,6 +921,16 @@ static char *js_array_to_string(HpeJs *js, JsValue v)
     return out;
 }
 
+/**
+ * @brief 把 Symbol 对象转为描述串 / Convert a Symbol object to its description string
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] o Symbol 对象 / The Symbol object
+ *
+ * @return `description` 属性字符串，缺省为 `Symbol()` / The `description` property string, or `Symbol()` when absent
+ *
+ * @note Symbol 用描述串给属性做键，因此 `obj[Symbol.iterator]` 与 `obj["Symbol.iterator"]` 命中同一槽位 / Symbols key properties by description, so both access forms reach the same slot
+ */
 static char *js_symbol_to_string(HpeJs *js, JsObj *o)
 {
     /* symbols key properties by their description string, so a computed
@@ -554,6 +942,16 @@ static char *js_symbol_to_string(HpeJs *js, JsObj *o)
     return hpe_js_strdup(js, "Symbol()");
 }
 
+/**
+ * @brief 用 Date 的原型 `toString` 渲染日期 / Render a Date via its prototype `toString`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     v Date 值 / The Date value
+ *
+ * @return 调用 `toString()` 得到的字符串；失败时返回 `Invalid Date` / The string returned by `toString()`, or `Invalid Date` on failure
+ *
+ * @note `String(date)` 走字符串提示的 ToPrimitive，因此优先生效原型上的 `toString` / `String(date)` uses the string-hint ToPrimitive, so the prototype `toString` wins
+ */
 static char *js_date_to_string(HpeJs *js, JsValue v)
 {
     /* String(date) uses ToPrimitive with the string hint, so the
@@ -567,6 +965,16 @@ static char *js_date_to_string(HpeJs *js, JsValue v)
     return hpe_js_strdup(js, "Invalid Date");
 }
 
+/**
+ * @brief 把 Error 对象格式化为 `name: message` / Format an Error object as `name: message`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] o Error 对象 / The Error object
+ *
+ * @return arena 中的错误描述串 / The error description string in the arena
+ *
+ * @note `name` 缺省为 `Error`；`message` 为空时只输出名字 / `name` defaults to `Error`; when `message` is empty only the name is emitted
+ */
 static char *js_error_to_string(HpeJs *js, JsObj *o)
 {
     JsValue nm = js_obj_get(js, o, "name");
@@ -587,6 +995,16 @@ static char *js_error_to_string(HpeJs *js, JsObj *o)
     return out;
 }
 
+/**
+ * @brief 生成对象的 `[object Class]` 形式串 / Produce the `[object Class]` form for an object
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] o JS 对象 / JS object
+ *
+ * @return `[object Object]` 或 `[object <类名>]` / `[object Object]` or `[object <class>]`
+ *
+ * @note 类名为 `Object` 或 `Module` 时统一输出 `[object Object]` / `Object` and `Module` both render as `[object Object]`
+ */
 static char *js_obj_to_string(HpeJs *js, JsObj *o)
 {
     char buf[64];
@@ -597,6 +1015,17 @@ static char *js_obj_to_string(HpeJs *js, JsObj *o)
     return hpe_js_strdup(js, buf);
 }
 
+/**
+ * @brief 按对象种类分派 `ToString` / Dispatch `ToString` by object kind
+ *
+ * @details 数组→逗号连接、函数→`function`、Symbol→描述串、Date→其 `toString`、Error→`name: message`，其余走 `[object Class]`。
+ *          Arrays join with commas, functions render as `function`, Symbols as their description, Dates via `toString`, Errors as `name: message`, everything else as `[object Class]`.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     v 待转换对象值 / Object value to convert
+ *
+ * @return arena 中的字符串表示 / The string representation in the arena
+ */
 static char *js_object_value_to_string(HpeJs *js, JsValue v)
 {
     if (!v.obj)
@@ -614,6 +1043,17 @@ static char *js_object_value_to_string(HpeJs *js, JsValue v)
     return js_obj_to_string(js, v.obj);
 }
 
+/**
+ * @brief 数值/语义上的 `ToString` 抽象操作 / The abstract `ToString` operation
+ *
+ * @details `undefined`→`undefined`、`null`→`null`、布尔→`true`/`false`、数值走 `js_num_to_string`、字符串原样返回、对象走对象分派。
+ *          `undefined` maps to `undefined`, `null` to `null`, booleans to their literal form, numbers through `js_num_to_string`, strings are returned as-is and objects are dispatched by kind.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     v 任意 JS 值 / Any JS value
+ *
+ * @return arena 中的字符串表示 / The string representation in the arena
+ */
 char *js_to_string(HpeJs *js, JsValue v)
 {
     switch (v.t) {
@@ -634,7 +1074,16 @@ char *js_to_string(HpeJs *js, JsValue v)
     }
 }
 
-/* parses a numeric literal out of the head of `s`; returns 0 when no digits */
+/**
+ * @brief 解析 `0x` 十六进制字面前缀 / Parse a `0x` hexadecimal literal prefix
+ *
+ * @param[in]     p 指向 `0x` 起始位置的输入串 / Input string pointing at the `0x` prefix
+ * @param[in]     sign 符号（1 或 -1）/ Sign (1 or -1)
+ * @param[out]    out 解析出的带符号数值 / Receives the signed numeric value
+ * @param[out]    end 解析结束的输入位置 / Receives the input position after parsing
+ *
+ * @return 总是返回 1 / Always returns 1
+ */
 static int parse_hex_prefix(const char *p, int sign, double *out, const char **end)
 {
     char *e = NULL;
@@ -644,7 +1093,19 @@ static int parse_hex_prefix(const char *p, int sign, double *out, const char **e
     return 1;
 }
 
-/* shared low-radix digit loop for 0b/0o literals */
+/**
+ * @brief 解析 `0b`/`0o` 低进制数字串 / Parse a `0b`/`0o` low-radix digit run
+ *
+ * @param[in]     digits 紧跟在前缀后的数字串 / The digit run right after the prefix
+ * @param[in]     base 进制（2 或 8）/ Radix (2 or 8)
+ * @param[in]     sign 符号（1 或 -1）/ Sign (1 or -1)
+ * @param[out]    out 解析出的带符号数值 / Receives the signed numeric value
+ * @param[out]    end 解析结束的输入位置 / Receives the input position after parsing
+ *
+ * @return 总是返回 1 / Always returns 1
+ *
+ * @note 遇到超出进制的数字即停止 / Stops at the first digit not valid for the radix
+ */
 static int parse_radix_prefix(const char *digits, int base, int sign, double *out,
                               const char **end)
 {
@@ -665,6 +1126,18 @@ static int parse_radix_prefix(const char *digits, int base, int sign, double *ou
     return 1;
 }
 
+/**
+ * @brief 解析十进制字面前缀（含小数与指数）/ Parse a decimal literal prefix including fraction and exponent
+ *
+ * @param[in]     p 指向数字起始位置的输入串 / Input string pointing at the first digit
+ * @param[in]     sign 符号（1 或 -1）/ Sign (1 or -1)
+ * @param[out]    out 解析出的带符号数值 / Receives the signed numeric value
+ * @param[out]    end 解析结束的输入位置 / Receives the input position after parsing
+ *
+ * @return 总是返回 1 / Always returns 1
+ *
+ * @note 拷贝进 64 字节临时缓冲后用 `strtod` 转换 / The run is copied into a 64-byte scratch buffer and converted with `strtod`
+ */
 static int parse_decimal_prefix(const char *p, int sign, double *out, const char **end)
 {
     char buf[64];
@@ -687,7 +1160,18 @@ static int parse_decimal_prefix(const char *p, int sign, double *out, const char
     return 1;
 }
 
-/* parses a numeric literal out of the head of `s`; returns 0 when no digits */
+/**
+ * @brief 解析字符串头部的数值字面量 / Parse a numeric literal from the head of a string
+ *
+ * @details 先跳过空白，识别可选符号，再按 `0x`/`0b`/`0o` 前缀选择进制解析，其余走十进制。
+ *          Leading whitespace is skipped, an optional sign is consumed, then the `0x`/`0b`/`0o` prefixes pick a radix and everything else falls through to decimal.
+ *
+ * @param[in]     s 输入字符串 / Input string
+ * @param[out]    out 解析出的数值 / Receives the numeric value
+ * @param[out]    end 解析结束的输入位置 / Receives the input position after parsing
+ *
+ * @return 成功解析出数字返回 1，否则返回 0（`*end` 置为 `s`）/ 1 when digits were parsed, otherwise 0 with `*end` set to `s`
+ */
 static int parse_number_prefix(const char *s, double *out, const char **end)
 {
     const char *p = s;
@@ -711,6 +1195,17 @@ static int parse_number_prefix(const char *s, double *out, const char **end)
     return parse_decimal_prefix(p, sign, out, end);
 }
 
+/**
+ * @brief 语义上的 `ToNumber` 抽象操作 / The abstract `ToNumber` operation
+ *
+ * @details `undefined`→NaN、`null`→0、布尔→0/1、数值原样；字符串解析前缀，空串为 0、含非法尾随为 NaN；对象先 `ToPrimitive` 再递归。
+ *          `undefined` gives NaN, `null` gives 0, booleans give 0/1 and numbers pass through; strings parse a prefix, empty strings yield 0 and invalid trailing text yields NaN; objects are primitived first and then converted recursively.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     v 任意 JS 值 / Any JS value
+ *
+ * @return 转换后的 double / The converted double
+ */
 double js_to_number(HpeJs *js, JsValue v)
 {
     switch (v.t) {
@@ -749,6 +1244,15 @@ double js_to_number(HpeJs *js, JsValue v)
     }
 }
 
+/**
+ * @brief 语义上的 `ToBoolean` 抽象操作 / The abstract `ToBoolean` operation
+ *
+ * @param[in]     v 任意 JS 值 / Any JS value
+ *
+ * @return 真值返回 1，假值返回 0 / 1 for truthy values, 0 for falsy ones
+ *
+ * @note falsy 为 `undefined`、`null`、`false`、`0`、`NaN`、空串；对象恒为真 / Falsy values are `undefined`, `null`, `false`, `0`, `NaN` and the empty string; objects are always truthy
+ */
 int js_truthy(JsValue v)
 {
     switch (v.t) {
@@ -768,6 +1272,19 @@ int js_truthy(JsValue v)
     }
 }
 
+/**
+ * @brief 按严格或宽松语义比较两个值 / Compare two values with strict or loose semantics
+ *
+ * @details 严格模式要求类型一致；宽松模式做数值/字符串互转、布尔转数、`null`≡`undefined`，对象与原始值比较时先求其原始值。
+ *          Strict mode requires matching types; loose mode coerces number/string, converts booleans to numbers, treats `null` and `undefined` as equal and primitives an object before comparing it.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     a 左操作数 / Left operand
+ * @param[in]     b 右操作数 / Right operand
+ * @param[in]     strict 严格比较为 1（`===`）/ 1 for strict comparison (`===`)
+ *
+ * @return 相等返回 1 / 1 when the values are equal
+ */
 int js_values_equal(HpeJs *js, JsValue a, JsValue b, int strict)
 {
     if (a.t == b.t) {
@@ -804,6 +1321,13 @@ int js_values_equal(HpeJs *js, JsValue a, JsValue b, int strict)
     return 0;
 }
 
+/**
+ * @brief 判断值是否可调用 / Test whether a value is callable
+ *
+ * @param[in]     v 任意 JS 值 / Any JS value
+ *
+ * @return 函数或原生函数返回 1 / 1 for functions and native functions
+ */
 int js_is_callable(JsValue v)
 {
     if (v.t != JS_OBJ || !v.obj)
@@ -811,8 +1335,19 @@ int js_is_callable(JsValue v)
     return v.obj->kind == JS_OBJ_FUNC || v.obj->kind == JS_OBJ_NATIVE;
 }
 
-/* ToPrimitive with the "default" hint: an object's own valueOf()/toString()
- * wins, otherwise the class-based string form. Enough for `obj == 1`. */
+/**
+ * @brief 对象到原始值的 `ToPrimitive`（default 提示）/ `ToPrimitive` on an object with the default hint
+ *
+ * @details 数组与 Promise 直接走字符串形式；其余先调用自身 `valueOf()`，再 `toString()`，返回非对象结果即采用。
+ *          Arrays and Promises go straight through the string form; otherwise the object's own `valueOf()` then `toString()` are invoked and the first non-object result is used.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     v 待转换的值 / Value to convert
+ *
+ * @return 原始值；非对象或无法转换时返回其字符串形式 / The primitive value, or the string form when the input is not an object or conversion failed
+ *
+ * @note 只够支撑 `obj == 1` 这类宽松比较 / Sufficient for loose comparisons such as `obj == 1`
+ */
 JsValue js_primitive_of(HpeJs *js, JsValue v)
 {
     JsProp *p;
@@ -835,6 +1370,14 @@ JsValue js_primitive_of(HpeJs *js, JsValue v)
     return js_string(js, js_to_string(js, v));
 }
 
+/**
+ * @brief 判断值是否为 thenable / Test whether a value is thenable
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     v 任意 JS 值 / Any JS value
+ *
+ * @return Promise 或带可调用 `then` 的对象返回 1 / 1 for a Promise or an object with a callable `then`
+ */
 int js_is_thenable(HpeJs *js, JsValue v)
 {
     if (v.t != JS_OBJ || !v.obj)
@@ -846,7 +1389,18 @@ int js_is_thenable(HpeJs *js, JsValue v)
     return 0;
 }
 
-/* ---------------- errors / exceptions ---------------- */
+/**
+ * @brief 创建 Error 对象 / Create an Error object
+ *
+ * @details 按 `name` 选择 `TypeError`/`RangeError`/`SyntaxError`/`ReferenceError` 的专用原型，其余回退到 `Error.prototype`，并写入 `name`、`message`。
+ *          The class name picks the dedicated `TypeError`/`RangeError`/`SyntaxError`/`ReferenceError` prototype, otherwise `Error.prototype`; `name` and `message` are set.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     name 错误类名（如 `TypeError`）/ Error class name such as `TypeError`
+ * @param[in]     msg 错误消息，可为 `NULL` / Error message, may be `NULL`
+ *
+ * @return 新的 Error 值 / The new Error value
+ */
 
 JsValue js_make_error(HpeJs *js, const char *name, const char *msg)
 {
@@ -868,6 +1422,14 @@ JsValue js_make_error(HpeJs *js, const char *name, const char *msg)
     return js_objval(o);
 }
 
+/**
+ * @brief 抛出值并展开到最近的 try 帧 / Throw a value and unwind to the innermost try frame
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     v 要抛出的值 / Value to throw
+ *
+ * @note 记录到 `js->thrown` 后 `longjmp` 到 `js->try_top`；无 try 帧时回退到 `js->jmp` 兜底 / The value is stored in `js->thrown` before `longjmp`-ing to `js->try_top`, falling back to `js->jmp` when there is no try frame
+ */
 void js_throw_value(HpeJs *js, JsValue v)
 {
     js->thrown = v;
@@ -878,6 +1440,15 @@ void js_throw_value(HpeJs *js, JsValue v)
     longjmp(js->jmp, 1);
 }
 
+/**
+ * @brief 格式化并抛出一个 SyntaxError / Format and throw a SyntaxError
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     line 行号，大于 0 时前缀 `line N:` / Line number, prefixed as `line N:` when positive
+ * @param[in]     fmt `printf` 风格格式串 / `printf`-style format string
+ *
+ * @note 变参经 `vsnprintf` 写入 224 字节缓冲，过长会截断 / Variadic arguments are rendered into a 224-byte buffer and may be truncated
+ */
 void js_error(HpeJs *js, int line, const char *fmt, ...)
 {
     va_list ap;
@@ -893,7 +1464,14 @@ void js_error(HpeJs *js, int line, const char *fmt, ...)
     js_throw_value(js, js_make_error(js, "SyntaxError", msg));
 }
 
-/* ---------------- environments ---------------- */
+/**
+ * @brief 新建一个词法环境 / Create a lexical environment
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] parent 父环境，可为 `NULL` / Parent environment, may be `NULL`
+ *
+ * @return 新环境；`strict` 继承父环境或全局设置 / The new environment whose `strict` inherits from the parent or the global setting
+ */
 
 JsEnv *js_env_new(HpeJs *js, JsEnv *parent)
 {
@@ -903,6 +1481,14 @@ JsEnv *js_env_new(HpeJs *js, JsEnv *parent)
     return env;
 }
 
+/**
+ * @brief 沿环境链查找变量槽位 / Look up a variable slot along the environment chain
+ *
+ * @param[in,out] env 起始环境 / Starting environment
+ * @param[in]     name 变量名 / Variable name
+ *
+ * @return 变量值槽位指针，未绑定返回 `NULL` / Pointer to the variable's value slot, or `NULL` when unbound
+ */
 JsValue *js_env_lookup(JsEnv *env, const char *name)
 {
     int i;
@@ -916,6 +1502,16 @@ JsValue *js_env_lookup(JsEnv *env, const char *name)
     return NULL;
 }
 
+/**
+ * @brief 在当前环境定义变量（已存在则赋值）/ Define a variable in the current environment, assigning when it already exists
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] env 目标环境 / Target environment
+ * @param[in]     name 变量名 / Variable name
+ * @param[in]     v 初始值 / Initial value
+ *
+ * @note 仅在当前环境建新槽位，不写入外层环境 / A new slot is added to this environment only; outer environments are not touched
+ */
 void js_env_define(HpeJs *js, JsEnv *env, const char *name, JsValue v)
 {
     JsValue *slot = js_env_lookup(env, name);
@@ -936,8 +1532,16 @@ void js_env_define(HpeJs *js, JsEnv *env, const char *name, JsValue v)
     env->var_count++;
 }
 
-/* defines a fresh binding in exactly this scope (let/const/class), shadowing
- * an outer one */
+/**
+ * @brief 在当前作用域做全新绑定（let/const/class）/ Create a fresh binding in the current scope (let/const/class)
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] env 目标环境 / Target environment
+ * @param[in]     name 变量名 / Variable name
+ * @param[in]     v 初始值 / Initial value
+ *
+ * @note 同名绑定已存在时直接改写其值，从而遮蔽外层 / When a same-named binding exists it is overwritten, shadowing the outer one
+ */
 void js_env_declare(HpeJs *js, JsEnv *env, const char *name, JsValue v)
 {
     int i;
@@ -950,6 +1554,13 @@ void js_env_declare(HpeJs *js, JsEnv *env, const char *name, JsValue v)
     js_env_define(js, env, name, v);
 }
 
+/**
+ * @brief 找到持有 `this` 绑定的最近环境 / Find the nearest environment that owns a `this` binding
+ *
+ * @param[in,out] env 起始环境 / Starting environment
+ *
+ * @return 最近持有 `this` 的环境，找不到返回 `NULL` / The nearest environment with `this`, or `NULL` when none exists
+ */
 JsEnv *js_env_this_env(JsEnv *env)
 {
     while (env && !env->has_this)

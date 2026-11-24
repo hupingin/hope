@@ -98,29 +98,122 @@ struct HpeEngine {
     char addr_committed[HPE_ADDR_MAX]; /* text as of focus time; Escape restores it */
 };
 
-/* re-builds the box tree and clamps the scroll offset (hope.c) */
+/**
+ * @brief 重建盒树并重新夹紧滚动偏移 / Rebuild the box tree and re-clamp the scroll offset
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @note 急切入口：无条件全量重建；实现位于 `hope.c`；加载、缩放、悬停、定时器等路径使用，惰性策略在 `hpe_engine_flush` / The eager entry point: unconditionally rebuilds everything; implemented in `hope.c`; used by load, resize, hover and timer paths, while the lazy policy lives in `hpe_engine_flush`
+ *
+ * @see hpe_engine_flush
+ */
 void hpe_engine_relayout(HpeEngine *engine);
-/* applies the DOM mutations recorded since the last call, doing only as much
- * layout/repaint as they require (hope.c). `force` requests a full rebuild. */
+
+/**
+ * @brief 应用自上次以来记录的 DOM 变更，只做其所需的排版/重绘 / Apply the DOM mutations recorded since the last call, doing only as much layout/repaint as they require
+ *
+ * @details 惰性重排策略：LAYOUT 重建受影响的盒子子树（作用域无界时整树）；PAINT 重算样式并重绘；NONE 完全跳过。作用域由变更汇聚点记录，可把重建限制在局部子树。
+ *          Lazy policy: LAYOUT rebuilds the affected box subtree (everything when unbounded), PAINT recomputes styles and repaints, and NONE skips entirely. The scope is recorded by the mutation sink, which can bound the rebuild to a partial subtree.
+ *
+ * @param[in,out] engine 引擎实例，NULL 时直接返回 / Engine instance, returns early when NULL
+ * @param[in]     force 非零请求全量重建 / Non-zero requests a full rebuild
+ *
+ * @note 实现位于 `hope.c` / Implemented in `hope.c`
+ *
+ * @see hpe_engine_relayout
+ */
 void hpe_engine_flush(HpeEngine *engine, int force);
-/* refreshes the status line (hope.c) */
+
+/**
+ * @brief 刷新状态行文本 / Refresh the status line
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @note 实现位于 `hope.c`；汇总文件名、尺寸、是否含地址栏、加载/绘制耗时与滚动位置，并追加粘性加载错误 / Implemented in `hope.c`; formats the file name, size, chrome flag, load/paint timings and scroll position, and appends the sticky load error
+ *
+ * @see hpe_engine_status
+ */
 void hpe_engine_refresh_status(HpeEngine *engine);
-/* height of the page viewport (window height minus chrome) */
+
+/**
+ * @brief 取页面视口高度（窗口高减地址栏）/ Get the page viewport height (window height minus chrome)
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @return 视口高度（像素），不小于 0；`engine` 为 NULL 时返回 0 / Viewport height in pixels, never below 0; 0 when `engine` is NULL
+ *
+ * @note 实现位于 `hope.c` / Implemented in `hope.c`
+ */
 int hpe_engine_view_height(HpeEngine *engine);
 
 /* ---------------- hope_chrome.c ---------------- */
 
-/* replaces the address text (truncating to the field capacity) and puts the
- * caret at the end, selection collapsed */
+/**
+ * @brief 替换地址栏文本并把插入符移到末尾 / Replace the address-bar text and put the caret at the end
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     text 新文本，超长时按输入框容量截断 / New text, truncated to the field capacity when too long
+ *
+ * @note 选区折叠，并记录为 Escape 回退所用的地址；实现位于 `hope_chrome.c` / The selection is collapsed and the text is recorded as the address Escape falls back to; implemented in `hope_chrome.c`
+ *
+ * @see hpe_chrome_navigate
+ */
 void hpe_chrome_set_text(HpeEngine *engine, const char *text);
-/* paints the address bar into the top `chrome_h` pixels */
+
+/**
+ * @brief 把地址栏绘制到顶部 `chrome_h` 像素 / Paint the address bar into the top `chrome_h` pixels
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @note 实现位于 `hope_chrome.c`；由 `hpe_engine_render` 在整帧或仅地址栏脏时调用 / Implemented in `hope_chrome.c`; called by `hpe_engine_render` for a full frame or a chrome-only repaint
+ *
+ * @see hpe_engine_render
+ */
 void hpe_chrome_paint(HpeEngine *engine);
-/* pointer press/release inside the chrome strip; returns 1 when consumed.
- * `mods` carries HPE_MOD_SHIFT (Shift+click extends the selection). */
+
+/**
+ * @brief 处理地址栏条带内的一次指针按下 / 抬起 / Handle one pointer press/release inside the chrome strip
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     x X 坐标（设备坐标）/ X coordinate in device coordinates
+ * @param[in]     y Y 坐标（设备坐标）/ Y coordinate in device coordinates
+ * @param[in]     down 按下为 1、抬起为 0 / 1 when pressed, 0 when released
+ * @param[in]     mods 修饰键掩码，`HPE_MOD_SHIFT` 时 Shift+点击扩展选区 / Modifier mask; `HPE_MOD_SHIFT` makes a Shift+click extend the selection
+ *
+ * @return 事件被地址栏消费返回 1，否则 0 / 1 when the bar consumed the event, otherwise 0
+ *
+ * @note 实现位于 `hope_chrome.c` / Implemented in `hope_chrome.c`
+ *
+ * @see hpe_chrome_mouse_move
+ */
 int hpe_chrome_mouse(HpeEngine *engine, int x, int y, int down, int mods);
-/* pointer move while the field is being dragged; returns 1 when consumed */
+
+/**
+ * @brief 地址栏拖选进行中时处理指针移动 / Handle a pointer move while the field is being dragged
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     x X 坐标（设备坐标）/ X coordinate in device coordinates
+ * @param[in]     y Y 坐标（设备坐标）/ Y coordinate in device coordinates
+ *
+ * @return 事件被地址栏消费返回 1，否则 0 / 1 when the bar consumed the event, otherwise 0
+ *
+ * @note 实现位于 `hope_chrome.c`；即使指针离开条带，源自条带内的拖拽仍继续接收移动 / Implemented in `hope_chrome.c`; a drag that began inside the strip keeps receiving moves even once the pointer leaves it
+ *
+ * @see hpe_chrome_mouse
+ */
 int hpe_chrome_mouse_move(HpeEngine *engine, int x, int y);
-/* loads engine->addr (empty text reloads the built-in blank page) */
+
+/**
+ * @brief 按地址栏内容（`addr`）导航 / Navigate using the address-bar contents (`addr`)
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @return 加载成功返回 1，否则 0 / 1 when the load succeeded, otherwise 0
+ *
+ * @note 实现位于 `hope_chrome.c`；文本为空时重新加载内置空白页 / Implemented in `hope_chrome.c`; empty text reloads the built-in blank page
+ *
+ * @see hpe_chrome_set_text hpe_engine_load_blank
+ */
 int hpe_chrome_navigate(HpeEngine *engine);
 
 #endif /* HPE_HOPE_INTERNAL_H */

@@ -27,7 +27,16 @@
 
 static JsValue d_arg(JsValue *a, int argc, int i);
 
-/* ---------------- calendar conversion (Howard Hinnant's civil algorithms) ------ */
+/**
+ * @brief 把纪元天数转换为公历年月日 / Convert a day count since the epoch to a civil date
+ *
+ * @param[in]     z 自 1970-01-01 起的天数 / Day count since 1970-01-01
+ * @param[out]    year 公历年 / Receives the year
+ * @param[out]    month 公历月（1..12）/ Receives the month, 1..12
+ * @param[out]    day 公历日 / Receives the day of month
+ *
+ * @note 采用 Howard Hinnant 的 civil 算法（自 0000-03-01 起的纪元划分）/ Uses Howard Hinnant's civil algorithm with the era anchored at 0000-03-01
+ */
 
 static void days_to_civil(long long z, int *year, int *month, int *day)
 {
@@ -48,6 +57,17 @@ static void days_to_civil(long long z, int *year, int *month, int *day)
     *day = (int)d;
 }
 
+/**
+ * @brief 把公历年月日转换为纪元天数 / Convert a civil date to a day count since the epoch
+ *
+ * @param[in]     y 公历年 / Year
+ * @param[in]     m 公历月（1..12）/ Month, 1..12
+ * @param[in]     d 公历日 / Day of month
+ *
+ * @return 自 1970-01-01 起的天数 / Day count since 1970-01-01
+ *
+ * @note 与 `days_to_civil` 互为逆运算 / The inverse of `days_to_civil`
+ */
 static long long civil_to_days(long long y, int m, int d)
 {
     long long era, yoe, doy, doe;
@@ -59,7 +79,15 @@ static long long civil_to_days(long long y, int m, int d)
     return era * 146097 + doe - 719468;
 }
 
-/* weekday: 0 = Sunday, matching Date.getDay() */
+/**
+ * @brief 由纪元天数求星期几 / Get the weekday from a day count since the epoch
+ *
+ * @param[in]     days 自 1970-01-01 起的天数 / Day count since 1970-01-01
+ *
+ * @return 星期几，0 表示周日 / The weekday with 0 meaning Sunday
+ *
+ * @note 与 `Date.getDay()` 的编号一致 / Matches the numbering of `Date.getDay()`
+ */
 static int day_of_week(long long days)
 {
     long long wd = (days + 4) % 7; /* 1970-01-01 was a Thursday */
@@ -68,6 +96,15 @@ static int day_of_week(long long days)
     return (int)wd;
 }
 
+/**
+ * @brief 读取 Date 实例的时间值 / Read the time value of a Date instance
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this`，必须是 Date / The `this` of the call, which must be a Date
+ * @param[out]    out 接收毫秒时间值 / Receives the millisecond time value
+ *
+ * @return 成功返回 1，`this` 不是 Date 时抛错并返回 0 / 1 on success; throws and returns 0 when `this` is not a Date
+ */
 static int date_value(HpeJs *js, JsValue thisv, double *out)
 {
     if (thisv.t != JS_OBJ || !thisv.obj || thisv.obj->kind != JS_OBJ_DATE) {
@@ -78,12 +115,27 @@ static int date_value(HpeJs *js, JsValue thisv, double *out)
     return 1;
 }
 
+/**
+ * @brief 从平台层取当前毫秒时间戳 / Get the current millisecond timestamp from the platform layer
+ *
+ * @return 自 Unix 纪元起的毫秒数 / Milliseconds since the Unix epoch
+ *
+ * @note Date 是唯一访问平台的内建，其余内建保持确定性以便无头测试 / Date is the only builtin touching the platform so the rest stay deterministic for headless tests
+ */
 static double now_ms(void)
 {
     return hpe_time_epoch_ms();
 }
 
-/* ---------------- string parsing (ISO 8601 + a few common forms) ---------------- */
+/**
+ * @brief 读取定长十进制数字并转成整数 / Read a fixed-length decimal run and convert it to an integer
+ *
+ * @param[in]     s 输入字符串 / Input string
+ * @param[in]     len 要读取的数字个数 / Number of digits to read
+ * @param[out]    out 接收转换结果 / Receives the converted value
+ *
+ * @return 全部为数字返回 1，否则返回 0 / 1 when every character is a digit, otherwise 0
+ */
 
 static int digits_in(const char *s, int len, int *out)
 {
@@ -101,7 +153,19 @@ static int digits_in(const char *s, int len, int *out)
  *   2024-01-02            2024-01-02T03:04:05.678Z
  *   2024-01-02T03:04:05+08:00              2024/01/02 03:04:05
  * Returns NaN when nothing recognisable is found. */
-/* consumes YYYY[-/]MM[-/]DD, filling whichever components are present */
+
+/**
+ * @brief 解析 `YYYY[-/]MM[-/]DD` 日期部分 / Parse a `YYYY[-/]MM[-/]DD` date portion
+ *
+ * @param[in]     p 解析游标 / Parse cursor
+ * @param[out]    y 年 / Receives the year
+ * @param[out]    mo 月 / Receives the month
+ * @param[out]    d 日 / Receives the day
+ *
+ * @return 解析后的游标；年月非法时返回 `NULL` / The cursor after parsing, or `NULL` when year or month is malformed
+ *
+ * @note 日部分可省略，缺省时保持调用方给的初值 / The day part is optional and keeps the caller's initial value when absent
+ */
 static const char *parse_date_numeric(const char *p, int *y, int *mo, int *d)
 {
     if (!digits_in(p, 4, y))
@@ -122,7 +186,19 @@ static const char *parse_date_numeric(const char *p, int *y, int *mo, int *d)
     return p;
 }
 
-/* consumes HH[:MM[:SS[.fff]]] */
+/**
+ * @brief 解析 `HH[:MM[:SS[.fff]]]` 时刻部分 / Parse an `HH[:MM[:SS[.fff]]]` clock portion
+ *
+ * @param[in]     p 解析游标 / Parse cursor
+ * @param[out]    h 时 / Receives the hour
+ * @param[out]    mi 分 / Receives the minute
+ * @param[out]    se 秒 / Receives the second
+ * @param[out]    ms 毫秒 / Receives the milliseconds
+ *
+ * @return 解析后的游标；时或分非法时返回 `NULL` / The cursor after parsing, or `NULL` when hour or minute is malformed
+ *
+ * @note 小数部分按位加权累加到 `*ms`，多余位数被忽略 / Fractional digits accumulate into `*ms` by place value; extra digits are ignored
+ */
 static const char *parse_date_clock(const char *p, int *h, int *mi, int *se, int *ms)
 {
     if (!digits_in(p, 2, h))
@@ -152,7 +228,18 @@ static const char *parse_date_clock(const char *p, int *h, int *mi, int *se, int
     return p;
 }
 
-/* consumes Z or +HH[:MM] / -HH[:MM]; returns the sign (0 = UTC/absent) */
+/**
+ * @brief 解析 `Z` 或 `±HH[:MM]` 时区部分 / Parse a `Z` or `±HH[:MM]` timezone portion
+ *
+ * @param[in]     p 解析游标 / Parse cursor
+ * @param[out]    tzh 时区小时 / Receives the timezone hours
+ * @param[out]    tzm 时区分钟 / Receives the timezone minutes
+ * @param[out]    sign 时区符号（1 东 / -1 西 / 0 为 UTC 或缺省）/ Receives the sign: 1 east, -1 west, 0 for UTC or absent
+ *
+ * @return 解析后的游标；小时非法时返回 `NULL` / The cursor after parsing, or `NULL` when the hours are malformed
+ *
+ * @note 分钟内可省略冒号；无时区标记时不推进游标 / The colon before minutes is optional; the cursor does not advance when no zone marker is present
+ */
 static const char *parse_date_zone(const char *p, int *tzh, int *tzm, int *sign)
 {
     if (*p == 'Z' || *p == 'z')
@@ -171,10 +258,18 @@ static const char *parse_date_zone(const char *p, int *tzh, int *tzm, int *sign)
     return p;
 }
 
-/* Parses the subset of the date-time string grammar tests rely on:
- *   2024-01-02            2024-01-02T03:04:05.678Z
- *   2024-01-02T03:04:05+08:00              2024/01/02 03:04:05
- * Returns NaN when nothing recognisable is found. */
+/**
+ * @brief 解析 ISO 8601 及常见日期的字符串形式 / Parse a date string in ISO 8601 and common forms
+ *
+ * @details 识别 `2024-01-02`、`2024-01-02T03:04:05.678Z`、`2024-01-02T03:04:05+08:00`、`2024/01/02 03:04:05` 等形式；`T`/空格后的时刻可省略，时区偏移会从结果中扣除。
+ *          Accepts `2024-01-02`, `2024-01-02T03:04:05.678Z`, `2024-01-02T03:04:05+08:00` and `2024/01/02 03:04:05`; the clock after `T` or a space is optional and a timezone offset is subtracted from the result.
+ *
+ * @param[in]     s 待解析的日期字符串 / Date string to parse
+ *
+ * @return 毫秒时间值；无法识别时返回 NaN / The millisecond time value, or NaN when nothing recognisable is found
+ *
+ * @note 尾部存在无法识别的字符时按无效处理 / Trailing garbage makes the whole string invalid
+ */
 static double parse_date_string(const char *s)
 {
     int y = 0, mo = 1, d = 1, h = 0, mi = 0, se = 0, ms = 0;
@@ -212,7 +307,14 @@ static double parse_date_string(const char *s)
     return t;
 }
 
-/* ---------------- constructor ---------------- */
+/**
+ * @brief 分配一个 Date 对象 / Allocate a Date object
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     ms 毫秒时间值（NaN 表示无效日期）/ The millisecond time value, NaN for an invalid date
+ *
+ * @return 类名为 `Date`、原型为 `Date.prototype` 的新对象 / The new object with class `Date` and prototype `Date.prototype`
+ */
 
 static JsObj *date_alloc(HpeJs *js, double ms)
 {
@@ -224,6 +326,22 @@ static JsObj *date_alloc(HpeJs *js, double ms)
     return o;
 }
 
+/**
+ * @brief `Date` 构造函数 / The `Date` constructor
+ *
+ * @details 无参取当前时间；单参按字符串解析、Date 拷贝或数值；多参按 `Date(y,m,d,h,mi,s,ms)` 处理，月份 0 起、越界字段回卷，两位年份映射到 1900..1999。
+ *          No argument uses the current time; a single argument is parsed as a string, copied from a Date or coerced from a number; multiple arguments follow `Date(y,m,d,h,mi,s,ms)` with zero-based months, roll-over fields and two-digit years mapped to 1900..1999.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 调用时的 `this`（未使用）/ The `this` of the call (unused)
+ * @param[in,out] a 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 新的 Date 实例 / The new Date instance
+ *
+ * @note 超出 `±275760` 年的年份直接得到无效日期 / An out-of-range year beyond `±275760` yields an invalid date
+ */
 static JsValue native_date_ctor(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     HPE_UNUSED(thisv);
@@ -276,6 +394,17 @@ typedef struct {
     int y, mo, d, wd, h, mi, se, ms;
 } DateParts;
 
+/**
+ * @brief 把 Date 的毫秒值拆成日期各字段 / Split a Date's millisecond value into calendar fields
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[out]    p 接收拆解后的字段结构 / Receives the split field structure
+ *
+ * @return 成功返回 1；`this` 非 Date 或时间值无效返回 0 / 1 on success; 0 when `this` is not a Date or the time value is invalid
+ *
+ * @note 负数毫秒的取整做了收尾处理，字段值全部非负 / Negative milliseconds are normalised so every field ends up non-negative
+ */
 static int split_time(HpeJs *js, JsValue thisv, DateParts *p)
 {
     double ms;
@@ -301,6 +430,17 @@ static int split_time(HpeJs *js, JsValue thisv, DateParts *p)
     return 1;
 }
 
+/**
+ * @brief `Date.prototype.getFullYear`：取四位年份 / `Date.prototype.getFullYear`: get the full year
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[in,out] a 实参数组（未使用）/ Actual argument array (unused)
+ * @param[in]     argc 参数个数（未使用）/ Argument count (unused)
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 年份数值，无效日期返回 NaN / The year, or NaN for an invalid date
+ */
 static JsValue date_get_full_year(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     DateParts p;
@@ -312,6 +452,17 @@ static JsValue date_get_full_year(HpeJs *js, JsValue thisv, JsValue *a, int argc
     return js_num((double)p.y);
 }
 
+/**
+ * @brief `Date.prototype.getMonth`：取月份（0 起）/ `Date.prototype.getMonth`: get the zero-based month
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[in,out] a 实参数组（未使用）/ Actual argument array (unused)
+ * @param[in]     argc 参数个数（未使用）/ Argument count (unused)
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 月份数值 0..11，无效日期返回 NaN / The month 0..11, or NaN for an invalid date
+ */
 static JsValue date_get_month(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     DateParts p;
@@ -323,6 +474,17 @@ static JsValue date_get_month(HpeJs *js, JsValue thisv, JsValue *a, int argc, vo
     return js_num((double)(p.mo - 1));
 }
 
+/**
+ * @brief `Date.prototype.getDate`：取月内日 / `Date.prototype.getDate`: get the day of month
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[in,out] a 实参数组（未使用）/ Actual argument array (unused)
+ * @param[in]     argc 参数个数（未使用）/ Argument count (unused)
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 日数值，无效日期返回 NaN / The day of month, or NaN for an invalid date
+ */
 static JsValue date_get_date(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     DateParts p;
@@ -334,6 +496,17 @@ static JsValue date_get_date(HpeJs *js, JsValue thisv, JsValue *a, int argc, voi
     return js_num((double)p.d);
 }
 
+/**
+ * @brief `Date.prototype.getDay`：取星期几 / `Date.prototype.getDay`: get the weekday
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[in,out] a 实参数组（未使用）/ Actual argument array (unused)
+ * @param[in]     argc 参数个数（未使用）/ Argument count (unused)
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 星期几 0..6（0 为周日），无效日期返回 NaN / The weekday 0..6 with 0 for Sunday, or NaN for an invalid date
+ */
 static JsValue date_get_day(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     DateParts p;
@@ -345,6 +518,17 @@ static JsValue date_get_day(HpeJs *js, JsValue thisv, JsValue *a, int argc, void
     return js_num((double)p.wd);
 }
 
+/**
+ * @brief `Date.prototype.getHours`：取小时 / `Date.prototype.getHours`: get the hour
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[in,out] a 实参数组（未使用）/ Actual argument array (unused)
+ * @param[in]     argc 参数个数（未使用）/ Argument count (unused)
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 小时数值，无效日期返回 NaN / The hour, or NaN for an invalid date
+ */
 static JsValue date_get_hours(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     DateParts p;
@@ -356,6 +540,17 @@ static JsValue date_get_hours(HpeJs *js, JsValue thisv, JsValue *a, int argc, vo
     return js_num((double)p.h);
 }
 
+/**
+ * @brief `Date.prototype.getMinutes`：取分钟 / `Date.prototype.getMinutes`: get the minute
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[in,out] a 实参数组（未使用）/ Actual argument array (unused)
+ * @param[in]     argc 参数个数（未使用）/ Argument count (unused)
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 分钟数值，无效日期返回 NaN / The minute, or NaN for an invalid date
+ */
 static JsValue date_get_minutes(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     DateParts p;
@@ -367,6 +562,17 @@ static JsValue date_get_minutes(HpeJs *js, JsValue thisv, JsValue *a, int argc, 
     return js_num((double)p.mi);
 }
 
+/**
+ * @brief `Date.prototype.getSeconds`：取秒 / `Date.prototype.getSeconds`: get the second
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[in,out] a 实参数组（未使用）/ Actual argument array (unused)
+ * @param[in]     argc 参数个数（未使用）/ Argument count (unused)
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 秒数值，无效日期返回 NaN / The second, or NaN for an invalid date
+ */
 static JsValue date_get_seconds(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     DateParts p;
@@ -378,6 +584,17 @@ static JsValue date_get_seconds(HpeJs *js, JsValue thisv, JsValue *a, int argc, 
     return js_num((double)p.se);
 }
 
+/**
+ * @brief `Date.prototype.getMilliseconds`：取毫秒 / `Date.prototype.getMilliseconds`: get the milliseconds
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[in,out] a 实参数组（未使用）/ Actual argument array (unused)
+ * @param[in]     argc 参数个数（未使用）/ Argument count (unused)
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 毫秒数值 0..999，无效日期返回 NaN / The milliseconds 0..999, or NaN for an invalid date
+ */
 static JsValue date_get_ms(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     DateParts p;
@@ -389,6 +606,17 @@ static JsValue date_get_ms(HpeJs *js, JsValue thisv, JsValue *a, int argc, void 
     return js_num((double)p.ms);
 }
 
+/**
+ * @brief `Date.prototype.getTime`：取毫秒时间值 / `Date.prototype.getTime`: get the millisecond time value
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[in,out] a 实参数组（未使用）/ Actual argument array (unused)
+ * @param[in]     argc 参数个数（未使用）/ Argument count (unused)
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 自 Unix 纪元起的毫秒数，无效日期返回 NaN / Milliseconds since the Unix epoch, or NaN for an invalid date
+ */
 static JsValue date_get_time(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     double ms;
@@ -400,6 +628,19 @@ static JsValue date_get_time(HpeJs *js, JsValue thisv, JsValue *a, int argc, voi
     return js_num(ms);
 }
 
+/**
+ * @brief `Date.prototype.getTimezoneOffset`：取时区偏移 / `Date.prototype.getTimezoneOffset`: get the timezone offset
+ *
+ * @param[in,out] js JS 运行时上下文（未使用）/ JS runtime context (unused)
+ * @param[in]     thisv 方法调用的 `this`（未使用）/ The `this` of the call (unused)
+ * @param[in,out] a 实参数组（未使用）/ Actual argument array (unused)
+ * @param[in]     argc 参数个数（未使用）/ Argument count (unused)
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 恒为 0 / Always 0
+ *
+ * @note 引擎没有时区数据库，本地时间即 UTC / The engine has no timezone database, so local time equals UTC
+ */
 static JsValue date_get_tz_offset(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     HPE_UNUSED(js);
@@ -410,7 +651,19 @@ static JsValue date_get_tz_offset(HpeJs *js, JsValue thisv, JsValue *a, int argc
     return js_num(0); /* no timezone database: local time is UTC */
 }
 
-/* ---------------- setters ---------------- */
+/**
+ * @brief `Date.prototype.setTime`：设置毫秒时间值 / `Date.prototype.setTime`: set the millisecond time value
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this`，必须是 Date / The `this` of the call, which must be a Date
+ * @param[in,out] a 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 写入后的时间值 / The stored time value
+ *
+ * @note `this` 非 Date 时抛错并返回 NaN；缺参时写入 NaN / Throws and returns NaN when `this` is not a Date; a missing argument stores NaN
+ */
 
 static JsValue date_set_time(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
@@ -425,10 +678,24 @@ static JsValue date_set_time(HpeJs *js, JsValue thisv, JsValue *a, int argc, voi
     return js_num(ms);
 }
 
-/* shared body for the field setters. `first_field` is the field index the first
- * argument writes to: setFullYear=0 (y,m,d), setMonth=1 (m,d), setDate=2, ...,
- * setMilliseconds=6. Unsupplied fields keep their current value, and
- * out-of-range values roll over exactly as the spec requires. */
+/**
+ * @brief 各字段 setter 共用的实现 / Shared implementation for the field setters
+ *
+ * @details 未提供的字段保持当前值，越界值按规范回卷；`first_field` 为 0 且首参在 0..99 时按 1900+ 解释两位年份，结果四舍五入到整毫秒。
+ *          Unsupplied fields keep their current value and out-of-range values roll over as the spec requires; when `first_field` is 0 and the first argument is 0..99 it is read as 1900+, and the result is rounded to whole milliseconds.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this`，必须是 Date / The `this` of the call, which must be a Date
+ * @param[in,out] a 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in]     first_field 首个实参写入的字段下标（0=年 … 6=毫秒）/ Field index the first argument writes to (0 = year … 6 = millisecond)
+ *
+ * @return 写入后的时间值 / The stored time value
+ *
+ * @note `this` 非 Date 时抛错并返回 NaN / Throws and returns NaN when `this` is not a Date
+ *
+ * @see date_set_full_year date_set_month date_set_date date_set_hours date_set_minutes date_set_seconds date_set_ms
+ */
 static JsValue set_fields(HpeJs *js, JsValue thisv, JsValue *a, int argc, int first_field)
 {
     DateParts p;
@@ -474,42 +741,133 @@ static JsValue set_fields(HpeJs *js, JsValue thisv, JsValue *a, int argc, int fi
     return js_num(t);
 }
 
+/**
+ * @brief `Date.prototype.setFullYear`：设置年（可带月日）/ `Date.prototype.setFullYear`: set the year, optionally with month and day
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[in,out] a 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 写入后的时间值 / The stored time value
+ *
+ * @see set_fields
+ */
 static JsValue date_set_full_year(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     HPE_UNUSED(ud);
     return set_fields(js, thisv, a, argc, 0);
 }
 
+/**
+ * @brief `Date.prototype.setMonth`：设置月（可带日）/ `Date.prototype.setMonth`: set the month, optionally with the day
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[in,out] a 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 写入后的时间值 / The stored time value
+ *
+ * @see set_fields
+ */
 static JsValue date_set_month(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     HPE_UNUSED(ud);
     return set_fields(js, thisv, a, argc, 1);
 }
 
+/**
+ * @brief `Date.prototype.setDate`：设置月内日 / `Date.prototype.setDate`: set the day of month
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[in,out] a 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 写入后的时间值 / The stored time value
+ *
+ * @see set_fields
+ */
 static JsValue date_set_date(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     HPE_UNUSED(ud);
     return set_fields(js, thisv, a, argc, 2);
 }
 
+/**
+ * @brief `Date.prototype.setHours`：设置时（可带分秒毫秒）/ `Date.prototype.setHours`: set the hour, optionally with minute, second and millisecond
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[in,out] a 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 写入后的时间值 / The stored time value
+ *
+ * @see set_fields
+ */
 static JsValue date_set_hours(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     HPE_UNUSED(ud);
     return set_fields(js, thisv, a, argc, 3);
 }
 
+/**
+ * @brief `Date.prototype.setMinutes`：设置分（可带秒毫秒）/ `Date.prototype.setMinutes`: set the minute, optionally with second and millisecond
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[in,out] a 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 写入后的时间值 / The stored time value
+ *
+ * @see set_fields
+ */
 static JsValue date_set_minutes(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     HPE_UNUSED(ud);
     return set_fields(js, thisv, a, argc, 4);
 }
 
+/**
+ * @brief `Date.prototype.setSeconds`：设置秒（可带毫秒）/ `Date.prototype.setSeconds`: set the second, optionally with milliseconds
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[in,out] a 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 写入后的时间值 / The stored time value
+ *
+ * @see set_fields
+ */
 static JsValue date_set_seconds(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     HPE_UNUSED(ud);
     return set_fields(js, thisv, a, argc, 5);
 }
 
+/**
+ * @brief `Date.prototype.setMilliseconds`：设置毫秒 / `Date.prototype.setMilliseconds`: set the milliseconds
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[in,out] a 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 写入后的时间值 / The stored time value
+ *
+ * @see set_fields
+ */
 static JsValue date_set_ms(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     HPE_UNUSED(ud);
@@ -522,6 +880,19 @@ static const char *const day_names[7] = { "Sun", "Mon", "Tue", "Wed", "Thu", "Fr
 static const char *const month_names[12] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
                                              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
 
+/**
+ * @brief `Date.prototype.toISOString`：输出 ISO 8601 文本 / `Date.prototype.toISOString`: render an ISO 8601 string
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[in,out] a 实参数组（未使用）/ Actual argument array (unused)
+ * @param[in]     argc 参数个数（未使用）/ Argument count (unused)
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 形如 `2024-01-02T03:04:05.678Z` 的字符串 / A string such as `2024-01-02T03:04:05.678Z`
+ *
+ * @note 无效日期时抛出 `RangeError`；年份在 0..9999 外用带符号的 7 位年 / Throws a `RangeError` for an invalid date; years outside 0..9999 use a signed 7-digit year
+ */
 static JsValue date_to_iso(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     DateParts p;
@@ -540,6 +911,17 @@ static JsValue date_to_iso(HpeJs *js, JsValue thisv, JsValue *a, int argc, void 
     return js_string(js, buf);
 }
 
+/**
+ * @brief `Date.prototype.toJSON`：无效日期返回 `null` / `Date.prototype.toJSON`: return `null` for an invalid date
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[in,out] a 实参数组（未使用）/ Actual argument array (unused)
+ * @param[in]     argc 参数个数（未使用）/ Argument count (unused)
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 有效时返回 `toISOString` 的结果，无效时返回 `null` / The `toISOString` result when valid, otherwise `null`
+ */
 static JsValue date_to_json(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     double ms;
@@ -553,6 +935,17 @@ static JsValue date_to_json(HpeJs *js, JsValue thisv, JsValue *a, int argc, void
     return date_to_iso(js, thisv, NULL, 0, NULL);
 }
 
+/**
+ * @brief `Date.prototype.toString`：输出人类可读日期 / `Date.prototype.toString`: render a human-readable date
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[in,out] a 实参数组（未使用）/ Actual argument array (unused)
+ * @param[in]     argc 参数个数（未使用）/ Argument count (unused)
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 形如 `Tue Jan 02 2024 03:04:05 GMT+0000 (Coordinated Universal Time)` 的字符串；无效日期返回 `Invalid Date` / A string like `Tue Jan 02 2024 03:04:05 GMT+0000 (Coordinated Universal Time)`, or `Invalid Date`
+ */
 static JsValue date_to_string(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     DateParts p;
@@ -567,6 +960,17 @@ static JsValue date_to_string(HpeJs *js, JsValue thisv, JsValue *a, int argc, vo
     return js_string(js, buf);
 }
 
+/**
+ * @brief `Date.prototype.toDateString`：只输出日期部分 / `Date.prototype.toDateString`: render only the date portion
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[in,out] a 实参数组（未使用）/ Actual argument array (unused)
+ * @param[in]     argc 参数个数（未使用）/ Argument count (unused)
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 形如 `Tue Jan 02 2024` 的字符串；无效日期返回 `Invalid Date` / A string like `Tue Jan 02 2024`, or `Invalid Date`
+ */
 static JsValue date_to_date_string(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     DateParts p;
@@ -580,6 +984,17 @@ static JsValue date_to_date_string(HpeJs *js, JsValue thisv, JsValue *a, int arg
     return js_string(js, buf);
 }
 
+/**
+ * @brief `Date.prototype.toTimeString`：只输出时刻部分 / `Date.prototype.toTimeString`: render only the time portion
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[in,out] a 实参数组（未使用）/ Actual argument array (unused)
+ * @param[in]     argc 参数个数（未使用）/ Argument count (unused)
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 形如 `03:04:05 GMT+0000` 的字符串；无效日期返回 `Invalid Date` / A string like `03:04:05 GMT+0000`, or `Invalid Date`
+ */
 static JsValue date_to_time_string(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     DateParts p;
@@ -593,6 +1008,17 @@ static JsValue date_to_time_string(HpeJs *js, JsValue thisv, JsValue *a, int arg
     return js_string(js, buf);
 }
 
+/**
+ * @brief `Date.prototype.valueOf`：取毫秒时间值 / `Date.prototype.valueOf`: get the millisecond time value
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[in,out] a 实参数组（未使用）/ Actual argument array (unused)
+ * @param[in]     argc 参数个数（未使用）/ Argument count (unused)
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 毫秒时间值，无效日期返回 NaN / The millisecond time value, or NaN for an invalid date
+ */
 static JsValue date_value_of(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     double ms;
@@ -604,7 +1030,19 @@ static JsValue date_value_of(HpeJs *js, JsValue thisv, JsValue *a, int argc, voi
     return js_num(ms);
 }
 
-/* en-US flavoured formatting, enough for UI labels without an Intl database */
+/**
+ * @brief `Date.prototype.toLocaleDateString`：输出美式本地日期 / `Date.prototype.toLocaleDateString`: render a US-style local date
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[in,out] a 实参数组（未使用）/ Actual argument array (unused)
+ * @param[in]     argc 参数个数（未使用）/ Argument count (unused)
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 形如 `1/2/2024` 的字符串；无效日期返回 `Invalid Date` / A string like `1/2/2024`, or `Invalid Date`
+ *
+ * @note `toLocaleString` 也复用本函数 / `toLocaleString` reuses this function
+ */
 static JsValue date_to_locale_date(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     DateParts p;
@@ -618,6 +1056,17 @@ static JsValue date_to_locale_date(HpeJs *js, JsValue thisv, JsValue *a, int arg
     return js_string(js, buf);
 }
 
+/**
+ * @brief `Date.prototype.toLocaleTimeString`：输出本地时刻 / `Date.prototype.toLocaleTimeString`: render a local time
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[in,out] a 实参数组（未使用）/ Actual argument array (unused)
+ * @param[in]     argc 参数个数（未使用）/ Argument count (unused)
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 形如 `03:04:05` 的字符串；无效日期返回 `Invalid Date` / A string like `03:04:05`, or `Invalid Date`
+ */
 static JsValue date_to_locale_time(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     DateParts p;
@@ -631,7 +1080,17 @@ static JsValue date_to_locale_time(HpeJs *js, JsValue thisv, JsValue *a, int arg
     return js_string(js, buf);
 }
 
-/* ---------------- statics ---------------- */
+/**
+ * @brief `Date.now()`：取当前毫秒时间戳 / `Date.now()`: get the current millisecond timestamp
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 调用时的 `this`（未使用）/ The `this` of the call (unused)
+ * @param[in,out] a 实参数组（未使用）/ Actual argument array (unused)
+ * @param[in]     argc 参数个数（未使用）/ Argument count (unused)
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 自 Unix 纪元起的毫秒数 / Milliseconds since the Unix epoch
+ */
 
 static JsValue date_static_now(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
@@ -642,6 +1101,19 @@ static JsValue date_static_now(HpeJs *js, JsValue thisv, JsValue *a, int argc, v
     return js_num(now_ms());
 }
 
+/**
+ * @brief `Date.parse()`：解析日期字符串 / `Date.parse()`: parse a date string
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 调用时的 `this`（未使用）/ The `this` of the call (unused)
+ * @param[in,out] a 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 毫秒时间值，无法解析返回 NaN / The millisecond time value, or NaN when unparseable
+ *
+ * @note 参数已是 Date 时直接取其时间值，否则先转字符串再解析 / A Date argument yields its value directly; anything else is stringified and parsed
+ */
 static JsValue date_static_parse(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     JsValue v = d_arg(a, argc, 0);
@@ -652,6 +1124,20 @@ static JsValue date_static_parse(HpeJs *js, JsValue thisv, JsValue *a, int argc,
     return js_num(parse_date_string(js_to_string(js, v)));
 }
 
+/**
+ * @brief `Date.UTC()`：把 UTC 字段合成毫秒时间值 / `Date.UTC()`: combine UTC fields into a millisecond time value
+ *
+ * @details 按 `(y, m, d, h, mi, s, ms)` 处理，月份 0 起、越界回卷；仅当提供了至少两个参数且年在 0..99 时按 1900+ 解释。
+ *          Fields follow `(y, m, d, h, mi, s, ms)` with zero-based months and roll-over; a year in 0..99 is read as 1900+ only when at least two arguments were supplied.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 调用时的 `this`（未使用）/ The `this` of the call (unused)
+ * @param[in,out] a 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 毫秒时间值；无参数时返回 NaN / The millisecond time value, or NaN when called with no arguments
+ */
 static JsValue date_static_utc(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     double yv, mv, dv, hv, miv, sv, msv;
@@ -689,20 +1175,47 @@ static JsValue date_static_utc(HpeJs *js, JsValue thisv, JsValue *a, int argc, v
 
 /* ---------------- install ---------------- */
 
-/* local mirrors of the interpreter's builtin helpers (those are file-static) */
+/**
+ * @brief 取第 i 个实参，越界返回 `undefined` / Get the i-th argument, returning `undefined` when out of range
+ *
+ * @param[in,out] a 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in]     i 下标 / Index
+ *
+ * @return 第 i 个实参或 `undefined` / The i-th argument or `undefined`
+ *
+ * @note 解释器内建辅助的本文件私有副本 / A local copy of the interpreter's file-static builtin helper
+ */
 static JsValue d_arg(JsValue *a, int argc, int i)
 {
     return i < argc ? a[i] : js_undef();
 }
 
+/**
+ * @brief 在对象上定义一个原生方法属性 / Define a native method property on an object
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] target 目标对象 / Target object
+ * @param[in]     name 方法名 / Method name
+ * @param[in]     fn 原生实现 / Native implementation
+ *
+ * @note 包装为 `js_native_new` 的原生函数并写入属性 / Wraps `fn` with `js_native_new` before storing it
+ */
 static void d_def(HpeJs *js, JsObj *target, const char *name, JsNativeFn fn)
 {
     js_obj_set(js, target, name, js_objval(js_native_new(js, fn, NULL)));
 }
 
-/* getters/setters that behave identically in local and UTC time (no timezone
- * database here) alias the same native function object under the getUTC / setUTC
- * names */
+/**
+ * @brief 把一个已有属性值复制到另一个键名 / Copy an existing property value under another key
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] p 目标原型对象 / Target prototype object
+ * @param[in]     name 新键名 / The new key
+ * @param[in]     src_name 被复制的原键名 / The source key to copy from
+ *
+ * @note 用于让 `getUTC*`/`setUTC*` 与本地时间版本共用同一函数对象 / Lets `getUTC*`/`setUTC*` share the very same function objects
+ */
 static void def_alias(HpeJs *js, JsObj *p, const char *name, const char *src_name)
 {
     JsProp *prop = js_obj_own_prop(p, src_name);
@@ -715,6 +1228,15 @@ typedef struct {
     JsNativeFn fn;
 } DateMethodDef;
 
+/**
+ * @brief 批量安装一组 Date 原型方法 / Install a batch of Date prototype methods
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] p 目标原型对象 / Target prototype object
+ * @param[in]     defs 以 `NULL` 名结尾的方法定义表 / Method definition table terminated by a `NULL` name
+ *
+ * @note 逐项调用 `d_def` 安装 / Each entry is installed through `d_def`
+ */
 static void date_def_methods(HpeJs *js, JsObj *p, const DateMethodDef *defs)
 {
     int i;
@@ -722,6 +1244,15 @@ static void date_def_methods(HpeJs *js, JsObj *p, const DateMethodDef *defs)
         d_def(js, p, defs[i].name, defs[i].fn);
 }
 
+/**
+ * @brief 批量安装别名属性 / Install a batch of alias properties
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] p 目标原型对象 / Target prototype object
+ * @param[in]     n 别名对数 / Number of alias pairs
+ *
+ * @note 别名对表形如 `{ 新名, 原名 }`，经 `def_alias` 逐个建立 / The table entries are `{ new_name, source_name }` pairs fed to `def_alias`
+ */
 static void date_def_aliases(HpeJs *js, JsObj *p, const char (*aliases)[2][24], int n)
 {
     int i;
@@ -780,6 +1311,14 @@ static const char date_alias_pairs[][2][24] = {
     { "getYear",            "getFullYear" }
 };
 
+/**
+ * @brief 创建 `Date.prototype` 并安装全局 `Date` / Build `Date.prototype` and install the global `Date`
+ *
+ * @details 安装原型方法及其 UTC 别名，构造全局构造函数（含 `now`/`parse`/`UTC` 静态方法）并写入 `global.Date`。
+ *          Installs the prototype methods and their UTC aliases, builds the global constructor with its `now`/`parse`/`UTC` statics and sets `global.Date`.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ */
 void hpe_js_date_install(HpeJs *js)
 {
     JsObj *p = js->date_proto;

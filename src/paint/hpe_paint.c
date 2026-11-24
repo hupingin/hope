@@ -9,11 +9,15 @@
 #include "base/hpe_util.h"
 #include "render/hpe_raster.h"
 
-/* Quantize a device y to a 1/64 px grid. Layout accumulates fractional heights
- * (178.4 + 319.6 = 497.99997...), and floor/ceil on such near-integer edges is
- * only stable if the value survives translation exactly. Multiples of 1/64 are
- * exactly representable and integer offsets (scroll, chrome height) keep them
- * that way, so a shifted copy of a row and a re-painted row always agree. */
+/**
+ * @brief 把设备 y 吸附到 1/64 像素栅格 / Snap a device y to a 1/64 px grid
+ *
+ * @param[in]     y 设备 y 坐标 / Device y coordinate
+ *
+ * @return 吸附后的 y / The snapped y
+ *
+ * @note 布局会累积浮点误差，1/64 的倍数可精确表示，因此平移后的行与重绘的行总能一致 / Layout accumulates fractional error; multiples of 1/64 are exactly representable so a shifted copy of a row and a repainted row always agree
+ */
 static float snap_y(float y)
 {
     return (float)((double)(int)(y * 64.0f + (y >= 0.0f ? 0.5f : -0.5f))) / 64.0f;
@@ -31,11 +35,31 @@ typedef struct PaintCtx {
 
 #define MAX_OPACITY_DEPTH 3
 
+/**
+ * @brief 把文档 y 映射为设备 y / Map a document y to device y
+ *
+ * @param[in]     ctx 绘制上下文 / Paint context
+ * @param[in]     doc_y 文档 y / Document y
+ * @param[in]     scroll 纵向滚动偏移 / Vertical scroll offset
+ *
+ * @return 设备 y / Device y
+ *
+ * @note 映射关系为 `doc_y - scroll + dev_y` / The mapping is `doc_y - scroll + dev_y`
+ */
 static float ctx_dev_y(PaintCtx *ctx, float doc_y, float scroll)
 {
     return doc_y - scroll + ctx->dev_y;
 }
 
+/**
+ * @brief 求盒边框盒的设备矩形 / Device rect of a box's border box
+ *
+ * @param[in]     ctx 绘制上下文 / Paint context
+ * @param[in]     box 盒 / Box
+ * @param[in]     scroll 纵向滚动偏移 / Vertical scroll offset
+ *
+ * @return 设备坐标矩形，y 已吸附 / Device-space rect with y snapped
+ */
 static HpeRect box_device_rect(PaintCtx *ctx, HpeBox *box, float scroll)
 {
     HpeRect r = box->border_box;
@@ -48,6 +72,13 @@ static HpeRect box_device_rect(PaintCtx *ctx, HpeBox *box, float scroll)
 /* list markers                                                        */
 /* ------------------------------------------------------------------ */
 
+/**
+ * @brief 判断盒是否为 `ul`/`ol` 下的 `<li>` / Test whether a box is an `<li>` inside a `ul`/`ol`
+ *
+ * @param[in]     box 盒 / Box
+ *
+ * @return 是列表项返回 1，否则 0 / 1 for a list item, else 0
+ */
 static int is_list_item(HpeBox *box)
 {
     return box->node && box->node->tag && !strcmp(box->node->tag, "li") && box->parent &&
@@ -55,7 +86,15 @@ static int is_list_item(HpeBox *box)
            (!strcmp(box->parent->node->tag, "ul") || !strcmp(box->parent->node->tag, "ol"));
 }
 
-/* an <ol> child shows its 1-based position among the <li> siblings */
+/**
+ * @brief 求 `<li>` 在其 `<ol>` 中的序号 / 1-based position of an `<li>` among its `<ol>` siblings
+ *
+ * @param[in]     box 列表项盒 / List item box
+ *
+ * @return 之前的 `<li>` 兄弟个数（0 起）/ Number of preceding `<li>` siblings, zero based
+ *
+ * @note 父级不是 `<ol>` 时返回 0 / Returns 0 when the parent is not an `<ol>`
+ */
 static int list_index(HpeBox *box)
 {
     HpeBox *sib;
@@ -68,9 +107,15 @@ static int list_index(HpeBox *box)
     return index;
 }
 
-/* The box tree inherits only a fixed property list, so `list-style-type` set on
- * <ul>/<ol> does not reach the <li>. Read it from the parent when the item
- * itself declares none. */
+/**
+ * @brief 求实际生效的 list-style-type / Effective `list-style-type` for a list item
+ *
+ * @param[in]     box 列表项盒 / List item box
+ *
+ * @return 生效的列表标记类型 / The effective list marker type
+ *
+ * @note 盒树只继承固定的属性列表，项自身未声明时从父盒读取 / The box tree inherits only a fixed property list, so the value is read from the parent when the item declares none
+ */
 static HpeListStyleType effective_list_type(HpeBox *box)
 {
     if (box->style.set2 & HPE_PROP2_LIST_STYLE_TYPE)
@@ -80,7 +125,16 @@ static HpeListStyleType effective_list_type(HpeBox *box)
     return HPE_LIST_DISC;
 }
 
-/* `list-style-type: square`: a small filled square at the marker anchor */
+/**
+ * @brief 绘制方形列表标记 / Paint a square list marker
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     box 列表项盒 / List item box
+ * @param[in]     marker_x 标记锚点 X / Marker anchor X
+ * @param[in]     baseline 基线设备 y / Baseline device y
+ *
+ * @note 对应 `list-style-type: square`，尺寸取字号的 0.32 / Corresponds to `list-style-type: square` with a size of 0.32 times the font size
+ */
 static void paint_marker_square(HpePixmap *pm, HpeBox *box, float marker_x, float baseline)
 {
     float size = box->style.font_size * 0.32f;
@@ -89,7 +143,16 @@ static void paint_marker_square(HpePixmap *pm, HpeBox *box, float marker_x, floa
                   box->style.color);
 }
 
-/* `list-style-type: circle`: a small hollow circle at the marker anchor */
+/**
+ * @brief 绘制空心圆列表标记 / Paint a hollow circle list marker
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     box 列表项盒 / List item box
+ * @param[in]     marker_x 标记锚点 X / Marker anchor X
+ * @param[in]     baseline 基线设备 y / Baseline device y
+ *
+ * @note 对应 `list-style-type: circle` / Corresponds to `list-style-type: circle`
+ */
 static void paint_marker_circle(HpePixmap *pm, HpeBox *box, float marker_x, float baseline)
 {
     float r = box->style.font_size * 0.18f;
@@ -99,6 +162,16 @@ static void paint_marker_circle(HpePixmap *pm, HpeBox *box, float marker_x, floa
                           r, 1.0f, box->style.color);
 }
 
+/**
+ * @brief 绘制列表项的标记 / Paint a list item's marker
+ *
+ * @param[in]     ctx 绘制上下文 / Paint context
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     box 列表项盒 / List item box
+ * @param[in]     scroll 纵向滚动偏移 / Vertical scroll offset
+ *
+ * @note 支持 decimal、square、circle、disc；`list-style-type:none` 与非列表项直接返回 / Supports decimal, square, circle and disc; returns immediately for `list-style-type:none` and non-list boxes
+ */
 static void paint_list_marker(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float scroll)
 {
     static const char bullet[] = "\xE2\x80\xA2"; /* U+2022 */
@@ -150,6 +223,17 @@ static void paint_list_marker(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float s
 /* text decoration                                                     */
 /* ------------------------------------------------------------------ */
 
+/**
+ * @brief 绘制文本装饰线 / Paint text decoration lines
+ *
+ * @param[in]     ctx 绘制上下文 / Paint context
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     box 含文本行的盒 / Box holding the text lines
+ * @param[in]     scroll 纵向滚动偏移 / Vertical scroll offset
+ * @param[in]     dec 装饰位掩码 / Decoration bit mask
+ *
+ * @note 下划线、上划线、删除线各画一条 1px 线，覆盖行内非原子 run 的水平范围 / Draws one 1px line each for underline, overline and line-through spanning the horizontal extent of the line's non-atomic runs
+ */
 static void paint_text_decorations(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float scroll,
                                    HpeTextDecoration dec)
 {
@@ -193,6 +277,16 @@ static void paint_text_decorations(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, fl
 /* shadows                                                             */
 /* ------------------------------------------------------------------ */
 
+/**
+ * @brief 绘制盒的 box-shadow / Paint a box's `box-shadow`
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     box 盒 / Box
+ * @param[in]     bb 盒的设备矩形 / Device rect of the box
+ * @param[in]     radius 圆角半径 / Corner radius
+ *
+ * @note 阴影矩形由偏移与 spread 从 bb 推出，无效或全透明时跳过 / The shadow rect is derived from `bb` by the offset and spread; skipped when invalid or fully transparent
+ */
 static void paint_box_shadow(HpePixmap *pm, HpeBox *box, HpeRect bb, float radius)
 {
     HpeShadow *sh = &box->style.box_shadow;
@@ -204,6 +298,16 @@ static void paint_box_shadow(HpePixmap *pm, HpeBox *box, HpeRect bb, float radiu
     hpe_fill_shadow(pm, r, radius > 0.0f ? radius : 0.0f, sh->blur, sh->color);
 }
 
+/**
+ * @brief 绘制文本的 text-shadow / Paint a box's `text-shadow`
+ *
+ * @param[in]     ctx 绘制上下文 / Paint context
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     box 含文本行的盒 / Box holding the text lines
+ * @param[in]     scroll 纵向滚动偏移 / Vertical scroll offset
+ *
+ * @note 逐个非原子 run 按阴影偏移绘制字形掩码 / Draws the glyph mask of every non-atomic run offset by the shadow
+ */
 static void paint_text_shadow(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float scroll)
 {
     HpeShadow *sh = &box->style.text_shadow;
@@ -231,6 +335,16 @@ static void paint_text_shadow(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float s
 /* background / borders                                                */
 /* ------------------------------------------------------------------ */
 
+/**
+ * @brief 绘制盒背景 / Paint a box's background
+ *
+ * @param[in]     bs 计算样式 / Computed style
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     bb 盒的设备矩形 / Device rect of the box
+ * @param[in]     radius 圆角半径 / Corner radius
+ *
+ * @note 线性渐变背景优先；否则纯色填充，radius > 0.5 时走圆角填充 / A linear-gradient background wins; otherwise a solid fill, using the rounded-rect path when `radius > 0.5`
+ */
 static void paint_background(HpeStyle *bs, HpePixmap *pm, HpeRect bb, float radius)
 {
     if (bs->background_image.kind == HPE_BG_LINEAR_GRADIENT) {
@@ -252,8 +366,16 @@ static void paint_background(HpeStyle *bs, HpePixmap *pm, HpeRect bb, float radi
     }
 }
 
-/* Draws the four border bands with their own colours. Rounded corners collapse
- * to a single ring (four colours cannot be split there cheaply). */
+/**
+ * @brief 绘制四边边框 / Paint the four border bands
+ *
+ * @param[in]     bs 计算样式 / Computed style
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     bb 盒的设备矩形 / Device rect of the box
+ * @param[in]     radius 圆角半径 / Corner radius
+ *
+ * @note 有圆角时退化为单环并取最不透明的边框色；无有效边框时直接返回 / With rounded corners it collapses to a single ring using the most opaque border colour; returns early when no border is effective
+ */
 static void paint_borders(HpeStyle *bs, HpePixmap *pm, HpeRect bb, float radius)
 {
     float bt = bs->border_w[0], br = bs->border_w[1];
@@ -308,7 +430,18 @@ static void paint_box_inner(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float scr
  * scratch buffer composites the subtree in isolation first. `bbox` is the
  * device-space region to capture; `opacity` is 1.0 when only a transform is
  * being applied. */
-/* clamps the scratch rect [x0,y0,w,h) to the destination clip; returns 0 when empty */
+
+/**
+ * @brief 把离屏矩形夹紧到目标裁剪区 / Clamp a scratch rect to the destination clip
+ *
+ * @param[in]     pm 目标像素缓冲 / Destination pixel buffer
+ * @param[in,out] x0 离屏左边界，被夹紧 / Scratch left edge, clamped in place
+ * @param[in,out] y0 离屏上边界，被夹紧 / Scratch top edge, clamped in place
+ * @param[in,out] w 离屏宽度，被夹紧 / Scratch width, clamped in place
+ * @param[in,out] h 离屏高度，被夹紧 / Scratch height, clamped in place
+ *
+ * @return 夹紧后仍非空返回 1，否则 0 / 1 when the clamped rect is still non-empty, else 0
+ */
 static int group_clip_scratch(HpePixmap *pm, int *x0, int *y0, int *w, int *h)
 {
     /* clip the scratch to what the destination can accept */
@@ -327,9 +460,22 @@ static int group_clip_scratch(HpePixmap *pm, int *x0, int *y0, int *w, int *h)
     return (*w > 0 && *h > 0);
 }
 
-/* composites the scratch subtree onto `pm`, mapping each destination pixel back
- * through `xf` when a transform is in effect and multiplying source alpha by
- * `opacity` on the way. */
+/**
+ * @brief 把离屏子树结果合成回目标 / Composite a scratch subtree result back onto the destination
+ *
+ * @param[in,out] pm 目标像素缓冲 / Destination pixel buffer
+ * @param[in]     scratch 承载子树的离屏缓冲 / Scratch buffer holding the subtree
+ * @param[in]     x0 离屏左边界 / Scratch left edge
+ * @param[in]     y0 离屏上边界 / Scratch top edge
+ * @param[in]     w 离屏宽度 / Scratch width
+ * @param[in]     h 离屏高度 / Scratch height
+ * @param[in]     opacity 不透明度 0..1 / Opacity in 0..1
+ * @param[in]     xf 变换矩阵，可为 `NULL` / Transform matrix, may be `NULL`
+ * @param[in]     anchor_x 变换锚点 X / Transform anchor X
+ * @param[in]     anchor_y 变换锚点 Y / Transform anchor Y
+ *
+ * @note 有变换时把目标像素逆映射回离屏空间；源 alpha 乘以 opacity 后按 255 定点混合 / With a transform each destination pixel is inverse-mapped into scratch space; source alpha is scaled by `opacity` and blended in 255 fixed point
+ */
 static void group_composite(HpePixmap *pm, const HpePixmap *scratch, int x0, int y0, int w, int h,
                             float opacity, HpeTransform *xf, int anchor_x, int anchor_y)
 {
@@ -382,16 +528,21 @@ static void group_composite(HpePixmap *pm, const HpePixmap *scratch, int x0, int
     }
 }
 
-/* Paints `box` (and its subtree) into a scratch pixmap and blends the result
- * back with a per-pixel alpha that is `opacity` uniformly multiplied on top of
- * each source pixel's own alpha.
+/**
+ * @brief 把盒子树绘入离屏缓冲再按不透明度合成回来 / Paint a box's subtree into a scratch pixmap and blend it back with an opacity
  *
- * A subtree painted directly into the destination would let a child blend with
- * a *sibling* it should never see (both share the page background otherwise),
- * and would leak the group's opacity into every descendant separately; the
- * scratch buffer composites the subtree in isolation first. `bbox` is the
- * device-space region to capture; `opacity` is 1.0 when only a transform is
- * being applied. */
+ * @param[in]     ctx 上层绘制上下文 / Enclosing paint context
+ * @param[in,out] pm 目标像素缓冲 / Destination pixel buffer
+ * @param[in]     box 分组根盒 / Group root box
+ * @param[in]     scroll 纵向滚动偏移 / Vertical scroll offset
+ * @param[in]     bbox 要捕获的设备区域 / Device-space region to capture
+ * @param[in]     opacity 整组不透明度 0..1 / Group opacity in 0..1
+ * @param[in]     xf 变换矩阵，可为 `NULL` / Transform matrix, may be `NULL`
+ * @param[in]     anchor_x 变换锚点 X / Transform anchor X
+ * @param[in]     anchor_y 变换锚点 Y / Transform anchor Y
+ *
+ * @note 先在离屏内孤立合成子树，避免子盒与不应见到的兄弟混合、也避免把整组不透明度逐个泄漏给后代；仅应用变换时 opacity 为 1.0 / The subtree is composited in isolation first so a child cannot blend with a sibling it should never see and the group opacity is not leaked into each descendant; `opacity` is 1.0 when only a transform is applied
+ */
 static void paint_group(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float scroll, HpeRect bbox,
                         float opacity, HpeTransform *xf, int anchor_x, int anchor_y)
 {
@@ -434,8 +585,16 @@ static void paint_group(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float scroll,
     hpe_free(scratch.pixels);
 }
 
-/* Axis-aligned bounds of the transformed box, in device space: rotate/skew turn
- * the box into a rotated quad, whose four corners bound it. */
+/**
+ * @brief 求变换后盒的轴对齐包围盒 / Axis-aligned bounds of a transformed box
+ *
+ * @param[in]     bb 变换前的盒矩形 / Box rect before the transform
+ * @param[in]     xf 变换矩阵 / Transform matrix
+ *
+ * @return 变换后四角的轴对齐包围盒 / Axis-aligned bounds of the four transformed corners
+ *
+ * @note 恒等变换时原样返回；旋转/倾斜会把盒变成四边形 / Returns the input unchanged for an identity transform; rotate and skew turn the box into a quad
+ */
 static HpeRect transform_bounds(HpeRect bb, HpeTransform *xf)
 {
     float cx[4], cy[4];
@@ -468,6 +627,16 @@ static HpeRect transform_bounds(HpeRect bb, HpeTransform *xf)
     return hpe_rect(minx, miny, maxx - minx, maxy - miny);
 }
 
+/**
+ * @brief 绘制一个盒及其子树 / Paint a box and its subtree
+ *
+ * @param[in]     ctx 绘制上下文 / Paint context
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     box 待绘制的盒 / Box to paint
+ * @param[in]     scroll 纵向滚动偏移 / Vertical scroll offset
+ *
+ * @note `display:none` 跳过；需要分组（透明度或变换）时走 paint_group，否则直接画内部 / `display:none` is skipped; a box needing a group (opacity or transform) goes through paint_group, otherwise its inner content is painted directly
+ */
 static void paint_box(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float scroll)
 {
     HpeStyle *bs = &box->style;
@@ -495,8 +664,18 @@ static void paint_box(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float scroll)
     paint_box_inner(ctx, pm, box, scroll);
 }
 
-/* paints this box's own visuals: shadow, background, borders, marker, text
- * shadow, text runs and decorations. `radius` may be negative (percentage). */
+/**
+ * @brief 绘制盒自身的视觉内容 / Paint a box's own visuals
+ *
+ * @param[in]     ctx 绘制上下文 / Paint context
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     box 盒 / Box
+ * @param[in]     own_scroll 本盒的滚动偏移 / The box's own scroll offset
+ * @param[in]     bb 盒的设备矩形 / Device rect of the box
+ * @param[in]     radius 圆角半径，负值表示百分比 / Corner radius, negative meaning a percentage
+ *
+ * @note 依次绘制阴影、背景、边框、列表标记、文本阴影、文本 run 与装饰；原子行内 run 由子盒递归绘制 / Paints the shadow, background, borders, list marker, text shadow, text runs and decorations; atomic inline runs are painted via child recursion
+ */
 static void paint_box_own_content(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float own_scroll,
                                   HpeRect bb, float radius)
 {
@@ -549,7 +728,14 @@ static void paint_box_own_content(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, flo
         paint_text_decorations(ctx, pm, box, own_scroll, bs->text_decoration);
 }
 
-/* inserts `key` into the z-order stack by increasing z-index (insertion sort) */
+/**
+ * @brief 按 z-index 升序插入分层盒序列 / Insert a box into the z-order stack by ascending z-index
+ *
+ * @param[in,out] stacked 分层盒指针数组 / Stacked box pointer array
+ * @param[in]     n 数组当前长度 / Current array length
+ *
+ * @note 对末尾元素做插入排序；长度不足 2 时无操作 / Insertion sort on the last element; no-op when the length is below 2
+ */
 static void stacked_insert_sorted(HpeBox **stacked, int n)
 {
     HpeBox *key;
@@ -565,8 +751,16 @@ static void stacked_insert_sorted(HpeBox **stacked, int n)
     stacked[j + 1] = key;
 }
 
-/* paints the child subtree: static children in order, positioned children on top
- * in ascending z-index */
+/**
+ * @brief 绘制子盒子树 / Paint the child subtree
+ *
+ * @param[in]     ctx 绘制上下文 / Paint context
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     box 父盒 / Parent box
+ * @param[in]     scroll 纵向滚动偏移 / Vertical scroll offset
+ *
+ * @note 静态子盒按顺序绘制，定位子盒按 z-index 升序叠在上层 / Static children paint in order; positioned children paint on top in ascending z-index
+ */
 static void paint_box_children(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float scroll)
 {
     HpeBox **stacked = NULL;
@@ -589,9 +783,17 @@ static void paint_box_children(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float 
         hpe_free(stacked);
 }
 
-/* overflow clipping: hidden/scroll/auto establish a clip rect for the subtree.
- * Element-level scrolling is not modelled yet, so `scroll` and `auto` behave
- * like `hidden` for content that exceeds the box. */
+/**
+ * @brief 按 overflow 裁剪后绘制子盒 / Paint the children clipped per `overflow`
+ *
+ * @param[in]     ctx 绘制上下文 / Paint context
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     box 父盒 / Parent box
+ * @param[in]     scroll 纵向滚动偏移 / Vertical scroll offset
+ * @param[in]     own_scroll 本盒的滚动偏移 / The box's own scroll offset
+ *
+ * @note hidden/scroll/auto 会为子树建立裁剪矩形；元素级滚动尚未实现，scroll/auto 对超出内容表现为 hidden / `hidden`/`scroll`/`auto` establish a clip rect; element-level scrolling is not modelled, so `scroll`/`auto` behave like `hidden` for overflow
+ */
 static void paint_box_clipped_children(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float scroll,
                                        float own_scroll)
 {
@@ -620,6 +822,16 @@ static void paint_box_clipped_children(PaintCtx *ctx, HpePixmap *pm, HpeBox *box
     }
 }
 
+/**
+ * @brief 绘制盒自身内容与已裁剪的子盒 / Paint a box's own content and its clipped children
+ *
+ * @param[in]     ctx 绘制上下文 / Paint context
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     box 盒 / Box
+ * @param[in]     scroll 纵向滚动偏移 / Vertical scroll offset
+ *
+ * @note 固定定位盒不随滚动，其子树同样使用零滚动；`visibility:hidden` 只隐藏本盒自身视觉，子树仍递归 / Fixed boxes never scroll and their subtrees share the same zero offset; `visibility:hidden` hides only this box's own visuals while the subtree is still recursed
+ */
 static void paint_box_inner(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float scroll)
 {
     HpeStyle *bs = &box->style;
@@ -654,6 +866,17 @@ static void paint_box_inner(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float scr
     paint_box_clipped_children(ctx, pm, box, scroll, own_scroll);
 }
 
+/**
+ * @brief 绘制整个文档 / Paint the whole document
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     root 盒子树根，可为 `NULL` / Box tree root, may be `NULL`
+ * @param[in]     scroll_y 纵向滚动偏移 / Vertical scroll offset
+ * @param[in]     page_background 页面背景色 / Page background colour
+ * @param[in]     origin_y 页面视口顶边的设备 y / Device y of the page viewport's top edge
+ *
+ * @note 先用背景色清屏，再把内容裁剪在 [origin_y, 像素缓冲高) 之内，避免画到浏览器外框上 / Clears with the background colour first, then clips content to `[origin_y, pixmap height)` so it never paints over browser chrome
+ */
 void hpe_paint_document(HpePixmap *pm, HpeBox *root, float scroll_y, HpeColor page_background,
                         float origin_y)
 {
@@ -674,10 +897,18 @@ void hpe_paint_document(HpePixmap *pm, HpeBox *root, float scroll_y, HpeColor pa
     }
 }
 
-/* Partial repaint for damage-rect scrolling: erases only `clip` with the page
- * background, then repaints the document intersected with it. The pixmap's
- * clip rect constrains every raster op; callers may repaint several regions
- * (e.g. fixed-position boxes plus the exposed scroll strip). */
+/**
+ * @brief 只重绘裁剪区域内的文档 / Repaint only the document inside a clip region
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     root 盒子树根，可为 `NULL` / Box tree root, may be `NULL`
+ * @param[in]     scroll_y 纵向滚动偏移 / Vertical scroll offset
+ * @param[in]     page_background 页面背景色 / Page background colour
+ * @param[in]     clip 设备坐标下的裁剪矩形 / Clip rect in device coordinates
+ * @param[in]     origin_y 页面视口顶边的设备 y / Device y of the page viewport's top edge
+ *
+ * @note 供滚动损伤跟踪使用：只用背景色擦除 clip，再重绘与该区域相交的文档；clip 会被抬到 origin_y 之下 / Used by scroll damage tracking: erases only `clip` with the background, then repaints the document intersected with it; the clip is raised below `origin_y`
+ */
 void hpe_paint_region(HpePixmap *pm, HpeBox *root, float scroll_y, HpeColor page_background,
                       HpeRect clip, float origin_y)
 {

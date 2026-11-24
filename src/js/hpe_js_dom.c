@@ -19,6 +19,15 @@ typedef struct {
     size_t cap;
 } SB;
 
+/**
+ * @brief 初始化一个小型字符串缓冲 / Initialise a small string builder
+ *
+ * @param[in,out] sb 待初始化的字符串缓冲 / String builder to initialise
+ *
+ * @note 初始容量 256 字节，调用方随后须用 `sb_free` 释放 / Starts at 256 bytes; release it later with `sb_free`
+ *
+ * @see sb_add, sb_free
+ */
 static void sb_init(SB *sb)
 {
     sb->cap = 256;
@@ -27,6 +36,15 @@ static void sb_init(SB *sb)
     sb->s[0] = '\0';
 }
 
+/**
+ * @brief 向字符串缓冲追加 n 字节 / Append n bytes to the string builder
+ *
+ * @param[out]    sb 字符串缓冲 / String builder
+ * @param[in]     s 源字节 / Source bytes
+ * @param[in]     n 追加的字节数 / Number of bytes to append
+ *
+ * @note 容量不足时反复翻倍并 realloc / Capacity is doubled (via realloc) until it fits
+ */
 static void sb_add(SB *sb, const char *s, size_t n)
 {
     if (sb->len + n + 1 > sb->cap) {
@@ -39,6 +57,13 @@ static void sb_add(SB *sb, const char *s, size_t n)
     sb->s[sb->len] = '\0';
 }
 
+/**
+ * @brief 释放字符串缓冲 / Free the string builder
+ *
+ * @param[in,out] sb 待释放的字符串缓冲 / String builder to release
+ *
+ * @note 释放后把内部指针置 `NULL` / The internal pointer is set to `NULL`
+ */
 static void sb_free(SB *sb)
 {
     free(sb->s);
@@ -52,9 +77,18 @@ static const HpeJsHostVt g_style_vt;
 static const HpeJsHostVt g_document_vt;
 static const HpeJsHostVt g_fragment_vt;
 
-/* wraps any DOM node in its host value. a DocumentFragment gets the fragment
- * vtable (no tagName/id/style, but the child-list mutators); everything else is
- * exposed through the element vtable. */
+/**
+ * @brief 把 DOM 节点包装成宿主值 / Wrap a DOM node in a host value
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node 要包装的节点 / Node to wrap
+ *
+ * @return 包装该节点的 JsValue；`node` 为 `NULL` 时返回 `null` / A JsValue wrapping the node; `null` when `node` is `NULL`
+ *
+ * @note DocumentFragment 用 fragment 虚表，其余用 element 虚表 / A fragment uses the fragment vtable, everything else the element vtable
+ *
+ * @see arg_node
+ */
 static JsValue node_value(HpeJs *js, HpeDomNode *node)
 {
     if (!node)
@@ -64,7 +98,15 @@ static JsValue node_value(HpeJs *js, HpeDomNode *node)
     return js_make_host(js, node, HPE_HOST_ELEMENT, &g_element_vt);
 }
 
-/* unwraps a node argument; accepts both element and fragment hosts */
+/**
+ * @brief 从实参解包出 DOM 节点 / Unwrap a DOM node from an argument
+ *
+ * @param[in]     v 待解包的 JS 值 / JS value to unwrap
+ *
+ * @return 节点指针（element 或 fragment 宿主），否则 `NULL` / The node pointer (element or fragment host), or `NULL`
+ *
+ * @see node_value
+ */
 static HpeDomNode *arg_node(JsValue v)
 {
     HpeDomNode *n = (HpeDomNode *)js_host_ptr(v, HPE_HOST_ELEMENT);
@@ -73,12 +115,31 @@ static HpeDomNode *arg_node(JsValue v)
     return n;
 }
 
-/* public wrapper over node_value so the MutationObserver bridge can reuse it */
+/**
+ * @brief node_value 的公开包装，供 MutationObserver 复用 / Public wrapper over node_value, reused by the MutationObserver bridge
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node 要包装的节点 / Node to wrap
+ *
+ * @return 包装该节点的 JsValue；`node` 为 `NULL` 时返回 `null` / A JsValue wrapping the node; `null` when `node` is `NULL`
+ *
+ * @see node_value
+ */
 JsValue hpe_js_dom_node_value(HpeJs *js, HpeDomNode *node)
 {
     return node_value(js, node);
 }
 
+/**
+ * @brief 取第 idx 个实参并转成字符串 / Convert the idx-th argument to a string
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in]     idx 实参下标 / Argument index
+ *
+ * @return 新分配的字符串；下标越界时返回 `NULL` / Newly allocated string, or `NULL` when the index is out of range
+ */
 static char *arg_string(HpeJs *js, JsValue *args, int argc, int idx)
 {
     if (idx >= argc)
@@ -90,7 +151,15 @@ static char *arg_string(HpeJs *js, JsValue *args, int argc, int idx)
 static void listener_append(HpeJs *js, HpeDomNode *node, const char *type, JsValue handler,
                             int via_on);
 
-/* camelCase js property -> dashed lowercase css property */
+/**
+ * @brief 把 camelCase 的 JS 属性名转成连字符小写的 CSS 名 / Convert a camelCase JS property name to a dashed lowercase CSS name
+ *
+ * @param[in]     jsname JS 侧属性名 / Property name on the JS side
+ * @param[out]    out 目标缓冲区 / Destination buffer
+ * @param[in]     out_size 接收缓冲区容量（字节）/ Capacity of the output buffer in bytes
+ *
+ * @note 每个大写字母展开为 `-` 加小写；输出始终以 NUL 结尾 / Each uppercase letter becomes `-` plus its lowercase; the output is NUL-terminated
+ */
 static void css_name_from_js(const char *jsname, char *out, size_t out_size)
 {
     size_t o = 0, i;
@@ -106,7 +175,14 @@ static void css_name_from_js(const char *jsname, char *out, size_t out_size)
     out[o] = '\0';
 }
 
-/* ---------------- text / html accessors ---------------- */
+/**
+ * @brief 递归收集子树中的文本 / Recursively collect the text of a subtree
+ *
+ * @param[in,out] node 子树根节点 / Subtree root node
+ * @param[out]    sb 字符串缓冲 / String builder
+ *
+ * @note 只拼接文本节点，仅对元素节点递归 / Only text nodes are appended, and only elements are recursed
+ */
 
 static void collect_text(HpeDomNode *node, SB *sb)
 {
@@ -121,6 +197,14 @@ static void collect_text(HpeDomNode *node, SB *sb)
     }
 }
 
+/**
+ * @brief 把节点序列化成 HTML 文本 / Serialise a node as HTML text
+ *
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[out]    sb 字符串缓冲 / String builder
+ *
+ * @note 文本节点原样输出；元素输出开始/结束标签与全部属性（属性值不转义）/ Text nodes are emitted verbatim; elements emit their open/close tags and every attribute (values are not escaped)
+ */
 static void serialize_node(HpeDomNode *node, SB *sb)
 {
     int i;
@@ -151,6 +235,16 @@ static void serialize_node(HpeDomNode *node, SB *sb)
     sb_add(sb, ">", 1);
 }
 
+/**
+ * @brief 取元素的 textContent / Read an element's `textContent`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ *
+ * @return 子树文本拼接成的 JS 字符串 / A JS string holding the concatenated subtree text
+ *
+ * @see collect_text
+ */
 static JsValue element_get_text(HpeJs *js, HpeDomNode *node)
 {
     SB sb;
@@ -162,6 +256,18 @@ static JsValue element_get_text(HpeJs *js, HpeDomNode *node)
     return v;
 }
 
+/**
+ * @brief 取元素子树的 innerHTML / Read an element's `innerHTML`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ *
+ * @return 子节点序列化后的 JS 字符串 / A JS string holding the serialised child nodes
+ *
+ * @note 不含元素自身的标签 / The element's own tag is not included
+ *
+ * @see serialize_node
+ */
 static JsValue element_get_html(HpeJs *js, HpeDomNode *node)
 {
     SB sb;
@@ -175,6 +281,14 @@ static JsValue element_get_html(HpeJs *js, HpeDomNode *node)
     return v;
 }
 
+/**
+ * @brief 删除全部子节点并追加一个文本节点 / Replace every child with a single text node
+ *
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in]     text 新文本；`NULL` 按空串处理 / New text; `NULL` is treated as empty
+ *
+ * @note 逐个 detach 子节点，使 MutationObserver 与引擎脏标记能看到删除 / Children are detached one by one so the mutation sink sees the removals
+ */
 static void node_replace_children_with_text(HpeDomNode *node, const char *text)
 {
     HpeDomNode *child, *next;
@@ -188,6 +302,16 @@ static void node_replace_children_with_text(HpeDomNode *node, const char *text)
     hpe_dom_append(node, hpe_dom_text(text ? text : ""));
 }
 
+/**
+ * @brief 解析 HTML 片段并替换元素的子节点 / Parse an HTML fragment and replace the element's children
+ *
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in]     html HTML 文本；`NULL` 按空串处理 / HTML text; `NULL` is treated as empty
+ *
+ * @note 先清空原有子节点，再把解析结果体节点的子节点搬入 / Existing children are cleared first, then the parsed body's children are moved in
+ *
+ * @see node_replace_children_with_text
+ */
 static void node_set_inner_html(HpeDomNode *node, const char *html)
 {
     HpeDomNode *frag;
@@ -207,8 +331,18 @@ static void node_set_inner_html(HpeDomNode *node, const char *html)
 
 /* ---------------- querySelector ---------------- */
 
-/* collects elements in document order whose subtree root is `node` (node itself
- * excluded) into a growable array. returns the element count. */
+/**
+ * @brief 按文档顺序收集子树中的元素 / Collect the elements of a subtree in document order
+ *
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in,out] out 可增长的元素数组 / Growable element array
+ * @param[in,out] cap 数组当前容量 / Current array capacity
+ * @param[in]     count 已收集的元素个数 / Number of elements already collected
+ *
+ * @return 收集到的元素总数 / Total number of elements collected
+ *
+ * @note 不含 `node` 自身；数组按需倍增 / `node` itself is excluded; the array doubles on demand
+ */
 static int collect_elements(HpeDomNode *node, HpeDomNode ***out, int *cap, int count)
 {
     HpeDomNode *child;
@@ -225,6 +359,21 @@ static int collect_elements(HpeDomNode *node, HpeDomNode ***out, int *cap, int c
     return count;
 }
 
+/**
+ * @brief querySelector/querySelectorAll 的共用实现 / Shared implementation of querySelector and querySelectorAll
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in]     all 非 0 时返回全部匹配 / Non-zero to return every match
+ *
+ * @return `all` 非 0 时返回匹配元素数组，否则返回首个匹配元素或 `null` / An array of matches when `all` is set, else the first match or `null`
+ *
+ * @note 选择器为空时：`all` 返回空数组，否则返回 `null` / On an empty selector: an empty array when `all`, otherwise `null`
+ *
+ * @see dm_query_selector, dm_query_selector_all
+ */
 static JsValue query_selector_impl(HpeJs *js, HpeDomNode *node, JsValue *args, int argc,
                                    int all)
 {
@@ -271,7 +420,14 @@ typedef struct {
     char *method;
 } DomMth;
 
-/* breadth-first search for the first element whose id attribute matches. */
+/**
+ * @brief 广度优先查找指定 id 的首个元素 / Breadth-first search for the first element with the given id
+ *
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in]     id 标识符 / Identifier
+ *
+ * @return 匹配的元素，未找到时返回 `NULL` / The matching element, or `NULL` when none is found
+ */
 static HpeDomNode *dom_find_by_id(HpeDomNode *node, const char *id)
 {
     HpeDomNode **queue;
@@ -305,6 +461,18 @@ static HpeDomNode *dom_find_by_id(HpeDomNode *node, const char *id)
 
 typedef JsValue (*DomMethodFn)(HpeJs *js, HpeDomNode *node, JsValue *args, int argc);
 
+/**
+ * @brief `getElementById` 的实现 / Implementation of `getElementById`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ *
+ * @return 找到的元素宿主值，否则 `null` / The element host value, else `null`
+ *
+ * @see dom_find_by_id
+ */
 static JsValue dm_get_element_by_id(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
 {
     char *id = arg_string(js, args, argc, 0);
@@ -315,6 +483,16 @@ static JsValue dm_get_element_by_id(HpeJs *js, HpeDomNode *node, JsValue *args, 
     return found ? node_value(js, found) : js_null();
 }
 
+/**
+ * @brief `createElement` 的实现 / Implementation of `createElement`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ *
+ * @return 新元素的宿主值；标签为空时返回 `null` / Host value of the new element, or `null` for an empty tag
+ */
 static JsValue dm_create_element(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
 {
     char *tag = arg_string(js, args, argc, 0);
@@ -324,6 +502,18 @@ static JsValue dm_create_element(HpeJs *js, HpeDomNode *node, JsValue *args, int
     return node_value(js, hpe_dom_element(tag));
 }
 
+/**
+ * @brief `createElementNS` 的实现 / Implementation of `createElementNS`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ *
+ * @return 新元素的宿主值；标签为空时返回 `null` / Host value of the new element, or `null` for an empty tag
+ *
+ * @note 命名空间被忽略，只取标签名（SVG 子元素按标签绘制）/ The namespace is ignored; only the tag name matters (SVG children are drawn by tag name)
+ */
 static JsValue dm_create_element_ns(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
 {
     /* namespace is irrelevant for our element model (SVG children are
@@ -335,6 +525,16 @@ static JsValue dm_create_element_ns(HpeJs *js, HpeDomNode *node, JsValue *args, 
     return node_value(js, hpe_dom_element(tag));
 }
 
+/**
+ * @brief `createDocumentFragment` 的实现 / Implementation of `createDocumentFragment`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ *
+ * @return 新文档片段的宿主值 / Host value of the new document fragment
+ */
 static JsValue dm_create_fragment(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
 {
     HPE_UNUSED(node);
@@ -343,6 +543,18 @@ static JsValue dm_create_fragment(HpeJs *js, HpeDomNode *node, JsValue *args, in
     return node_value(js, hpe_dom_fragment());
 }
 
+/**
+ * @brief `removeChild` 的实现 / Implementation of `removeChild`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ *
+ * @return 总是返回 `undefined` / Always returns `undefined`
+ *
+ * @note 仅当子节点确属该父节点时才 detach / The child is detached only when it really belongs to this parent
+ */
 static JsValue dm_remove_child(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
 {
     HpeDomNode *child = argc > 0 ? arg_node(args[0]) : NULL;
@@ -352,12 +564,32 @@ static JsValue dm_remove_child(HpeJs *js, HpeDomNode *node, JsValue *args, int a
     return js_undef();
 }
 
+/**
+ * @brief `cloneNode` 的实现 / Implementation of `cloneNode`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ *
+ * @return 克隆出的节点宿主值 / Host value of the cloned node
+ */
 static JsValue dm_clone_node(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
 {
     int deep = argc > 0 && js_truthy(args[0]);
     return node_value(js, hpe_dom_clone(node, deep));
 }
 
+/**
+ * @brief `hasChildNodes` 的实现 / Implementation of `hasChildNodes`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ *
+ * @return 存在子节点返回 `true`，否则 `false` / `true` when a child exists, otherwise `false`
+ */
 static JsValue dm_has_child_nodes(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
 {
     HPE_UNUSED(js);
@@ -366,6 +598,16 @@ static JsValue dm_has_child_nodes(HpeJs *js, HpeDomNode *node, JsValue *args, in
     return js_bool(node->first_child != NULL);
 }
 
+/**
+ * @brief `insertBefore` 的实现 / Implementation of `insertBefore`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ *
+ * @return 插入的子节点宿主值；子节点为空时返回 `null` / Host value of the inserted child, or `null` when the child is absent
+ */
 static JsValue dm_insert_before(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
 {
     HpeDomNode *child = argc > 0 ? arg_node(args[0]) : NULL;
@@ -377,6 +619,16 @@ static JsValue dm_insert_before(HpeJs *js, HpeDomNode *node, JsValue *args, int 
     return node_value(js, child);
 }
 
+/**
+ * @brief `replaceChild` 的实现 / Implementation of `replaceChild`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ *
+ * @return 被替换掉的旧节点宿主值；旧节点为空时返回 `null` / Host value of the replaced old node, or `null` when it is absent
+ */
 static JsValue dm_replace_child(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
 {
     HpeDomNode *newc = argc > 0 ? arg_node(args[0]) : NULL;
@@ -387,6 +639,16 @@ static JsValue dm_replace_child(HpeJs *js, HpeDomNode *node, JsValue *args, int 
     return node_value(js, hpe_dom_replace_child(node, newc, oldc));
 }
 
+/**
+ * @brief `getAttribute` 的实现 / Implementation of `getAttribute`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ *
+ * @return 属性值字符串，不存在时返回 `null` / The attribute value string, or `null` when absent
+ */
 static JsValue dm_get_attribute(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
 {
     char *name = arg_string(js, args, argc, 0);
@@ -394,6 +656,18 @@ static JsValue dm_get_attribute(HpeJs *js, HpeDomNode *node, JsValue *args, int 
     return v ? js_string(js, v) : js_null();
 }
 
+/**
+ * @brief `setAttribute` 的实现 / Implementation of `setAttribute`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ *
+ * @return 总是返回 `undefined` / Always returns `undefined`
+ *
+ * @note 属性值缺失时写入空串 / An absent value is stored as the empty string
+ */
 static JsValue dm_set_attribute(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
 {
     char *name = arg_string(js, args, argc, 0);
@@ -404,6 +678,16 @@ static JsValue dm_set_attribute(HpeJs *js, HpeDomNode *node, JsValue *args, int 
     return js_undef();
 }
 
+/**
+ * @brief `removeAttribute` 的实现 / Implementation of `removeAttribute`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ *
+ * @return 总是返回 `undefined` / Always returns `undefined`
+ */
 static JsValue dm_remove_attribute(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
 {
     char *name = arg_string(js, args, argc, 0);
@@ -413,12 +697,32 @@ static JsValue dm_remove_attribute(HpeJs *js, HpeDomNode *node, JsValue *args, i
     return js_undef();
 }
 
+/**
+ * @brief `hasAttribute` 的实现 / Implementation of `hasAttribute`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ *
+ * @return 属性存在返回 `true`，否则 `false` / `true` when the attribute exists, otherwise `false`
+ */
 static JsValue dm_has_attribute(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
 {
     char *name = arg_string(js, args, argc, 0);
     return js_bool(name && hpe_dom_attr(node, name) != NULL);
 }
 
+/**
+ * @brief `appendChild` 的实现 / Implementation of `appendChild`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ *
+ * @return 追加的子节点宿主值；子节点为空时返回 `null` / Host value of the appended child, or `null` when the child is absent
+ */
 static JsValue dm_append_child(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
 {
     HpeDomNode *child = argc > 0 ? arg_node(args[0]) : NULL;
@@ -429,6 +733,16 @@ static JsValue dm_append_child(HpeJs *js, HpeDomNode *node, JsValue *args, int a
     return js_null();
 }
 
+/**
+ * @brief `remove` 的实现：把自己从父节点上摘除 / Implementation of `remove`: detach this node from its parent
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ *
+ * @return 总是返回 `undefined` / Always returns `undefined`
+ */
 static JsValue dm_remove_self(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
 {
     HPE_UNUSED(js);
@@ -438,16 +752,54 @@ static JsValue dm_remove_self(HpeJs *js, HpeDomNode *node, JsValue *args, int ar
     return js_undef();
 }
 
+/**
+ * @brief `querySelector` 的实现 / Implementation of `querySelector`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ *
+ * @return 首个匹配元素的宿主值，无匹配或空选择器时返回 `null` / Host value of the first match, or `null` when nothing matches or the selector is empty
+ *
+ * @see query_selector_impl
+ */
 static JsValue dm_query_selector(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
 {
     return query_selector_impl(js, node, args, argc, 0);
 }
 
+/**
+ * @brief `querySelectorAll` 的实现 / Implementation of `querySelectorAll`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ *
+ * @return 匹配元素组成的数组 / An array of the matching elements
+ *
+ * @see query_selector_impl
+ */
 static JsValue dm_query_selector_all(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
 {
     return query_selector_impl(js, node, args, argc, 1);
 }
 
+/**
+ * @brief `addEventListener` 的实现 / Implementation of `addEventListener`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ *
+ * @return 总是返回 `undefined` / Always returns `undefined`
+ *
+ * @note 事件类型为空时不注册 / Nothing is registered for an empty event type
+ *
+ * @see listener_append
+ */
 static JsValue dm_add_event_listener(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
 {
     char *type = arg_string(js, args, argc, 0);
@@ -484,6 +836,21 @@ static const struct {
     { NULL, NULL }
 };
 
+/**
+ * @brief DOM 方法绑定对象的统一入口 / Common entry point for bound DOM method objects
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 调用时的 this（未使用）/ The `this` value (unused)
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 指向 DomMth 的绑定信息 / Binding info pointing at the `DomMth`
+ *
+ * @return 查表命中的方法返回值；未命中时返回 `undefined` / The matched method's result, or `undefined` when the name is unknown
+ *
+ * @note 纯查表分派，新增方法只需在表中加一行 / Dispatch is a pure table lookup, so adding a method is a one-line table edit
+ *
+ * @see bind_dom_method, method_is
+ */
 static JsValue dom_method_dispatch(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *ud)
 {
     DomMth *m = (DomMth *)ud;
@@ -496,6 +863,19 @@ static JsValue dom_method_dispatch(HpeJs *js, JsValue thisv, JsValue *args, int 
     return js_undef();
 }
 
+/**
+ * @brief 把某个 DOM 方法绑定成原生函数对象 / Bind one DOM method as a native function object
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in]     method 方法名 / Method name
+ *
+ * @return 绑定到该节点的方法函数值 / A function value bound to this node
+ *
+ * @note 绑定信息从 js arena 分配 / The binding info is allocated from the JS arena
+ *
+ * @see dom_method_dispatch
+ */
 static JsValue bind_dom_method(HpeJs *js, HpeDomNode *node, const char *method)
 {
     DomMth *m = (DomMth *)hpe_js_alloc(js, sizeof(DomMth));
@@ -504,6 +884,15 @@ static JsValue bind_dom_method(HpeJs *js, HpeDomNode *node, const char *method)
     return js_objval(js_native_new(js, dom_method_dispatch, m));
 }
 
+/**
+ * @brief 判断属性名是否是受支持的 DOM 方法 / Test whether a property name is a supported DOM method
+ *
+ * @param[in]     prop 属性名 / Property name
+ *
+ * @return 是方法名返回 1，否则 0 / 1 when it is a method name, otherwise 0
+ *
+ * @see dom_method_dispatch
+ */
 static int method_is(const char *prop)
 {
     return !strcmp(prop, "getElementById") || !strcmp(prop, "createElement") ||
@@ -526,6 +915,15 @@ typedef struct JsListener {
     struct JsListener *next;
 } JsListener;
 
+/**
+ * @brief 把 `on*` 属性名映射成事件类型名 / Map an `on*` property name to its event type name
+ *
+ * @param[in]     prop 属性名 / Property name
+ *
+ * @return 对应的事件类型串（如 `click`）；否则 `NULL` / The matching event type (e.g. `click`), or `NULL`
+ *
+ * @note 当前支持 `onclick` / `onmousedown` / `onmouseup` / Currently recognises `onclick`, `onmousedown` and `onmouseup`
+ */
 static const char *on_prop_event(const char *prop)
 {
     static const char *evts[] = {"click", "mousedown", "mouseup", NULL};
@@ -538,13 +936,31 @@ static const char *on_prop_event(const char *prop)
     return NULL;
 }
 
+/**
+ * @brief 取节点上的监听器链表头 / Get the head of a node's listener list
+ *
+ * @param[in,out] node DOM 节点 / DOM node
+ *
+ * @return 监听器链表头，可能为 `NULL` / The listener list head, possibly `NULL`
+ */
 static JsListener *node_listeners(HpeDomNode *node)
 {
     return (JsListener *)node->listeners;
 }
 
-/* stores a listener on a node. via_on handlers replace any previous via_on of the
- * same type; a null/undefined handler removes it. list nodes live in the js arena. */
+/**
+ * @brief 在节点上登记一个事件监听器 / Store an event listener on a node
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in]     type 事件类型 / Event type
+ * @param[in]     handler 处理函数 / Handler function
+ * @param[in]     via_on 经 `on*` 属性登记为 1 / 1 when added through an `on*` property
+ *
+ * @note `via_on` 会替换同类型的旧监听；handler 为 `null`/`undefined` 时只做删除 / A `via_on` handler replaces any previous one of the same type; a `null`/`undefined` handler only removes
+ *
+ * @see on_handler_get, dm_add_event_listener
+ */
 static void listener_append(HpeJs *js, HpeDomNode *node, const char *type, JsValue handler,
                             int via_on)
 {
@@ -574,6 +990,14 @@ static void listener_append(HpeJs *js, HpeDomNode *node, const char *type, JsVal
     }
 }
 
+/**
+ * @brief 取某类型经 `on*` 登记的监听器 / Read the `on*` handler registered for a type
+ *
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in]     type 事件类型 / Event type
+ *
+ * @return 对应的处理函数；没有时返回 `null` / The handler function, or `null` when none is set
+ */
 static JsValue on_handler_get(HpeDomNode *node, const char *type)
 {
     JsListener *l;
@@ -583,6 +1007,19 @@ static JsValue on_handler_get(HpeDomNode *node, const char *type)
     return js_null();
 }
 
+/**
+ * @brief 什么都不做的原生函数 / A native function that does nothing
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 调用时的 this 值 / The `this` value of the call
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 宿主回调透传的用户数据 / Opaque user data passed through to the host
+ *
+ * @return 总是返回 `undefined` / Always returns `undefined`
+ *
+ * @note 用作 `reload`/`scrollTo` 等空实现 / Used as the empty implementation for `reload`, `scrollTo` and friends
+ */
 static JsValue native_noop(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *ud)
 {
     HPE_UNUSED(js);
@@ -593,8 +1030,21 @@ static JsValue native_noop(HpeJs *js, JsValue thisv, JsValue *args, int argc, vo
     return js_undef();
 }
 
-/* stopPropagation()/stopImmediatePropagation() are recorded on the event object
- * itself: the dispatch loop below re-checks the flag after every handler. */
+/**
+ * @brief 在事件对象上记录停止传播标志 / Record a stop-propagation flag on the event object
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 事件对象 / The event object
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 宿主回调透传的用户数据 / Opaque user data passed through to the host
+ *
+ * @return 总是返回 `undefined` / Always returns `undefined`
+ *
+ * @note `stopPropagation` 与 `stopImmediatePropagation` 共用此实现 / Both `stopPropagation` and `stopImmediatePropagation` share this implementation
+ *
+ * @see propagation_stopped
+ */
 static JsValue native_stop_propagation(HpeJs *js, JsValue thisv, JsValue *args, int argc,
                                        void *ud)
 {
@@ -606,6 +1056,16 @@ static JsValue native_stop_propagation(HpeJs *js, JsValue thisv, JsValue *args, 
     return js_undef();
 }
 
+/**
+ * @brief 检查事件对象是否已请求停止传播 / Test whether the event object asked to stop propagation
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     ev 事件对象 / Event object
+ *
+ * @return 已停止返回 1，否则 0 / 1 when stopped, otherwise 0
+ *
+ * @see native_stop_propagation
+ */
 static int propagation_stopped(HpeJs *js, JsValue ev)
 {
     JsValue v;
@@ -615,6 +1075,19 @@ static int propagation_stopped(HpeJs *js, JsValue ev)
     return v.t == JS_BOOL && v.num != 0.0;
 }
 
+/**
+ * @brief 构造一个事件对象 / Build an event object
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     type 事件类型 / Event type
+ * @param[in]     x 客户端 X 坐标 / Client X coordinate
+ * @param[in]     y 客户端 Y 坐标 / Client Y coordinate
+ * @param[in,out] target 事件目标节点 / Event target node
+ *
+ * @return 带有 type/clientX/clientY/target 及方法的事件对象 / An event object carrying type/clientX/clientY/target plus methods
+ *
+ * @note 同时挂上 `preventDefault`（空实现）与两个停止传播方法 / Also attaches `preventDefault` (a no-op) and the two stop-propagation methods
+ */
 static JsValue event_object(HpeJs *js, const char *type, int x, int y, HpeDomNode *target)
 {
     JsObj *o = js_object_new(js);
@@ -630,6 +1103,21 @@ static JsValue event_object(HpeJs *js, const char *type, int x, int y, HpeDomNod
     return js_objval(o);
 }
 
+/**
+ * @brief 从目标节点向上冒泡派发事件 / Dispatch an event by bubbling from the target upwards
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] target 事件目标节点 / Event target node
+ * @param[in]     type 事件类型 / Event type
+ * @param[in]     clientX 客户端 X 坐标 / Client X coordinate
+ * @param[in]     clientY 客户端 Y 坐标 / Client Y coordinate
+ *
+ * @return 至少调用过一个处理函数时返回 1，否则 0 / 1 when at least one handler ran, otherwise 0
+ *
+ * @note 每层更新 `currentTarget`；处理函数调用 `stopPropagation` 后立即停止 / `currentTarget` is updated per level; dispatch stops as soon as a handler requests it
+ *
+ * @see event_object, listener_append
+ */
 int hpe_js_dom_dispatch(HpeJs *js, HpeDomNode *target, const char *type, int clientX,
                         int clientY)
 {
@@ -656,7 +1144,16 @@ int hpe_js_dom_dispatch(HpeJs *js, HpeDomNode *target, const char *type, int cli
 }
 
 
-/* ---------------- vtables ---------------- */
+/**
+ * @brief 取元素标签名并转成大写 / Read an element's tag name uppercased
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ *
+ * @return 大写标签名的 JS 字符串 / A JS string holding the uppercased tag name
+ *
+ * @note 模拟 HTML 文档中浏览器报告大写元素名的行为 / Mimics how browsers uppercase element names in HTML documents
+ */
 
 static JsValue element_upper_tag(HpeJs *js, HpeDomNode *node)
 {
@@ -673,12 +1170,32 @@ static JsValue element_upper_tag(HpeJs *js, HpeDomNode *node)
     return js_string(js, upper);
 }
 
+/**
+ * @brief 取属性值，缺失时返回空串 / Read an attribute value, falling back to the empty string
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in]     attr 属性名 / Attribute name
+ *
+ * @return 属性值的 JS 字符串；缺失时为空串 / A JS string with the attribute value, or the empty string when absent
+ */
 static JsValue element_attr_str(HpeJs *js, HpeDomNode *node, const char *attr)
 {
     const char *v = hpe_dom_attr(node, attr);
     return js_string(js, v ? v : "");
 }
 
+/**
+ * @brief 取元素的 clientWidth/clientHeight / Read an element's `clientWidth`/`clientHeight`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in]     prop `clientWidth` 或 `clientHeight` / Either `clientWidth` or `clientHeight`
+ *
+ * @return 布局后的内容区宽度或高度；无盒时返回 0 / The laid-out content width or height, or 0 without a box
+ *
+ * @note 浏览器在此会强制布局；本引擎用元素到盒的反向指针取已布局尺寸 / Browsers force layout here; the engine reads the laid-out size via the element-to-box back pointer
+ */
 static JsValue element_client_size(HpeJs *js, HpeDomNode *node, const char *prop)
 {
     /* browsers force a layout here; we keep element -> box back pointers
@@ -692,6 +1209,15 @@ static JsValue element_client_size(HpeJs *js, HpeDomNode *node, const char *prop
 
 typedef JsValue (*ElemGetFn)(HpeJs *js, HpeDomNode *node, const char *prop);
 
+/**
+ * @brief `nodeType` 读取器，元素固定返回 1 / `nodeType` getter, always 1 for elements
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in]     prop CSS 属性名 / CSS property name
+ *
+ * @return 数值 1（ELEMENT_NODE）/ The number 1 (ELEMENT_NODE)
+ */
 static JsValue eg_node_type(HpeJs *js, HpeDomNode *node, const char *prop)
 {
     HPE_UNUSED(node);
@@ -699,60 +1225,154 @@ static JsValue eg_node_type(HpeJs *js, HpeDomNode *node, const char *prop)
     return js_num(1); /* ELEMENT_NODE */
 }
 
+/**
+ * @brief `tagName`/`nodeName` 读取器 / `tagName`/`nodeName` getter
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in]     prop CSS 属性名 / CSS property name
+ *
+ * @return 大写标签名的 JS 字符串 / A JS string with the uppercased tag name
+ *
+ * @see element_upper_tag
+ */
 static JsValue eg_tag_name(HpeJs *js, HpeDomNode *node, const char *prop)
 {
     HPE_UNUSED(prop);
     return element_upper_tag(js, node);
 }
 
+/**
+ * @brief `id` 读取器 / `id` getter
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in]     prop CSS 属性名 / CSS property name
+ *
+ * @return `id` 属性值的 JS 字符串 / A JS string with the `id` attribute
+ */
 static JsValue eg_id(HpeJs *js, HpeDomNode *node, const char *prop)
 {
     HPE_UNUSED(prop);
     return element_attr_str(js, node, "id");
 }
 
+/**
+ * @brief `className` 读取器 / `className` getter
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in]     prop CSS 属性名 / CSS property name
+ *
+ * @return `class` 属性值的 JS 字符串 / A JS string with the `class` attribute
+ */
 static JsValue eg_class_name(HpeJs *js, HpeDomNode *node, const char *prop)
 {
     HPE_UNUSED(prop);
     return element_attr_str(js, node, "class");
 }
 
+/**
+ * @brief `textContent` 读取器 / `textContent` getter
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in]     prop CSS 属性名 / CSS property name
+ *
+ * @return 子树文本拼接成的 JS 字符串 / A JS string holding the concatenated subtree text
+ */
 static JsValue eg_text_content(HpeJs *js, HpeDomNode *node, const char *prop)
 {
     HPE_UNUSED(prop);
     return element_get_text(js, node);
 }
 
+/**
+ * @brief `innerHTML` 读取器 / `innerHTML` getter
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in]     prop CSS 属性名 / CSS property name
+ *
+ * @return 子节点序列化后的 JS 字符串 / A JS string holding the serialised children
+ */
 static JsValue eg_inner_html(HpeJs *js, HpeDomNode *node, const char *prop)
 {
     HPE_UNUSED(prop);
     return element_get_html(js, node);
 }
 
+/**
+ * @brief `style` 读取器，返回样式宿主对象 / `style` getter, returning a style host object
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in]     prop CSS 属性名 / CSS property name
+ *
+ * @return 绑定到该节点的 style 宿主值 / A style host value bound to this node
+ */
 static JsValue eg_style(HpeJs *js, HpeDomNode *node, const char *prop)
 {
     HPE_UNUSED(prop);
     return js_make_host(js, node, HPE_HOST_STYLE, &g_style_vt);
 }
 
+/**
+ * @brief `firstChild` 读取器 / `firstChild` getter
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in]     prop CSS 属性名 / CSS property name
+ *
+ * @return 首个子节点的宿主值，没有时返回 `null` / Host value of the first child, or `null` when there is none
+ */
 static JsValue eg_first_child(HpeJs *js, HpeDomNode *node, const char *prop)
 {
     HPE_UNUSED(prop);
     return node->first_child ? node_value(js, node->first_child) : js_null();
 }
 
+/**
+ * @brief `nextSibling` 读取器 / `nextSibling` getter
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in]     prop CSS 属性名 / CSS property name
+ *
+ * @return 下一个兄弟节点的宿主值，没有时返回 `null` / Host value of the next sibling, or `null` when there is none
+ */
 static JsValue eg_next_sibling(HpeJs *js, HpeDomNode *node, const char *prop)
 {
     HPE_UNUSED(prop);
     return node->next_sibling ? node_value(js, node->next_sibling) : js_null();
 }
 
+/**
+ * @brief `parentNode` 读取器 / `parentNode` getter
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in]     prop CSS 属性名 / CSS property name
+ *
+ * @return 父节点的宿主值，没有时返回 `null` / Host value of the parent, or `null` when there is none
+ */
 static JsValue eg_parent_node(HpeJs *js, HpeDomNode *node, const char *prop)
 {
     HPE_UNUSED(prop);
     return node->parent ? node_value(js, node->parent) : js_null();
 }
 
+/**
+ * @brief `clientWidth`/`clientHeight` 读取器 / `clientWidth`/`clientHeight` getter
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node DOM 节点 / DOM node
+ * @param[in]     prop CSS 属性名 / CSS property name
+ *
+ * @return 布局后的内容区尺寸 / The laid-out content size
+ *
+ * @see element_client_size
+ */
 static JsValue eg_client_size(HpeJs *js, HpeDomNode *node, const char *prop)
 {
     return element_client_size(js, node, prop);
@@ -778,6 +1398,20 @@ static const struct {
     { NULL, NULL }
 };
 
+/**
+ * @brief 元素宿主的属性读取虚函数 / Property-get virtual for element hosts
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     target 元素宿主逐个的 DOM 节点指针 / DOM node behind the element host
+ * @param[in]     prop 属性名 / Property name
+ * @param[out]    out 接收读取结果的值 / Receives the read value
+ *
+ * @return 已处理返回 1，未识别返回 0 / 1 when handled, 0 when the property is unknown
+ *
+ * @note 顺序为 `<template>.content`、属性表、方法绑定、`on*` 处理函数 / Order: `<template>.content`, the property table, method binding, then `on*` handlers
+ *
+ * @see element_vt_set, bind_dom_method
+ */
 static int element_vt_get(HpeJs *js, void *target, const char *prop, JsValue *out)
 {
     HpeDomNode *node = (HpeDomNode *)target;
@@ -809,6 +1443,18 @@ static int element_vt_get(HpeJs *js, void *target, const char *prop, JsValue *ou
     return 0;
 }
 
+/**
+ * @brief 元素宿主的属性写入虚函数 / Property-set virtual for element hosts
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     target 元素宿主背后的 DOM 节点指针 / DOM node behind the element host
+ * @param[in]     prop 属性名 / Property name
+ * @param[in]     value 待写入的值 / Value to write
+ *
+ * @return 已处理返回 1，未识别返回 0 / 1 when handled, 0 when the property is unknown
+ *
+ * @note 处理 `textContent`/`innerHTML`/`style`/`id`/`className` 与 `on*` 属性 / Handles `textContent`, `innerHTML`, `style`, `id`, `className` and `on*` properties
+ */
 static int element_vt_set(HpeJs *js, void *target, const char *prop, JsValue value)
 {
     HpeDomNode *node = (HpeDomNode *)target;
@@ -846,9 +1492,20 @@ static int element_vt_set(HpeJs *js, void *target, const char *prop, JsValue val
 
 static const HpeJsHostVt g_element_vt = {element_vt_get, element_vt_set};
 
-/* DocumentFragment host: shares the node-level accessors (children, tree links,
- * methods) with elements but exposes no element-only members (tagName/id/style).
- * A fragment never reaches the box tree, so clientWidth/Height stay 0. */
+/**
+ * @brief 文档片段宿主的属性读取虚函数 / Property-get virtual for document-fragment hosts
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     target 片段宿主背后的 DOM 节点指针 / DOM node behind the fragment host
+ * @param[in]     prop 属性名 / Property name
+ * @param[out]    out 接收读取结果的值 / Receives the read value
+ *
+ * @return 已处理返回 1，未识别返回 0 / 1 when handled, 0 when the property is unknown
+ *
+ * @note `nodeType` 为 11；`childNodes`/`children` 每次读取都构造一次快照 / `nodeType` is 11; `childNodes`/`children` build a snapshot on each read
+ *
+ * @see fragment_vt_set
+ */
 static int fragment_vt_get(HpeJs *js, void *target, const char *prop, JsValue *out)
 {
     HpeDomNode *node = (HpeDomNode *)target;
@@ -899,6 +1556,18 @@ static int fragment_vt_get(HpeJs *js, void *target, const char *prop, JsValue *o
     return 0;
 }
 
+/**
+ * @brief 文档片段宿主的属性写入虚函数 / Property-set virtual for document-fragment hosts
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     target 片段宿主背后的 DOM 节点指针 / DOM node behind the fragment host
+ * @param[in]     prop 属性名 / Property name
+ * @param[in]     value 待写入的值 / Value to write
+ *
+ * @return 已处理返回 1，未识别返回 0 / 1 when handled, 0 when the property is unknown
+ *
+ * @note 仅处理 `textContent` 与 `innerHTML` / Only `textContent` and `innerHTML` are handled
+ */
 static int fragment_vt_set(HpeJs *js, void *target, const char *prop, JsValue value)
 {
     HpeDomNode *node = (HpeDomNode *)target;
@@ -917,6 +1586,20 @@ static int fragment_vt_set(HpeJs *js, void *target, const char *prop, JsValue va
 
 static const HpeJsHostVt g_fragment_vt = {fragment_vt_get, fragment_vt_set};
 
+/**
+ * @brief style 宿主的属性读取虚函数 / Property-get virtual for style hosts
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     target 样式宿主背后的 DOM 节点指针 / DOM node behind the style host
+ * @param[in]     prop 属性名 / Property name
+ * @param[out]    out 接收读取结果的值 / Receives the read value
+ *
+ * @return 始终返回 1 / Always returns 1
+ *
+ * @note camelCase 属性名转成 CSS 名后查内联样式，缺失返回空串 / The camelCase name is converted to a CSS name and looked up in the inline style; absent values give the empty string
+ *
+ * @see style_vt_set, css_name_from_js
+ */
 static int style_vt_get(HpeJs *js, void *target, const char *prop, JsValue *out)
 {
     HpeDomNode *node = (HpeDomNode *)target;
@@ -933,6 +1616,18 @@ static int style_vt_get(HpeJs *js, void *target, const char *prop, JsValue *out)
     return 1;
 }
 
+/**
+ * @brief style 宿主的属性写入虚函数 / Property-set virtual for style hosts
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     target 样式宿主背后的 DOM 节点指针 / DOM node behind the style host
+ * @param[in]     prop 属性名 / Property name
+ * @param[in]     value 待写入的值 / Value to write
+ *
+ * @return 节点为空返回 0，否则返回 1 / 0 when the node is absent, otherwise 1
+ *
+ * @note 写入内联样式表 / Writes into the inline style table
+ */
 static int style_vt_set(HpeJs *js, void *target, const char *prop, JsValue value)
 {
     HpeDomNode *node = (HpeDomNode *)target;
@@ -948,6 +1643,20 @@ static int style_vt_set(HpeJs *js, void *target, const char *prop, JsValue value
 
 static const HpeJsHostVt g_style_vt = {style_vt_get, style_vt_set};
 
+/**
+ * @brief document 宿主的属性读取虚函数 / Property-get virtual for the document host
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     target 文档根节点指针 / Document root node
+ * @param[in]     prop 属性名 / Property name
+ * @param[out]    out 接收读取结果的值 / Receives the read value
+ *
+ * @return 已处理返回 1，未识别返回 0 / 1 when handled, 0 when the property is unknown
+ *
+ * @note `body`/`head`/`documentElement` 按标签查找；随后是方法绑定与 `on*` / `body`/`head`/`documentElement` are looked up by tag, followed by method binding and `on*`
+ *
+ * @see document_vt_set
+ */
 static int document_vt_get(HpeJs *js, void *target, const char *prop, JsValue *out)
 {
     HpeDomNode *doc = (HpeDomNode *)target;
@@ -979,6 +1688,18 @@ static int document_vt_get(HpeJs *js, void *target, const char *prop, JsValue *o
     return 0;
 }
 
+/**
+ * @brief document 宿主的属性写入虚函数 / Property-set virtual for the document host
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     target 文档根节点指针 / Document root node
+ * @param[in]     prop 属性名 / Property name
+ * @param[in]     value 待写入的值 / Value to write
+ *
+ * @return 已处理返回 1，未识别返回 0 / 1 when handled, 0 when the property is unknown
+ *
+ * @note `title` 写入 head 中的 title 元素；`on*` 登记监听 / `title` writes into the title element within head; `on*` registers a listener
+ */
 static int document_vt_set(HpeJs *js, void *target, const char *prop, JsValue value)
 {
     HpeDomNode *doc = (HpeDomNode *)target;
@@ -1004,8 +1725,17 @@ static int document_vt_set(HpeJs *js, void *target, const char *prop, JsValue va
 
 static const HpeJsHostVt g_document_vt = {document_vt_get, document_vt_set};
 
-/* the engine only ever loads local files, so `location` is a plain data object
- * (`hash` stays writable because pages use it for view modes such as `#all`) */
+/**
+ * @brief `location.toString` 实现，返回 `href` / Implementation of `location.toString`, returning `href`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 调用时的 this 值 / The `this` value of the call
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 宿主回调透传的用户数据 / Opaque user data passed through to the host
+ *
+ * @return `href` 字段的字符串形式 / The `href` field as a string
+ */
 static JsValue loc_toString(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *ud)
 {
     HPE_UNUSED(args);
@@ -1014,6 +1744,19 @@ static JsValue loc_toString(HpeJs *js, JsValue thisv, JsValue *args, int argc, v
     return js_string(js, js_to_string(js, js_obj_get(js, thisv.obj, "href")));
 }
 
+/**
+ * @brief `getComputedStyle` 的空实现 / Empty implementation of `getComputedStyle`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 调用时的 this 值 / The `this` value of the call
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 宿主回调透传的用户数据 / Opaque user data passed through to the host
+ *
+ * @return 一个新的空对象 / A fresh empty object
+ *
+ * @note 引擎不计算样式，仅让守卫代码不报错 / The engine does not compute styles; this only keeps guarding scripts from failing
+ */
 static JsValue dom_style_stub(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *ud)
 {
     HPE_UNUSED(thisv);
@@ -1023,6 +1766,19 @@ static JsValue dom_style_stub(HpeJs *js, JsValue thisv, JsValue *args, int argc,
     return js_objval(js_object_new(js));
 }
 
+/**
+ * @brief `requestAnimationFrame` 的空实现 / Empty implementation of `requestAnimationFrame`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 调用时的 this 值 / The `this` value of the call
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 宿主回调透传的用户数据 / Opaque user data passed through to the host
+ *
+ * @return 句柄 0 / The handle 0
+ *
+ * @note 回调不会被调度 / The callback is never scheduled
+ */
 static JsValue dom_raf(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *ud)
 {
     HPE_UNUSED(thisv);
@@ -1032,18 +1788,45 @@ static JsValue dom_raf(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *
     return js_num(0.0);
 }
 
+/**
+ * @brief 往对象上设置一个属性 / Set one property on an object
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] o 目标对象 / Target object
+ * @param[in]     k 属性键 / Property key
+ * @param[in]     v 属性值 / Property value
+ *
+ * @note `js_obj_set` 的薄封装 / A thin wrapper over `js_obj_set`
+ */
 static void set_prop(HpeJs *js, JsObj *o, const char *k, JsValue v)
 {
     js_obj_set(js, o, k, v);
 }
 
+/**
+ * @brief 把原生函数指针包成 JS 函数值 / Wrap a native function pointer as a JS function value
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     fn 原生函数指针 / Native function pointer
+ * @param[in,out] ud 宿主回调透传的用户数据 / Opaque user data passed through to the host
+ *
+ * @return 包好的函数值 / The wrapped function value
+ */
 static JsValue nat(HpeJs *js, JsNativeFn fn, void *ud)
 {
     return js_objval(js_native_new(js, fn, ud));
 }
 
-/* registers `location` / `navigator` / `window` so ordinary page scripts that
- * guard on them keep running (the engine has no network and no navigation) */
+/**
+ * @brief 注册 location/navigator/window 等浏览器全局对象 / Register browser globals such as `location`, `navigator` and `window`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] document 文档根节点 / Document root node
+ *
+ * @note 引擎无网络也无导航，所有网络类方法都是空实现；只让检测这些对象的页面脚本继续运行 / The engine has no network or navigation, so network-ish methods are no-ops; this only keeps scripts that probe them running
+ *
+ * @see hpe_js_dom_install, set_prop, nat
+ */
 static void install_window_builtins(HpeJs *js, HpeDomNode *document)
 {
     JsObj *win = js_object_new(js);
@@ -1090,6 +1873,16 @@ static void install_window_builtins(HpeJs *js, HpeDomNode *document)
     js_obj_set(js, js->global_obj, "self", js_objval(win));
 }
 
+/**
+ * @brief 安装 DOM 绑定、浏览器全局、定时器与 MutationObserver / Install the DOM bridge, browser globals, timers and the MutationObserver
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] document 文档根节点 / Document root node
+ *
+ * @note 把 `document` 注册为全局宿主，随后依次安装 window 内建、定时器与变更通知 / `document` is registered as a global host, then window builtins, timers and change notification are installed
+ *
+ * @see install_window_builtins
+ */
 void hpe_js_dom_install(HpeJs *js, HpeDomNode *document)
 {
     hpe_js_set_global_host(js, "document", document, HPE_HOST_DOCUMENT, &g_document_vt);

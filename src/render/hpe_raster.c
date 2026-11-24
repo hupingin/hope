@@ -6,6 +6,19 @@
 
 #include "base/hpe_util.h"
 
+/**
+ * @brief 把源色按 alpha 混合到目标色上 / Blend a source colour onto a destination colour
+ *
+ * @param[in]     dst 目标像素 `0x00RRGGBB` / Destination pixel `0x00RRGGBB`
+ * @param[in]     src 源颜色 `0x00RRGGBB` / Source colour `0x00RRGGBB`
+ * @param[in]     alpha 混合系数 0~255 / Blend factor 0..255
+ *
+ * @return 不透明的混合结果 `0xFFRRGGBB` / The blended opaque pixel `0xFFRRGGBB`
+ *
+ * @note alpha 为 0 原样返回目标，大于等于 255 直接取源色 / alpha of 0 returns the destination untouched; alpha of 255 or more returns the source outright
+ *
+ * @see blend_px_pm
+ */
 static inline uint32_t blend(uint32_t dst, uint32_t src, uint32_t alpha)
 {
     uint32_t inv, dr, dg, db, sr, sg, sb, r, g, b;
@@ -26,6 +39,17 @@ static inline uint32_t blend(uint32_t dst, uint32_t src, uint32_t alpha)
     return 0xFF000000u | (r << 16) | (g << 8) | b;
 }
 
+/**
+ * @brief 用纯色填充一个矩形 / Fill a rectangle with a solid colour
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     rect 矩形区域（用户空间坐标）/ Rectangle in user-space coordinates
+ * @param[in]     color 颜色 / Colour
+ *
+ * @note 坐标按左/上 `floor`、右/下 `ceil` 取整后交给 `hpe_fill_rect_i` / The rectangle is rounded with `floor` on the top/left edges and `ceil` on the bottom/right edges before being passed to `hpe_fill_rect_i`
+ *
+ * @see hpe_fill_rect_i
+ */
 void hpe_fill_rect(HpePixmap *pm, HpeRect rect, HpeColor color)
 {
     int x0, y0, x1, y1;
@@ -38,6 +62,20 @@ void hpe_fill_rect(HpePixmap *pm, HpeRect rect, HpeColor color)
     hpe_fill_rect_i(pm, x0, y0, x1 - x0, y1 - y0, color);
 }
 
+/**
+ * @brief 按整数坐标用纯色填充矩形 / Fill an integer-coordinate rectangle with a solid colour
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     x 矩形左边界 / Rectangle left edge
+ * @param[in]     y 矩形上边界 / Rectangle top edge
+ * @param[in]     w 矩形宽度 / Rectangle width
+ * @param[in]     h 矩形高度 / Rectangle height
+ * @param[in]     color 颜色 / Colour
+ *
+ * @note 矩形会夹到当前裁剪范围内，全不透明时按行整体写入，否则逐像素混合 / The rectangle is clamped to the current clip; a fully opaque fill writes whole rows while a translucent one blends per pixel
+ *
+ * @see hpe_fill_rect
+ */
 void hpe_fill_rect_i(HpePixmap *pm, int x, int y, int w, int h, HpeColor color)
 {
     int row, col;
@@ -82,6 +120,20 @@ void hpe_fill_rect_i(HpePixmap *pm, int x, int y, int w, int h, HpeColor color)
     }
 }
 
+/**
+ * @brief 把 8 位覆盖率掩码合成到像素缓冲 / Composite an 8-bit coverage mask onto the pixel buffer
+ *
+ * @details 掩码逐行逐列按覆盖率与颜色 alpha 相乘后混合，超出裁剪范围的像素跳过。
+ *          Each mask pixel is blended after multiplying its coverage by the colour alpha; pixels outside the clip are skipped.
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     x 笔位置 X（设备像素）/ Pen X position in device pixels
+ * @param[in]     y 基线 Y（设备像素）/ Baseline Y in device pixels
+ * @param[in]     mask 字形覆盖率掩码 / Glyph coverage mask
+ * @param[in]     color 文字颜色 / Text colour
+ *
+ * @note `(x, y)` 是基线上的笔位置，掩码自身的 `baseline` 用于定位顶部 / `(x, y)` is the pen position on the baseline and the mask's own `baseline` is used to locate the top
+ */
 void hpe_draw_text_mask(HpePixmap *pm, int x, int y, const HpeTextMask *mask, HpeColor color)
 {
     int row, col;
@@ -115,10 +167,19 @@ void hpe_draw_text_mask(HpePixmap *pm, int x, int y, const HpeTextMask *mask, Hp
     }
 }
 
-/* ---------------- anti-aliased rounded rectangles ----------------
- * Coverage comes from the signed distance to a rounded box: the corners are the
- * only place where the distance is not axis aligned, which keeps this cheap
- * enough to use for every button and badge. */
+/**
+ * @brief 按覆盖率把一个颜色混合到单个像素 / Blend a colour into a single pixel by coverage
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     x 像素 X 坐标 / Pixel X coordinate
+ * @param[in]     y 像素 Y 坐标 / Pixel Y coordinate
+ * @param[in]     c 要混合的颜色 / Colour to blend
+ * @param[in]     cov 覆盖率 0..1，会自动夹取 / Coverage in 0..1, automatically clamped
+ *
+ * @note 越界、被裁剪或覆盖率非正的像素直接跳过；写入结果始终为不透明 / Pixels out of bounds, clipped away or with non-positive coverage are skipped; the written pixel is always opaque
+ *
+ * @see blend
+ */
 
 static void blend_px_pm(HpePixmap *pm, int x, int y, HpeColor c, float cov)
 {
@@ -150,7 +211,19 @@ static void blend_px_pm(HpePixmap *pm, int x, int y, HpeColor c, float cov)
            (uint32_t)((float)c.b * a + db * ia + 0.5f);
 }
 
-/* distance from a pixel centre to the rounded rect outline (negative inside) */
+/**
+ * @brief 求像素中心到圆角矩形轮廓的有符号距离 / Compute the signed distance from a pixel centre to a rounded-rectangle outline
+ *
+ * @param[in]     px 像素中心 X 坐标 / Pixel centre X
+ * @param[in]     py 像素中心 Y 坐标 / Pixel centre Y
+ * @param[in]     cx 矩形中心 X / Rectangle centre X
+ * @param[in]     cy 矩形中心 Y / Rectangle centre Y
+ * @param[in]     hw 矩形半宽 / Rectangle half width
+ * @param[in]     hh 矩形半高 / Rectangle half height
+ * @param[in]     r 圆角半径 / Corner radius
+ *
+ * @return 有符号距离，矩形内部为负 / Signed distance, negative inside the rectangle
+ */
 static float rrect_sdf(float px, float py, float cx, float cy, float hw, float hh, float r)
 {
     float dx = fabsf(px - cx) - (hw - r);
@@ -160,6 +233,23 @@ static float rrect_sdf(float px, float py, float cx, float cy, float hw, float h
     return sqrtf(ax * ax + ay * ay) - r;
 }
 
+/**
+ * @brief 按圆角矩形的距离场逐像素绘制填充或描边 / Rasterise a rounded rectangle pixel by pixel from its distance field
+ *
+ * @details 半径会夹到半宽/半高之内；描边时覆盖率来自到环带 `[-width, 0]` 的距离，否则来自到轮廓的距离。
+ *          The radius is clamped to the half width and half height; for a stroke the coverage comes from the distance to the band `[-width, 0]`, otherwise from the distance to the outline.
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     rect 目标矩形（用户空间坐标）/ Target rectangle in user-space coordinates
+ * @param[in]     r 圆角半径 / Corner radius
+ * @param[in]     width 描边宽度；填充时忽略 / Stroke width, ignored when filling
+ * @param[in]     color 颜色 / Colour
+ * @param[in]     stroke 非 0 表示画描边环，0 表示实心填充 / Non-zero draws a stroke ring, 0 fills solid
+ *
+ * @note 绘制范围在矩形四周各外扩 1 像素以容纳抗锯齿边 / The scan range extends one pixel beyond the rectangle on every side to accommodate the anti-aliased edge
+ *
+ * @see rrect_sdf blend_px_pm
+ */
 static void rrect_span(HpePixmap *pm, HpeRect rect, float r, float width, HpeColor color,
                        int stroke)
 {
@@ -192,6 +282,18 @@ static void rrect_span(HpePixmap *pm, HpeRect rect, float r, float width, HpeCol
     }
 }
 
+/**
+ * @brief 用纯色填充抗锯齿圆角矩形 / Fill an anti-aliased rounded rectangle with a solid colour
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     rect 目标矩形（用户空间坐标）/ Target rectangle in user-space coordinates
+ * @param[in]     radius 圆角半径 / Corner radius
+ * @param[in]     color 颜色 / Colour
+ *
+ * @note 半径不超过 0.5 时退化为直角矩形，直接调用 `hpe_fill_rect` / A radius of 0.5 or less degenerates to a square rectangle via `hpe_fill_rect`
+ *
+ * @see hpe_stroke_round_rect hpe_fill_rect
+ */
 void hpe_fill_round_rect(HpePixmap *pm, HpeRect rect, float radius, HpeColor color)
 {
     if (radius <= 0.5f) {
@@ -201,6 +303,19 @@ void hpe_fill_round_rect(HpePixmap *pm, HpeRect rect, float radius, HpeColor col
     rrect_span(pm, rect, radius, 0.0f, color, 0);
 }
 
+/**
+ * @brief 用纯色画圆角矩形的内描边环 / Stroke an inner border ring of a rounded rectangle
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     rect 目标矩形（用户空间坐标）/ Target rectangle in user-space coordinates
+ * @param[in]     radius 圆角半径 / Corner radius
+ * @param[in]     width 描边宽度 / Stroke width
+ * @param[in]     color 颜色 / Colour
+ *
+ * @note 宽度非正时不做任何事；半径不超过 0.5 时改为画四条直角边带 / Does nothing for a non-positive width; a radius of 0.5 or less draws four axis-aligned bands instead
+ *
+ * @see hpe_fill_round_rect rrect_span
+ */
 void hpe_stroke_round_rect(HpePixmap *pm, HpeRect rect, float radius, float width, HpeColor color)
 {
     if (width <= 0.0f)
@@ -216,11 +331,19 @@ void hpe_stroke_round_rect(HpePixmap *pm, HpeRect rect, float radius, float widt
     rrect_span(pm, rect, radius, width, color, 1);
 }
 
-/* ---------------- gradients ----------------
- * A linear gradient is a projection of the pixel onto the gradient axis: for
- * CSS `angle` (0 = to top, clockwise), the direction vector is
- * (sin a, -cos a). The gradient line is sized so the corners are covered
- * (|w*sin a| + |h*cos a|), matching the spec. */
+/**
+ * @brief 按参数 t 在色标列表中采样颜色 / Sample the colour of a stop list at parameter t
+ *
+ * @details t 落在首个色标之前或末个色标之后时取端点颜色，否则在相邻两色标间按位置线性插值。
+ *          A t before the first stop or after the last one takes the end colour; otherwise the colour is linearly interpolated between the two neighbouring stops.
+ *
+ * @param[in]     stops 色标数组 / Colour stop array
+ * @param[in]     n 色标个数；非正时写出全透明黑 / Number of stops, writing transparent black when non-positive
+ * @param[in]     t 采样位置 0..1 / Sample position in 0..1
+ * @param[out]    out 采样得到的颜色 / Receives the sampled colour
+ *
+ * @note 两色标位置重合时按前一个色标取色 / Coincident stops take the earlier stop's colour
+ */
 
 static void stop_sample(const HpeRasterStop *stops, int n, float t, HpeColor *out)
 {
@@ -258,11 +381,47 @@ static void stop_sample(const HpeRasterStop *stops, int n, float t, HpeColor *ou
     *out = stops[n - 1].color;
 }
 
+/**
+ * @brief 按参数 t 在色标列表中采样颜色 / Sample the colour of a stop list at parameter t
+ *
+ * @param[in]     stops 色标数组 / Colour stop array
+ * @param[in]     stop_count 色标个数 / Number of colour stops
+ * @param[in]     t 采样位置 0..1 / Sample position in 0..1
+ * @param[out]    out 采样得到的颜色 / Receives the sampled colour
+ *
+ * @note CSS 背景渐变与 SVG 渐变绘制共用的入口，实现在 `stop_sample` / Shared entry point for CSS background gradients and the SVG gradient painter, implemented by `stop_sample`
+ *
+ * @see stop_sample
+ */
 void hpe_sample_stops(const HpeRasterStop *stops, int stop_count, float t, HpeColor *out)
 {
     stop_sample(stops, stop_count, t, out);
 }
 
+/**
+ * @brief 在矩形内填充线性渐变 / Fill a rectangle with a linear gradient
+ *
+ * @details 渐变轴由 `angle_deg` 决定，方向向量为 `(sin a, -cos a)`，渐变线长度按 `
+ *          w*sin a
+ *          +
+ *          h*cos a
+ *          ` 覆盖到四角。
+ *          The gradient axis comes from `angle_deg` with direction vector `(sin a, -cos a)`; the gradient line is sized as `
+ *          w*sin a
+ *          +
+ *          h*cos a
+ *          ` so the corners are covered.
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     rect 目标矩形（用户空间坐标）/ Target rectangle in user-space coordinates
+ * @param[in]     angle_deg 渐变角度（度），0 向上、90 向右 / Gradient angle in degrees, 0 is upward and 90 rightward
+ * @param[in]     stops 色标数组 / Colour stop array
+ * @param[in]     stop_count 色标个数 / Number of colour stops
+ *
+ * @note 色标按位置扫描采样，无需预先排序；全透明色标跳过 / Stops are sampled by a position scan so they need not be pre-sorted; fully transparent stops are skipped
+ *
+ * @see hpe_fill_round_rect_gradient hpe_sample_stops
+ */
 void hpe_fill_linear_gradient(HpePixmap *pm, HpeRect rect, float angle_deg,
                               const HpeRasterStop *stops, int stop_count)
 {
@@ -309,7 +468,19 @@ void hpe_fill_linear_gradient(HpePixmap *pm, HpeRect rect, float angle_deg,
 }
 
 /* gradient clipped to a rounded rect: reuse the coverage of the filled rrect */
-/* fills a scratch pixmap with the linear gradient, sized to the rrect bounds */
+/**
+ * @brief 把线性渐变填满一块临时像素缓冲 / Fill a scratch pixel buffer with the linear gradient
+ *
+ * @param[in,out] local 临时像素缓冲 / Scratch pixel buffer
+ * @param[in]     dx 渐变方向向量 X 分量 / X component of the gradient direction
+ * @param[in]     dy 渐变方向向量 Y 分量 / Y component of the gradient direction
+ * @param[in]     stops 色标数组 / Colour stop array
+ * @param[in]     stop_count 色标个数 / Number of colour stops
+ *
+ * @note 渐变线以缓冲区中心为原点、按其尺寸覆盖，写入的颜色保留 alpha / The gradient line is centred on the buffer and sized to cover it; the written colours keep their alpha
+ *
+ * @see gradient_composite_rrect
+ */
 static void gradient_fill_scratch(HpePixmap *local, float dx, float dy, const HpeRasterStop *stops,
                                   int stop_count)
 {
@@ -334,7 +505,18 @@ static void gradient_fill_scratch(HpePixmap *local, float dx, float dy, const Hp
     }
 }
 
-/* composites the scratch gradient onto `pm` through the rrect's SDF coverage */
+/**
+ * @brief 按圆角矩形覆盖率把临时渐变合成到目标缓冲 / Composite the scratch gradient onto the target through the rounded-rect coverage
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     local 渐变临时缓冲（源）/ Scratch gradient buffer, the source
+ * @param[in]     rect 目标圆角矩形（用户空间坐标）/ Target rounded rectangle in user-space coordinates
+ * @param[in]     radius 圆角半径 / Corner radius
+ *
+ * @note 覆盖率来自与实心填充相同的距离场，采样坐标相对矩形左上角偏移 1 像素 / Coverage comes from the same distance field the solid fill uses, sampling with a one-pixel offset from the rectangle's top-left corner
+ *
+ * @see rrect_sdf gradient_fill_scratch
+ */
 static void gradient_composite_rrect(HpePixmap *pm, const HpePixmap *local, HpeRect rect,
                                      float radius)
 {
@@ -376,7 +558,23 @@ static void gradient_composite_rrect(HpePixmap *pm, const HpePixmap *local, HpeR
     }
 }
 
-/* gradient clipped to a rounded rect: reuse the coverage of the filled rrect */
+/**
+ * @brief 在圆角矩形内填充线性渐变 / Fill a rounded rectangle with a linear gradient
+ *
+ * @details 先把渐变画进与圆角矩形同尺寸的临时缓冲，再按圆角矩形的距离场覆盖率合成回目标缓冲。
+ *          The gradient is first painted into a scratch buffer the size of the rounded rectangle, then composited back through the rounded-rectangle distance-field coverage.
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     rect 目标矩形（用户空间坐标）/ Target rectangle in user-space coordinates
+ * @param[in]     radius 圆角半径 / Corner radius
+ * @param[in]     angle_deg 渐变角度（度），0 向上、90 向右 / Gradient angle in degrees, 0 is upward and 90 rightward
+ * @param[in]     stops 色标数组 / Colour stop array
+ * @param[in]     stop_count 色标个数 / Number of colour stops
+ *
+ * @note 半径不超过 0.5 时退化为普通线性渐变，直接调用 `hpe_fill_linear_gradient` / A radius of 0.5 or less degenerates to a plain linear gradient via `hpe_fill_linear_gradient`
+ *
+ * @see hpe_fill_linear_gradient hpe_fill_round_rect
+ */
 void hpe_fill_round_rect_gradient(HpePixmap *pm, HpeRect rect, float radius, float angle_deg,
                                   const HpeRasterStop *stops, int stop_count)
 {
@@ -412,10 +610,22 @@ void hpe_fill_round_rect_gradient(HpePixmap *pm, HpeRect rect, float radius, flo
     hpe_free(local.pixels);
 }
 
-/* ---------------- soft shadow ----------------
- * A gaussian blur would need a separable pass; a few concentric rounded rects
- * with decreasing alpha approximate it well enough for card shadows and keep
- * the inner region fully opaque. */
+/**
+ * @brief 在矩形周围绘制柔和投影 / Draw a soft drop shadow around a rectangle
+ *
+ * @details 用若干层同心圆角矩形（alpha 由外向内递增）近似高斯模糊，最内层保持完全不透明。
+ *          A gaussian blur is approximated by concentric rounded rectangles whose alpha increases inward, with the innermost layer fully opaque.
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     rect 投影矩形（用户空间坐标）/ The rectangle casting the shadow, in user-space coordinates
+ * @param[in]     radius 圆角半径 / Corner radius
+ * @param[in]     blur 模糊半径 / Blur radius
+ * @param[in]     color 颜色 / Colour
+ *
+ * @note 模糊半径小于 1 时退化为一次实心圆角矩形填充；层数夹在 1~24 / A blur below 1 degenerates to a single solid rounded-rectangle fill; the ring count is clamped to 1..24
+ *
+ * @see hpe_fill_round_rect
+ */
 void hpe_fill_shadow(HpePixmap *pm, HpeRect rect, float radius, float blur, HpeColor color)
 {
     int steps, i;

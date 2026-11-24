@@ -6,6 +6,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+/**
+ * @brief 分配一块堆内存 / Allocate a block of heap memory
+ *
+ * @param[in]     size 请求的字节数（0 视为 1）/ Requested byte count, 0 is treated as 1
+ *
+ * @return 指向新内存的指针 / Pointer to the new block
+ *
+ * @note 分配失败时打印错误并 abort，绝不返回 NULL / Prints an error and aborts on failure, never returns NULL
+ *
+ * @see hpe_calloc hpe_free
+ */
 void *hpe_alloc(size_t size)
 {
     void *p = malloc(size ? size : 1);
@@ -16,6 +27,16 @@ void *hpe_alloc(size_t size)
     return p;
 }
 
+/**
+ * @brief 分配并清零一块堆内存 / Allocate a zeroed block of heap memory
+ *
+ * @param[in]     count 元素个数（0 视为 1）/ Element count, 0 is treated as 1
+ * @param[in]     size 单个元素字节数（0 视为 1）/ Byte size of one element, 0 is treated as 1
+ *
+ * @return 指向已清零内存的指针 / Pointer to the zeroed block
+ *
+ * @note 分配失败时打印错误并 abort，绝不返回 NULL / Prints an error and aborts on failure, never returns NULL
+ */
 void *hpe_calloc(size_t count, size_t size)
 {
     void *p = calloc(count ? count : 1, size ? size : 1);
@@ -26,6 +47,16 @@ void *hpe_calloc(size_t count, size_t size)
     return p;
 }
 
+/**
+ * @brief 调整已分配内存块的大小 / Resize an allocated memory block
+ *
+ * @param[in,out] ptr 原内存块，可为 NULL / Previous block, may be NULL
+ * @param[in]     size 新字节数（0 视为 1）/ New byte count, 0 is treated as 1
+ *
+ * @return 指向新内存块的指针 / Pointer to the resized block
+ *
+ * @warning 失败时 abort，因此调用方无需检查 NULL / Aborts on failure, so callers need not check for NULL
+ */
 void *hpe_realloc(void *ptr, size_t size)
 {
     void *p = realloc(ptr, size ? size : 1);
@@ -36,6 +67,13 @@ void *hpe_realloc(void *ptr, size_t size)
     return p;
 }
 
+/**
+ * @brief 复制字符串到新分配的堆内存 / Duplicate a string onto the heap
+ *
+ * @param[in]     s 以 NUL 结尾的源字符串 / NUL-terminated source string
+ *
+ * @return 新分配的副本，调用方负责释放 / Newly allocated copy owned by the caller
+ */
 char *hpe_strdup(const char *s)
 {
     if (!s)
@@ -43,6 +81,16 @@ char *hpe_strdup(const char *s)
     return hpe_strndup(s, strlen(s));
 }
 
+/**
+ * @brief 复制字符串的前 n 个字节 / Duplicate the first n bytes of a string
+ *
+ * @param[in]     s 源字符串 / Source string
+ * @param[in]     n 最多复制的字节数 / Maximum number of bytes to copy
+ *
+ * @return 新分配且以 NUL 结尾的副本 / Newly allocated NUL-terminated copy
+ *
+ * @note 遇到 `\0` 提前结束；结果长度取 n 与 strlen(s) 的较小者 / Stops early at `\0`; the copy is min(n, strlen(s)) bytes long
+ */
 char *hpe_strndup(const char *s, size_t n)
 {
     char *p = (char *)hpe_alloc(n + 1);
@@ -52,11 +100,28 @@ char *hpe_strndup(const char *s, size_t n)
     return p;
 }
 
+/**
+ * @brief 释放引擎分配的内存 / Free memory allocated by the engine
+ *
+ * @param[in,out] ptr 待释放的指针，可为 NULL / Pointer to free, may be NULL
+ */
 void hpe_free(void *ptr)
 {
     free(ptr);
 }
 
+/**
+ * @brief 按需倍增数组容量 / Grow an array's capacity by repeated doubling
+ *
+ * @param[in,out] ptr 原数组，可为 NULL / Previous array, may be NULL
+ * @param[out]    cap 当前容量，写入新容量 / Current capacity, receives the new one
+ * @param[in]     need 需要的元素个数 / Required element count
+ * @param[in]     elem_size 单个元素字节数 / Byte size of one element
+ *
+ * @return 必要时重新分配后的数组指针 / Reallocated array pointer when growth was needed
+ *
+ * @note 容量不足时从 8 起翻倍直到覆盖 need；已够用时原样返回 / Doubles from 8 until `need` fits; returns the input untouched when it already does
+ */
 void *hpe_grow(void *ptr, size_t *cap, size_t need, size_t elem_size)
 {
     size_t newcap;
@@ -70,11 +135,28 @@ void *hpe_grow(void *ptr, size_t *cap, size_t need, size_t elem_size)
     return ptr;
 }
 
+/**
+ * @brief 把 ASCII 大写字母转为小写 / Lowercase an ASCII letter
+ *
+ * @param[in]     c 输入字符 / Input character
+ *
+ * @return 小写形式，非大写字母原样返回 / Lowercased character, other inputs unchanged
+ */
 int hpe_ascii_lower(int c)
 {
     return (c >= 'A' && c <= 'Z') ? c + ('a' - 'A') : c;
 }
 
+/**
+ * @brief 忽略大小写比较两个字符串 / Compare two strings case-insensitively
+ *
+ * @param[in]     a 第一个字符串，可为 NULL / First string, may be NULL
+ * @param[in]     b 第二个字符串，可为 NULL / Second string, may be NULL
+ *
+ * @return 相等返回 1 / 1 when equal
+ *
+ * @note 两个指针同为 NULL 时视为相等 / Two NULL pointers compare equal
+ */
 int hpe_str_ieq(const char *a, const char *b)
 {
     if (!a || !b)
@@ -88,6 +170,15 @@ int hpe_str_ieq(const char *a, const char *b)
     return *a == *b;
 }
 
+/**
+ * @brief 忽略大小写比较两个字符串的前 n 个字节 / Compare the first n bytes of two strings case-insensitively
+ *
+ * @param[in]     a 第一个字符串 / First string
+ * @param[in]     b 第二个字符串 / Second string
+ * @param[in]     n 比较的字节数 / Number of bytes to compare
+ *
+ * @return 前 n 个字节都相同返回 1 / 1 when the first n bytes match
+ */
 int hpe_str_ieq_n(const char *a, const char *b, size_t n)
 {
     size_t i;
@@ -100,16 +191,42 @@ int hpe_str_ieq_n(const char *a, const char *b, size_t n)
     return 1;
 }
 
+/**
+ * @brief 忽略大小写判断字符串是否以某前缀开头 / Test whether a string starts with a prefix, case-insensitively
+ *
+ * @param[in]     s 待检查字符串 / String to inspect
+ * @param[in]     prefix 前缀 / Prefix to look for
+ *
+ * @return 以前缀开头返回 1 / 1 when the prefix matches
+ */
 int hpe_starts_with_i(const char *s, const char *prefix)
 {
     return hpe_str_ieq_n(s, prefix, strlen(prefix));
 }
 
+/**
+ * @brief 判断字符是否为 ASCII 空白 / Test whether a character is ASCII whitespace
+ *
+ * @param[in]     c 输入字符 / Input character
+ *
+ * @return 是空白返回 1 / 1 for whitespace
+ *
+ * @note 空白集合为空格、`\t`、`\n`、`\r`、`\f`、`\v` / The set is space, `\t`, `\n`, `\r`, `\f` and `\v`
+ */
 int hpe_is_space(char c)
 {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
 }
 
+/**
+ * @brief 就地去除字符串首尾空白 / Trim leading and trailing whitespace in place
+ *
+ * @param[in,out] s 可修改的字符串，可为 NULL / Mutable string, may be NULL
+ *
+ * @return 去掉前导空白后的起始指针 / Pointer past the leading whitespace
+ *
+ * @warning 会写入 s 的内容，不可传字符串字面量 / Writes into `s`, so never pass a string literal
+ */
 char *hpe_trim(char *s)
 {
     char *end;
@@ -124,6 +241,16 @@ char *hpe_trim(char *s)
     return s;
 }
 
+/**
+ * @brief 解码下一个 UTF-8 码点 / Decode the next UTF-8 code point
+ *
+ * @param[in]     s 指向码点起始字节 / Points at the first byte of the code point
+ * @param[out]    cp 解码出的码点 / Decoded code point
+ *
+ * @return 消耗的字节数（至少 1）/ Number of bytes consumed, at least 1
+ *
+ * @note 非法序列写出 U+FFFD 并只前进 1 字节，因此不会死循环 / Illegally encoded sequences yield U+FFFD and advance one byte, so the caller never loops
+ */
 int hpe_utf8_next(const char *s, uint32_t *cp)
 {
     const unsigned char *p = (const unsigned char *)s;
@@ -158,6 +285,16 @@ int hpe_utf8_next(const char *s, uint32_t *cp)
     return extra + 1;
 }
 
+/**
+ * @brief 向前回退一个 UTF-8 码点 / Step back one UTF-8 code point
+ *
+ * @param[in]     begin 缓冲区起始指针 / Start of the buffer
+ * @param[in]     cur 当前指针 / Current pointer
+ *
+ * @return 回退消耗的字节数，已在起始处返回 0 / Bytes to step back, 0 when already at `begin`
+ *
+ * @note 只扫描 continuation 字节（`0b10xxxxxx`）/ Only continuation bytes are scanned
+ */
 int hpe_utf8_prev(const char *begin, const char *cur)
 {
     int n = 1;
@@ -171,6 +308,16 @@ int hpe_utf8_prev(const char *begin, const char *cur)
     return n;
 }
 
+/**
+ * @brief 把一个码点编码为 UTF-8 / Encode a code point as UTF-8
+ *
+ * @param[in]     cp Unicode 码点 / Unicode code point
+ * @param[out]    out 至少 4 字节的输出缓冲 / Output buffer of at least 4 bytes
+ *
+ * @return 写出的字节数（1~4）/ Number of bytes written, 1 to 4
+ *
+ * @note 不做范围校验，码点大于 U+10FFFF 时按 4 字节写入 / Range is not validated; code points above U+10FFFF are still written as 4 bytes
+ */
 int hpe_utf8_encode(uint32_t cp, char out[4])
 {
     if (cp < 0x80) {
@@ -195,7 +342,11 @@ int hpe_utf8_encode(uint32_t cp, char out[4])
     return 4;
 }
 
-/* ---------- lengths ---------- */
+/**
+ * @brief 构造 `auto` 长度 / Build an `auto` length
+ *
+ * @return 单位为 `HPE_LEN_AUTO` 的长度值 / A length whose unit is `HPE_LEN_AUTO`
+ */
 
 HpeLength hpe_len_auto(void)
 {
@@ -205,6 +356,13 @@ HpeLength hpe_len_auto(void)
     return l;
 }
 
+/**
+ * @brief 构造像素长度 / Build a pixel length
+ *
+ * @param[in]     v 像素值 / Value in pixels
+ *
+ * @return 单位为 `HPE_LEN_PX` 的长度值 / A length whose unit is `HPE_LEN_PX`
+ */
 HpeLength hpe_len_px(float v)
 {
     HpeLength l;
@@ -213,6 +371,13 @@ HpeLength hpe_len_px(float v)
     return l;
 }
 
+/**
+ * @brief 构造百分比长度 / Build a percentage length
+ *
+ * @param[in]     v 百分比数值（未除 100）/ Percentage value, not divided by 100
+ *
+ * @return 单位为 `HPE_LEN_PCT` 的长度值 / A length whose unit is `HPE_LEN_PCT`
+ */
 HpeLength hpe_len_pct(float v)
 {
     HpeLength l;
@@ -221,6 +386,14 @@ HpeLength hpe_len_pct(float v)
     return l;
 }
 
+/**
+ * @brief 按指定单位构造长度 / Build a length with an explicit unit
+ *
+ * @param[in]     v 数值 / Numeric value
+ * @param[in]     unit 长度单位 / Length unit
+ *
+ * @return 构造出的长度值 / The constructed length
+ */
 HpeLength hpe_len_unit(float v, HpeLenUnit unit)
 {
     HpeLength l;
@@ -229,18 +402,45 @@ HpeLength hpe_len_unit(float v, HpeLenUnit unit)
     return l;
 }
 
+/**
+ * @brief 判断长度是否为绝对像素值 / Test whether a length is an absolute pixel value
+ *
+ * @param[in]     len 待检查长度 / Length to inspect
+ *
+ * @return 单位为 px 返回 1 / 1 when the unit is px
+ *
+ * @note 解析期已把物理单位换算为 px，因此此类长度无需上下文即可求值 / Physical units were already converted at parse time, so no layout context is needed to resolve it
+ */
 int hpe_len_is_px(HpeLength len)
 {
     return len.unit == HPE_LEN_PX;
 }
 
+/**
+ * @brief 判断长度是否为 `auto` / Test whether a length is `auto`
+ *
+ * @param[in]     len 待检查长度 / Length to inspect
+ *
+ * @return `auto` 返回 1 / 1 for `auto`
+ */
 int hpe_len_is_auto(HpeLength len)
 {
     return len.unit == HPE_LEN_AUTO;
 }
 
-/* unit suffixes are matched longest-first so "vmin" does not shadow "vh" and
- * "rem" does not shadow "em" (both start with a shared prefix). */
+/**
+ * @brief 把单位后缀映射为长度单位枚举 / Map a unit suffix to a length unit
+ *
+ * @details 后缀按最长优先匹配，避免 `vmin` 被 `vh` 抢先、`rem` 被 `em` 抢先。
+ *          Suffixes are matched longest-first so that `vmin` does not shadow `vh` and `rem` does not shadow `em`.
+ *
+ * @param[in]     s 单位后缀，如 `rem`、`vh` / Unit suffix such as `rem` or `vh`
+ * @param[out]    out 映射到的单位 / Mapped unit
+ *
+ * @return 识别成功返回 1 / 1 when the suffix was recognised
+ *
+ * @note `ex` 归入 em、`pc`/`pt` 归入 pt、`in`/`cm`/`mm`/`q` 归入 px / `ex` maps to em, `pc` and `pt` to pt, `in`/`cm`/`mm`/`q` to px
+ */
 static int len_unit_from_suffix(const char *s, HpeLenUnit *out)
 {
     static const struct {
@@ -263,6 +463,15 @@ static int len_unit_from_suffix(const char *s, HpeLenUnit *out)
     return 0;
 }
 
+/**
+ * @brief 解析 CSS 长度字面量 / Parse a CSS length literal
+ *
+ * @param[in]     s 长度文本，可为 NULL / Length text, may be NULL
+ *
+ * @return 解析出的长度值 / The parsed length
+ *
+ * @note 支持 `auto`、`%`、`px`、`em`、`rem`、`vw`、`vh`、`ch`、`pt`、`pc`、`in`、`cm`、`mm`、`q`；物理单位按 96dpi 立即折算为 px，无法识别时按 px 处理 / Accepts `auto`, `%`, `px`, `em`, `rem`, `vw`, `vh`, `ch`, `pt`, `pc`, `in`, `cm`, `mm` and `q`; physical units become px at 96dpi and unrecognised suffixes fall back to px
+ */
 HpeLength hpe_len_parse(const char *s)
 {
     char buf[64];
@@ -313,11 +522,38 @@ HpeLength hpe_len_parse(const char *s)
     return hpe_len_px(v);
 }
 
+/**
+ * @brief 把长度按基准值求值为像素 / Resolve a length against a single base value
+ *
+ * @param[in]     len 待求值长度 / Length to resolve
+ * @param[in]     base 百分比基准（通常为包含块宽度）/ Percentage base, normally the containing block width
+ *
+ * @return 像素值；`auto` 返回 -1 / Pixel value, or -1 for `auto`
+ *
+ * @note 相对单位（em/rem/vw/vh/ch）一律按 0 上下文求值，等价于传全 0 给 hpe_len_resolve_full / Relative units are resolved with an all-zero context
+ *
+ * @see hpe_len_resolve_full
+ */
 float hpe_len_resolve(HpeLength len, float base)
 {
     return hpe_len_resolve_full(len, base, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
 }
 
+/**
+ * @brief 带完整上下文地把长度求值为像素 / Resolve a length to pixels with a full context
+ *
+ * @param[in]     len 待求值长度 / Length to resolve
+ * @param[in]     base 百分比基准（包含块宽度或高度）/ Percentage base
+ * @param[in]     font_size 元素自身字号，供 em 使用（0 视为 16）/ Element font size for em, 0 falls back to 16
+ * @param[in]     root_font_size 根元素字号，供 rem 使用（0 视为 16）/ Root font size for rem, 0 falls back to 16
+ * @param[in]     vw 视口宽度，供 vw 使用 / Viewport width for vw
+ * @param[in]     vh 视口高度，供 vh 使用 / Viewport height for vh
+ * @param[in]     ch_width `0` 字形步进宽度，供 ch 使用 / Advance width of the `0` glyph for ch
+ *
+ * @return 像素值；`auto` 返回 -1 / Pixel value, or -1 for `auto`
+ *
+ * @note 缺省上下文时 em/rem 退回 16px、vw/vh 退回 16px、ch 退回半字号 / With a missing context em and rem fall back to 16px, vw and vh to 16px, and ch to half the font size
+ */
 float hpe_len_resolve_full(HpeLength len, float base, float font_size, float root_font_size,
                            float vw, float vh, float ch_width)
 {
@@ -426,6 +662,13 @@ static const HpeNamedColor g_named_colors[] = {
     {"yellowgreen", 0x9ACD32, 255},
 };
 
+/**
+ * @brief 把十六进制字符转成数值 / Convert a hexadecimal digit to its value
+ *
+ * @param[in]     c 输入字符 / Input character
+ *
+ * @return 0~15，非十六进制字符返回 -1 / 0 to 15, or -1 when the character is not a hex digit
+ */
 static int hex_val(char c)
 {
     if (c >= '0' && c <= '9')
@@ -436,7 +679,20 @@ static int hex_val(char c)
     return -1;
 }
 
-/* ---------- charset ---------- */
+/**
+ * @brief 把 Latin-1/cp1252 字节流转换为 UTF-8 / Transcode a Latin-1/cp1252 byte stream to UTF-8
+ *
+ * @details `0x80`~`0x9F` 经 cp1252 表映射（弯引号、破折号、省略号、欧元符号等），其余按 Latin-1 处理。
+ *          Bytes `0x80` to `0x9F` go through the cp1252 table (curly quotes, dashes, ellipsis, euro sign, ...), everything else is treated as Latin-1.
+ *
+ * @param[in]     src 源字节流 / Source bytes
+ * @param[in]     len 源字节数 / Source byte count
+ * @param[out]    out_len 结果的 UTF-8 字节数，可为 NULL / Result length in bytes, may be NULL
+ *
+ * @return 新分配且以 NUL 结尾的 UTF-8 字符串 / Newly allocated NUL-terminated UTF-8 string
+ *
+ * @note 调用方负责释放返回值 / The caller owns the returned buffer
+ */
 
 char *hpe_latin1_to_utf8(const char *src, size_t len, size_t *out_len)
 {
@@ -472,7 +728,17 @@ char *hpe_latin1_to_utf8(const char *src, size_t len, size_t *out_len)
     return out;
 }
 
-/* `#rgb` / `#rgba` (3/4 digits, each doubled) */
+/**
+ * @brief 解析 `#rgb` / `#rgba` 短十六进制颜色 / Parse a `#rgb` or `#rgba` short hex colour
+ *
+ * @param[in]     s 以 `#` 开头的颜色文本 / Colour text beginning with `#`
+ * @param[in]     len 文本长度 / Text length
+ * @param[out]    out 解析出的颜色 / Parsed colour
+ *
+ * @return 解析成功返回 1 / 1 on success
+ *
+ * @note 每个十六进制位重复一次展开为 8 位分量；4 位形式第 4 位为 alpha / Each digit is doubled to form a full byte; a 4-digit form carries alpha
+ */
 static int color_parse_hex_short(const char *s, size_t len, HpeColor *out)
 {
     int v[4] = {0, 0, 0, 15};
@@ -492,7 +758,17 @@ static int color_parse_hex_short(const char *s, size_t len, HpeColor *out)
     return 1;
 }
 
-/* `#rrggbb` / `#rrggbbaa` (6/8 digits) */
+/**
+ * @brief 解析 `#rrggbb` / `#rrggbbaa` 长十六进制颜色 / Parse a `#rrggbb` or `#rrggbbaa` long hex colour
+ *
+ * @param[in]     s 以 `#` 开头的颜色文本 / Colour text beginning with `#`
+ * @param[in]     len 文本长度 / Text length
+ * @param[out]    out 解析出的颜色 / Parsed colour
+ *
+ * @return 解析成功返回 1 / 1 on success
+ *
+ * @note 6 位形式省略 alpha 时视为不透明 / A 6-digit form implies full opacity
+ */
 static int color_parse_hex_long(const char *s, size_t len, HpeColor *out)
 {
     uint8_t v[4] = {0, 0, 0, 255};
@@ -513,16 +789,30 @@ static int color_parse_hex_long(const char *s, size_t len, HpeColor *out)
     return 1;
 }
 
-/* skips the separators (` `, `,`, `/`) that divide functional-notation parts */
+/**
+ * @brief 跳过函数式颜色参数间的分隔符 / Skip the separators between functional colour arguments
+ *
+ * @param[in,out] pp 读写游标指针 / Read-write cursor pointer
+ *
+ * @note 分隔符为空格、逗号和斜杠 / The separators are space, comma and slash
+ */
 static void color_skip_seps(const char **pp)
 {
     while (**pp == ' ' || **pp == ',' || **pp == '/')
         (*pp)++;
 }
 
-/* reads up to four numeric components of a `rgb()` / `hsl()` argument list;
- * `pct` receives 1 for each component written with a trailing '%'. Returns the
- * number of components read. */
+/**
+ * @brief 读取 `rgb()` / `hsl()` 参数表里的数值分量 / Read the numeric components of an `rgb()` or `hsl()` argument list
+ *
+ * @param[in]     p 指向左括号的文本 / Text pointing at the opening parenthesis
+ * @param[out]    comp 分量数组，容量至少 4 / Component array of at least 4 slots
+ * @param[out]    pct 每个分量是否带百分号 / Percent-sign flag per component
+ *
+ * @return 实际读到的分量个数（0~4）/ Number of components read, 0 to 4
+ *
+ * @note 带 `%` 的 rgb 分量按 255 折算，第 4 个分量（alpha）按 1.0 折算 / Percent-suffixed rgb components scale to 255, while the fourth (alpha) scales to 1.0
+ */
 static int color_read_components(const char *p, float *comp, int *pct)
 {
     int idx = 0;
@@ -554,6 +844,13 @@ static int color_read_components(const char *p, float *comp, int *pct)
     return idx;
 }
 
+/**
+ * @brief 把浮点数夹到 [0, 1] / Clamp a float into [0, 1]
+ *
+ * @param[in]     v 输入值 / Input value
+ *
+ * @return 夹取后的值 / The clamped value
+ */
 static float clamp01(float v)
 {
     if (v < 0.0f)
@@ -563,6 +860,13 @@ static float clamp01(float v)
     return v;
 }
 
+/**
+ * @brief 把浮点数夹到 [0, 255] 并转为字节 / Clamp a float into [0, 255] and narrow it to a byte
+ *
+ * @param[in]     v 输入值 / Input value
+ *
+ * @return 夹取并取整后的字节 / The clamped byte
+ */
 static uint8_t clamp_byte(float v)
 {
     if (v < 0.0f)
@@ -572,7 +876,16 @@ static uint8_t clamp_byte(float v)
     return (uint8_t)v;
 }
 
-/* `rgb(r, g, b[, a])` and the `%`-based form */
+/**
+ * @brief 解析 `rgb()` 颜色函数 / Parse an `rgb()` colour function
+ *
+ * @param[in]     s 以 `rgb(` 开头的颜色文本 / Colour text beginning with `rgb(`
+ * @param[out]    out 解析出的颜色 / Parsed colour
+ *
+ * @return 解析成功返回 1 / 1 on success
+ *
+ * @note 支持 `rgb(r, g, b)`、`rgb(r, g, b, a)` 以及各分量的百分比写法 / Accepts `rgb(r, g, b)`, `rgb(r, g, b, a)` and percentage forms
+ */
 static int color_parse_rgb(const char *s, HpeColor *out)
 {
     const char *p = strchr(s, '(');
@@ -593,7 +906,16 @@ static int color_parse_rgb(const char *s, HpeColor *out)
     return 1;
 }
 
-/* maps the hue sextant to the rgb chroma triple used by hsl→rgb */
+/**
+ * @brief 把色相扇区映射为 HSL 转 RGB 所需的色度三元组 / Map a hue sextant to the chroma triple used by the HSL-to-RGB conversion
+ *
+ * @param[in]     sextant 色相扇区 0~5 / Hue sextant, 0 to 5
+ * @param[in]     c 色度 / Chroma
+ * @param[in]     x 中间分量 / Intermediate component
+ * @param[out]    r 红色分量 / Red component
+ * @param[out]    g 绿色分量 / Green component
+ * @param[out]    b 蓝色分量 / Blue component
+ */
 static void hsl_sextant_rgb(int sextant, float c, float x, float *r, float *g, float *b)
 {
     switch (sextant) {
@@ -606,8 +928,16 @@ static void hsl_sextant_rgb(int sextant, float c, float x, float *r, float *g, f
     }
 }
 
-/* reads up to four components of a `hsl()` argument list, applying /100 to any
- * component written with a trailing '%'; returns the count read */
+/**
+ * @brief 读取 `hsl()` 参数表里的数值分量 / Read the numeric components of an `hsl()` argument list
+ *
+ * @param[in]     p 指向左括号的文本 / Text pointing at the opening parenthesis
+ * @param[out]    comp 分量数组，容量至少 4 / Component array of at least 4 slots
+ *
+ * @return 实际读到的分量个数（0~4）/ Number of components read, 0 to 4
+ *
+ * @note 带 `%` 的分量就地除以 100，得到 0~1 的归一值 / Percent-suffixed components are divided by 100 into the 0..1 range
+ */
 static int color_read_hsl_components(const char *p, float *comp)
 {
     int idx = 0;
@@ -635,7 +965,16 @@ static int color_read_hsl_components(const char *p, float *comp)
     return idx;
 }
 
-/* `hsl(h, s%, l%[, a])` */
+/**
+ * @brief 解析 `hsl()` 颜色函数 / Parse an `hsl()` colour function
+ *
+ * @param[in]     s 以 `hsl(` 开头的颜色文本 / Colour text beginning with `hsl(`
+ * @param[out]    out 解析出的颜色 / Parsed colour
+ *
+ * @return 解析成功返回 1 / 1 on success
+ *
+ * @note 支持 `hsl(h, s%, l%)` 与带 alpha 的四分量形式；色相按度取模 360 / Accepts `hsl(h, s%, l%)` and the four-component alpha form; hue wraps modulo 360 degrees
+ */
 static int color_parse_hsl(const char *s, HpeColor *out)
 {
     const char *p = strchr(s, '(');
@@ -667,7 +1006,17 @@ static int color_parse_hsl(const char *s, HpeColor *out)
     return 1;
 }
 
-/* case-insensitive lookup of a CSS named colour */
+/**
+ * @brief 按具名色表解析颜色 / Resolve a colour from the named-colour table
+ *
+ * @param[in]     s 颜色名 / Colour name
+ * @param[in]     len 名称长度 / Name length
+ * @param[out]    out 解析出的颜色 / Parsed colour
+ *
+ * @return 命中返回 1 / 1 when the name was found
+ *
+ * @note 表内为完整的 CSS Color 4 具名色（含两种 gray/grey 拼写）与 `transparent` / The table holds the full CSS Color 4 set including both grey spellings and `transparent`
+ */
 static int color_parse_named(const char *s, size_t len, HpeColor *out)
 {
     size_t i;
@@ -686,6 +1035,16 @@ static int color_parse_named(const char *s, size_t len, HpeColor *out)
     return 0;
 }
 
+/**
+ * @brief 解析任意 CSS 颜色写法 / Parse any supported CSS colour notation
+ *
+ * @param[in]     s 颜色文本，可为 NULL / Colour text, may be NULL
+ * @param[out]    out 解析出的颜色 / Parsed colour
+ *
+ * @return 解析成功返回 1 / 1 on success
+ *
+ * @note 依次尝试具名色、`#` 十六进制短/长写法、`rgb()`/`rgba()`、`hsl()`/`hsla()` / Tries named colours, short and long `#` hex, `rgb()`/`rgba()` and `hsl()`/`hsla()`
+ */
 int hpe_color_parse(const char *s, HpeColor *out)
 {
     size_t len;

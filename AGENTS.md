@@ -19,6 +19,31 @@
 - 函数注释：参考 docs/AI纯C语言注释规范.md —— 所有函数必须写 Doxygen 风格文档注释
   （`/**` 开头、中英双语「中文 / English」、`@param[in|out|in,out]` 标注方向、
   标签顺序 `@brief`→`@details`→`@param`→`@return`→`@retval`→`@note`→`@warning`→`@see`）。
+- **落地状态**：`src/` 全部 1742 个函数定义与原型（含头文件里的 `static inline`）均已带合规
+  注释块（1742 个 `/**`、5184 个 `@param`）。新增/修改函数时按同规范补注释，可复用 `tools/`
+  下的生成管线（见下）。
+
+## 注释维护工具（tools/）
+- `tools/doxy_extract.py` —— 字符串/注释感知地提取全部函数定义与原型（`.c` 与 `.h` 都会扫，
+  头文件里的 `static inline` 定义同样计入），产出 `tools/functions.json`。
+- `tools/doxy_apply.py` —— 依据描述表把 Doxygen 块插入源码，幂等（已有 `/**` 则跳过），
+  支持 `--dry` 预演、`--force` 覆盖；自动合并 `*.part*.json` 分片。
+  参数方向按类型推断（`const` 指针→`in`，其余指针→`in,out`，按值→`in`），
+  `@param[...]` 标签统一 15 列宽对齐，参数名恒从第 18 列开始。
+- `tools/paramdict.json` —— 全局参数名词典（561 条，覆盖全部 5184 个参数名），避免逐函数重复描述
+  通用参数（`js`/`engine`/`node`/`out`/`s`…）。
+- `tools/notes/<模块>__<文件>.json` —— 每文件的函数描述表（`brief`/`params`/`return`/`retval`/
+  `note`/`warning`/`see`）。
+- `tools/NOTES_SPEC.md` —— 描述表编写规范。
+
+改动函数签名后的标准流程：
+
+```
+python tools/doxy_extract.py            # 刷新函数清单
+python tools/doxy_apply.py <文件> --dry  # 预演，确认 skip=0
+python tools/doxy_apply.py <文件>        # 插入
+python tools/doxy_apply.py --dry         # 全树校验：应为 0 blocks（幂等）
+```
 
 ## 已确定的技术选型
 - 抽象平台层 + 自研软件光栅（像素级自己合成，不依赖 Direct2D/Skia）。
@@ -91,6 +116,9 @@ docs/                    design.md（设计文档）、需求.md（需求清单�
                          func_len_audit.py（函数长度自查：python3 docs/func_len_audit.py 50）、
                          run_tests.sh（回归入口：逐字节像素基线 + js-modern/js-builtins/dom-mutation/
                          html-parse 断言 + headless ES 模块）
+tools/                   doxy_extract.py / doxy_apply.py（Doxygen 注释批量提取与插入）、
+                         paramdict.json（全局参数词典 561 条）、NOTES_SPEC.md（描述表规范）、
+                         notes/（每文件的函数描述表）、functions.json（函数清单缓存）
 ```
 
 ## 构建与运行

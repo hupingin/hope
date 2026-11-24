@@ -42,6 +42,16 @@ static const char *k_in_row[] = {"td", "th", "script", "style", "template", NULL
 static const char *k_in_select[] = {"option", "optgroup", "hr", "script",
                                     "style", "template", NULL};
 
+/**
+ * @brief 判断字符串是否命中以 NULL 结尾的字符串表 / Test whether a string appears in a NULL-terminated string table
+ *
+ * @param[in]     list 以 `NULL` 结尾的字符串数组 / A `NULL`-terminated array of strings
+ * @param[in]     tag 待查找的字符串 / String to look up
+ *
+ * @return 命中返回 1，否则 0 / 1 when found, otherwise 0
+ *
+ * @note 用于标签集合的成员判定（如 `k_void_tags`、`k_closes_p`）/ Used for tag-set membership tests such as `k_void_tags` and `k_closes_p`
+ */
 static int in_list(const char **list, const char *tag)
 {
     int i;
@@ -52,12 +62,29 @@ static int in_list(const char **list, const char *tag)
     return 0;
 }
 
+/**
+ * @brief 判断标签是否为 `h1`~`h6` / Test whether a tag is `h1` through `h6`
+ *
+ * @param[in]     tag 标签名 / Tag name
+ *
+ * @return 是标题标签返回 1 / 1 when the tag is a heading
+ *
+ * @note 标题之间互相隐式闭合，此判定用于该规则 / Headings implicitly close one another, and this predicate backs that rule
+ */
 static int is_heading(const char *tag)
 {
     return tag[0] == 'h' && tag[1] >= '1' && tag[1] <= '6' && tag[2] == '\0';
 }
 
-/* ---------------- entity decoding ---------------- */
+/**
+ * @brief 在具名实体表中查找字符实体的 UTF-8 值 / Look up the UTF-8 value of a named character entity
+ *
+ * @param[in]     name 实体名，不含前导 `&` 与结尾 `;` / Entity name without the leading `&` or trailing `;`
+ *
+ * @return 对应的 UTF-8 字节串（静态存储）或 `NULL` / The UTF-8 byte string in static storage, or `NULL`
+ *
+ * @note 表内覆盖 `amp`、`lt`、`nbsp`、`copy`、`mdash` 等常用实体 / The table covers common entities such as `amp`, `lt`, `nbsp`, `copy` and `mdash`
+ */
 
 static const char *entity_named(const char *name)
 {
@@ -82,8 +109,20 @@ static const char *entity_named(const char *name)
     return NULL;
 }
 
-/* decodes a single `&...;` token at `s` (length `len`); returns the number of
- * utf-8 bytes written to `out` (max 4) or 0 when the token is not recognised */
+/**
+ * @brief 解码单个 `&...;` 实体 / Decode a single `&...;` entity token
+ *
+ * @details 支持十进制 `&#123;` 与十六进制 `&#x1F600;` 数字实体，以及 `entity_named` 表中的具名实体。
+ *          Numeric forms `&#123;` and `&#x1F600;` are decoded, as are the named entities in the `entity_named` table.
+ *
+ * @param[in]     s 指向 `&` 之后、`;` 之前的实体正文 / Entity body after the `&` and before the `;`
+ * @param[in]     len 实体正文加上结尾 `;` 的字节数 / Byte count of the body including the trailing `;`
+ * @param[out]    out 写入最多 4 字节 UTF-8 的缓冲 / Buffer receiving up to 4 UTF-8 bytes
+ *
+ * @return 写出的 UTF-8 字节数（1~4），无法识别时 0 / UTF-8 bytes written, 1 to 4, or 0 when unrecognised
+ *
+ * @note 正文长度必须小于 16 且以 `;` 结尾，否则返回 0 / The body must be shorter than 16 bytes and end with `;`, otherwise 0 is returned
+ */
 static int decode_one_entity(const char *s, size_t len, char out[4])
 {
     char ent[16];
@@ -131,6 +170,20 @@ static int decode_one_entity(const char *s, size_t len, char out[4])
     }
 }
 
+/**
+ * @brief 把一段文本里的字符实体全部解码 / Decode every character entity in a text run
+ *
+ * @details 逐字节扫描，遇到 `&` 时按最长 12 字节向前找 `;`，识别则替换、否则原样保留。
+ *          Scans byte by byte; on `&` it looks ahead up to 12 bytes for `;` and replaces when recognised, otherwise copies verbatim.
+ *
+ * @param[in]     s 以 NUL 结尾的字符串 / NUL-terminated string
+ * @param[in]     len 源文本字节数 / Source byte count
+ * @param[out]    out_len 解码结果的字节数，可为 `NULL` / Result byte count, may be `NULL`
+ *
+ * @return 新分配且以 NUL 结尾的解码文本 / Newly allocated NUL-terminated decoded text
+ *
+ * @note 输出缓冲按输入长度 +1 分配，实体替换不会超出该大小 / The output is allocated at the input length plus one, and entity replacement never exceeds it
+ */
 static char *decode_entities(const char *s, size_t len, size_t *out_len)
 {
     char *out = (char *)hpe_alloc(len + 1);
@@ -180,6 +233,14 @@ typedef struct {
     NodeStack stack;
 } Parser;
 
+/**
+ * @brief 把节点压入开放元素栈 / Push a node onto the open-element stack
+ *
+ * @param[in,out] st 开放元素栈 / The open-element stack
+ * @param[in,out] node 压入的节点 / Node being pushed
+ *
+ * @note 按需倍增内部数组容量 / The internal array grows by doubling as needed
+ */
 static void stack_push(NodeStack *st, HpeDomNode *node)
 {
     st->items = (HpeDomNode **)hpe_grow(st->items, &st->cap, (size_t)st->count + 1,
@@ -187,6 +248,15 @@ static void stack_push(NodeStack *st, HpeDomNode *node)
     st->items[st->count++] = node;
 }
 
+/**
+ * @brief 取得当前的插入位置节点 / Obtain the current insertion point node
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ *
+ * @return 栈顶元素，栈空时返回 `<body>` / The stack top, or the `<body>` element when the stack is empty
+ *
+ * @note 树构建阶段的“当前节点”概念 / The “current node” concept of the tree-construction stage
+ */
 static HpeDomNode *current_node(Parser *p)
 {
     if (p->stack.count > 0)
@@ -194,11 +264,28 @@ static HpeDomNode *current_node(Parser *p)
     return p->body;
 }
 
+/**
+ * @brief 只看不弹地取得栈顶节点 / Peek at the top node of the stack
+ *
+ * @param[in,out] st 开放元素栈 / The open-element stack
+ *
+ * @return 栈顶节点，栈空时 `NULL` / The top node, or `NULL` when the stack is empty
+ */
 static HpeDomNode *stack_top(NodeStack *st)
 {
     return st->count > 0 ? st->items[st->count - 1] : NULL;
 }
 
+/**
+ * @brief 反复弹栈直到指定节点被弹出 / Pop the stack until the given node has been popped
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ * @param[in,out] node 目标节点；栈被清空仍未遇到时全部弹出 / Target node, with everything popped when it is never reached
+ *
+ * @note 该节点自身也会被弹出（含端点）/ The node itself is popped as well (inclusive)
+ *
+ * @see stack_top
+ */
 static void stack_pop_to(Parser *p, HpeDomNode *node)
 {
     while (p->stack.count > 0) {
@@ -209,6 +296,15 @@ static void stack_pop_to(Parser *p, HpeDomNode *node)
     }
 }
 
+/**
+ * @brief 判断字符串是否全为空白 / Test whether a string is entirely whitespace
+ *
+ * @param[in]     s 以 NUL 结尾的字符串 / NUL-terminated string
+ *
+ * @return 全为空白（含空串）返回 1 / 1 when every character is whitespace, including the empty string
+ *
+ * @note 空白集合由 `hpe_is_space` 定义 / The whitespace set is defined by `hpe_is_space`
+ */
 static int all_whitespace(const char *s)
 {
     for (; *s; s++) {
@@ -218,10 +314,16 @@ static int all_whitespace(const char *s)
     return 1;
 }
 
-/* ---------------- table context / foster parenting ----------------
- * When text or a non-table element appears directly inside table/tbody/thead/
- * tfoot/tr, the HTML parser "fosters" it to just before the nearest <table>
- * (that is why a stray <div> in a table renders above it in browsers). */
+/**
+ * @brief 判断节点是否处于表格插入上下文 / Test whether a node is a table insertion context
+ *
+ * @details 这些节点只接受合法的表格内容，其它文本与元素要被 foster parenting 搬到最近的 `<table>` 之前。
+ *          These nodes only accept legal table content, so other text and elements are foster-parented to just before the nearest `<table>`.
+ *
+ * @param[in,out] n 待检查的节点，可为 `NULL` / Node to inspect, may be `NULL`
+ *
+ * @return 是 `table`/`tbody`/`thead`/`tfoot`/`tr` 元素返回 1 / 1 for a `table`, `tbody`, `thead`, `tfoot` or `tr` element
+ */
 
 static int in_table_context(HpeDomNode *n)
 {
@@ -232,6 +334,16 @@ static int in_table_context(HpeDomNode *n)
            !strcmp(n->tag, "tr");
 }
 
+/**
+ * @brief 判断标签在给定表格上下文中是否合法 / Test whether a tag is legal in a given table context
+ *
+ * @param[in,out] ctx 表格上下文节点（`table`/`tr`/`tbody` 等）/ Table context node such as `table`, `tr` or `tbody`
+ * @param[in]     tag 待判定的标签名，可为 `NULL` / Tag name to test, may be `NULL`
+ *
+ * @return 合法返回 1 / 1 when the tag may appear there
+ *
+ * @note 按上下文选择 `k_in_table` / `k_in_row` / `k_in_section` 三张白名单 / The whitelist is chosen among `k_in_table`, `k_in_row` and `k_in_section` by context
+ */
 static int allowed_in_table(HpeDomNode *ctx, const char *tag)
 {
     if (!strcmp(ctx->tag, "table"))
@@ -241,6 +353,15 @@ static int allowed_in_table(HpeDomNode *ctx, const char *tag)
     return tag ? in_list(k_in_section, tag) : 0; /* tbody / thead / tfoot */
 }
 
+/**
+ * @brief 在开放元素栈上寻找最近的 `<table>` / Find the nearest `<table>` on the open-element stack
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ *
+ * @return 最近的 `table` 元素，无则 `NULL` / The nearest `table` element, or `NULL`
+ *
+ * @note foster parenting 的插入锚点由它给出 / It provides the insertion anchor for foster parenting
+ */
 static HpeDomNode *nearest_table(Parser *p)
 {
     int i;
@@ -252,8 +373,20 @@ static HpeDomNode *nearest_table(Parser *p)
     return NULL;
 }
 
-/* appends `node` at the insertion point, fostering it before the table when the
- * current node is a table context that does not accept it */
+/**
+ * @brief 把节点插入到当前插入点，必要时 foster parenting / Insert a node at the current point, foster-parenting when required
+ *
+ * @details 当当前节点是表格上下文且不接受 `tag` 时，节点被插到最近的 `<table>` 之前，与浏览器的容错行为一致。
+ *          When the current node is a table context that does not accept `tag`, the node is placed just before the nearest `<table>`, matching browser fault tolerance.
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ * @param[in,out] node 待插入的节点 / Node to insert
+ * @param[in]     tag 标签名，可为 `NULL`（文本节点）/ Tag name, `NULL` for a text node
+ *
+ * @note 接受时按 `hpe_dom_children_root` 追加到当前节点 / When accepted it is appended through `hpe_dom_children_root` of the current node
+ *
+ * @see hpe_dom_append
+ */
 static void insert_node(Parser *p, HpeDomNode *node, const char *tag)
 {
     HpeDomNode *ctx = current_node(p);
@@ -268,6 +401,18 @@ static void insert_node(Parser *p, HpeDomNode *node, const char *tag)
     hpe_dom_append(hpe_dom_children_root(ctx), node);
 }
 
+/**
+ * @brief 解码并插入一段文本节点 / Decode and insert a text node
+ *
+ * @details 先做实体解码；`<head>` 内的空白与表格上下文中的纯空白文本被丢弃。
+ *          Entities are decoded first; whitespace inside `<head>` and whitespace-only text in a table context are dropped.
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ * @param[in]     begin 文本起止指针（含）/ Start of the text run, inclusive
+ * @param[in]     end 文本结束指针（不含）/ End of the text run, exclusive
+ *
+ * @note 解码结果为空或纯空白（在上述位置）时不插入任何节点 / No node is inserted when the decoded text is empty or whitespace-only in those positions
+ */
 static void add_text(Parser *p, const char *begin, const char *end)
 {
     size_t declen = 0;
@@ -295,20 +440,45 @@ static void add_text(Parser *p, const char *begin, const char *end)
     hpe_free(text);
 }
 
-/* ---------------- token helpers ---------------- */
+/**
+ * @brief 判断字符是否可出现在标签/属性名中 / Test whether a character may appear in a tag or attribute name
+ *
+ * @param[in]     c 输入字符 / Input character
+ *
+ * @return 是名称字符返回 1 / 1 when it is a name character
+ *
+ * @note 空白、`>`、`/`、`=` 与 `\0` 都不是名称字符 / Whitespace, `>`, `/`, `=` and `\0` are not name characters
+ */
 
 static int is_name_char(char c)
 {
     return !hpe_is_space(c) && c != '>' && c != '/' && c != '=' && c != '\0';
 }
 
+/**
+ * @brief 跳过解析游标处的连续空白 / Skip consecutive whitespace at the parse cursor
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ *
+ * @note 只前进 `pos`，不修改源文本 / Only advances `pos` and never modifies the source
+ */
 static void skip_spaces(Parser *p)
 {
     while (p->pos < p->len && hpe_is_space(p->src[p->pos]))
         p->pos++;
 }
 
-/* reads a lowercased tag/attribute name into `out`; returns its length */
+/**
+ * @brief 读取并小写化一个标签/属性名 / Read and lowercase a tag or attribute name
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ * @param[out]    out 接收小写名称的缓冲 / Buffer receiving the lowercased name
+ * @param[in]     cap 输出缓冲容量（字节）/ Capacity of the output buffer in bytes
+ *
+ * @return 读到的名称长度 / Length of the name read
+ *
+ * @note 超出 `cap` 的部分只前进游标不再写入，结果始终以 NUL 结尾 / Characters beyond `cap` advance the cursor without being stored, and the result is always NUL-terminated
+ */
 static int read_name(Parser *p, char *out, size_t cap)
 {
     int n = 0;
@@ -321,7 +491,13 @@ static int read_name(Parser *p, char *out, size_t cap)
     return n;
 }
 
-/* advances past the next '>' (consuming it when present) */
+/**
+ * @brief 前进到下一个 `>` 并跳过它 / Advance past the next `>` consuming it
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ *
+ * @note 到达输入末尾时停在末尾，不越界 / Stops at the end of input and never reads past it
+ */
 static void skip_to_tag_end(Parser *p)
 {
     while (p->pos < p->len && p->src[p->pos] != '>')
@@ -330,6 +506,18 @@ static void skip_to_tag_end(Parser *p)
         p->pos++;
 }
 
+/**
+ * @brief 在文本中忽略大小写查找子串 / Search a substring case-insensitively
+ *
+ * @param[in]     hay 被搜索的文本 / Text being searched
+ * @param[in]     hay_len 被搜索文本长度 / Length of the haystack
+ * @param[in]     from 起始搜索下标 / Index to start searching from
+ * @param[in]     needle 要查找的子串 / Substring to look for
+ *
+ * @return 首次出现的下标，未找到返回 `(size_t)-1` / Index of the first occurrence, or `(size_t)-1` when absent
+ *
+ * @note 用于查找 `</script` 等结束标签与注释结束符 / Used to locate end tags such as `</script` and comment terminators
+ */
 static size_t find_ci(const char *hay, size_t hay_len, size_t from, const char *needle)
 {
     size_t nlen = strlen(needle), i, j;
@@ -347,6 +535,15 @@ static size_t find_ci(const char *hay, size_t hay_len, size_t from, const char *
     return (size_t)-1;
 }
 
+/**
+ * @brief 判断标签是否属于 `<head>` 的合法内容 / Test whether a tag is legal `<head>` content
+ *
+ * @param[in]     tag 标签名 / Tag name
+ *
+ * @return 属于 head 内容返回 1 / 1 when the tag belongs in the head
+ *
+ * @note `meta`/`link`/`style`/`title`/`base`/`script`/`template`/`noscript` 视为 head 内容 / `meta`, `link`, `style`, `title`, `base`, `script`, `template` and `noscript` count as head content
+ */
 static int is_head_content(const char *tag)
 {
     return !strcmp(tag, "meta") || !strcmp(tag, "link") || !strcmp(tag, "style") ||
@@ -354,12 +551,31 @@ static int is_head_content(const char *tag)
            !strcmp(tag, "template") || !strcmp(tag, "noscript");
 }
 
+/**
+ * @brief 判断标签是否为原始文本元素 / Test whether a tag is a raw-text element
+ *
+ * @param[in]     tag 标签名 / Tag name
+ *
+ * @return `style` 或 `script` 返回 1 / 1 for `style` or `script`
+ *
+ * @note 原始文本元素内部不做标签解析，直到遇到自己的结束标签 / Their body is not tag-parsed until their own end tag appears
+ */
 static int is_rawtext(const char *tag)
 {
     return !strcmp(tag, "style") || !strcmp(tag, "script");
 }
 
-/* the innermost open <select>, or NULL */
+/**
+ * @brief 寻找最内层仍开放的 `<select>` / Find the innermost still-open `<select>`
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ *
+ * @return 开放中的 `select` 元素，无则 `NULL` / The open `select` element, or `NULL`
+ *
+ * @note 遇到 `table` 或 `template` 即停止搜索，作为 select 作用域边界 / The search stops at `table` or `template`, the select scope boundaries
+ *
+ * @see handle_start_tag handle_end_tag
+ */
 static HpeDomNode *open_select(Parser *p)
 {
     int i;
@@ -416,6 +632,19 @@ static const CloseRule k_close_rules[] = {
     {"rp", k_rt_rp},
 };
 
+/**
+ * @brief 判断起始标签是否隐式闭合当前开放元素 / Test whether a start tag implicitly closes the current open element
+ *
+ * @details 规则由数据表 `k_close_rules` 驱动（`<li>a<li>b`、`<p>x<div>`、`<td>a<td>b` 等）；标题之间互相闭合。
+ *          Rules are driven by the `k_close_rules` table (`<li>a<li>b`, `<p>x<div>`, `<td>a<td>b`, ...); headings close one another.
+ *
+ * @param[in]     open_tag 栈顶当前开放的标签 / Tag currently open at the stack top
+ * @param[in]     tag 即将开始的标签 / Tag that is about to start
+ *
+ * @return 会触发闭合返回 1 / 1 when it triggers a close
+ *
+ * @note 新增容错规则只需改数据表，无需改代码 / Adding a fault-tolerance rule is a data change, not a code change
+ */
 static int closes_open_element(const char *open_tag, const char *tag)
 {
     size_t i;
@@ -429,6 +658,16 @@ static int closes_open_element(const char *open_tag, const char *tag)
     return 0;
 }
 
+/**
+ * @brief 为即将开始的标签弹出需要隐式闭合的开放元素 / Pop the elements implicitly closed by an upcoming start tag
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ * @param[in]     tag 即将开始的标签 / Tag that is about to start
+ *
+ * @note 至多循环 64 次以防规则异常导致死循环 / Loops at most 64 times to guard against runaway rules
+ *
+ * @see closes_open_element
+ */
 static void auto_close_for_start(Parser *p, const char *tag)
 {
     int guard = 0;
@@ -442,8 +681,17 @@ static void auto_close_for_start(Parser *p, const char *tag)
     }
 }
 
-/* `<table><tr>` implies `<tbody>`; `<table><td>` / `<tbody><td>` imply `<tr>`
- * (and a section). Synthesised elements are legal table content, no fostering. */
+/**
+ * @brief 为表格内容补出缺失的 `tbody` / `tr` 元素 / Synthesise missing `tbody` and `tr` elements for table content
+ *
+ * @details `<table><tr>` 补出 `<tbody>`；`<table><td>` 或 `<tbody><td>` 补出 `<tr>`（必要时先补 `<tbody>`）。补出的元素是合法表格内容，不触发 foster parenting。
+ *          `<table><tr>` gains a `<tbody>`; `<table><td>` or `<tbody><td>` gains a `<tr>` (and a `<tbody>` first when needed). The synthesised elements are legal table content and are not foster-parented.
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ * @param[in]     tag 即将开始的标签 / Tag that is about to start
+ *
+ * @note 仅当栈上存在 `<table>` 时才生效 / It only takes effect when a `<table>` is open on the stack
+ */
 static void synthesize_table_nodes(Parser *p, const char *tag)
 {
     HpeDomNode *top;
@@ -475,8 +723,20 @@ static void synthesize_table_nodes(Parser *p, const char *tag)
 
 /* ---------------- tree builder ---------------- */
 
-/* <html>/<head>/<body> fold into the synthetic scaffolding instead of being
- * inserted; returns 1 when the tag was consumed that way */
+/**
+ * @brief 把 `<html>`/`<head>`/`<body>` 折算进合成骨架 / Fold `<html>`, `<head>` and `<body>` into the synthetic scaffolding
+ *
+ * @details 属性被合并到预建的骨架元素上，`<head>`/`<body>` 还会相应调整开放元素栈。
+ *          Attributes are merged onto the pre-built scaffolding elements, and `<head>` or `<body>` also adjust the open-element stack.
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ * @param[in]     tag 标签名 / Tag name
+ * @param[in,out] node 已创建的对应元素节点 / The element node that was created for it
+ *
+ * @return 按这种方式处理掉返回 1，否则 0 / 1 when the tag was consumed this way, otherwise 0
+ *
+ * @note 非这三个标签一律返回 0，交由常规路径处理 / Any other tag returns 0 and goes down the normal path
+ */
 static int handle_implied_container(Parser *p, const char *tag, HpeDomNode *node)
 {
     HpeDomNode *target = NULL;
@@ -503,6 +763,19 @@ static int handle_implied_container(Parser *p, const char *tag, HpeDomNode *node
     return 1;
 }
 
+/**
+ * @brief 处理一个起始标签 / Handle a start tag
+ *
+ * @details 依次执行：折入隐含容器、`<select>` 作用域过滤、body 内容开始时隐式闭合 `</head>`、隐式闭合规则、表格节点补全，最后插入并按需压栈。
+ *          In order: fold into implied containers, filter inside `<select>` scope, implicitly close `</head>` when body content starts, apply implicit-closing rules, synthesise table nodes, then insert and push when appropriate.
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ * @param[in]     tag 标签名（已小写）/ Tag name, already lowercased
+ * @param[in,out] node 已创建并解析好属性的元素节点 / Element node already created with its attributes parsed
+ * @param[in]     self_closing 自闭合标志（`/>` 为 1）/ Self-closing flag, 1 for `/>`
+ *
+ * @note 空元素（`k_void_tags` 中的标签）与自闭合标签不压栈 / Void tags (those in `k_void_tags`) and self-closing tags are not pushed
+ */
 static void handle_start_tag(Parser *p, const char *tag, HpeDomNode *node, int self_closing)
 {
     HpeDomNode *sel;
@@ -534,13 +807,33 @@ static void handle_start_tag(Parser *p, const char *tag, HpeDomNode *node, int s
         stack_push(&p->stack, node);
 }
 
-/* `</p>` with no open paragraph inserts an empty one (HTML fault tolerance) */
+/**
+ * @brief 插入一个空 `<p>` 元素 / Insert an empty `p` element
+ *
+ * @details `</p>` 在没有开放段落时按 HTML 容错规则插入一个空段落。
+ *          A `</p>` with no open paragraph inserts an empty one, per HTML fault tolerance.
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ */
 static void insert_empty_p(Parser *p)
 {
     HpeDomNode *node = hpe_dom_element("p");
     insert_node(p, node, "p");
 }
 
+/**
+ * @brief 处理一个结束标签 / Handle an end tag
+ *
+ * @details `</html>`/`</body>` 弹空到 `<html>`；`</br>` 按 `<br>` 处理；`<select>` 内只认可少数结束标签；否则沿栈找到同名元素并把其上的节点全部弹出。
+ *          `</html>` and `</body>` pop back to `<html>`; `</br>` behaves as `<br>`; only a few end tags are honoured inside `<select>`; otherwise the stack is searched for a matching element and everything above it is popped.
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ * @param[in]     tag 标签名（已小写）/ Tag name, already lowercased
+ *
+ * @note 找不到匹配元素且标签为 `p` 时补插空段落 / When no element matches and the tag is `p`, an empty paragraph is inserted
+ *
+ * @see insert_empty_p
+ */
 static void handle_end_tag(Parser *p, const char *tag)
 {
     HpeDomNode *sel;
@@ -574,8 +867,18 @@ static void handle_end_tag(Parser *p, const char *tag)
 
 /* ---------------- tokenizer ---------------- */
 
-/* parses `name="value"` pairs up to the closing '>'; sets *self_closing when a
- * trailing '/' was seen */
+/**
+ * @brief 解析起始标签内的 `name="value"` 属性 / Parse the `name="value"` attributes of a start tag
+ *
+ * @details 支持双引号、单引号与无引号三种取值形式，属性值经实体解码后写入；读到 `>` 结束。
+ *          Quoted (double or single) and unquoted values are supported, each entity-decoded before being stored; parsing ends at `>`.
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ * @param[in,out] node 接收属性的元素节点 / Element node receiving the attributes
+ * @param[out]    self_closing 置 1 表示见到结尾 `/` / Set to 1 when a trailing `/` was seen
+ *
+ * @note 同名属性重复出现时后者覆盖前者 / Later duplicates of the same attribute overwrite earlier ones
+ */
 static void parse_attributes(Parser *p, HpeDomNode *node, int *self_closing)
 {
     while (p->pos < p->len) {
@@ -625,7 +928,15 @@ static void parse_attributes(Parser *p, HpeDomNode *node, int *self_closing)
     }
 }
 
-/* consumes the raw body of a <style>/<script> up to its own end tag */
+/**
+ * @brief 消费 `<style>`/`<script>` 的原始文本直到其结束标签 / Consume the raw body of a `<style>` or `<script>` up to its end tag
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ * @param[in,out] node 原始文本所属元素 / Element owning the raw text
+ * @param[in]     tag 元素标签名，用于构造结束标签 / Element tag name, used to build the closing tag
+ *
+ * @note 找不到结束标签时一直消费到输入末尾 / When no end tag is found the rest of the input is consumed
+ */
 static void parse_rawtext_body(Parser *p, HpeDomNode *node, const char *tag)
 {
     char close[80];
@@ -646,7 +957,17 @@ static void parse_rawtext_body(Parser *p, HpeDomNode *node, const char *tag)
         skip_to_tag_end(p);
 }
 
-/* consumes `</name ...>` and applies it; returns 1 when an end tag was read */
+/**
+ * @brief 消费一个 `</name ...>` 结束标签并应用 / Consume a `</name ...>` end tag and apply it
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ *
+ * @return 固定返回 1 表示已读到一个结束标签 / Always 1, reporting that an end tag was read
+ *
+ * @note 读到名称为空时只前进游标，不触发任何树操作 / An empty name only advances the cursor without any tree action
+ *
+ * @see handle_end_tag
+ */
 static int consume_end_tag(Parser *p)
 {
     char name[64];
@@ -663,7 +984,18 @@ static int consume_end_tag(Parser *p)
     return 1;
 }
 
-/* consumes `<name attrs...>` (or rawtext); returns 1 when a start tag was read */
+/**
+ * @brief 消费一个 `<name attrs...>` 起始标签或原始文本 / Consume a `<name attrs...>` start tag or raw text
+ *
+ * @details 读取名称与属性；原始文本元素转入 `parse_rawtext_body`，其余交给 `handle_start_tag`。
+ *          The name and attributes are read; raw-text elements divert to `parse_rawtext_body`, everything else goes to `handle_start_tag`.
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ *
+ * @return 固定返回 1 表示已读到一个起始标签 / Always 1, reporting that a start tag was read
+ *
+ * @note 孤立 `<` 当作普通文本写入；未被树接纳的节点会被立即释放 / A stray `<` is emitted as text, and a node the tree did not accept is freed immediately
+ */
 static int consume_start_tag(Parser *p)
 {
     char tag[64];
@@ -695,7 +1027,16 @@ static int consume_start_tag(Parser *p)
     return 1;
 }
 
-/* consumes a comment, doctype or processing instruction */
+/**
+ * @brief 消费注释、DOCTYPE 或处理指令 / Consume a comment, doctype or processing instruction
+ *
+ * @details `<!-- ... -->` 跳到注释结束符；`<!doctype ...>` 与 `<?pi ...>` 跳到下一个 `>`。
+ *          `<!-- ... -->` skips to the comment terminator, while `<!doctype ...>` and `<?pi ...>` skip to the next `>`.
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ *
+ * @note 这些结构不产生任何 DOM 节点 / None of these constructs produce a DOM node
+ */
 static void consume_markup_decl(Parser *p)
 {
     if (p->pos + 4 <= p->len && !strncmp(p->src + p->pos, "<!--", 4)) {
@@ -706,7 +1047,16 @@ static void consume_markup_decl(Parser *p)
     skip_to_tag_end(p); /* <!doctype ...> / <?pi ...> */
 }
 
-/* ---------------- entry point ---------------- */
+/**
+ * @brief 初始化解析器及其合成骨架 / Initialise the parser and its synthetic scaffolding
+ *
+ * @details 预建 `document → html → head, body` 骨架并把 `<body>` 压入开放元素栈。
+ *          Pre-builds the `document` → `html` → `head`, `body` scaffolding and pushes `<body>` onto the open-element stack.
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ * @param[in]     source 待解析的 HTML 源文本 / HTML source text to parse
+ * @param[in]     length 源文本字节数 / Source byte count
+ */
 
 static void parser_init(Parser *p, const char *source, size_t length)
 {
@@ -723,7 +1073,16 @@ static void parser_init(Parser *p, const char *source, size_t length)
     stack_push(&p->stack, p->body);
 }
 
-/* one step of the tokenizer: text run, markup declaration, end tag or start tag */
+/**
+ * @brief 推进解析器一步 / Advance the parser by one step
+ *
+ * @details 按当前字符分派：普通文本走 `add_text`，`<!`/`<?` 走 `consume_markup_decl`，`</` 走 `consume_end_tag`，其余走 `consume_start_tag`。
+ *          Dispatch on the current character: plain text goes to `add_text`, `<!`/`<?` to `consume_markup_decl`, `</` to `consume_end_tag` and anything else to `consume_start_tag`.
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ *
+ * @note 一次调用至少消费一个字符，因此主循环必然前进 / A call always consumes at least one character, so the main loop always makes progress
+ */
 static void parse_step(Parser *p)
 {
     if (p->src[p->pos] != '<') {
@@ -744,6 +1103,21 @@ static void parse_step(Parser *p)
     consume_start_tag(p);
 }
 
+/**
+ * @brief 解析本地 HTML 文档为 DOM 树 / Parse a local HTML document into a DOM tree
+ *
+ * @details 容错解析：隐式闭合、表格节点补全、foster parenting、原始文本与实体解码都在此过程中完成。
+ *          Fault-tolerant parsing: implicit closing, table-node synthesis, foster parenting, raw-text handling and entity decoding all happen here.
+ *
+ * @param[in]     source HTML 源文本 / HTML source text
+ * @param[in]     length 源文本字节数 / Source byte count
+ *
+ * @return 包含 `<html><head></head><body>...</body></html>` 的文档节点 / A document node containing `<html><head></head><body>...</body></html>`
+ *
+ * @note 返回的文档树由调用方用 `hpe_dom_free` 释放 / The caller frees the returned document tree with `hpe_dom_free`
+ *
+ * @see hpe_dom_free
+ */
 HpeDomNode *hpe_html_parse(const char *source, size_t length)
 {
     Parser p;

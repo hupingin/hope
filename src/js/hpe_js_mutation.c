@@ -50,7 +50,15 @@ typedef struct JsMutationObserver {
     struct JsMutationObserver *next; /* the js-wide observer list */
 } JsMutationObserver;
 
-/* ---------------- per-interpreter state ---------------- */
+/**
+ * @brief 取（必要时创建）解释器的 MutationObserver 状态 / Get, creating on demand, the interpreter's MutationObserver state
+ *
+ * @param[in,out] js JS 运行时上下文，可为 `NULL` / JS runtime context, may be `NULL`
+ *
+ * @return 解释器级状态块；`js` 为 `NULL` 时返回 `NULL` / The per-interpreter state block, or `NULL` when `js` is `NULL`
+ *
+ * @note 状态块从 arena 分配并清零，首次调用时缓存到 `js->mutation_state` / The block is arena-allocated, zeroed and cached in `js->mutation_state` on first use
+ */
 
 HpeJsMutationState *hpe_js_mutation_state(HpeJs *js)
 {
@@ -65,7 +73,13 @@ HpeJsMutationState *hpe_js_mutation_state(HpeJs *js)
     return st;
 }
 
-/* ---------------- record bookkeeping ---------------- */
+/**
+ * @brief 分配一条待投递的变更记录 / Allocate a pending mutation record
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ *
+ * @return 已清零的新记录 / The new zeroed record
+ */
 
 static JsMutationRecord *record_new(HpeJs *js)
 {
@@ -74,6 +88,14 @@ static JsMutationRecord *record_new(HpeJs *js)
     return r;
 }
 
+/**
+ * @brief 把记录追加到观察者的待投递链表尾 / Append a record to the tail of the observer's pending list
+ *
+ * @param[in,out] o 目标观察者 / Target observer
+ * @param[in,out] r 要入队的记录 / The record to enqueue
+ *
+ * @note 链表为空时同时设置头指针 / Sets the head pointer too when the list was empty
+ */
 static void record_push(JsMutationObserver *o, JsMutationRecord *r)
 {
     if (o->tail)
@@ -83,7 +105,16 @@ static void record_push(JsMutationObserver *o, JsMutationRecord *r)
     o->tail = r;
 }
 
-/* does this observer watch `target`? walks ancestors when subtree is set */
+/**
+ * @brief 判断观察者是否监听了该节点 / Test whether the observer watches a node
+ *
+ * @param[in,out] o 观察者 / The observer
+ * @param[in,out] target 变更发生的节点 / The node that changed
+ *
+ * @return 命中返回 1 / 1 when the node is watched
+ *
+ * @note 未开启 `subtree` 时只匹配观察目标本身，否则沿 `parent` 向上查找 / Without `subtree` only the observed node itself matches; otherwise ancestors are walked via `parent`
+ */
 static int observes_node(JsMutationObserver *o, HpeDomNode *target)
 {
     HpeDomNode *n = target;
@@ -98,6 +129,16 @@ static int observes_node(JsMutationObserver *o, HpeDomNode *target)
     return 0;
 }
 
+/**
+ * @brief 判断属性名是否通过 `attributeFilter` 过滤 / Test whether an attribute name passes the `attributeFilter`
+ *
+ * @param[in,out] o 观察者 / The observer
+ * @param[in]     name 变更的属性名，可为 `NULL` / The changed attribute name, may be `NULL`
+ *
+ * @return 通过返回 1 / 1 when the attribute passes
+ *
+ * @note 未设置过滤表时全部通过；设置了过滤表但属性名为 `NULL` 则不通过 / Everything passes without a filter list; with one, a `NULL` name fails
+ */
 static int attr_passes_filter(JsMutationObserver *o, const char *name)
 {
     int i;
@@ -111,7 +152,18 @@ static int attr_passes_filter(JsMutationObserver *o, const char *name)
     return 0;
 }
 
-/* ---------------- delivery ---------------- */
+/**
+ * @brief 把内部记录转换为 MutationRecord 对象 / Convert an internal record into a MutationRecord object
+ *
+ * @details `type` 由记录种类映射为 `attributes`/`characterData`/`childList`；`oldValue` 仅在观察者开启对应 `*OldValue` 时给出，否则为 `null`。
+ *          The record kind maps `type` to `attributes`, `characterData` or `childList`; `oldValue` is only present when the observer enabled the matching `*OldValue` option, otherwise it is `null`.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] o 所属观察者（决定是否带 `oldValue`）/ The owning observer, which decides whether `oldValue` is included
+ * @param[in,out] r 待转换的记录 / The record to convert
+ *
+ * @return 形如 `{ type, target, attributeName, oldValue }` 的普通对象 / A plain object with `type`, `target`, `attributeName` and `oldValue`
+ */
 
 static JsValue record_to_object(HpeJs *js, JsMutationObserver *o, JsMutationRecord *r)
 {
@@ -139,7 +191,16 @@ static JsValue record_to_object(HpeJs *js, JsMutationObserver *o, JsMutationReco
     return js_objval(obj);
 }
 
-/* builds the JS array of records, clearing the observer's queue */
+/**
+ * @brief 取出观察者的全部待投递记录并清空队列 / Take all pending records of an observer, clearing its queue
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] o 目标观察者 / Target observer
+ *
+ * @return 记录对象构成的数组 / An array of record objects
+ *
+ * @note 取出后头尾指针清零并同步写入 `length` / The head and tail pointers are cleared and `length` is written
+ */
 static JsValue take_records_value(HpeJs *js, JsMutationObserver *o)
 {
     JsObj *arr = js_array_new(js);
@@ -155,7 +216,19 @@ static JsValue take_records_value(HpeJs *js, JsMutationObserver *o)
     return js_objval(arr);
 }
 
-/* the microtask body: deliver every record queued so far */
+/**
+ * @brief 投递微任务体：把已入队记录交给回调 / The delivery microtask body: hand the queued records to the callback
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 调用时的 `this`（未使用）/ The `this` of the call (unused)
+ * @param[in,out] args 实参数组（未使用）/ Argument array (unused)
+ * @param[in]     argc 参数个数（未使用）/ Argument count (unused)
+ * @param[in,out] ud 透传的观察者指针 / The observer pointer passed through
+ *
+ * @return 始终返回 `undefined` / Always returns `undefined`
+ *
+ * @note 先清除 `queued` 标志；无待投递记录时不做任何事，否则以记录数组为唯一实参调用回调 / The `queued` flag is cleared first; with no pending records it returns, otherwise the callback is invoked with the records array as its only argument
+ */
 static JsValue observer_deliver(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *ud)
 {
     JsMutationObserver *o = (JsMutationObserver *)ud;
@@ -175,7 +248,16 @@ static JsValue observer_deliver(HpeJs *js, JsValue thisv, JsValue *args, int arg
     return js_undef();
 }
 
-/* queues one microtask so delivery is asynchronous, as in browsers */
+/**
+ * @brief 为一个观察者排入投递微任务 / Queue a delivery microtask for an observer
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] o 目标观察者 / Target observer
+ *
+ * @note 已有待投递微任务时直接返回；否则置 `queued` 标志并投递 `observer_deliver` / Returns immediately when a delivery is already pending, otherwise sets `queued` and queues `observer_deliver`
+ *
+ * @see observer_deliver
+ */
 static void queue_delivery(HpeJs *js, JsMutationObserver *o)
 {
     JsObj *fn;
@@ -186,7 +268,22 @@ static void queue_delivery(HpeJs *js, JsMutationObserver *o)
     hpe_js_queue_microtask(js, js_objval(fn), js_undef());
 }
 
-/* ---------------- DOM sink ---------------- */
+/**
+ * @brief DOM 变更接收器：为匹配的观察者生成记录 / DOM mutation sink: create records for the observers that match
+ *
+ * @details 遍历解释器的观察者链：子节点变更要求 `childList` 且命中节点，属性变更额外要求通过属性过滤，字符数据变更要求 `characterData`；命中者建一条记录并入队投递微任务。
+ *          Walks the interpreter's observer list: a child-list change requires `childList` and a watched node, an attribute change also needs to pass the filter, and a character-data change requires `characterData`; a hit builds a record and queues a delivery microtask.
+ *
+ * @param[in,out] ud 透传的 JS 上下文 / The JS context passed through
+ * @param[in]     kind 变更种类（`HPE_MUT_*`）/ Mutation kind, one of `HPE_MUT_*`
+ * @param[in,out] target 发生变更的 DOM 节点 / The DOM node that changed
+ * @param[in]     name 属性名（属性变更时）/ The attribute name for attribute mutations
+ * @param[in]     old_value 变更前的旧值，可为 `NULL` / The previous value, may be `NULL`
+ * @param[in,out] added 新增节点（未使用）/ The added node (unused)
+ * @param[in,out] removed 被移除节点（未使用）/ The removed node (unused)
+ *
+ * @see queue_delivery record_push
+ */
 
 static void mutation_bridge(void *ud, int kind, HpeDomNode *target, const char *name,
                             const char *old_value, HpeDomNode *added, HpeDomNode *removed)
@@ -224,7 +321,13 @@ static void mutation_bridge(void *ud, int kind, HpeDomNode *target, const char *
     }
 }
 
-/* Registers the bridge sink on the DOM layer (once per document). */
+/**
+ * @brief 注册 DOM 变更接收器 / Register the DOM mutation sink
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ *
+ * @note 每个解释器只注册一次（由 `sink_installed` 保证），接收器经 `hpe_dom_add_mutation_sink` 挂到 DOM 层 / Registers once per interpreter guarded by `sink_installed`, attaching the bridge through `hpe_dom_add_mutation_sink`
+ */
 void hpe_js_mutation_install(HpeJs *js)
 {
     HpeJsMutationState *st = hpe_js_mutation_state(js);
@@ -235,6 +338,13 @@ void hpe_js_mutation_install(HpeJs *js)
     hpe_dom_add_mutation_sink(mutation_bridge, js);
 }
 
+/**
+ * @brief 注销 DOM 变更接收器 / Unregister the DOM mutation sink
+ *
+ * @param[in,out] js JS 运行时上下文，可为 `NULL` / JS runtime context, may be `NULL`
+ *
+ * @note 未注册时不做任何事，否则摘除接收器并清 `sink_installed` / Does nothing when not installed, otherwise removes the sink and clears `sink_installed`
+ */
 void hpe_js_mutation_uninstall(HpeJs *js)
 {
     HpeJsMutationState *st = js ? js->mutation_state : NULL;
@@ -244,7 +354,22 @@ void hpe_js_mutation_uninstall(HpeJs *js)
     st->sink_installed = 0;
 }
 
-/* ---------------- observer methods ---------------- */
+/**
+ * @brief `MutationObserver.prototype.observe`：开始监听目标节点 / `MutationObserver.prototype.observe`: start watching a target node
+ *
+ * @details 目标须为 `HPE_HOST_ELEMENT` 或 `HPE_HOST_FRAGMENT` 宿主值；从选项对象读取 `childList`/`attributes`/`characterData`/`subtree`/`attributeOldValue`/`characterDataOldValue` 与 `attributeFilter`。
+ *          The target must be a `HPE_HOST_ELEMENT` or `HPE_HOST_FRAGMENT` host value; the options object supplies `childList`, `attributes`, `characterData`, `subtree`, `attributeOldValue`, `characterDataOldValue` and `attributeFilter`.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 调用时的 `this`（未使用）/ The `this` of the call (unused)
+ * @param[in,out] args 实参数组：`[目标节点, 选项对象]` / Argument array: `[target node, options object]`
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 透传的观察者指针 / The observer pointer passed through
+ *
+ * @return 始终返回 `undefined` / Always returns `undefined`
+ *
+ * @note 缺少选项对象时只记录目标不设任何监听开关；过滤器条目经 `ToString` 复制 / Without an options object only the target is recorded and no watch flags are set; filter entries are copied as strings
+ */
 
 static JsValue observer_observe(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *ud)
 {
@@ -289,6 +414,19 @@ static JsValue observer_observe(HpeJs *js, JsValue thisv, JsValue *args, int arg
     return js_undef();
 }
 
+/**
+ * @brief `MutationObserver.prototype.disconnect`：停止监听并丢弃待投递记录 / `MutationObserver.prototype.disconnect`: stop watching and drop pending records
+ *
+ * @param[in,out] js JS 运行时上下文（未使用）/ JS runtime context (unused)
+ * @param[in]     thisv 调用时的 `this`（未使用）/ The `this` of the call (unused)
+ * @param[in,out] args 实参数组（未使用）/ Argument array (unused)
+ * @param[in]     argc 参数个数（未使用）/ Argument count (unused)
+ * @param[in,out] ud 透传的观察者指针 / The observer pointer passed through
+ *
+ * @return 始终返回 `undefined` / Always returns `undefined`
+ *
+ * @note 清空目标、待投递记录链与 `queued` 标志 / Clears the target, the pending record list and the `queued` flag
+ */
 static JsValue observer_disconnect(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *ud)
 {
     JsMutationObserver *o = (JsMutationObserver *)ud;
@@ -304,6 +442,21 @@ static JsValue observer_disconnect(HpeJs *js, JsValue thisv, JsValue *args, int 
     return js_undef();
 }
 
+/**
+ * @brief `MutationObserver.prototype.takeRecords`：取走并清空待投递记录 / `MutationObserver.prototype.takeRecords`: take and clear the pending records
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 调用时的 `this`（未使用）/ The `this` of the call (unused)
+ * @param[in,out] args 实参数组（未使用）/ Argument array (unused)
+ * @param[in]     argc 参数个数（未使用）/ Argument count (unused)
+ * @param[in,out] ud 透传的观察者指针 / The observer pointer passed through
+ *
+ * @return 记录对象数组 / An array of record objects
+ *
+ * @note 观察者指针为空时返回空数组 / Returns an empty array when the observer pointer is `NULL`
+ *
+ * @see take_records_value
+ */
 static JsValue observer_take_records(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *ud)
 {
     JsMutationObserver *o = (JsMutationObserver *)ud;
@@ -315,7 +468,20 @@ static JsValue observer_take_records(HpeJs *js, JsValue thisv, JsValue *args, in
     return take_records_value(js, o);
 }
 
-/* MutationObserver(<callback>) */
+/**
+ * @brief `MutationObserver` 构造函数 / The `MutationObserver` constructor
+ *
+ * @details 分配并清零观察者结构，首参存为回调，注册到解释器状态链，并把 `observe`/`disconnect`/`takeRecords` 作为自身属性挂上。
+ *          The observer struct is allocated and zeroed, the first argument is stored as the callback, the observer is linked into the interpreter state and `observe`, `disconnect` and `takeRecords` are attached as own properties.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 调用时的 `this`（未使用）/ The `this` of the call (unused)
+ * @param[in,out] args 实参数组：`[回调]` / Argument array: `[callback]`
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ *
+ * @return 新的 MutationObserver 宿主值 / The new MutationObserver host value
+ */
 static JsValue observer_ctor(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *ud)
 {
     HpeJsMutationState *st = hpe_js_mutation_state(js);
@@ -337,7 +503,13 @@ static JsValue observer_ctor(HpeJs *js, JsValue thisv, JsValue *args, int argc, 
     return js_objval(obj);
 }
 
-/* installs the global MutationObserver constructor */
+/**
+ * @brief 安装全局 `MutationObserver` 构造器 / Install the global `MutationObserver` constructor
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ *
+ * @note `js` 为 `NULL` 时直接返回；否则把带 `name` 的原生函数写入 `global.MutationObserver` / Returns early when `js` is `NULL`; otherwise the native function with a `name` property is stored in `global.MutationObserver`
+ */
 void hpe_js_mutation_install_ctor(HpeJs *js)
 {
     JsObj *fn;

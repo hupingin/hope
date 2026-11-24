@@ -15,10 +15,17 @@ static void css_parse_into(HpeStylesheet *sheet, const char *css, size_t length,
 
 /* ---------------- defaults ---------------- */
 
-/*
- * Box-model longhands: lengths, per-side defaults and the identity transform.
- * Those whose CSS initial value is already zero are left to the caller's
- * memset, so only non-zero initials are written here.
+/**
+ * @brief 写入盒模型相关长属性的非零初值 / Write the non-zero initial values of the box-model longhands
+ *
+ * @details 填充背景/边框/宽高/内外边距/inset 等长度与颜色字段，并把 `transform` 置为单位矩阵。
+ *          It fills the length and colour fields for background, border, width/height, margins, padding and inset, and sets `transform` to the identity matrix.
+ *          CSS 初值本身即 0 的字段交给调用方的 `memset`，这里只写非零初值。
+ *          Fields whose CSS initial value is already zero are left to the caller's `memset`; only non-zero initials are written here.
+ *
+ * @param[in,out] s 待初始化的样式 / Style being initialised
+ *
+ * @see style_init_scalars hpe_style_default
  */
 static void style_init_box(HpeStyle *s)
 {
@@ -47,7 +54,16 @@ static void style_init_box(HpeStyle *s)
     s->transform.identity = 1;
 }
 
-/* enum- and scalar-valued longhands whose CSS initial value is not zero */
+/**
+ * @brief 写入枚举与标量长属性的非零初值 / Write the non-zero initial values of the enum and scalar longhands
+ *
+ * @details 设置颜色、`display: inline`、`font-size: 16px`、`font-weight: 400`、`line-height: 0`（表示 `normal`）以及各枚举属性的初始枚举值，并令 `background_image.kind` 为 `HPE_BG_NONE`。
+ *          It sets the colour, `display: inline`, `font-size: 16px`, `font-weight: 400`, `line-height: 0` (meaning `normal`), the initial enum value of every enum property, and `background_image.kind` to `HPE_BG_NONE`.
+ *
+ * @param[in,out] s 待初始化的样式 / Style being initialised
+ *
+ * @see style_init_box hpe_style_default
+ */
 static void style_init_scalars(HpeStyle *s)
 {
     s->color = hpe_rgb(0, 0, 0);
@@ -77,6 +93,16 @@ static void style_init_scalars(HpeStyle *s)
     s->background_image.kind = HPE_BG_NONE;
 }
 
+/**
+ * @brief 返回一份填好 CSS 初始值的默认样式 / Return a default style seeded with CSS initial values
+ *
+ * @details 先 `memset` 清零，再依次调用 `style_init_box` 与 `style_init_scalars`，使所有非零初值就位。
+ *          The struct is zeroed and then `style_init_box` and `style_init_scalars` bring every non-zero initial value into place.
+ *
+ * @return 初始化完毕的样式值（按值返回）/ A fully initialised style returned by value
+ *
+ * @see style_init_box style_init_scalars
+ */
 HpeStyle hpe_style_default(void)
 {
     HpeStyle s;
@@ -87,7 +113,20 @@ HpeStyle hpe_style_default(void)
     return s;
 }
 
-/* ---------------- value helpers ---------------- */
+/**
+ * @brief 按空白切分字符串，并保持括号内的空白 / Split a string on whitespace while keeping whitespace inside parentheses
+ *
+ * @details 就地以 `\0` 截断并写入各段起始指针，最多记录 `max` 段；括号深度大于 0 的空白不视为分隔，因此 `func(a, b, c)` 仍是一个 token。
+ *          Segments are NUL-terminated in place and their start pointers stored, at most `max` of them; whitespace at paren depth greater than 0 is not a separator, so `func(a, b, c)` stays a single token.
+ *
+ * @param[in,out] s 待切分的字符串（会被就地改写）/ String to split, modified in place
+ * @param[out]    out 各段起始指针数组 / Array that receives each segment pointer
+ * @param[in]     max 最多可写入的段数 / Maximum number of segments to store
+ *
+ * @return 实际切分出的段数 / Number of segments written
+ *
+ * @see split_top_level
+ */
 
 static int split_ws(char *s, char **out, int max)
 {
@@ -120,6 +159,19 @@ static int split_ws(char *s, char **out, int max)
     return n;
 }
 
+/**
+ * @brief 解析一个不含单位的纯数字 / Parse a bare number with no unit
+ *
+ * @details 用 `strtod` 读取后要求其后只剩空白，否则视为解析失败，因此带单位的长度不会通过。
+ *          After `strtod` the remainder must be whitespace only, so a length carrying a unit does not pass.
+ *
+ * @param[in]     s 待解析的字符串 / String to parse
+ * @param[out]    out 解析出的数值 / Receives the parsed number
+ *
+ * @return 成功返回 1，失败返回 0 / 1 on success, 0 on failure
+ *
+ * @see parse_float_token media_feature_value
+ */
 static int parse_plain_number(const char *s, float *out)
 {
     char *end = NULL;
@@ -179,7 +231,19 @@ static void set_sides(HpeStyle *d, const char *value, int is_margin){
 
 /* ---------------- gradient / shadow / transform helpers ---------------- */
 
-/* parses a hex number-ish angle/number token; returns 1 on success */
+/**
+ * @brief 解析角度/数值 token，支持 `deg`/`rad`/`turn` 等后缀 / Parse an angle or number token, accepting `deg`, `rad` and `turn` suffixes
+ *
+ * @details 带 `rad` 时换算为度、带 `turn` 时乘以 360；允许的后缀为 `deg`/`px`/`%`/`rad`/`turn`，其它非空后缀判为失败。
+ *          `rad` is converted to degrees and `turn` multiplied by 360; the accepted suffixes are `deg`/`px`/`%`/`rad`/`turn`, and any other trailing text fails the parse.
+ *
+ * @param[in]     s 待解析的 token / Token to parse
+ * @param[out]    out 解析出的数值（角度已换算为度）/ Receives the parsed number with angles converted to degrees
+ *
+ * @return 成功返回 1，失败返回 0 / 1 on success, 0 on failure
+ *
+ * @see parse_plain_number
+ */
 static int parse_float_token(const char *s, float *out)
 {
     char *end = NULL;
@@ -204,8 +268,20 @@ static int parse_float_token(const char *s, float *out)
     return 1;
 }
 
-/* splits `body` on commas at paren-depth 0 (colour functions carry their own
- * commas); writes up to `max` segment pointers and returns how many it found */
+/**
+ * @brief 按顶层逗号切分，忽略括号内的逗号 / Split on top-level commas, ignoring commas inside parentheses
+ *
+ * @details 只在括号深度为 0 的逗号处切断，颜色函数自带的逗号因此不会拆开参数；最多记录 `max` 段并返回段数。
+ *          Splitting only happens at commas where the paren depth is 0, so commas inside a colour function do not break a segment; up to `max` segments are stored and their count returned.
+ *
+ * @param[in,out] body 待切分的文本（会被就地改写）/ Text to split, modified in place
+ * @param[out]    seg 各段起始指针数组 / Array that receives each segment pointer
+ * @param[in]     max 最多可写入的段数 / Maximum number of segments to store
+ *
+ * @return 实际切分出的段数 / Number of segments written
+ *
+ * @see split_ws collect_gradient_stops
+ */
 static int split_top_level(char *body, char **seg, int max)
 {
     int depth = 0;
@@ -230,8 +306,21 @@ static int split_top_level(char *body, char **seg, int max)
     return nseg;
 }
 
-/* maps a `to <side>` keyword or an angle token to degrees; returns 1 when the
- * token was a direction (so it must not also be treated as a colour stop) */
+/**
+ * @brief 把 `to <side>` 关键字或角度 token 映射为度数 / Map a `to <side>` keyword or angle token to degrees
+ *
+ * @details `to top`/`bottom`/`left`/`right` 及四个对角关键字映射为对应的度数值（0 表示向上、90 表示向右）；也接受带 `deg`/`rad`/`turn` 的角度 token。
+ *          `to top`/`bottom`/`left`/`right` and the four corner keywords map to their degree values (0 points up, 90 points right); an angle token carrying `deg`/`rad`/`turn` is also accepted.
+ *
+ * @param[in]     tok 待识别的 token / Token to recognise
+ * @param[out]    angle 解析出的角度（度）/ Receives the angle in degrees
+ *
+ * @return 是方向 token 返回 1，否则返回 0 / 1 when the token was a direction, 0 otherwise
+ *
+ * @note 返回 1 的 token 不应再当作色标处理 / A token that returns 1 must not also be treated as a colour stop
+ *
+ * @see collect_gradient_stops parse_gradient_stop
+ */
 static int gradient_direction(const char *tok, float *angle)
 {
     if (hpe_starts_with_i(tok, "to ")) {
@@ -265,7 +354,20 @@ static int gradient_direction(const char *tok, float *angle)
     return 0;
 }
 
-/* parses `<color> [<pos>]`; returns 1 when the token held a colour */
+/**
+ * @brief 解析 `<颜色> [<位置>]` 形式的色标 / Parse a `<color> [<position>]` gradient stop
+ *
+ * @details 颜色与位置以空白分隔，位置缺省时置为 -1（稍后由 `distribute_gradient_stops` 补齐）；位置大于 1 或带 `%` 时按百分数换算为 0..1。
+ *          The colour and position are whitespace-separated and a missing position is marked -1 for `distribute_gradient_stops` to fill in later; a position above 1 or carrying `%` is treated as a percentage scaled to 0..1.
+ *
+ * @param[in]     tok 待解析的色标 token / Stop token to parse
+ * @param[out]    c 解析出的颜色 / Receives the parsed colour
+ * @param[out]    pos 解析出的位置 0..1，缺省为 -1 / Receives the position in 0..1, or -1 when absent
+ *
+ * @return token 中含有颜色返回 1，否则返回 0 / 1 when the token held a colour, 0 otherwise
+ *
+ * @see collect_gradient_stops distribute_gradient_stops
+ */
 static int parse_gradient_stop(const char *tok, HpeColor *c, float *pos)
 {
     char buf[128];
@@ -285,7 +387,17 @@ static int parse_gradient_stop(const char *tok, HpeColor *c, float *pos)
     return hpe_color_parse(hpe_trim(buf), c);
 }
 
-/* fills any unset stop positions by even distribution across [0,1] */
+/**
+ * @brief 为未设置位置的色标按均匀分布补齐位置 / Fill in unset stop positions by even distribution
+ *
+ * @details 首尾色标缺省时分别置为 0 与 1，中间色标缺省时按下标均分到 [0,1]，已显式给出的位置保持不变。
+ *          The first and last stops default to 0 and 1 and interior stops default to an even division of [0,1]; explicitly given positions are left untouched.
+ *
+ * @param[in,out] bg 渐变描述 / Gradient description
+ * @param[in]     count 色标个数 / Number of colour stops
+ *
+ * @see collect_gradient_stops
+ */
 static void distribute_gradient_stops(HpeBackground *bg, int count)
 {
     int i;
@@ -299,7 +411,20 @@ static void distribute_gradient_stops(HpeBackground *bg, int count)
     }
 }
 
-/* parses a `linear-gradient(...)` body into stops; returns the stop count */
+/**
+ * @brief 把 `linear-gradient(...)` 的参数体解析为色标数组 / Parse a `linear-gradient(...)` body into the stop array
+ *
+ * @details 按顶层逗号分段，跳过空段与方向段，颜色段写入 `bg->stops`（上限 `HPE_MAX_GRADIENT_STOPS`），同时输出首个方向段解析出的角度。
+ *          The body is split on top-level commas; empty and direction segments are skipped, colour segments are written into `bg->stops` up to `HPE_MAX_GRADIENT_STOPS`, and the angle parsed from the leading direction segment is returned.
+ *
+ * @param[in,out] body 渐变的参数体（会被就地改写）/ Gradient argument body, modified in place
+ * @param[in,out] bg 接收色标的渐变描述 / Gradient description that receives the stops
+ * @param[out]    angle 渐变角度（度）/ Receives the gradient angle in degrees
+ *
+ * @return 写入的色标个数 / Number of stops written
+ *
+ * @see parse_linear_gradient distribute_gradient_stops
+ */
 static int collect_gradient_stops(char *body, HpeBackground *bg, float *angle)
 {
     char *seg[16];
@@ -326,8 +451,21 @@ static int collect_gradient_stops(char *body, HpeBackground *bg, float *angle)
     return count;
 }
 
-/* parses `linear-gradient(...)`; only the 2-stop / n-stop colour-list form with
- * an optional leading direction (`to right`, `to bottom`, `Ndeg`) is supported. */
+/**
+ * @brief 解析 `linear-gradient(...)` 为背景描述 / Parse `linear-gradient(...)` into a background description
+ *
+ * @details 仅支持带可选起始方向（`to right`、`to bottom`、`Ndeg` 等）的 2 段及以上的颜色列表形式；角度缺省为 `180deg`（to bottom），色标少于 2 个视为失败。
+ *          Only the 2-or-more-stop colour-list form with an optional leading direction such as `to right`, `to bottom` or `Ndeg` is supported; the angle defaults to `180deg` (to bottom) and fewer than two stops fails the parse.
+ *
+ * @param[in]     value 属性值文本 / Property value text
+ * @param[in,out] bg 接收解析结果的背景描述 / Background description that receives the result
+ *
+ * @return 成功返回 1，否则返回 0 / 1 on success, 0 otherwise
+ *
+ * @note 成功时把 `bg->kind` 置为 `HPE_BG_LINEAR_GRADIENT` / On success `bg->kind` is set to `HPE_BG_LINEAR_GRADIENT`
+ *
+ * @see collect_gradient_stops apply_background apply_background_image
+ */
 static int parse_linear_gradient(const char *value, HpeBackground *bg)
 {
     const char *lp, *rp;
@@ -364,7 +502,21 @@ static int parse_linear_gradient(const char *value, HpeBackground *bg)
     return 1;
 }
 
-/* parses `[ox oy blur spread] color` (colour may lead or trail) */
+/**
+ * @brief 解析 `[ox oy blur spread] color` 形式的阴影 / Parse a `[ox oy blur spread] color` shadow
+ *
+ * @details 逐个 token 分类：能解析为颜色的作为颜色（缺省为半透明黑），能解析为数字的依次填入偏移/模糊/扩散；至少要有两个数字才算成功，颜色可出现在任意位置（前导或尾随）。
+ *          Each token is classified: one that parses as a colour becomes the colour (defaulting to translucent black) and numeric ones fill offset, blur and spread in order; at least two numbers are required and the colour may lead or trail.
+ *
+ * @param[in]     value 属性值文本 / Property value text
+ * @param[out]    out 接收阴影描述 / Receives the shadow description
+ *
+ * @return 成功返回 1，否则返回 0 / 1 on success, 0 otherwise
+ *
+ * @note 成功时把 `out->valid` 置为 1 / `out->valid` is set to 1 on success
+ *
+ * @see apply_box_shadow apply_text_shadow
+ */
 static int parse_shadow(const char *value, HpeShadow *out)
 {
     char buf[256];
@@ -401,6 +553,20 @@ static int parse_shadow(const char *value, HpeShadow *out)
     return 1;
 }
 
+/**
+ * @brief 计算两个仿射矩阵的乘积 `m * n` / Compute the product `m * n` of two affine matrices
+ *
+ * @details 计算方式是先应用 `n` 再应用 `m`，结果为 2D 仿射（末行为 `0 0 1`），并据结果是否等于单位矩阵更新 `identity` 标志。
+ *          It applies `n` first and then `m`, produces a 2D affine matrix (implicit last row `0 0 1`), and updates the `identity` flag according to whether the result equals the identity.
+ *
+ * @param[out]    dst 接收乘积的矩阵 / Receives the product matrix
+ * @param[in]     m 左矩阵 / Left matrix
+ * @param[in]     n 右矩阵 / Right matrix
+ *
+ * @note `dst` 可与 `m` 或 `n` 为同一对象（就地累乘）/ `dst` may alias `m` or `n` for in-place accumulation
+ *
+ * @see transform_from_fn apply_transform_fn
+ */
 static void mat_mul(HpeTransform *dst, const HpeTransform *m, const HpeTransform *n)
 {
     /* dst = m * n (apply n then m) */
@@ -419,7 +585,19 @@ static void mat_mul(HpeTransform *dst, const HpeTransform *m, const HpeTransform
     dst->identity = (a == 1.0f && b == 0.0f && c == 0.0f && d == 1.0f && e == 0.0f && f == 0.0f);
 }
 
-/* builds the affine matrix for one transform function name + its two args */
+/**
+ * @brief 为单个变换函数名与两个参数构建仿射矩阵 / Build the affine matrix for one transform function name and its two arguments
+ *
+ * @details 支持 `translate`/`translatex`/`translatey`、`scale`/`scalex`/`scaley`、`rotate` 与 `skewx`/`skewy`；`rotate` 与 `skew` 的角度参数按度转弧度；`matrix` 不支持，保持单位矩阵。
+ *          It supports `translate`/`translatex`/`translatey`, `scale`/`scalex`/`scaley`, `rotate` and `skewx`/`skewy`; the angles of `rotate` and the skew functions convert from degrees to radians; `matrix` is unsupported and leaves the identity.
+ *
+ * @param[in]     fn 小写的变换函数名 / Lowercased transform function name
+ * @param[in]     v1 第一个参数 / First argument
+ * @param[in]     v2 第二个参数 / Second argument
+ * @param[out]    m 接收构建出的矩阵 / Receives the built matrix
+ *
+ * @see apply_transform_fn parse_transform
+ */
 static void transform_from_fn(const char *fn, float v1, float v2, HpeTransform *m)
 {
     m->a = 1.0f;
@@ -460,7 +638,18 @@ static void transform_from_fn(const char *fn, float v1, float v2, HpeTransform *
          m->f == 0.0f);
 }
 
-/* applies one `name(args)` transform to the accumulator */
+/**
+ * @brief 把一个 `name(args)` 变换累积到累加矩阵上 / Accumulate one `name(args)` transform onto the accumulator matrix
+ *
+ * @details 复制参数体后按逗号拆出最多两个数值，构建该函数的矩阵；仅在矩阵非单位矩阵时左乘累加，因此 `translate(0)` 一类不改变结果。
+ *          The argument body is copied and split on the comma into at most two numbers to build the function's matrix; it is left-multiplied onto the accumulator only when the matrix is not the identity, so calls like `translate(0)` change nothing.
+ *
+ * @param[in]     fn 小写的变换函数名 / Lowercased transform function name
+ * @param[in]     body 函数括号内的参数文本 / Argument text inside the function parentheses
+ * @param[in,out] acc 累加矩阵 / Accumulator matrix
+ *
+ * @see transform_from_fn parse_transform mat_mul
+ */
 static void apply_transform_fn(const char *fn, const char *body, HpeTransform *acc)
 {
     char *copy = hpe_strdup(body);
@@ -479,7 +668,17 @@ static void apply_transform_fn(const char *fn, const char *body, HpeTransform *a
     hpe_free(copy);
 }
 
-/* parses a comma/space separated transform function list; only 2d functions */
+/**
+ * @brief 解析逗号/空白分隔的 2D 变换函数列表 / Parse a comma- or space-separated list of 2D transform functions
+ *
+ * @details 从单位矩阵开始，逐个识别 `name(...)` 并累积相乘；值为 `none` 或为空时输出单位矩阵，函数名会被转为小写，未知函数名由 `transform_from_fn` 视为不变。
+ *          Starting from the identity it recognises each `name(...)` in turn and multiplies it in; `none` or an empty value yields the identity, function names are lowercased, and unknown names are treated as no-ops by `transform_from_fn`.
+ *
+ * @param[in]     value 属性值文本 / Property value text
+ * @param[out]    out 接收解析出的矩阵 / Receives the parsed matrix
+ *
+ * @see apply_transform_fn apply_transform
+ */
 static void parse_transform(const char *value, HpeTransform *out)
 {
     HpeTransform acc;
@@ -536,8 +735,19 @@ static void parse_transform(const char *value, HpeTransform *out)
  * so adding a property is a data change, and every applier stays small enough
  * to be read and reasoned about on its own. */
 
-/* split `value` on whitespace and return the last token that parses as a colour
- * (handles shorthands such as `1px solid #ccc` where the colour is trailing). */
+/**
+ * @brief 返回以空白分隔后最后一个能解析为颜色的 token / Return the last whitespace-separated token that parses as a colour
+ *
+ * @details 从末段向前扫描，遇到第一个颜色即返回，用于处理颜色位于尾部的简写（如 `1px solid #ccc`）。
+ *          It scans from the last segment backwards and returns on the first colour, handling shorthands whose colour trails such as `1px solid #ccc`.
+ *
+ * @param[in]     value 属性值文本 / Property value text
+ * @param[out]    out 接收解析出的颜色 / Receives the parsed colour
+ *
+ * @return 找到颜色返回 1，否则返回 0 / 1 when a colour was found, 0 otherwise
+ *
+ * @see apply_background
+ */
 static int last_color_token(const char *value, HpeColor *out)
 {
     char buf[256];
@@ -553,7 +763,18 @@ static int last_color_token(const char *value, HpeColor *out)
     return 0;
 }
 
-/* CSS expands 1..4 border-colour values by repetition (T R B L) */
+/**
+ * @brief 把 1..4 个边框颜色按 CSS 规则展开到四边 / Expand 1..4 border colours across the four sides per the CSS rule
+ *
+ * @details 按 (上,右,下,左) 顺序重复取值：1 个值四边相同，2 个值上下取首值、左右取次值，3 个值下边取次值，4 个值一一对应；同时置位各边颜色位并把简写颜色同步为第一个值。
+ *          Values repeat in (top,right,bottom,left) order: one value fills all sides, two values give the first to top/bottom and the second to right/left, three values give the second to the bottom, and four map one-to-one; each side colour bit is set and the shorthand colour is synced to the first value.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     vals 已解析出的颜色数组 / Array of parsed colours
+ * @param[in]     got 有效颜色个数 1..4 / Number of valid colours, 1..4
+ *
+ * @see apply_border_color
+ */
 static void expand_border_colors(HpeStyle *d, const HpeColor *vals, int got)
 {
     static const int pick4[4] = {0, 1, 2, 3};
@@ -571,7 +792,19 @@ static void expand_border_colors(HpeStyle *d, const HpeColor *vals, int got)
     d->set |= HPE_PROP_BORDER_COLOR;
 }
 
-/* width applies to every side when `side` < 0, otherwise to that side only */
+/**
+ * @brief 设置某一侧或全部四侧的边框宽度 / Set the border width of one side or of all four sides
+ *
+ * @details `side` 非负时只写该侧并置位其宽度位；`side` 为负时把四侧统一写入并置位简写宽度位。
+ *          When `side` is non-negative only that side is written and its width bit set; when `side` is negative all four sides are written uniformly and the shorthand width bit is set.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     w 边框宽度（像素）/ Border width in pixels
+ * @param[in]     side 边序号 0..3，小于 0 表示全部四边 / Side index 0..3, negative for all four sides
+ * @param[in]     side_bit 该边的宽度属性位 / Width property bit for that side
+ *
+ * @see apply_border_side
+ */
 static void set_border_width(HpeStyle *d, float w, int side, uint64_t side_bit)
 {
     if (side >= 0) {
@@ -585,6 +818,18 @@ static void set_border_width(HpeStyle *d, float w, int side, uint64_t side_bit)
     }
 }
 
+/**
+ * @brief 按名称关键字把字体族归入 mono/serif/sans / Classify a font family name into mono, serif or sans by keyword
+ *
+ * @details 名称同时匹配中英文关键字，例如 `mono`/`courier`/`consolas` 归等宽，`serif`/`times`/`宋` 归衬线，`sans`/`yahei`/`arial`/`黑` 归无衬线；无法识别时返回默认族。
+ *          The name is matched against both Latin and Chinese keywords: `mono`/`courier`/`consolas` map to monospace, `serif`/`times`/`宋` to serif, `sans`/`yahei`/`arial`/`黑` to sans-serif; an unrecognised name falls back to the default family.
+ *
+ * @param[in]     name 已小写的字体族名 / Lowercased font family name
+ *
+ * @return 对应的 `HpeFontFamily` 枚举 / The matching `HpeFontFamily` value
+ *
+ * @see normalize_family_name apply_font_family
+ */
 static HpeFontFamily classify_font_family(const char *name)
 {
     if (strstr(name, "mono") || !strcmp(name, "courier") || strstr(name, "consolas"))
@@ -599,7 +844,16 @@ static HpeFontFamily classify_font_family(const char *name)
     return HPE_FONT_DEFAULT;
 }
 
-/* strips surrounding quotes and lowercases a family token in place */
+/**
+ * @brief 就地去除字体名两侧引号并转为小写 / Strip surrounding quotes from a family name in place and lowercase it
+ *
+ * @details 名称首尾同为 `"` 时去掉这对引号，然后把整串按 ASCII 转为小写，便于后续关键字匹配。
+ *          When the name starts and ends with `"` that pair is removed, then the whole string is lowercased by ASCII so keyword matching works.
+ *
+ * @param[in,out] name 待规范化的字体名（会被就地改写）/ Family name to normalise, modified in place
+ *
+ * @see classify_font_family apply_font_family
+ */
 static void normalize_family_name(char *name)
 {
     size_t len = strlen(name);
@@ -614,6 +868,18 @@ static void normalize_family_name(char *name)
         name[j] = (char)hpe_ascii_lower((unsigned char)name[j]);
 }
 
+/**
+ * @brief 把 overflow 关键字映射为枚举值 / Map an overflow keyword to its enum value
+ *
+ * @details `hidden`/`scroll`/`auto` 分别映射到对应枚举，其余（含 `visible`）一律返回 `HPE_OVERFLOW_VISIBLE`。
+ *          `hidden`, `scroll` and `auto` map to their enums and anything else, including `visible`, returns `HPE_OVERFLOW_VISIBLE`.
+ *
+ * @param[in]     tok 关键字 token / Keyword token
+ *
+ * @return 对应的 `HpeOverflow` 枚举 / The matching `HpeOverflow` value
+ *
+ * @see apply_overflow apply_overflow_x apply_overflow_y
+ */
 static HpeOverflow overflow_keyword(const char *tok)
 {
     if (!strcmp(tok, "hidden"))
@@ -625,7 +891,19 @@ static HpeOverflow overflow_keyword(const char *tok)
     return HPE_OVERFLOW_VISIBLE;
 }
 
-/* ---------------- appliers ---------------- */
+/**
+ * @brief 把 `display` 声明写入样式 / Write a `display` declaration into the style
+ *
+ * @details 识别 `none`/`inline-block`/`flex`/`inline`，其余（含缺省）按 `block` 处理；`inline-flex` 因引擎没有行内级弹性容器而被提升为 `flex`。
+ *          It recognises `none`, `inline-block`, `flex` and `inline` and treats everything else, including the default, as `block`; `inline-flex` is blockified to `flex` because the engine has no inline-level flex container.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @note 同时置位 `HPE_PROP_DISPLAY` / It also sets `HPE_PROP_DISPLAY`
+ *
+ * @see apply_property
+ */
 
 static void apply_display(HpeStyle *d, const char *value)
 {
@@ -643,6 +921,17 @@ static void apply_display(HpeStyle *d, const char *value)
     d->set |= HPE_PROP_DISPLAY;
 }
 
+/**
+ * @brief 把 `color` 声明写入样式的文本颜色 / Write a `color` declaration into the style's text colour
+ *
+ * @details 用 `hpe_color_parse` 解析成功才写入；解析失败时保持原值不变。
+ *          The value is written only when `hpe_color_parse` succeeds; on failure the previous value is kept.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see hpe_color_parse apply_property
+ */
 static void apply_color(HpeStyle *d, const char *value)
 {
     HpeColor c;
@@ -652,6 +941,17 @@ static void apply_color(HpeStyle *d, const char *value)
     }
 }
 
+/**
+ * @brief 解析 `background`/`background-color` 简写 / Parse the `background`/`background-color` shorthand
+ *
+ * @details 先尝试 `linear-gradient(...)` 并写入背景图层；`none`/`transparent` 置为透明色；否则先整体解析颜色（`rgba(...)` 等带空格的函数式写法不拆分），失败再取最后一个颜色 token（处理 `1px solid #ccc` 之类）。
+ *          It first tries `linear-gradient(...)` and writes the image layer; `none`/`transparent` become transparent; otherwise the whole value is parsed as a colour first (so `rgba(...)` with spaces is not split) and on failure the last colour token is used, handling cases like `1px solid #ccc`.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see parse_linear_gradient last_color_token
+ */
 static void apply_background(HpeStyle *d, const char *value)
 {
     HpeColor c;
@@ -674,6 +974,17 @@ static void apply_background(HpeStyle *d, const char *value)
     }
 }
 
+/**
+ * @brief 把 `min-width` 声明写入样式 / Write a `min-width` declaration into the style
+ *
+ * @details 仅接受 `px` 或百分比长度，其它单位（如 `auto`）不改动样式。
+ *          Only `px` and percentage lengths are accepted; other units such as `auto` leave the style unchanged.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_width hpe_len_parse
+ */
 static void apply_min_width(HpeStyle *d, const char *value)
 {
     HpeLength len = hpe_len_parse(value);
@@ -683,29 +994,77 @@ static void apply_min_width(HpeStyle *d, const char *value)
     }
 }
 
+/**
+ * @brief 把 `width` 声明写入样式 / Write a `width` declaration into the style
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @note 无条件写入并置位 `HPE_PROP_WIDTH`，`auto` 由 `hpe_len_parse` 表示 / It writes unconditionally and sets `HPE_PROP_WIDTH`; `auto` is represented by `hpe_len_parse`
+ *
+ * @see apply_height hpe_len_parse
+ */
 static void apply_width(HpeStyle *d, const char *value)
 {
     d->width = hpe_len_parse(value);
     d->set |= HPE_PROP_WIDTH;
 }
 
+/**
+ * @brief 把 `height` 声明写入样式 / Write a `height` declaration into the style
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @note 无条件写入并置位 `HPE_PROP_HEIGHT` / It writes unconditionally and sets `HPE_PROP_HEIGHT`
+ *
+ * @see apply_width hpe_len_parse
+ */
 static void apply_height(HpeStyle *d, const char *value)
 {
     d->height = hpe_len_parse(value);
     d->set |= HPE_PROP_HEIGHT;
 }
 
+/**
+ * @brief 解析 `margin` 简写并展开到四条边 / Parse the `margin` shorthand and expand it across the four sides
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see set_sides apply_padding
+ */
 static void apply_margin(HpeStyle *d, const char *value)
 {
     set_sides(d, value, 1);
 }
 
+/**
+ * @brief 解析 `padding` 简写并展开到四条边 / Parse the `padding` shorthand and expand it across the four sides
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see set_sides apply_margin
+ */
 static void apply_padding(HpeStyle *d, const char *value)
 {
     set_sides(d, value, 0);
 }
 
-/* one side of the margin/padding shorthand as a longhand setting */
+/**
+ * @brief 写入 margin/padding 的单边长属性 / Write one side of the margin/padding shorthand as a longhand
+ *
+ * @details `idx` 取 0..3 对应上右下左，`is_margin` 决定写入外边距还是内边距，并据类型置位对应的单边属性位。
+ *          `idx` 0..3 selects top, right, bottom and left and `is_margin` chooses the outer or inner edge, setting the matching per-side property bit.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ * @param[in]     idx 边序号 0..3（上右下左）/ Side index 0..3 (top, right, bottom, left)
+ * @param[in]     is_margin 为 1 时写外边距，为 0 时写内边距 / 1 writes a margin, 0 writes padding
+ *
+ * @see apply_margin apply_padding
+ */
 static void apply_box_side(HpeStyle *d, const char *value, int idx, int is_margin)
 {
     HpeLength len = hpe_len_parse(value);
@@ -727,7 +1086,17 @@ static void apply_padding_right(HpeStyle *d, const char *v) { apply_box_side(d, 
 static void apply_padding_bottom(HpeStyle *d, const char *v) { apply_box_side(d, v, 2, 0); }
 static void apply_padding_left(HpeStyle *d, const char *v) { apply_box_side(d, v, 3, 0); }
 
-/* `border-color: c1 [c2 [c3 [c4]]]` — top, right, bottom, left */
+/**
+ * @brief 解析 `border-color` 简写 / Parse the `border-color` shorthand
+ *
+ * @details 按空白最多拆出四段并逐个尝试解析颜色，至少解析出一个颜色才展开到四边。
+ *          At most four whitespace-separated segments are tried as colours and expansion happens only when at least one colour parses.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see expand_border_colors
+ */
 static void apply_border_color(HpeStyle *d, const char *value)
 {
     char buf[256];
@@ -745,8 +1114,19 @@ static void apply_border_color(HpeStyle *d, const char *value)
         expand_border_colors(d, vals, got);
 }
 
-/* `border` / `border-width` / `border-<side>`: width, style and colour in any
- * order; `side` < 0 means all four sides, `side_bit` is the side's width flag */
+/**
+ * @brief 解析 `border` 与 `border-<side>` 简写 / Parse the `border` and `border-<side>` shorthands
+ *
+ * @details 逐 token 处理宽度、样式与颜色（顺序无关）：`none` 把该侧宽度置 0，`solid`/`dashed`/`dotted`/`double` 被跳过，颜色分别写入该侧或四边，`px` 长度作为宽度；`side` 小于 0 表示四边。
+ *          Each token is handled for width, style or colour in any order: `none` zeroes that side's width, `solid`/`dashed`/`dotted`/`double` are skipped, a colour goes to that side or to all four, and a `px` length becomes the width; `side` below 0 means all four sides.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ * @param[in]     side 边序号 0..3，小于 0 表示全部四边 / Side index 0..3, negative for all four sides
+ * @param[in]     side_bit 该边的宽度属性位 / Width property bit for that side
+ *
+ * @see set_border_width apply_border_width
+ */
 static void apply_border_side(HpeStyle *d, const char *value, int side, uint64_t side_bit)
 {
     char buf[256];
@@ -794,6 +1174,17 @@ static void apply_border_right(HpeStyle *d, const char *v) { apply_border_side(d
 static void apply_border_bottom(HpeStyle *d, const char *v) { apply_border_side(d, v, 2, HPE_PROP_BORDER_BOTTOM); }
 static void apply_border_left(HpeStyle *d, const char *v) { apply_border_side(d, v, 3, HPE_PROP_BORDER_LEFT); }
 
+/**
+ * @brief 把 `border-radius` 声明写入样式 / Write a `border-radius` declaration into the style
+ *
+ * @details `px` 长度原样写入；百分比因需依赖边框盒而被存为负值，留待绘制阶段求解。
+ *          A `px` length is stored as-is; a percentage is stored negated because it depends on the border box, and is solved at paint time.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see hpe_len_parse
+ */
 static void apply_border_radius(HpeStyle *d, const char *value)
 {
     HpeLength len = hpe_len_parse(value);
@@ -808,6 +1199,17 @@ static void apply_border_radius(HpeStyle *d, const char *value)
     }
 }
 
+/**
+ * @brief 解析 `inset` 简写并展开到四边 / Parse the `inset` shorthand and expand it across the four sides
+ *
+ * @details 按 1/2/3/4 值的 CSS 规则展开到 (上,右,下,左)，逐边写入并置位对应的 inset 属性位。
+ *          It expands 1/2/3/4 values across (top,right,bottom,left) per the CSS rule, writing each edge and setting the inset property bit.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_inset_side hpe_len_parse
+ */
 static void apply_inset(HpeStyle *d, const char *value)
 {
     char buf[256];
@@ -837,12 +1239,34 @@ static void apply_inset(HpeStyle *d, const char *value)
     }
 }
 
+/**
+ * @brief 把 `flex-direction` 声明写入样式 / Write a `flex-direction` declaration into the style
+ *
+ * @details 仅 `column` 映射为 `HPE_FLEX_COLUMN`，其余（含 `row`）为 `HPE_FLEX_ROW`；不支持 `*-reverse`。
+ *          Only `column` maps to `HPE_FLEX_COLUMN` and everything else, including `row`, is `HPE_FLEX_ROW`; `*-reverse` is not supported.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_property
+ */
 static void apply_flex_direction(HpeStyle *d, const char *value)
 {
     d->flex_dir = !strcmp(value, "column") ? HPE_FLEX_COLUMN : HPE_FLEX_ROW;
     d->set |= HPE_PROP_FLEX_DIR;
 }
 
+/**
+ * @brief 把 `align-items` 声明写入样式 / Write an `align-items` declaration into the style
+ *
+ * @details 识别 `center`、`flex-start`/`start`、`flex-end`/`end`、`baseline`，其余一律为 `stretch`。
+ *          It recognises `center`, `flex-start`/`start`, `flex-end`/`end` and `baseline`, and treats everything else as `stretch`.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_align_self
+ */
 static void apply_align_items(HpeStyle *d, const char *value)
 {
     if (!strcmp(value, "center"))
@@ -858,6 +1282,17 @@ static void apply_align_items(HpeStyle *d, const char *value)
     d->set |= HPE_PROP_ALIGN_ITEMS;
 }
 
+/**
+ * @brief 把 `align-self` 声明写入样式 / Write an `align-self` declaration into the style
+ *
+ * @details 识别 `center`、`flex-start`/`start`、`flex-end`/`end`、`stretch`，其余（含 `auto`）为 `HPE_ALIGN_ITEMS_AUTO`。
+ *          It recognises `center`, `flex-start`/`start`, `flex-end`/`end` and `stretch`, and treats everything else, including `auto`, as `HPE_ALIGN_ITEMS_AUTO`.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_align_items
+ */
 static void apply_align_self(HpeStyle *d, const char *value)
 {
     if (!strcmp(value, "center"))
@@ -873,6 +1308,17 @@ static void apply_align_self(HpeStyle *d, const char *value)
     d->set |= HPE_PROP_ALIGN_SELF;
 }
 
+/**
+ * @brief 把 `justify-content` 声明写入样式 / Write a `justify-content` declaration into the style
+ *
+ * @details 识别 `center`、`flex-end`/`end`、`space-between`、`space-around`，其余（含 `flex-start`/`start`）为起始对齐。
+ *          It recognises `center`, `flex-end`/`end`, `space-between` and `space-around`; everything else, including `flex-start`/`start`, is start-aligned.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_property
+ */
 static void apply_justify(HpeStyle *d, const char *value)
 {
     if (!strcmp(value, "center"))
@@ -888,6 +1334,17 @@ static void apply_justify(HpeStyle *d, const char *value)
     d->set |= HPE_PROP_JUSTIFY;
 }
 
+/**
+ * @brief 把 `gap`/`row-gap`/`column-gap` 声明写入样式 / Write a `gap`/`row-gap`/`column-gap` declaration into the style
+ *
+ * @details 仅 `px` 与百分比长度取值为间距，其它单位落为 0。
+ *          Only `px` and percentage lengths yield a spacing; other units become 0.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_flex_grow
+ */
 static void apply_gap(HpeStyle *d, const char *value)
 {
     HpeLength len = hpe_len_parse(value);
@@ -895,6 +1352,17 @@ static void apply_gap(HpeStyle *d, const char *value)
     d->set |= HPE_PROP_GAP;
 }
 
+/**
+ * @brief 把 `flex`/`flex-grow` 声明写入样式 / Write a `flex`/`flex-grow` declaration into the style
+ *
+ * @details 仅 `px` 与百分比长度取值为伸缩系数（复用长度解析读取数值），其它单位落为 0。
+ *          Only `px` and percentage lengths yield a grow factor (the length parser supplies the number); other units become 0.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_gap
+ */
 static void apply_flex_grow(HpeStyle *d, const char *value)
 {
     HpeLength len = hpe_len_parse(value);
@@ -902,6 +1370,17 @@ static void apply_flex_grow(HpeStyle *d, const char *value)
     d->set |= HPE_PROP_FLEX_GROW;
 }
 
+/**
+ * @brief 把 `font-size` 声明写入样式 / Write a `font-size` declaration into the style
+ *
+ * @details 支持 `small`/`medium`/`large`/`x-large`/`xx-large`/`smaller`/`larger` 关键字；`px` 直接取值，百分比与 `em` 以父级 16px 为基准换算，`rem` 以 16px 根字号换算；结果非正时不写入。
+ *          It supports the `small`/`medium`/`large`/`x-large`/`xx-large`/`smaller`/`larger` keywords; `px` is taken directly, percentage and `em` resolve against a 16px parent and `rem` against a 16px root size; a non-positive result is not written.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see hpe_len_parse
+ */
 static void apply_font_size(HpeStyle *d, const char *value)
 {
     float v = 0.0f;
@@ -935,6 +1414,17 @@ static void apply_font_size(HpeStyle *d, const char *value)
     }
 }
 
+/**
+ * @brief 把 `font-weight` 声明归一为 400 或 700 / Normalise a `font-weight` declaration to 400 or 700
+ *
+ * @details `bold` 取 700、`normal` 取 400，其它情况解析为数值后按是否大于等于 600 归为 700 或 400（只有常规与粗体两档）。
+ *          `bold` is 700 and `normal` is 400; otherwise the value is parsed as a number and mapped to 700 when at least 600 and 400 otherwise (only a regular and a bold weight exist).
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see parse_plain_number
+ */
 static void apply_font_weight(HpeStyle *d, const char *value)
 {
     float v;
@@ -950,6 +1440,17 @@ static void apply_font_weight(HpeStyle *d, const char *value)
     d->set |= HPE_PROP_FONT_WEIGHT;
 }
 
+/**
+ * @brief 把 `text-align` 声明写入样式 / Write a `text-align` declaration into the style
+ *
+ * @details 识别 `center` 与 `right`，其余（含 `left`/`justify`）一律左对齐。
+ *          It recognises `center` and `right` and treats everything else, including `left`/`justify`, as left-aligned.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_property
+ */
 static void apply_text_align(HpeStyle *d, const char *value)
 {
     if (!strcmp(value, "center"))
@@ -961,6 +1462,19 @@ static void apply_text_align(HpeStyle *d, const char *value)
     d->set |= HPE_PROP_TEXT_ALIGN;
 }
 
+/**
+ * @brief 把 `line-height` 声明写入样式 / Write a `line-height` declaration into the style
+ *
+ * @details `normal` 置 0；无单位数字存为负值（表示字号倍数）；`px` 长度原样写入；其它单位不生效。
+ *          `normal` stores 0; a unitless number is stored negated to mean a multiple of the font size; a `px` length is stored as-is; other units have no effect.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @note `line_height <= 0` 表示 `auto`，负值 -n 表示 n 倍字号 / `line_height <= 0` means `auto` and a negative -n means an n-multiple of the font size
+ *
+ * @see parse_plain_number hpe_len_parse
+ */
 static void apply_line_height(HpeStyle *d, const char *value)
 {
     float v;
@@ -983,6 +1497,17 @@ static void apply_line_height(HpeStyle *d, const char *value)
     }
 }
 
+/**
+ * @brief 把 `white-space` 声明写入样式 / Write a `white-space` declaration into the style
+ *
+ * @details 识别 `nowrap`、`pre`、`pre-wrap`、`pre-line`，其余（含 `normal`）为 `HPE_WS_NORMAL`。
+ *          It recognises `nowrap`, `pre`, `pre-wrap` and `pre-line`; everything else, including `normal`, is `HPE_WS_NORMAL`.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_property
+ */
 static void apply_white_space(HpeStyle *d, const char *value)
 {
     if (!strcmp(value, "nowrap"))
@@ -998,6 +1523,17 @@ static void apply_white_space(HpeStyle *d, const char *value)
     d->set |= HPE_PROP_WHITE_SPACE;
 }
 
+/**
+ * @brief 从字体族列表中取首个可识别的族 / Take the first recognisable family from a font family list
+ *
+ * @details 按逗号分段，逐段去引号、转小写并按关键字归类，取第一个非默认族即停止；整串都识别不出时落到 `HPE_FONT_SANS`。
+ *          Segments are split on commas, each is de-quoted, lowercased and classified by keyword, and the first non-default family wins; when none is recognisable it falls back to `HPE_FONT_SANS`.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see classify_font_family normalize_family_name
+ */
 static void apply_font_family(HpeStyle *d, const char *value)
 {
     char buf[256];
@@ -1040,6 +1576,17 @@ static void apply_font_family(HpeStyle *d, const char *value)
     d->set |= HPE_PROP_FONT_FAMILY;
 }
 
+/**
+ * @brief 把 `position` 声明写入样式 / Write a `position` declaration into the style
+ *
+ * @details 识别 `relative`、`absolute`、`fixed`，其余（含 `static`）为 `HPE_POS_STATIC`。
+ *          It recognises `relative`, `absolute` and `fixed`; everything else, including `static`, is `HPE_POS_STATIC`.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_inset_side
+ */
 static void apply_position(HpeStyle *d, const char *value)
 {
     if (!strcmp(value, "relative"))
@@ -1053,7 +1600,19 @@ static void apply_position(HpeStyle *d, const char *value)
     d->set |= HPE_PROP_POSITION;
 }
 
-/* top/right/bottom/left: a single inset side */
+/**
+ * @brief 写入 top/right/bottom/left 中的一条 inset 长属性 / Write one inset longhand out of top, right, bottom and left
+ *
+ * @details 解析长度后写入 `inset[idx]` 并置位 `bit`。
+ *          The length is parsed into `inset[idx]` and `bit` is set.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ * @param[in]     idx 边序号 0..3（上右下左）/ Side index 0..3 (top, right, bottom, left)
+ * @param[in]     bit 该边的 inset 属性位 / Inset property bit for that side
+ *
+ * @see apply_inset
+ */
 static void apply_inset_side(HpeStyle *d, const char *value, int idx, uint32_t bit)
 {
     d->inset[idx] = hpe_len_parse(value);
@@ -1065,6 +1624,17 @@ static void apply_right(HpeStyle *d, const char *v) { apply_inset_side(d, v, 1, 
 static void apply_bottom(HpeStyle *d, const char *v) { apply_inset_side(d, v, 2, HPE_PROP_INSET_BOTTOM); }
 static void apply_left(HpeStyle *d, const char *v) { apply_inset_side(d, v, 3, HPE_PROP_INSET_LEFT); }
 
+/**
+ * @brief 把 `z-index` 声明写入样式 / Write a `z-index` declaration into the style
+ *
+ * @details `auto` 置 `z_auto=1` 且 `z_index=0`；纯数字则关闭 `auto` 并取整数值；其它值不改动。
+ *          `auto` sets `z_auto=1` with `z_index=0`; a bare number clears `auto` and stores the integer value; other values are ignored.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see parse_plain_number
+ */
 static void apply_z_index(HpeStyle *d, const char *value)
 {
     if (!strcmp(value, "auto")) {
@@ -1080,6 +1650,17 @@ static void apply_z_index(HpeStyle *d, const char *value)
     d->set |= HPE_PROP_Z_INDEX;
 }
 
+/**
+ * @brief 把 `float` 声明写入样式 / Write a `float` declaration into the style
+ *
+ * @details 识别 `left`、`right`，其余（含 `none`）为 `HPE_FLOAT_NONE`。
+ *          It recognises `left` and `right`; everything else, including `none`, is `HPE_FLOAT_NONE`.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_clear
+ */
 static void apply_float(HpeStyle *d, const char *value)
 {
     if (!strcmp(value, "left"))
@@ -1091,6 +1672,17 @@ static void apply_float(HpeStyle *d, const char *value)
     d->set |= HPE_PROP_FLOAT;
 }
 
+/**
+ * @brief 把 `clear` 声明写入样式 / Write a `clear` declaration into the style
+ *
+ * @details 识别 `left`、`right`、`both`，其余（含 `none`）为 `HPE_CLEAR_NONE`。
+ *          It recognises `left`, `right` and `both`; everything else, including `none`, is `HPE_CLEAR_NONE`.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_float
+ */
 static void apply_clear(HpeStyle *d, const char *value)
 {
     if (!strcmp(value, "left"))
@@ -1104,7 +1696,19 @@ static void apply_clear(HpeStyle *d, const char *value)
     d->set |= HPE_PROP_CLEAR;
 }
 
-/* min-height / max-width / max-height (min-width is handled separately) */
+/**
+ * @brief 写入第二属性字中的一条尺寸长属性 / Write one size longhand carried in the second property word
+ *
+ * @details 解析长度写入 `slot` 并置位 `bit`，用于 `min-height`/`max-width`/`max-height`（`min-width` 单独处理）。
+ *          The length is parsed into `slot` and `bit` is set; used by `min-height`, `max-width` and `max-height` while `min-width` is handled separately.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ * @param[in,out] slot 目标长度槽位 / Length member that receives the value
+ * @param[in]     bit 对应的属性位 / The matching property bit
+ *
+ * @see apply_min_width hpe_len_parse
+ */
 static void apply_size2(HpeStyle *d, const char *value, HpeLength *slot, uint64_t bit)
 {
     *slot = hpe_len_parse(value);
@@ -1115,12 +1719,34 @@ static void apply_min_height(HpeStyle *d, const char *v) { apply_size2(d, v, &d-
 static void apply_max_width(HpeStyle *d, const char *v) { apply_size2(d, v, &d->max_width, HPE_PROP2_MAX_WIDTH); }
 static void apply_max_height(HpeStyle *d, const char *v) { apply_size2(d, v, &d->max_height, HPE_PROP2_MAX_HEIGHT); }
 
+/**
+ * @brief 把 `box-sizing` 声明写入样式 / Write a `box-sizing` declaration into the style
+ *
+ * @details `border-box` 映射为 `HPE_BOX_SIZING_BORDER`，其余为 `HPE_BOX_SIZING_CONTENT`。
+ *          `border-box` maps to `HPE_BOX_SIZING_BORDER` and everything else to `HPE_BOX_SIZING_CONTENT`.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_property
+ */
 static void apply_box_sizing(HpeStyle *d, const char *value)
 {
     d->box_sizing = !strcmp(value, "border-box") ? HPE_BOX_SIZING_BORDER : HPE_BOX_SIZING_CONTENT;
     d->set2 |= HPE_PROP2_BOX_SIZING;
 }
 
+/**
+ * @brief 解析 `overflow` 简写写入两轴 / Parse the `overflow` shorthand into the two axes
+ *
+ * @details 一个值同时设置两轴，两个值依次为 x、y；关键字经 `overflow_keyword` 映射后同时置位两轴的属性位。
+ *          One value sets both axes and two values give x then y; keywords are mapped by `overflow_keyword` and both axis property bits are set.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see overflow_keyword apply_overflow_x apply_overflow_y
+ */
 static void apply_overflow(HpeStyle *d, const char *value)
 {
     char buf[128];
@@ -1137,18 +1763,45 @@ static void apply_overflow(HpeStyle *d, const char *value)
     d->set2 |= HPE_PROP2_OVERFLOW_X | HPE_PROP2_OVERFLOW_Y;
 }
 
+/**
+ * @brief 把 `overflow-x` 声明写入横向溢出 / Write an `overflow-x` declaration into the horizontal overflow
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see overflow_keyword apply_overflow
+ */
 static void apply_overflow_x(HpeStyle *d, const char *value)
 {
     d->overflow_x = overflow_keyword(value);
     d->set2 |= HPE_PROP2_OVERFLOW_X;
 }
 
+/**
+ * @brief 把 `overflow-y` 声明写入纵向溢出 / Write an `overflow-y` declaration into the vertical overflow
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see overflow_keyword apply_overflow
+ */
 static void apply_overflow_y(HpeStyle *d, const char *value)
 {
     d->overflow_y = overflow_keyword(value);
     d->set2 |= HPE_PROP2_OVERFLOW_Y;
 }
 
+/**
+ * @brief 把 `opacity` 声明写入样式并按 0..1 夹取 / Write an `opacity` declaration into the style, clamped to 0..1
+ *
+ * @details 只有能解析为纯数字时才写入，写入前把值夹到 [0,1]。
+ *          The value is written only when it parses as a bare number and is clamped to [0,1] beforehand.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see parse_plain_number
+ */
 static void apply_opacity(HpeStyle *d, const char *value)
 {
     float v;
@@ -1162,6 +1815,17 @@ static void apply_opacity(HpeStyle *d, const char *value)
     }
 }
 
+/**
+ * @brief 把 `visibility` 声明写入样式 / Write a `visibility` declaration into the style
+ *
+ * @details 识别 `hidden`、`collapse`，其余（含 `visible`）为 `HPE_VISIBILITY_VISIBLE`。
+ *          It recognises `hidden` and `collapse`; everything else, including `visible`, is `HPE_VISIBILITY_VISIBLE`.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_property
+ */
 static void apply_visibility(HpeStyle *d, const char *value)
 {
     if (!strcmp(value, "hidden"))
@@ -1173,6 +1837,17 @@ static void apply_visibility(HpeStyle *d, const char *value)
     d->set2 |= HPE_PROP2_VISIBILITY;
 }
 
+/**
+ * @brief 把 `cursor` 声明映射为光标枚举 / Map a `cursor` declaration to the cursor enum
+ *
+ * @details 识别 pointer/text/move/wait/help/crosshair/not-allowed/grab/grabbing、`ew-resize`/`col-resize`、`ns-resize`/`row-resize`、`default`；其余（含 `auto`）为 `HPE_CURSOR_AUTO`。
+ *          It recognises pointer/text/move/wait/help/crosshair/not-allowed/grab/grabbing, `ew-resize`/`col-resize`, `ns-resize`/`row-resize` and `default`; everything else, including `auto`, is `HPE_CURSOR_AUTO`.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_property
+ */
 static void apply_cursor(HpeStyle *d, const char *value)
 {
     if (!strcmp(value, "pointer"))
@@ -1204,6 +1879,17 @@ static void apply_cursor(HpeStyle *d, const char *value)
     d->set2 |= HPE_PROP2_CURSOR;
 }
 
+/**
+ * @brief 解析 `text-decoration` 写入装饰位掩码 / Parse `text-decoration` into the decoration bit mask
+ *
+ * @details 按空白分段，`underline`/`overline`/`line-through` 按位或累加，`none` 清空；多个装饰可叠加。
+ *          Segments are split on whitespace and `underline`/`overline`/`line-through` are OR-ed in while `none` clears the mask, so several decorations can combine.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_property
+ */
 static void apply_text_decoration(HpeStyle *d, const char *value)
 {
     char buf[128];
@@ -1227,6 +1913,19 @@ static void apply_text_decoration(HpeStyle *d, const char *value)
     d->set2 |= HPE_PROP2_TEXT_DECORATION;
 }
 
+/**
+ * @brief 写入 letter/word-spacing 与 text-indent 长属性 / Write the letter/word-spacing and text-indent longhands
+ *
+ * @details 解析长度写入 `slot`；`auto`（即 `normal`）被替换为 0px，然后置位 `bit`。
+ *          The length is parsed into `slot`; `auto`, i.e. `normal`, is replaced with 0px, then `bit` is set.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ * @param[in,out] slot 目标长度槽位 / Length member that receives the value
+ * @param[in]     bit 对应的属性位 / The matching property bit
+ *
+ * @see apply_letter_spacing apply_vertical_align
+ */
 static void apply_text_spacing(HpeStyle *d, const char *value, HpeLength *slot, uint64_t bit)
 {
     HpeLength len = hpe_len_parse(value);
@@ -1240,6 +1939,17 @@ static void apply_letter_spacing(HpeStyle *d, const char *v) { apply_text_spacin
 static void apply_word_spacing(HpeStyle *d, const char *v) { apply_text_spacing(d, v, &d->word_spacing, HPE_PROP2_WORD_SPACING); }
 static void apply_text_indent(HpeStyle *d, const char *v) { apply_text_spacing(d, v, &d->text_indent, HPE_PROP2_TEXT_INDENT); }
 
+/**
+ * @brief 把 `vertical-align` 声明写入样式 / Write a `vertical-align` declaration into the style
+ *
+ * @details 识别 middle/top/bottom/text-top/text-bottom，其余（含 `baseline`）为 `HPE_VALIGN_BASELINE`。
+ *          It recognises middle/top/bottom/text-top/text-bottom; everything else, including `baseline`, is `HPE_VALIGN_BASELINE`.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_text_spacing
+ */
 static void apply_vertical_align(HpeStyle *d, const char *value)
 {
     if (!strcmp(value, "middle"))
@@ -1257,6 +1967,17 @@ static void apply_vertical_align(HpeStyle *d, const char *value)
     d->set2 |= HPE_PROP2_VERTICAL_ALIGN;
 }
 
+/**
+ * @brief 解析 `list-style` 简写写入类型与位置 / Parse the `list-style` shorthand into type and position
+ *
+ * @details 按空白分段，circle/square/disc/decimal/none 设置列表类型，inside/outside 设置位置，每命中一项即置位对应的属性位。
+ *          Segments are split on whitespace: circle/square/disc/decimal/none set the type and inside/outside set the position, each setting the matching property bit.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_list_style_position
+ */
 static void apply_list_style(HpeStyle *d, const char *value)
 {
     char buf[128];
@@ -1291,12 +2012,34 @@ static void apply_list_style(HpeStyle *d, const char *value)
     }
 }
 
+/**
+ * @brief 把 `list-style-position` 声明写入样式 / Write a `list-style-position` declaration into the style
+ *
+ * @details `inside` 映射为 `HPE_LIST_INSIDE`，其余（含 `outside`）为 `HPE_LIST_OUTSIDE`。
+ *          `inside` maps to `HPE_LIST_INSIDE`; everything else, including `outside`, is `HPE_LIST_OUTSIDE`.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_list_style
+ */
 static void apply_list_style_position(HpeStyle *d, const char *value)
 {
     d->list_style_position = !strcmp(value, "inside") ? HPE_LIST_INSIDE : HPE_LIST_OUTSIDE;
     d->set2 |= HPE_PROP2_LIST_STYLE_POSITION;
 }
 
+/**
+ * @brief 把 `background-image` 声明写入背景图层 / Write a `background-image` declaration into the image layer
+ *
+ * @details 能解析为线性渐变则写入渐变图层，`none` 则把图层类型置为 `HPE_BG_NONE`；两种情形都置位背景图层属性位。
+ *          A linear gradient is written into the image layer and `none` clears the layer kind to `HPE_BG_NONE`; both set the background-image property bit.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see parse_linear_gradient apply_background
+ */
 static void apply_background_image(HpeStyle *d, const char *value)
 {
     if (parse_linear_gradient(value, &d->background_image)) {
@@ -1307,6 +2050,17 @@ static void apply_background_image(HpeStyle *d, const char *value)
     }
 }
 
+/**
+ * @brief 把 `box-shadow` 声明写入样式 / Write a `box-shadow` declaration into the style
+ *
+ * @details 解析成功写入阴影并使 `valid` 为 1；`none` 则把 `valid` 置 0；两种情形都置位阴影属性位。
+ *          A successful parse writes the shadow with `valid` 1 and `none` clears `valid`; both set the box-shadow property bit.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see parse_shadow apply_text_shadow
+ */
 static void apply_box_shadow(HpeStyle *d, const char *value)
 {
     if (parse_shadow(value, &d->box_shadow))
@@ -1317,6 +2071,17 @@ static void apply_box_shadow(HpeStyle *d, const char *value)
     }
 }
 
+/**
+ * @brief 把 `text-shadow` 声明写入样式 / Write a `text-shadow` declaration into the style
+ *
+ * @details 解析成功写入文本阴影并使 `valid` 为 1；`none` 则把 `valid` 置 0；两种情形都置位文本阴影属性位。
+ *          A successful parse writes the text shadow with `valid` 1 and `none` clears `valid`; both set the text-shadow property bit.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see parse_shadow apply_box_shadow
+ */
 static void apply_text_shadow(HpeStyle *d, const char *value)
 {
     if (parse_shadow(value, &d->text_shadow))
@@ -1327,25 +2092,69 @@ static void apply_text_shadow(HpeStyle *d, const char *value)
     }
 }
 
+/**
+ * @brief 把 `transform` 声明写入样式 / Write a `transform` declaration into the style
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @note 无条件写入矩阵并置位 `HPE_PROP2_TRANSFORM` / It writes the matrix unconditionally and sets `HPE_PROP2_TRANSFORM`
+ *
+ * @see parse_transform
+ */
 static void apply_transform(HpeStyle *d, const char *value)
 {
     parse_transform(value, &d->transform);
     d->set2 |= HPE_PROP2_TRANSFORM;
 }
 
+/**
+ * @brief 记录 `transition` 是否被声明 / Record whether `transition` was declared
+ *
+ * @details 值为 `none` 时 `has_transition` 置 0，否则置 1；只记录存在性，引擎尚无插值时钟。
+ *          `has_transition` is 0 for `none` and 1 otherwise; only presence is recorded as the engine has no interpolation clock yet.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_animation
+ */
 static void apply_transition(HpeStyle *d, const char *value)
 {
     d->has_transition = !strcmp(value, "none") ? 0 : 1;
     d->set2 |= HPE_PROP2_TRANSITION;
 }
 
+/**
+ * @brief 记录 `animation` 是否被声明 / Record whether `animation` was declared
+ *
+ * @details 值为 `none` 时 `has_animation` 置 0，否则置 1；只记录存在性，尚未实现动画播放。
+ *          `has_animation` is 0 for `none` and 1 otherwise; only presence is recorded and animation playback is not implemented.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_transition
+ */
 static void apply_animation(HpeStyle *d, const char *value)
 {
     d->has_animation = !strcmp(value, "none") ? 0 : 1;
     d->set2 |= HPE_PROP2_ANIMATION;
 }
 
-/* per-side border colours: `border-top-color` etc. */
+/**
+ * @brief 写入某一边的边框颜色长属性 / Write the border colour longhand of one side
+ *
+ * @details 解析成功才写入该侧颜色，同时把简写颜色同步为该值，并置位简写颜色位与该侧的颜色位。
+ *          The colour is written to that side only on a successful parse, the shorthand colour is synced to the same value, and both the shorthand bit and that side's colour bit are set.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ * @param[in]     side 边序号 0..3（上右下左）/ Side index 0..3 (top, right, bottom, left)
+ * @param[in]     bit 该边的颜色属性位 / Colour property bit for that side
+ *
+ * @see apply_border_color
+ */
 static void apply_border_side_color(HpeStyle *d, const char *value, int side, uint64_t bit)
 {
     HpeColor c;
@@ -1451,6 +2260,18 @@ static const PropEntry k_prop_table[] = {
     {"border-left-color", apply_border_left_color},
 };
 
+/**
+ * @brief 按属性名查表并分派到对应应用函数 / Look a property name up in the table and dispatch to its applier
+ *
+ * @details 先把属性名转为小写，`inherit` 直接忽略（层叠已从父样式起步）；随后在 `k_prop_table` 中按名匹配并调用对应函数，未注册的属性名静默忽略。
+ *          The property name is lowercased, `inherit` is ignored outright because the cascade already starts from the parent style, and the name is then matched in `k_prop_table` and dispatched; an unregistered name is silently ignored.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     prop CSS 属性名（大小写不敏感）/ CSS property name, case-insensitive
+ * @param[in]     value 已剥离 `!important` 的声明值 / Declaration value with `!important` already stripped
+ *
+ * @see hpe_css_parse_declarations
+ */
 static void apply_property(HpeStyle *d, const char *prop, const char *value)
 {
     char lprop[64];
@@ -1475,7 +2296,23 @@ static void apply_property(HpeStyle *d, const char *prop, const char *value)
     }
 }
 
-/* ---------------- declaration parsing ---------------- */
+/**
+ * @brief 去除尾部 `!important` 并报告是否存在 / Strip a trailing `!important` and report whether it was present
+ *
+ * @details 先把值复制到 `buf` 并去掉尾部空白，若末尾恰好是 `!important` 则截断并把 `*out_important` 置 1。
+ *          The value is copied into `buf` and trailing whitespace trimmed; when the tail is exactly `!important` it is cut off and `*out_important` is set to 1.
+ *
+ * @param[in]     value 待处理的声明值 / Declaration value to process
+ * @param[out]    buf 存放剥离后文本的缓冲 / Buffer that holds the stripped text
+ * @param[in]     buf_size `buf` 的容量 / Capacity of `buf`
+ * @param[out]    out_important 置 1 表示存在 `!important` / Set to 1 when `!important` was present
+ *
+ * @return 指向 `buf` 内去空白后的值文本 / Pointer to the trimmed value text inside `buf`
+ *
+ * @note `out_important` 可为 `NULL` / `out_important` may be `NULL`
+ *
+ * @see hpe_css_parse_declarations
+ */
 
 static const char *strip_important(const char *value, char *buf, size_t buf_size, int *out_important)
 {
@@ -1495,6 +2332,20 @@ static const char *strip_important(const char *value, char *buf, size_t buf_size
     return hpe_trim(buf);
 }
 
+/**
+ * @brief 解析声明块并写入样式 / Parse a declaration block into a style
+ *
+ * @details 输入通常是 `style=""` 属性的内容；按 `;` 逐条拆分，对每条解析 `属性: 值` 并调用 `apply_property`，随后据该条是否带 `!important` 把新置位的属性位补记到 `imp`/`imp2`。
+ *          The input is normally the content of a `style=""` attribute; it is split on `;` and each `property: value` pair is parsed through `apply_property`, after which the bits newly set by that declaration are copied into `imp`/`imp2` when it carried `!important`.
+ *
+ * @param[in]     text 声明块文本 / Declaration block text
+ * @param[in]     length `text` 的字节长度 / Byte length of `text`
+ * @param[out]    decl 接收解析结果的样式 / Receives the parsed style
+ *
+ * @note 进入时先清零 `decl`；属性名或值为空、或无冒号的声明会被跳过 / `decl` is zeroed on entry; a declaration with a missing name or value, or without a colon, is skipped
+ *
+ * @see apply_property strip_important
+ */
 void hpe_css_parse_declarations(const char *text, size_t length, HpeStyle *decl)
 {
     char *copy;
@@ -1547,7 +2398,18 @@ void hpe_css_parse_declarations(const char *text, size_t length, HpeStyle *decl)
     hpe_free(copy);
 }
 
-/* ---------------- selectors ---------------- */
+/**
+ * @brief 判断字符是否为标识符字符 / Test whether a character may appear in an identifier
+ *
+ * @details 只接受 ASCII 字母、数字、下划线与连字符。
+ *          Only ASCII letters, digits, underscores and hyphens are accepted.
+ *
+ * @param[in]     c 待判断的字符 / Character to test
+ *
+ * @return 是标识符字符返回 1，否则返回 0 / 1 when it is an identifier character, 0 otherwise
+ *
+ * @see read_ident
+ */
 
 static int is_ident_char(char c)
 {
@@ -1555,6 +2417,21 @@ static int is_ident_char(char c)
            c == '_' || c == '-';
 }
 
+/**
+ * @brief 从游标处读取一个标识符 / Read one identifier starting at the cursor
+ *
+ * @details 连续读取标识符字符，超过 `out_size-1` 的部分被截断；什么都没读到则返回 `NULL`；成功后 `*pp` 前移到标识符末尾。
+ *          Consecutive identifier characters are read and anything beyond `out_size-1` is truncated; `NULL` is returned when nothing was read and otherwise `*pp` advances past the identifier.
+ *
+ * @param[in,out] pp 解析游标指针 / Parse cursor pointer
+ * @param[in]     end 输入缓冲区末尾 / End of the input buffer
+ * @param[out]    out 标识符缓冲 / Identifier buffer
+ * @param[in]     out_size `out` 的容量 / Capacity of `out`
+ *
+ * @return 标识符缓冲 `out`，无标识符时返回 `NULL` / The identifier buffer `out`, or `NULL` when none was read
+ *
+ * @see is_ident_char
+ */
 static char *read_ident(const char **pp, const char *end, char *out, size_t out_size)
 {
     const char *p = *pp;
@@ -1573,6 +2450,17 @@ static char *read_ident(const char **pp, const char *end, char *out, size_t out_
     return out;
 }
 
+/**
+ * @brief 给复合选择器追加一个类名 / Append a class name to a compound selector
+ *
+ * @details 扩容 `classes` 数组并存入类名的副本，类计数加一。
+ *          The `classes` array is grown and a copy of the name stored, incrementing the class count.
+ *
+ * @param[in,out] c 目标复合选择器 / Target compound selector
+ * @param[in]     name 类名 / Class name
+ *
+ * @see compound_free parse_class_or_id
+ */
 static void compound_add_class(HpeCompound *c, const char *name)
 {
     c->classes = (char **)hpe_grow(c->classes, &c->class_cap, (size_t)c->class_count + 1,
@@ -1580,6 +2468,16 @@ static void compound_add_class(HpeCompound *c, const char *name)
     c->classes[c->class_count++] = hpe_strdup(name);
 }
 
+/**
+ * @brief 释放复合选择器持有的全部内存 / Release every allocation held by a compound selector
+ *
+ * @details 依次释放标签、id、各类名与属性选择器的名字/运算符/值，最后把整个结构清零。
+ *          The tag, id, each class name and every attribute selector's name, operator and value are released before the struct is zeroed.
+ *
+ * @param[in,out] c 目标复合选择器 / Target compound selector
+ *
+ * @see compound_add_class compound_add_attr
+ */
 static void compound_free(HpeCompound *c)
 {
     int i;
@@ -1604,7 +2502,22 @@ static void compound_free(HpeCompound *c)
     memset(c, 0, sizeof(*c));
 }
 
-/* parses one `.class` / `#id` token; returns 0 on a malformed selector */
+/**
+ * @brief 解析一个 `.class` 或 `#id` token / Parse one `.class` or `#id` token
+ *
+ * @details 读取标记符（`.` 或 `#`）后的标识符：`.` 追加类名，`#` 写入 id（已有 id 时替换）；标识符为空视为格式错误。
+ *          The identifier after the sigil (`.` or `#`) is read: `.` appends a class and `#` writes the id, replacing any previous one; an empty identifier is a malformed selector.
+ *
+ * @param[in,out] out 目标复合选择器 / Target compound selector
+ * @param[in,out] pp 解析游标指针 / Parse cursor pointer
+ * @param[in]     end 输入缓冲区末尾 / End of the input buffer
+ * @param[out]    ident 标识符临时缓冲 / Scratch identifier buffer
+ * @param[in]     ident_size `ident` 的容量 / Capacity of `ident`
+ *
+ * @return 成功返回 1，格式错误返回 0 / 1 on success, 0 on a malformed selector
+ *
+ * @see read_ident compound_add_class
+ */
 static int parse_class_or_id(HpeCompound *out, const char **pp, const char *end, char *ident,
                              size_t ident_size)
 {
@@ -1624,8 +2537,22 @@ static int parse_class_or_id(HpeCompound *out, const char **pp, const char *end,
     return 1;
 }
 
-/* parses a `:pseudo` token; only :root and :hover affect the static match, the
- * rest are tolerated so a selector containing them does not fail to parse */
+/**
+ * @brief 解析一个 `:pseudo` token / Parse one `:pseudo` token
+ *
+ * @details `:root` 在缺少标签时补上 `html`，`:hover` 置位 `pseudo_hover`；其余动态/结构伪类被有意忽略，以便含它们的选择器仍能解析而不失败。
+ *          `:root` supplies an `html` tag when the tag is absent and `:hover` sets `pseudo_hover`; other dynamic and structural pseudo-classes are deliberately ignored so a selector containing them still parses instead of failing.
+ *
+ * @param[in,out] out 目标复合选择器 / Target compound selector
+ * @param[in,out] pp 解析游标指针 / Parse cursor pointer
+ * @param[in]     end 输入缓冲区末尾 / End of the input buffer
+ * @param[out]    ident 标识符临时缓冲 / Scratch identifier buffer
+ * @param[in]     ident_size `ident` 的容量 / Capacity of `ident`
+ *
+ * @return 成功返回 1，缺少标识符返回 0 / 1 on success, 0 when the identifier is missing
+ *
+ * @see read_ident parse_compound
+ */
 static int parse_pseudo(HpeCompound *out, const char **pp, const char *end, char *ident,
                         size_t ident_size)
 {
@@ -1644,8 +2571,25 @@ static int parse_pseudo(HpeCompound *out, const char **pp, const char *end, char
     return 1;
 }
 
-/* splits the body of `[...]` into name / operator / value; mirrors the engine's
- * lenient (non-spec) tokenisation exactly so selector behaviour is unchanged */
+/**
+ * @brief 把 `[...]` 内容拆为属性名/运算符/值 / Split an `[...]` body into name, operator and value
+ *
+ * @details 属性名读到空格或 `=` 为止；遇到 `=` 时记录运算符（`~`/`
+ *          `/`^`/`$`/`*` 后接连写 `=`），并读取可选的、可带引号的值；无 `=` 但以运算符结尾的畸形输入也被容忍。
+ *          The name is read up to a space or `=`, the operator is recorded when `=` is present (with `~`/`
+ *          `/`^`/`$`/`*` prefixed), and the optional possibly-quoted value is read; malformed input that trails an operator without `=` is also tolerated.
+ *
+ * @param[in]     body `[...]` 括号内的文本 / Text inside the `[...]` brackets
+ * @param[out]    aname 属性名 / Attribute name
+ * @param[out]    aop 属性匹配运算符 / Attribute match operator
+ * @param[out]    avalue 属性值 / Attribute value
+ * @param[in]     avalue_size `avalue` 的容量 / Capacity of `avalue`
+ * @param[out]    has_val 是否带值 / Whether a value is present
+ *
+ * @note 沿用引擎既有的宽松（非规范）分词方式以保持行为不变 / It mirrors the engine's lenient, non-spec tokenisation so behaviour is unchanged
+ *
+ * @see parse_attr_selector compound_add_attr
+ */
 static void dissect_attr_expr(const char *body, char *aname, char *aop, char *avalue,
                               size_t avalue_size, int *has_val)
 {
@@ -1699,6 +2643,20 @@ static void dissect_attr_expr(const char *body, char *aname, char *aop, char *av
     hpe_free(tmp);
 }
 
+/**
+ * @brief 给复合选择器追加一个属性选择器 / Append an attribute selector to a compound selector
+ *
+ * @details 先把属性名就地转为小写，再扩容 `attrs` 数组并存入名字、运算符与值的副本；无值时值为空串。
+ *          The attribute name is lowercased in place, the `attrs` array is grown and copies of the name, operator and value are stored, with an empty value when none was given.
+ *
+ * @param[in,out] out 目标复合选择器 / Target compound selector
+ * @param[in]     aname 属性名（会被就地转小写）/ Attribute name, lowercased in place
+ * @param[in]     aop 属性匹配运算符 / Attribute match operator
+ * @param[in]     avalue 属性值 / Attribute value
+ * @param[in]     has_val 是否带值 / Whether a value is present
+ *
+ * @see dissect_attr_expr compound_free
+ */
 static void compound_add_attr(HpeCompound *out, const char *aname, const char *aop,
                               const char *avalue, int has_val)
 {
@@ -1715,7 +2673,20 @@ static void compound_add_attr(HpeCompound *out, const char *aname, const char *a
     as->value = hpe_strdup(has_val ? avalue : "");
 }
 
-/* parses a `[attr]` / `[attr=v]` / `[attr~=v]` selector */
+/**
+ * @brief 解析一个 `[attr]` / `[attr=v]` / `[attr~=v]` 选择器 / Parse a `[attr]`, `[attr=v]` or `[attr~=v]` selector
+ *
+ * @details 先找到配对的 `]`，缺失则视为格式错误；把括号内文本交给 `dissect_attr_expr` 拆分后追加到复合选择器，游标移到 `]` 之后。
+ *          The matching `]` is located and its absence is a malformed selector; the bracketed text is split by `dissect_attr_expr` and appended to the compound, and the cursor moves past `]`.
+ *
+ * @param[in,out] out 目标复合选择器 / Target compound selector
+ * @param[in,out] pp 解析游标指针 / Parse cursor pointer
+ * @param[in]     end 输入缓冲区末尾 / End of the input buffer
+ *
+ * @return 成功返回 1，括号不配返回 0 / 1 on success, 0 when the brackets are unbalanced
+ *
+ * @see dissect_attr_expr compound_add_attr
+ */
 static int parse_attr_selector(HpeCompound *out, const char **pp, const char *end)
 {
     const char *a = *pp + 1;
@@ -1737,6 +2708,20 @@ static int parse_attr_selector(HpeCompound *out, const char **pp, const char *en
     return 1;
 }
 
+/**
+ * @brief 解析一个复合选择器（标签 + 若干简单选择器）/ Parse one compound selector (a tag plus simple selectors)
+ *
+ * @details 先处理可选的 `*` 或标签名（标签转小写存入），随后循环读取 `.class`/`#id`/`:pseudo`/`[attr]`，遇到其它字符即停止；任一简单选择器解析失败则整体失败并清零结果。
+ *          The optional `*` or a tag name is handled first (the tag lowercased), after which `.class`/`#id`/`:pseudo`/`[attr]` are read in a loop until any other character stops it; a failing simple selector fails the whole compound and leaves the result zeroed.
+ *
+ * @param[in,out] pp 解析游标指针 / Parse cursor pointer
+ * @param[in]     end 输入缓冲区末尾 / End of the input buffer
+ * @param[out]    out 接收解析出的复合选择器 / Receives the parsed compound selector
+ *
+ * @return 成功返回 1，失败返回 0 / 1 on success, 0 on failure
+ *
+ * @see parse_class_or_id parse_pseudo parse_attr_selector
+ */
 static int parse_compound(const char **pp, const char *end, HpeCompound *out)
 {
     const char *p = *pp;
@@ -1771,6 +2756,19 @@ static int parse_compound(const char **pp, const char *end, HpeCompound *out)
     return 1;
 }
 
+/**
+ * @brief 给选择器追加一个复合部分并累加特异性 / Append one compound part to a selector and accumulate its specificity
+ *
+ * @details 扩容 `parts` 并以值拷贝存入该部分，然后累加特异性：id 记 100、每个类记 10、`:hover` 记 10（伪类按类计）、标签记 1。
+ *          The `parts` array is grown and the compound copied in by value, then specificity accumulates: 100 for an id, 10 per class, 10 for `:hover` (a pseudo-class counts as a class) and 1 for a tag.
+ *
+ * @param[in,out] sel 目标选择器 / Target selector
+ * @param[in]     part 待追加的复合选择器 / Compound selector to append
+ *
+ * @return 恒返回 1 / Always returns 1
+ *
+ * @see parse_one_selector
+ */
 static int selector_add_part(HpeSelector *sel, const HpeCompound *part)
 {
     sel->parts = (HpeCompound *)hpe_grow(sel->parts, &sel->cap, (size_t)sel->count + 1,
@@ -1786,6 +2784,16 @@ static int selector_add_part(HpeSelector *sel, const HpeCompound *part)
     return 1;
 }
 
+/**
+ * @brief 释放选择器持有的全部内存 / Release every allocation held by a selector
+ *
+ * @details 逐部分调用 `compound_free`，再释放 `parts` 数组并把结构清零。
+ *          Each part is released through `compound_free`, then the `parts` array is freed and the struct zeroed.
+ *
+ * @param[in,out] sel 目标选择器 / Target selector
+ *
+ * @see compound_free rule_free
+ */
 static void selector_free(HpeSelector *sel)
 {
     int i;
@@ -1796,6 +2804,16 @@ static void selector_free(HpeSelector *sel)
     memset(sel, 0, sizeof(*sel));
 }
 
+/**
+ * @brief 释放规则持有的选择器与声明 / Release the selectors and declarations held by a rule
+ *
+ * @details 逐条释放选择器，再释放选择器数组与声明数组，最后把规则清零。
+ *          Every selector is released, then the selector array and the declaration array are freed and the rule zeroed.
+ *
+ * @param[in,out] rule 目标 CSS 规则 / Target CSS rule
+ *
+ * @see selector_free
+ */
 static void rule_free(HpeRule *rule)
 {
     int i;
@@ -1808,7 +2826,19 @@ static void rule_free(HpeRule *rule)
     memset(rule, 0, sizeof(*rule));
 }
 
-/* consumes an explicit combinator token (`>` `+` `~`), defaulting to descendant */
+/**
+ * @brief 读取组合符 token，缺省为后代组合符 / Read a combinator token, defaulting to the descendant combinator
+ *
+ * @details 识别 `>`/`+`/`~` 分别为子代/相邻兄弟/一般兄弟，其后跳过空白并把游标前移；无组合符时返回后代。
+ *          `>`/`+`/`~` map to child, adjacent sibling and general sibling respectively, whitespace is then skipped and the cursor advanced; without a combinator the descendant combinator is returned.
+ *
+ * @param[in,out] pq 解析游标指针 / Parse cursor pointer
+ * @param[in]     end 输入缓冲区末尾 / End of the input buffer
+ *
+ * @return 读到的 `HpeCombinator` 枚举 / The `HpeCombinator` value that was read
+ *
+ * @see parse_one_selector
+ */
 static int read_combinator(const char **pq, const char *end)
 {
     const char *q = *pq;
@@ -1830,7 +2860,20 @@ static int read_combinator(const char **pq, const char *end)
     return comb;
 }
 
-/* parses one comma-separated selector (a chain of compounds) into `sel` */
+/**
+ * @brief 解析一个以逗号分隔的单个选择器（复合链）/ Parse one comma-separated selector (a chain of compounds)
+ *
+ * @details 逐个读取复合部分并记录其相对前一部分的组合符，首部分的组合符固定为后代；某部分解析失败时把 `count` 置 -1 以标记整个选择器无效。
+ *          Compound parts are read one by one with each recording its combinator relative to the previous part, the first part always using the descendant combinator; a failing part sets `count` to -1 to mark the whole selector invalid.
+ *
+ * @param[in]     part_start 选择器文本起始指针 / Start pointer of the selector text
+ * @param[in]     part_end 选择器文本结束指针 / End pointer of the selector text
+ * @param[out]    sel 接收解析出的选择器 / Receives the parsed selector
+ *
+ * @note 进入时先清零 `sel` / `sel` is zeroed on entry
+ *
+ * @see read_combinator parse_compound selector_add_part
+ */
 static void parse_one_selector(const char *part_start, const char *part_end, HpeSelector *sel)
 {
     const char *q = part_start;
@@ -1862,7 +2905,18 @@ static void parse_one_selector(const char *part_start, const char *part_end, Hpe
     }
 }
 
-/* parses "a b, c > d" into selector list */
+/**
+ * @brief 把 `a b, c > d` 形式的文本解析为选择器列表 / Parse text such as `a b, c > d` into a selector list
+ *
+ * @details 按逗号切分为各选择器，逐个解析后仅把 `count > 0` 的有效选择器追加到规则；空或无效的选择器被释放丢弃。
+ *          Segments are split on commas and parsed individually, and only valid selectors with `count > 0` are appended to the rule; empty or invalid selectors are freed and dropped.
+ *
+ * @param[in,out] rule 接收选择器的 CSS 规则 / CSS rule that receives the selectors
+ * @param[in]     text 选择器列表文本 / Selector list text
+ * @param[in]     length `text` 的字节长度 / Byte length of `text`
+ *
+ * @see parse_one_selector selector_free
+ */
 static void parse_selector_list(HpeRule *rule, const char *text, size_t length)
 {
     const char *p = text;
@@ -1891,6 +2945,19 @@ static void parse_selector_list(HpeRule *rule, const char *text, size_t length)
     }
 }
 
+/**
+ * @brief 判断 `class` 属性值是否含某个类名 / Test whether a `class` attribute value contains a given class name
+ *
+ * @details 把 `list` 按空白切成单词，逐个与目标名做等长比较，命中返回 1；`list` 为 `NULL` 返回 0。
+ *          The `list` is split into whitespace-separated words compared for equal length against the name and 1 is returned on a hit; a `NULL` list returns 0.
+ *
+ * @param[in]     list 空的 `class` 属性值 / The `class` attribute value
+ * @param[in]     name 要查找的类名 / Class name to look for
+ *
+ * @return 包含返回 1，否则返回 0 / 1 when present, 0 otherwise
+ *
+ * @see compound_matches
+ */
 static int class_list_contains(const char *list, const char *name)
 {
     const char *p = list;
@@ -1910,7 +2977,19 @@ static int class_list_contains(const char *list, const char *name)
     return 0;
 }
 
-/* true if `val` appears as a whitespace-separated word inside `list` */
+/**
+ * @brief 判断 `val` 是否作为空白分隔的整词出现在 `list` 中 / Test whether `val` appears as a whitespace-separated word inside `list`
+ *
+ * @details 用于 `~=` 运算符：按空白分词后做等长比较；`list` 为 `NULL` 或 `val` 为空返回 0。
+ *          Used by the `~=` operator: the list is split on whitespace and compared for equal length; a `NULL` list or an empty `val` returns 0.
+ *
+ * @param[in]     list 被搜索的文本 / Text to search
+ * @param[in]     val 要查找的整词 / Word to look for
+ *
+ * @return 命中返回 1，否则返回 0 / 1 on a hit, 0 otherwise
+ *
+ * @see attr_op_matches
+ */
 static int attr_word_contains(const char *list, const char *val)
 {
     size_t vlen = strlen(val);
@@ -1930,12 +3009,20 @@ static int attr_word_contains(const char *list, const char *val)
     return 0;
 }
 
-/*
- * Match one attribute selector, operator included, against the node's raw
- * attribute value. `attr_val` may be NULL (attribute absent). An empty op
- * means a bare presence test; any unrecognised operator is treated as a
- * match so that a future selector form degrades gracefully instead of
- * silently dropping the whole rule.
+/**
+ * @brief 按运算符把属性选择器与节点属性值匹配 / Match an attribute selector against a node's raw attribute value
+ *
+ * @details 空运算符表示仅测试存在性（`attr_val` 非 `NULL` 即匹配）；`=` 全等、`~=` 整词、`
+ *          =` 前缀且其后为 `-` 或结束、`^=` 前缀、`$=` 后缀、`*=` 子串；任何无法识别的运算符都按匹配处理，避免将来新增形式时整条规则被静默丢弃。
+ *          An empty operator is a bare presence test (`attr_val` non-`NULL` matches); `=` is equality, `~=` a whole word, `
+ *          =` a prefix followed by `-` or end, `^=` a prefix, `$=` a suffix and `*=` a substring; any unrecognised operator is treated as a match so a future selector form degrades gracefully rather than silently dropping the rule.
+ *
+ * @param[in]     as 属性选择器 / Attribute selector
+ * @param[in]     attr_val 节点的属性值，属性不存在时为 `NULL` / The node's attribute value, `NULL` when the attribute is absent
+ *
+ * @return 匹配返回 1，否则返回 0 / 1 on a match, 0 otherwise
+ *
+ * @see attr_word_contains compound_matches
  */
 static int attr_op_matches(const HpeAttrSel *as, const char *attr_val)
 {
@@ -1964,6 +3051,19 @@ static int attr_op_matches(const HpeAttrSel *as, const char *attr_val)
     return 1;
 }
 
+/**
+ * @brief 判断复合选择器是否匹配一个元素节点 / Test whether a compound selector matches an element node
+ *
+ * @details 元素类型不符直接不匹配；依次校验标签、`hover` 状态、id、全部类名（逐个要求在 `class` 中）与全部属性选择器，全部通过才匹配。
+ *          A non-element node fails immediately; the tag, hover state, id, every class (each required to appear in `class`) and every attribute selector are checked in turn and all must pass.
+ *
+ * @param[in]     c 复合选择器 / Compound selector
+ * @param[in]     node 待测试的 DOM 节点 / DOM node to test
+ *
+ * @return 匹配返回 1，否则返回 0 / 1 on a match, 0 otherwise
+ *
+ * @see attr_op_matches class_list_contains
+ */
 static int compound_matches(const HpeCompound *c, const HpeDomNode *node)
 {
     int i;
@@ -1995,6 +3095,22 @@ static int compound_matches(const HpeCompound *c, const HpeDomNode *node)
     return 1;
 }
 
+/**
+ * @brief 测试单个选择器是否匹配给定节点 / Test whether a standalone selector matches a node
+ *
+ * @details 把 `sel` 解析成临时规则，依次测试其中每个选择器，一旦命中即用 `hit` 提前跳出循环并返回。
+ *          `sel` is parsed into a temporary rule and its selectors are tested in turn; `hit` breaks the loop on the first match.
+ *
+ * @param[in]     node 待测试的 DOM 节点 / DOM node to test
+ * @param[in]     sel 选择器文本（可含逗号）/ Selector text, possibly comma-separated
+ * @param[in]     len `sel` 的字节长度 / Byte length of `sel`
+ *
+ * @return 匹配返回 1，否则返回 0 / 1 on a match, 0 otherwise
+ *
+ * @note 供 `querySelector` 一类接口使用 / Used by interfaces such as `querySelector`
+ *
+ * @see parse_selector_list selector_matches rule_free
+ */
 int hpe_css_selector_matches(const HpeDomNode *node, const char *sel, size_t len)
 {
     HpeRule rule;
@@ -2010,6 +3126,19 @@ int hpe_css_selector_matches(const HpeDomNode *node, const char *sel, size_t len
     return hit;
 }
 
+/**
+ * @brief 从句尾（主体）向左逐部分匹配选择器 / Match a selector right-to-left from its subject part
+ *
+ * @details 先要求最后一个部分匹配当前节点，再依次向左处理组合符：子代回退到直接父节点、相邻兄弟回退到前一个兄弟、一般兄弟向前搜索任意匹配的兄弟、后代则沿父链向上找首个匹配的祖先，中途失败即返回 0。
+ *          The last part must match the current node, after which combinators are walked leftwards: a child moves to the direct parent, an adjacent sibling to the previous sibling, a general sibling searches earlier siblings for any match, and a descendant climbs the parent chain to the first matching ancestor; any failure returns 0.
+ *
+ * @param[in]     sel 选择器 / Selector
+ * @param[in]     node 待测试的 DOM 节点 / DOM node to test
+ *
+ * @return 匹配返回 1，否则返回 0 / 1 on a match, 0 otherwise
+ *
+ * @see compound_matches hpe_css_selector_matches
+ */
 static int selector_matches(const HpeSelector *sel, const HpeDomNode *node)
 {
     int part;
@@ -2058,7 +3187,18 @@ static int selector_matches(const HpeSelector *sel, const HpeDomNode *node)
 
 /* ---------------- media queries ---------------- */
 
-/* maps a media feature name to its HPE_MF_* id, 0 when unrecognised */
+/**
+ * @brief 把媒体特性名映射为 `HPE_MF_*` 编号 / Map a media feature name to its `HPE_MF_*` id
+ *
+ * @details 识别 min-width/max-width/min-height/max-height/width/height，未知名称返回 0。
+ *          It recognises min-width/max-width/min-height/max-height/width/height and returns 0 for an unknown name.
+ *
+ * @param[in]     name 媒体特性名 / Media feature name
+ *
+ * @return 对应的特性编号，未识别返回 0 / The feature id, or 0 when unrecognised
+ *
+ * @see media_parse_condition media_alt_matches
+ */
 static int media_feature_id(const char *name)
 {
     if (hpe_str_ieq(name, "min-width"))
@@ -2076,7 +3216,19 @@ static int media_feature_id(const char *name)
     return 0;
 }
 
-/* parses a media feature value in px (only px lengths are honoured) */
+/**
+ * @brief 解析媒体特性值（仅接受 px 长度）/ Parse a media feature value, accepting only px lengths
+ *
+ * @details 读取数值后允许可选的 `px` 后缀与空白，其后必须为空；带其它单位的输入判为失败，只理解裸的 px 长度。
+ *          A number is read followed by an optional `px` suffix and whitespace, after which nothing may remain; input with any other unit fails as only a bare px length is understood.
+ *
+ * @param[in]     s 待解析的值文本 / Value text to parse
+ * @param[out]    out 解析出的像素值 / Receives the value in pixels
+ *
+ * @return 成功返回 1，失败返回 0 / 1 on success, 0 on failure
+ *
+ * @see media_parse_condition
+ */
 static int media_feature_value(const char *s, float *out)
 {
     char *end = NULL;
@@ -2099,7 +3251,18 @@ static int media_feature_value(const char *s, float *out)
 }
 
 /* parses the text between `@media` and `{` into `mq`. */
-/* consumes a leading `not` / `only` qualifier; returns the negate flag */
+/**
+ * @brief 消费前导的 `not`/`only` 并返回取反标志 / Consume a leading `not`/`only` and return the negate flag
+ *
+ * @details 以 `not` 开头时前移游标并返回 1；以 `only` 开头时只前移游标并返回 0；均以不区分大小写匹配并跳过其后空白。
+ *          A leading `not` advances the cursor and returns 1, a leading `only` advances the cursor and returns 0, both matched case-insensitively with trailing whitespace skipped.
+ *
+ * @param[in,out] pq 解析游标指针 / Parse cursor pointer
+ *
+ * @return 存在 `not` 返回 1，否则返回 0 / 1 when `not` was present, 0 otherwise
+ *
+ * @see parse_media_query
+ */
 static int media_consume_qualifier(char **pq)
 {
     char *q = *pq;
@@ -2112,7 +3275,19 @@ static int media_consume_qualifier(char **pq)
     return 0;
 }
 
-/* parses one `(feature: value)` condition into the alternative */
+/**
+ * @brief 解析一个 `(feature: value)` 条件到备选分支 / Parse one `(feature: value)` condition into an alternative
+ *
+ * @details 截取到 `)` 为止并拆出特性名与值，能识别且未超过条件上限时写入 `conds` 并计数；特性名或值无法识别时把该备选标记为 `unknown`。
+ *          The text up to `)` is taken and split into feature and value; a recognised pair within the condition limit is stored in `conds` and counted, while an unrecognised name or value marks the alternative `unknown`.
+ *
+ * @param[in,out] pq 解析游标指针 / Parse cursor pointer
+ * @param[in,out] alt 媒体条件备选分支 / Alternative media branch
+ *
+ * @note 缺少 `)` 时直接返回，不消费任何输入 / It returns without consuming anything when `)` is missing
+ *
+ * @see media_feature_id media_feature_value media_parse_alt_body
+ */
 static void media_parse_condition(char **pq, HpeMediaAlt *alt)
 {
     char *q = *pq;
@@ -2140,7 +3315,17 @@ static void media_parse_condition(char **pq, HpeMediaAlt *alt)
     *pq = close + 1;
 }
 
-/* parses a bare media-type token (`all` / `screen` / `print`) into `alt` */
+/**
+ * @brief 解析一个裸媒体类型 token 到备选分支 / Parse a bare media-type token into an alternative
+ *
+ * @details 截取到空白为止，`all`/`screen`/`print` 分别映射到对应 `HPE_MTYPE_*`，其它值把备选标记为 `unknown`。
+ *          The text up to whitespace is taken and `all`/`screen`/`print` map to their `HPE_MTYPE_*` values while anything else marks the alternative `unknown`.
+ *
+ * @param[in,out] pq 解析游标指针 / Parse cursor pointer
+ * @param[in,out] alt 媒体条件备选分支 / Alternative media branch
+ *
+ * @see media_parse_alt_body
+ */
 static void media_parse_type(char **pq, HpeMediaAlt *alt)
 {
     char *q = *pq;
@@ -2164,7 +3349,17 @@ static void media_parse_type(char **pq, HpeMediaAlt *alt)
     *pq = sp;
 }
 
-/* parses the conjunction inside one alternative (features joined by `and`) */
+/**
+ * @brief 解析一个备选分支内以 `and` 连接的合取 / Parse the `and`-joined conjunction inside one alternative
+ *
+ * @details 循环读取条件或媒体类型，之后跳过空白；遇 `and` 继续、直接遇 `(` 亦继续，否则结束。
+ *          Conditions or media types are read in a loop with trailing whitespace skipped; an `and` continues the loop, a following `(` also continues, and anything else ends it.
+ *
+ * @param[in,out] q 备选分支的文本游标 / Text cursor of the alternative
+ * @param[in,out] alt 媒体条件备选分支 / Alternative media branch
+ *
+ * @see media_parse_condition media_parse_type
+ */
 static void media_parse_alt_body(char *q, HpeMediaAlt *alt)
 {
     while (*q) {
@@ -2185,7 +3380,20 @@ static void media_parse_alt_body(char *q, HpeMediaAlt *alt)
     }
 }
 
-/* parses the text between `@media` and `{` into `mq`. */
+/**
+ * @brief 解析 `@media` 与 `{` 之间的文本为媒体查询 / Parse the text between `@media` and `{` into a media query
+ *
+ * @details 按逗号切分为各备选分支，每段复制成 NUL 结尾串后先消费 `not`/`only` 限定符，再解析类型与 `and` 条件；备选数超过上限即停止。
+ *          The text is split into alternatives on commas; each segment is copied into a NUL-terminated string, its `not`/`only` qualifier consumed, and its type and `and` conditions parsed; parsing stops once the alternative limit is reached.
+ *
+ * @param[in]     text `@media` 关键字之后的文本 / Text after the `@media` keyword
+ * @param[in]     length `text` 的字节长度 / Byte length of `text`
+ * @param[out]    mq 接收解析出的媒体查询 / Receives the parsed media query
+ *
+ * @note 进入时先清零并置 `present=1`；`alt_count` 记录实际备选数 / The struct is zeroed with `present=1` on entry and `alt_count` records the alternatives parsed
+ *
+ * @see media_consume_qualifier media_parse_alt_body
+ */
 static void parse_media_query(const char *text, size_t length, HpeMediaQuery *mq)
 {
     const char *end = text + length;
@@ -2217,7 +3425,20 @@ static void parse_media_query(const char *text, size_t length, HpeMediaQuery *mq
     mq->alt_count = ai;
 }
 
-/* evaluates one alternative against the viewport; 0 = no match */
+/**
+ * @brief 按视口尺寸求值一组媒体条件 / Evaluate one media condition list against the viewport size
+ *
+ * @details 逐个备选分支计算：`unknown` 或 `print` 类型直接不匹配；各条件按 min/max-width/height 与视口宽高比较（width/height 取整后相等），再按需取反；任一备选匹配即返回 1（备选之间为或关系）。
+ *          Each alternative is evaluated: `unknown` or a `print` type never matches; conditions compare the feature against the viewport width or height (with width/height requiring integer equality) and the result is negated when needed; any matching alternative returns 1 since alternatives are OR-ed.
+ *
+ * @param[in]     mq 媒体查询 / Media query
+ * @param[in]     vw 视口宽度 / Viewport width
+ * @param[in]     vh 视口高度 / Viewport height
+ *
+ * @return 匹配返回 1，否则返回 0 / 1 on a match, 0 otherwise
+ *
+ * @see rule_media_ok
+ */
 static int media_alt_matches(const HpeMediaQuery *mq, float vw, float vh)
 {
     int alt;
@@ -2250,6 +3471,20 @@ static int media_alt_matches(const HpeMediaQuery *mq, float vw, float vh)
     return 0;
 }
 
+/**
+ * @brief 设置用于求值 @media 的视口尺寸 / Set the viewport size used to evaluate @media
+ *
+ * @details 只写入宽高两个字段；规则的 `@media` 条件在层叠时按此尺寸即时求值，因此在重新层叠前调用即可让媒体查询随窗口变化生效。
+ *          Only the width and height fields are written; each rule's `@media` conditions are evaluated against this size at cascade time, so calling it before a re-cascade makes media queries follow the window.
+ *
+ * @param[in,out] sheet 目标样式表 / Target stylesheet
+ * @param[in]     vw 视口宽度（像素）/ Viewport width in pixels
+ * @param[in]     vh 视口高度（像素）/ Viewport height in pixels
+ *
+ * @note 传 `NULL` 时直接返回 / Returns immediately when `NULL` is passed
+ *
+ * @see hpe_css_compute
+ */
 void hpe_css_set_viewport(HpeStylesheet *sheet, float vw, float vh)
 {
     if (!sheet)
@@ -2258,7 +3493,17 @@ void hpe_css_set_viewport(HpeStylesheet *sheet, float vw, float vh)
     sheet->vh = vh;
 }
 
-/* ---------------- stylesheet parsing ---------------- */
+/**
+ * @brief 跳过空白与 `/ * * /` 注释 / Skip whitespace and `/ * * /` comments
+ *
+ * @details 循环跳过空白；遇到 `/ *` 则一路跳到配对的 `* /` 之后继续，注释未闭合时直接跳到输入末尾。
+ *          Whitespace is skipped in a loop; on `/ *` the scan runs to the matching `* /` and continues, and an unterminated comment sends the cursor to the end of the input.
+ *
+ * @param[in,out] pp 解析游标指针 / Parse cursor pointer
+ * @param[in]     end 输入缓冲区末尾 / End of the input buffer
+ *
+ * @see css_parse_into
+ */
 
 static void skip_ws_comments(const char **pp, const char *end)
 {
@@ -2278,8 +3523,19 @@ static void skip_ws_comments(const char **pp, const char *end)
     *pp = p;
 }
 
-/* find the matching '}' of the block that starts at `block`; returns the index
- * of that closing brace, or `end` if the block is unterminated */
+/**
+ * @brief 找到与起始 `{` 配对的 `}` / Find the `}` matching a block's opening `{`
+ *
+ * @details 从 `block` 开始按大括号计数扫描，每遇到 `}` 深度减一，深度归零即返回该位置；块未闭合时返回 `end`。
+ *          The scan counts braces from `block`, decrementing on each `}` and returning that position when the depth reaches zero; an unterminated block returns `end`.
+ *
+ * @param[in]     block 块体起始指针（`{` 之后）/ Pointer to the block body, just past `{`
+ * @param[in]     end 输入缓冲区末尾 / End of the input buffer
+ *
+ * @return 配对的 `}` 位置，或未闭合时的 `end` / The matching `}` position, or `end` when unterminated
+ *
+ * @see parse_at_rule
+ */
 static const char *find_block_end(const char *block, const char *end)
 {
     const char *scan = block;
@@ -2296,7 +3552,19 @@ static const char *find_block_end(const char *block, const char *end)
     return scan;
 }
 
-/* append one fully-parsed rule (with its enclosing @media chain) to `sheet` */
+/**
+ * @brief 把一条已解析的规则连同其 @media 链追加到样式表 / Append a fully-parsed rule with its @media chain to a stylesheet
+ *
+ * @details `mq_depth` 大于 0 时把外层 `@media` 的媒体查询栈整段复制进规则的 `mq` 并记录深度，随后扩容规则数组并以值拷贝追加该规则。
+ *          When `mq_depth` is above 0 the enclosing `@media` query stack is copied wholesale into the rule's `mq` array with its depth recorded, after which the rule array is grown and the rule appended by value.
+ *
+ * @param[in,out] sheet 目标样式表 / Target stylesheet
+ * @param[in,out] rule 待追加的规则（其声明数组所有权移交样式表）/ Rule being appended, whose declaration array ownership transfers to the sheet
+ * @param[in]     mq_stack 外层 `@media` 的媒体查询栈 / Media query stack of enclosing `@media` blocks
+ * @param[in]     mq_depth 嵌套深度 / Nesting depth
+ *
+ * @see parse_style_rule rule_media_ok
+ */
 static void sheet_add_rule(HpeStylesheet *sheet, HpeRule *rule,
                            const HpeMediaQuery *mq_stack, int mq_depth)
 {
@@ -2312,11 +3580,20 @@ static void sheet_add_rule(HpeStylesheet *sheet, HpeRule *rule,
     sheet->rules[sheet->rule_count++] = *rule;
 }
 
-/*
- * Parse the body of an at-rule that opened at `p` with its terminator found at
- * `q` (either ';' which ends a statement at-rule, or '{' which opens a block).
- * Only `@media` has an effect today; other blocks are skipped wholesale so an
- * unknown at-rule never corrupts the surrounding rule stream.
+/**
+ * @brief 解析一个 at-rule 的体 / Parse the body of an at-rule
+ *
+ * @details 以 `;` 结尾的语句型 at-rule 直接跳过；否则找到块体匹配的 `}`，若是 `@media` 且未超过嵌套上限则解析其条件并压栈，再以更深的栈递归 `css_parse_into`；其它 at-rule 整体跳过，避免未知块破坏后续规则流。
+ *          A statement at-rule ending in `;` is skipped; otherwise the matching `}` of its body is found, and for an `@media` within the nesting limit its conditions are parsed and pushed before recursing into `css_parse_into` with a deeper stack; any other at-rule is skipped wholesale so an unknown block never corrupts the surrounding rule stream.
+ *
+ * @param[in,out] sheet 目标样式表 / Target stylesheet
+ * @param[in,out] pp 解析游标指针 / Parse cursor pointer
+ * @param[in]     q at-rule 头部结束处（`;` 或 `{`）/ End of the at-rule prelude (`;` or `{`)
+ * @param[in]     end 输入缓冲区末尾 / End of the input buffer
+ * @param[in,out] mq_stack 媒体查询栈 / Media query stack
+ * @param[in]     mq_depth 当前嵌套深度 / Current nesting depth
+ *
+ * @see parse_media_query css_parse_into find_block_end
  */
 static void parse_at_rule(HpeStylesheet *sheet, const char **pp, const char *q,
                           const char *end, HpeMediaQuery *mq_stack, int mq_depth)
@@ -2350,8 +3627,19 @@ static void parse_at_rule(HpeStylesheet *sheet, const char **pp, const char *q,
     }
 }
 
-/* advance past a declaration block, honouring quoted strings so a '}' inside
- * a string value does not terminate the block early */
+/**
+ * @brief 前进到声明块结束，识别字符串中的 `}` / Advance to the end of a declaration block, honouring quoted strings
+ *
+ * @details 扫描到 `}` 为止，但遇到引号时先跳到配对的引号之后，因此字符串值里的 `}` 不会提前结束块。
+ *          The scan runs to `}` but on a quote it jumps past the matching quote first, so a `}` inside a string value does not terminate the block early.
+ *
+ * @param[in]     p 块体起始指针 / Pointer to the start of the block body
+ * @param[in]     end 输入缓冲区末尾 / End of the input buffer
+ *
+ * @return 块结束的 `}` 位置，或未闭合时的 `end` / The terminating `}` position, or `end` when unterminated
+ *
+ * @see parse_style_rule
+ */
 static const char *find_decl_block_end(const char *p, const char *end)
 {
     const char *scan = p;
@@ -2371,8 +3659,22 @@ static const char *find_decl_block_end(const char *p, const char *end)
     return scan;
 }
 
-/* parse one `selector { declarations }` rule and, when it declares anything,
- * materialise it into the sheet */
+/**
+ * @brief 解析一条 `选择器 { 声明 }` 规则 / Parse one `selector { declarations }` rule
+ *
+ * @details 先定位 `{` 得到选择器与声明区间，解析选择器列表后解析声明块；仅当选择器非空且声明确实设置了属性时，才把该规则连同递增的源码顺序号追加到样式表。
+ *          The `{` is located to delimit the selector and declaration spans, the selector list and declaration block are then parsed, and only when selectors are present and the declarations actually set a property is the rule appended to the sheet with an incremented source-order number.
+ *
+ * @param[in,out] sheet 目标样式表 / Target stylesheet
+ * @param[in,out] pp 解析游标指针 / Parse cursor pointer
+ * @param[in]     end 输入缓冲区末尾 / End of the input buffer
+ * @param[in]     mq_stack 外层 `@media` 的媒体查询栈 / Media query stack of enclosing `@media` blocks
+ * @param[in]     mq_depth 嵌套深度 / Nesting depth
+ *
+ * @note 找不到 `{` 或声明为空时游标推进到末尾且不产生规则 / When no `{` is found or the declarations are empty the cursor moves to the end and no rule is produced
+ *
+ * @see parse_selector_list hpe_css_parse_declarations sheet_add_rule
+ */
 static void parse_style_rule(HpeStylesheet *sheet, const char **pp, const char *end,
                              const HpeMediaQuery *mq_stack, int mq_depth)
 {
@@ -2415,9 +3717,22 @@ static void parse_style_rule(HpeStylesheet *sheet, const char **pp, const char *
     rule_free(&rule);
 }
 
-/* `mq_stack` holds the conditions of the enclosing @media blocks (outermost
- * first); rules are tagged with the whole chain and only match when every
- * enclosing query matches the viewport at cascade time. */
+/**
+ * @brief 递归解析样式表文本并追加规则 / Recursively parse stylesheet text and append rules
+ *
+ * @details 跳过空白与注释后，`@` 开头的交给 `parse_at_rule`（`@media` 会以更深的栈递归回本函数），其余交给 `parse_style_rule`；规则的 `mq_stack` 保存外层 `@media` 条件（最外层在前），层叠时须整条链都匹配视口才生效。
+ *          After whitespace and comments are skipped, `@`-prefixed input goes to `parse_at_rule` (whose `@media` re-enters this function with a deeper stack) and anything else to `parse_style_rule`; a rule's `mq_stack` holds the enclosing `@media` conditions outermost first and only matches at cascade time when the whole chain matches the viewport.
+ *
+ * @param[in,out] sheet 目标样式表 / Target stylesheet
+ * @param[in]     css 待解析的 CSS 文本 / CSS text to parse
+ * @param[in]     length `css` 的字节长度 / Byte length of `css`
+ * @param[in,out] mq_stack 媒体查询栈 / Media query stack
+ * @param[in]     mq_depth 当前嵌套深度 / Current nesting depth
+ *
+ * @note `sheet` 或 `css` 为 `NULL` 时直接返回 / It returns immediately when `sheet` or `css` is `NULL`
+ *
+ * @see parse_at_rule parse_style_rule hpe_css_parse
+ */
 static void css_parse_into(HpeStylesheet *sheet, const char *css, size_t length,
                            HpeMediaQuery *mq_stack, int mq_depth)
 {
@@ -2445,12 +3760,36 @@ static void css_parse_into(HpeStylesheet *sheet, const char *css, size_t length,
     }
 }
 
+/**
+ * @brief 解析一段 CSS 文本并追加到样式表 / Parse CSS text and append it to a stylesheet
+ *
+ * @details 在栈上分配媒体查询栈后从第 0 层开始调用 `css_parse_into`，规则按出现顺序追加且不会清空已有规则。
+ *          A media-query stack is allocated on the stack and `css_parse_into` is entered at depth 0; rules are appended in source order and existing rules are kept.
+ *
+ * @param[in,out] sheet 目标样式表 / Target stylesheet
+ * @param[in]     css 待解析的 CSS 文本 / CSS text to parse
+ * @param[in]     length `css` 的字节长度 / Byte length of `css`
+ *
+ * @see css_parse_into hpe_css_init
+ */
 void hpe_css_parse(HpeStylesheet *sheet, const char *css, size_t length)
 {
     HpeMediaQuery stack[HPE_MEDIA_MAX_DEPTH];
     css_parse_into(sheet, css, length, stack, 0);
 }
 
+/**
+ * @brief 初始化样式表并载入内置 UA 样式 / Initialise a stylesheet and load the built-in UA stylesheet
+ *
+ * @details 先把整个结构清零、把视口默认设为 800x600，再解析 `hpe_ua_stylesheet()` 的文本，因此新样式表一开始就带有浏览器默认样式。
+ *          The struct is zeroed, the viewport defaults to 800x600 and the text from `hpe_ua_stylesheet()` is parsed, so a fresh sheet already carries the user-agent defaults.
+ *
+ * @param[in,out] sheet 目标样式表 / Target stylesheet
+ *
+ * @note 传 `NULL` 时直接返回 / Returns immediately when `NULL` is passed
+ *
+ * @see hpe_css_free hpe_css_parse hpe_ua_stylesheet
+ */
 void hpe_css_init(HpeStylesheet *sheet)
 {
     if (!sheet)
@@ -2461,6 +3800,18 @@ void hpe_css_init(HpeStylesheet *sheet)
     hpe_css_parse(sheet, hpe_ua_stylesheet(), strlen(hpe_ua_stylesheet()));
 }
 
+/**
+ * @brief 释放样式表持有的全部规则 / Release every rule held by a stylesheet
+ *
+ * @details 逐条调用 `rule_free` 后释放规则数组并把整个结构清零，可安全重复调用。
+ *          Every rule is released through `rule_free`, the rule array is freed and the struct zeroed, so repeated calls are safe.
+ *
+ * @param[in,out] sheet 目标样式表 / Target stylesheet
+ *
+ * @note 传 `NULL` 时直接返回 / Returns immediately when `NULL` is passed
+ *
+ * @see hpe_css_init rule_free
+ */
 void hpe_css_free(HpeStylesheet *sheet)
 {
     int i;
@@ -2475,7 +3826,18 @@ void hpe_css_free(HpeStylesheet *sheet)
 
 /* ---------------- cascade ---------------- */
 
-/* copies the four-sided (margin/padding/border-width/inset) longhands */
+/**
+ * @brief 按掩码拷贝四边的 margin/padding/边框宽/inset / Copy the four-sided margin, padding, border-width and inset longhands selected by a mask
+ *
+ * @details 逐边检查 `HPE_PROP_MARGIN_TOP`/`PADDING_TOP`/`BORDER_TOP`/`INSET_TOP` 及其 `+i` 位，命中即拷贝该边长属性；掩码含对应的“四边”位时再统一拷贝四条边框宽度。
+ *          Each edge is checked for the `HPE_PROP_MARGIN_TOP`/`PADDING_TOP`/`BORDER_TOP`/`INSET_TOP` bit and its `+i` variants, copying that longhand on a hit; when the shorthand border-width bit is present all four border widths are copied.
+ *
+ * @param[in,out] dst 接收拷贝的目标样式 / Target style that receives the copies
+ * @param[in]     src 源样式 / Source style
+ * @param[in]     s 本次生效的属性位掩码 / Property bit mask that is in effect
+ *
+ * @see apply_decl_masked
+ */
 static void apply_box_edges(HpeStyle *dst, const HpeStyle *src, uint64_t s)
 {
     int i;
@@ -2565,7 +3927,20 @@ static const ScalarCopy k_scalars_word2[] = {
     SCALAR_COPY(HPE_PROP2_ANIMATION, has_animation),
 };
 
-/* apply the rows whose bit is set in `mask`, copying member bytes dst<-src */
+/**
+ * @brief 按掩码表逐项把源样式的标量成员拷到目标 / Copy the scalar members selected by a mask table from source to destination
+ *
+ * @details 遍历拷贝表，凡其位在 `mask` 中的项即用表中记录的偏移与大小整体拷贝成员字节，因此新增属性只需在表中加一行。
+ *          The table is walked and every entry whose bit is set in `mask` has its member bytes copied wholesale using the recorded offset and size, so adding a property means adding one row.
+ *
+ * @param[in,out] dst 接收拷贝的目标样式 / Target style that receives the copies
+ * @param[in]     src 源样式 / Source style
+ * @param[in]     mask 生效的属性位掩码 / Property bit mask in effect
+ * @param[in]     tbl 长属性拷贝表 / Scalar longhand copy table
+ * @param[in]     count 表中的条目数 / Number of entries in the table
+ *
+ * @see apply_first_word_scalars apply_second_word_scalars
+ */
 static void apply_scalar_table(HpeStyle *dst, const HpeStyle *src, uint64_t mask,
                                const ScalarCopy *tbl, size_t count)
 {
@@ -2578,22 +3953,55 @@ static void apply_scalar_table(HpeStyle *dst, const HpeStyle *src, uint64_t mask
     }
 }
 
-/* copies the scalar longhands carried in the first property word */
+/**
+ * @brief 拷贝第一属性字中的标量长属性 / Copy the scalar longhands carried in the first property word
+ *
+ * @details 以第一属性字掩码调用 `apply_scalar_table`。
+ *          It calls `apply_scalar_table` with the first-word mask.
+ *
+ * @param[in,out] dst 接收拷贝的目标样式 / Target style that receives the copies
+ * @param[in]     src 源样式 / Source style
+ * @param[in]     s 第一属性字的位掩码 / Bit mask of the first property word
+ *
+ * @see apply_scalar_table apply_second_word_scalars
+ */
 static void apply_first_word_scalars(HpeStyle *dst, const HpeStyle *src, uint64_t s)
 {
     apply_scalar_table(dst, src, s, k_scalars_word1,
                        sizeof(k_scalars_word1) / sizeof(k_scalars_word1[0]));
 }
 
-/* copies the scalar longhands carried in the second property word (v0.9) */
+/**
+ * @brief 拷贝第二属性字中的标量长属性 / Copy the scalar longhands carried in the second property word
+ *
+ * @details 以第二属性字掩码调用 `apply_scalar_table`。
+ *          It calls `apply_scalar_table` with the second-word mask.
+ *
+ * @param[in,out] dst 接收拷贝的目标样式 / Target style that receives the copies
+ * @param[in]     src 源样式 / Source style
+ * @param[in]     s2 第二属性字的位掩码 / Bit mask of the second property word
+ *
+ * @see apply_scalar_table apply_first_word_scalars
+ */
 static void apply_second_word_scalars(HpeStyle *dst, const HpeStyle *src, uint64_t s2)
 {
     apply_scalar_table(dst, src, s2, k_scalars_word2,
                        sizeof(k_scalars_word2) / sizeof(k_scalars_word2[0]));
 }
 
-/* per-side border colours default to the shared shorthand when only that one
- * was declared, so a `border-color` still paints all four sides. */
+/**
+ * @brief 解析并拷贝四边边框颜色 / Resolve and copy the per-side border colours
+ *
+ * @details 逐边优先取该侧颜色位对应的值；若该侧未声明但简写颜色位存在，则用简写颜色兜底，使 `border-color` 仍能画出四边。
+ *          Each edge prefers the value of its own colour bit and falls back to the shorthand colour when that edge was not declared but the shorthand bit is set, so a `border-color` still paints all four sides.
+ *
+ * @param[in,out] dst 接收颜色拷贝的目标样式 / Target style that receives the copies
+ * @param[in]     src 源样式 / Source style
+ * @param[in]     s 第一属性字的位掩码 / Bit mask of the first property word
+ * @param[in]     s2 第二属性字的位掩码 / Bit mask of the second property word
+ *
+ * @see apply_decl_masked
+ */
 static void apply_border_color_resolved(HpeStyle *dst, const HpeStyle *src, uint64_t s,
                                         uint64_t s2)
 {
@@ -2608,6 +4016,19 @@ static void apply_border_color_resolved(HpeStyle *dst, const HpeStyle *src, uint
     }
 }
 
+/**
+ * @brief 按掩码把一条声明应用到样式 / Apply one declaration onto a style, restricted to the given masks
+ *
+ * @details 先取出 `src->set & mask` 与 `src->set2 & mask2` 并把它们并入目标的“已声明”位（供后续阶段区分显式值与继承值），再依次拷贝四边、第一属性字标量、第二属性字标量、四边边框颜色；若没有任何单边颜色位而简写颜色位在掩码内，则四边统一用简写颜色。
+ *          It first takes `src->set & mask` and `src->set2 & mask2` and folds them into the destination's "declared" bits (so later stages can tell explicit from inherited values), then copies the box edges, the first-word scalars, the second-word scalars and the per-side border colours; when no per-side colour bit is present but the shorthand colour bit is inside the mask, all four edges take the shorthand colour.
+ *
+ * @param[in,out] dst 目标样式 / Target style
+ * @param[in]     src 源声明 / Source declaration
+ * @param[in]     mask 第一属性字的生效掩码 / Mask applied to the first property word
+ * @param[in]     mask2 第二属性字的生效掩码 / Mask applied to the second property word
+ *
+ * @see apply_decl apply_decl_important
+ */
 static void apply_decl_masked(HpeStyle *dst, const HpeStyle *src, uint64_t mask,
                               uint64_t mask2)
 {
@@ -2634,13 +4055,33 @@ static void apply_decl_masked(HpeStyle *dst, const HpeStyle *src, uint64_t mask,
     }
 }
 
-/* applies every declared property */
+/**
+ * @brief 把一条声明的全部属性应用到样式 / Apply every property of one declaration onto a style
+ *
+ * @details 以全 1 掩码调用 `apply_decl_masked`，即不加筛选地应用所有已声明属性。
+ *          It calls `apply_decl_masked` with all-ones masks, applying every declared property without filtering.
+ *
+ * @param[in,out] dst 目标样式 / Target style
+ * @param[in]     src 源声明 / Source declaration
+ *
+ * @see apply_decl_masked apply_decl_important
+ */
 static void apply_decl(HpeStyle *dst, const HpeStyle *src)
 {
     apply_decl_masked(dst, src, ~(uint64_t)0, ~(uint64_t)0);
 }
 
-/* applies only the properties flagged `!important` in `src` */
+/**
+ * @brief 只应用一条声明中被标为 `!important` 的属性 / Apply only the `!important` properties of one declaration
+ *
+ * @details 以该声明的 `imp`/`imp2` 掩码调用 `apply_decl_masked`。
+ *          It calls `apply_decl_masked` with the declaration's `imp`/`imp2` masks.
+ *
+ * @param[in,out] dst 目标样式 / Target style
+ * @param[in]     src 源声明 / Source declaration
+ *
+ * @see apply_decl_masked apply_important_pass
+ */
 static void apply_decl_important(HpeStyle *dst, const HpeStyle *src)
 {
     apply_decl_masked(dst, src, src->imp, src->imp2);
@@ -2662,7 +4103,17 @@ typedef struct {
     int inline_style;
 } HpeImpMatch;
 
-/* the cascade starts from the parent's computed style for inherited properties */
+/**
+ * @brief 从父样式拷贝可继承属性 / Copy the inheritable properties from the parent style
+ *
+ * @details 把颜色、字号、字重、文本对齐、行高、空白处理、字体族、可见性、光标、列表类型与位置以及字/词间距、文本缩进等可继承属性从 `parent` 复制到当前样式，作为层叠的起点。
+ *          Inheritable properties such as colour, font size, font weight, text alignment, line height, white-space, family, visibility, cursor, list type and position, letter/word spacing and text indent are copied from `parent` to seed the cascade.
+ *
+ * @param[in,out] style 目标样式 / Target style
+ * @param[in]     parent 父元素样式 / Parent style
+ *
+ * @see hpe_css_compute
+ */
 static void inherit_parent_style(HpeStyle *style, const HpeStyle *parent)
 {
     style->color = parent->color;
@@ -2681,7 +4132,19 @@ static void inherit_parent_style(HpeStyle *style, const HpeStyle *parent)
     style->text_indent = parent->text_indent;
 }
 
-/* true when every enclosing @media query matches the viewport at cascade time */
+/**
+ * @brief 判断规则的全部外层 `@media` 条件是否都命中视口 / Test whether every enclosing `@media` condition of a rule matches the viewport
+ *
+ * @details 沿规则保存的媒体查询链逐层用视口宽高求值，任一层不匹配即返回 0；无条件的规则（深度 0）直接返回 1。
+ *          The rule's stored query chain is evaluated layer by layer against the viewport size and any failing layer returns 0; an unconditional rule (depth 0) returns 1 immediately.
+ *
+ * @param[in]     rule CSS 规则 / CSS rule
+ * @param[in]     sheet 提供视口尺寸的样式表 / Stylesheet that supplies the viewport size
+ *
+ * @return 全部命中返回 1，否则返回 0 / 1 when all match, 0 otherwise
+ *
+ * @see media_alt_matches collect_matches
+ */
 static int rule_media_ok(const HpeRule *rule, const HpeStylesheet *sheet)
 {
     int k;
@@ -2692,6 +4155,19 @@ static int rule_media_ok(const HpeRule *rule, const HpeStylesheet *sheet)
     return 1;
 }
 
+/**
+ * @brief 返回规则中匹配该节点的最高特异性 / Return the highest specificity among a rule's selectors that match the node
+ *
+ * @details 遍历规则的选择器，仅统计匹配节点者，取其特异性最大值；无任何选择器匹配时返回 -1。
+ *          It walks the rule's selectors, considering only those matching the node, and takes the maximum specificity; -1 is returned when none matches.
+ *
+ * @param[in]     rule CSS 规则 / CSS rule
+ * @param[in]     node 待测试的 DOM 节点 / DOM node to test
+ *
+ * @return 最高特异性，或无匹配时的 -1 / The highest specificity, or -1 when none matches
+ *
+ * @see selector_matches collect_matches
+ */
 static int rule_best_specificity(const HpeRule *rule, const HpeDomNode *node)
 {
     int best = -1;
@@ -2704,7 +4180,20 @@ static int rule_best_specificity(const HpeRule *rule, const HpeDomNode *node)
     return best;
 }
 
-/* collects every stylesheet rule matching `node`, recording its specificity */
+/**
+ * @brief 收集所有匹配节点的样式表规则 / Collect every stylesheet rule matching a node
+ *
+ * @details 遍历样式表规则，跳过媒体条件未命中的规则，对命中的记录其最高特异性、源码顺序与声明指针；匹配数组按需扩容。
+ *          The sheet's rules are walked, media conditions that fail are skipped, and each hit records its best specificity, source order and declaration pointer; the match array grows on demand.
+ *
+ * @param[in]     sheet 样式表 / Stylesheet
+ * @param[in]     node 待计算样式的 DOM 节点 / DOM node being styled
+ * @param[in,out] matches 匹配结果数组 / Match result array
+ * @param[in,out] count 已收集的匹配个数 / Number of matches collected so far
+ * @param[in,out] cap 匹配数组当前容量 / Current capacity of the match array
+ *
+ * @see rule_media_ok rule_best_specificity hpe_css_compute
+ */
 static void collect_matches(const HpeStylesheet *sheet, const HpeDomNode *node,
                             HpeMatch **matches, size_t *count, size_t *cap)
 {
@@ -2727,7 +4216,17 @@ static void collect_matches(const HpeStylesheet *sheet, const HpeDomNode *node,
     }
 }
 
-/* stable insertion sort of the matches by (specificity, source order) */
+/**
+ * @brief 按（特异性, 源码顺序）稳定排序匹配项 / Stable sort the matches by (specificity, source order)
+ *
+ * @details 用插入排序按键升序排列，特异性相同时按源码顺序，稳定排序保证同键项的相对顺序不变，从而使后写的规则覆盖先写的。
+ *          An insertion sort orders the entries ascending by key with source order breaking ties; being stable it keeps equal-key entries in their original relative order, so later rules override earlier ones.
+ *
+ * @param[in,out] m 待排序的匹配数组 / Match array to sort
+ * @param[in]     n 数组元素个数 / Number of entries in the array
+ *
+ * @see apply_normal_declarations
+ */
 static void sort_matches(HpeMatch *m, int n)
 {
     int i, j;
@@ -2743,7 +4242,17 @@ static void sort_matches(HpeMatch *m, int n)
     }
 }
 
-/* stable insertion sort of the important matches by the same key */
+/**
+ * @brief 按（特异性, 源码顺序）稳定排序 important 匹配项 / Stable sort the important matches by (specificity, source order)
+ *
+ * @details 与 `sort_matches` 相同的键与稳定插入排序，作用于 `HpeImpMatch` 数组。
+ *          It uses the same key and stable insertion sort as `sort_matches`, applied to the `HpeImpMatch` array.
+ *
+ * @param[in,out] m 待排序的 important 匹配数组 / Important match array to sort
+ * @param[in]     n 数组元素个数 / Number of entries in the array
+ *
+ * @see apply_important_pass
+ */
 static void sort_imps(HpeImpMatch *m, int n)
 {
     int i, j;
@@ -2759,7 +4268,19 @@ static void sort_imps(HpeImpMatch *m, int n)
     }
 }
 
-/* parses the element's inline style attribute, returning 1 when non-empty */
+/**
+ * @brief 解析元素的内联 `style` 属性 / Parse the element's inline `style` attribute
+ *
+ * @details 非元素节点或无 `style` 属性时返回 0；否则把属性文本交给 `hpe_css_parse_declarations` 解析进 `out` 并返回 1。
+ *          A non-element node or a missing `style` attribute returns 0; otherwise the attribute text is parsed into `out` by `hpe_css_parse_declarations` and 1 is returned.
+ *
+ * @param[in]     node 目标 DOM 节点 / Target DOM node
+ * @param[out]    out 接收解析出的样式 / Receives the parsed style
+ *
+ * @return 存在非空 `style` 属性返回 1，否则返回 0 / 1 when a non-empty `style` attribute exists, 0 otherwise
+ *
+ * @see hpe_css_parse_declarations apply_normal_declarations
+ */
 static int parse_inline_style(const HpeDomNode *node, HpeStyle *out)
 {
     const char *inline_style;
@@ -2773,8 +4294,19 @@ static int parse_inline_style(const HpeDomNode *node, HpeStyle *out)
     return 1;
 }
 
-/* normal declarations: matching rules first, then the inline style attribute,
- * which beats any normal stylesheet declaration */
+/**
+ * @brief 应用普通声明：先规则后内联样式 / Apply the normal declarations: matching rules first, then the inline style
+ *
+ * @details 按排序后的顺序逐条应用样式表声明，其后若存在内联 `style` 属性再应用一次，从而内联样式胜过任何普通样式表声明。
+ *          The sorted stylesheet declarations are applied in order and the inline `style` attribute, when present, is applied afterwards, so the inline style beats any normal stylesheet declaration.
+ *
+ * @param[in,out] style 目标样式 / Target style
+ * @param[in]     matches 已排序的匹配数组 / The sorted match array
+ * @param[in]     n 匹配个数 / Number of matches
+ * @param[in]     node 待计算样式的 DOM 节点 / DOM node being styled
+ *
+ * @see apply_decl parse_inline_style hpe_css_compute
+ */
 static void apply_normal_declarations(HpeStyle *style, const HpeMatch *matches, int n,
                                       const HpeDomNode *node)
 {
@@ -2787,8 +4319,21 @@ static void apply_normal_declarations(HpeStyle *style, const HpeMatch *matches, 
         apply_decl(style, &decl);
 }
 
-/* gathers the important declarations (from rules and the inline attribute) that
- * the second pass will resolve */
+/**
+ * @brief 收集待第二趟处理的 `!important` 声明 / Gather the `!important` declarations for the second pass
+ *
+ * @details 逐条检查匹配规则中确实含 important 位的声明并记录其特异性与顺序；若内联 `style` 也含 important 项，则以高于任何选择器的特异性（`1<<20`）与更晚的顺序（`1<<30`）作为单独一项加入，并以 `inline_style` 标记。
+ *          Each matching rule whose declaration actually carries important bits is recorded with its specificity and order; when the inline `style` also has important declarations it is added as a separate entry with a specificity above any selector (`1<<20`) and a later order (`1<<30`), flagged through `inline_style`.
+ *
+ * @param[in]     matches 匹配数组 / Match array
+ * @param[in]     n 匹配个数 / Number of matches
+ * @param[in]     node 待计算样式的 DOM 节点 / DOM node being styled
+ * @param[in,out] imps important 匹配列表 / `!important` match array
+ * @param[in,out] count 已收集的 important 个数 / Number of important matches collected so far
+ * @param[in,out] cap important 数组当前容量 / Current capacity of the important array
+ *
+ * @see apply_important_pass sort_imps
+ */
 static void collect_imps(const HpeMatch *matches, int n, const HpeDomNode *node,
                          HpeImpMatch **imps, size_t *count, size_t *cap)
 {
@@ -2818,7 +4363,19 @@ static void collect_imps(const HpeMatch *matches, int n, const HpeDomNode *node,
     }
 }
 
-/* applies the sorted important declarations in one final pass */
+/**
+ * @brief 按排序结果应用 important 声明 / Apply the sorted important declarations
+ *
+ * @details 按顺序逐项处理：内联项重新解析 `style` 属性后只应用其 important 位，规则项直接调用 `apply_decl_important`，因此 important 声明整体覆盖所有普通声明。
+ *          The entries are handled in order: an inline entry re-parses the `style` attribute and applies only its important bits while a rule entry goes straight through `apply_decl_important`, so important declarations override every normal one.
+ *
+ * @param[in,out] style 目标样式 / Target style
+ * @param[in]     imps 已排序的 important 匹配数组 / The sorted important match array
+ * @param[in]     n important 个数 / Number of important matches
+ * @param[in]     node 待计算样式的 DOM 节点 / DOM node being styled
+ *
+ * @see apply_decl_important collect_imps hpe_css_compute
+ */
 static void apply_important_pass(HpeStyle *style, const HpeImpMatch *imps, int n,
                                  const HpeDomNode *node)
 {
@@ -2834,6 +4391,23 @@ static void apply_important_pass(HpeStyle *style, const HpeImpMatch *imps, int n
     }
 }
 
+/**
+ * @brief 计算节点的最终样式（两趟层叠）/ Compute a node's final style with a two-pass cascade
+ *
+ * @details 第一趟从 `hpe_style_default` 出发，按 `parent` 继承可继承属性，收集所有媒体条件通过且选择器匹配的规则，按（特异性, 源码顺序）排序后依次应用，最后叠加内联 `style=""`（胜过普通样式表声明）。
+ *          Pass one starts from `hpe_style_default`, inherits the inheritable properties from `parent`, gathers every rule whose media conditions pass and whose selectors match, applies them sorted by (specificity, source order), and finally overlays the inline `style=""`, which beats a normal stylesheet declaration.
+ *          第二趟只处理 `!important`：把（含内联的）important 声明按同一种键排序后只应用被标记为 important 的位；在 important 层内内联仍胜过样式表，其余由源码顺序决定。
+ *          Pass two handles `!important` only: the important declarations, inline ones included, are sorted by the same key and only the bits flagged important are applied; within the important origin an inline `style=""` still beats a stylesheet and otherwise source order decides.
+ *
+ * @param[in,out] sheet 样式表；为 `NULL` 时跳过规则匹配 / Stylesheet; rule matching is skipped when `NULL`
+ * @param[in]     node 待计算样式的 DOM 节点 / DOM node whose style is computed
+ * @param[in]     parent 父节点样式，用于继承；可为 `NULL` / Parent style used for inheritance; may be `NULL`
+ * @param[out]    out 接收计算后的样式 / Receives the computed style
+ *
+ * @note 计算得到的样式保留“已声明”位（`set`/`set2`），供绘制阶段区分显式值与继承值 / The computed style keeps the "declared" bits (`set`/`set2`) so later stages can tell an explicit value from an inherited one
+ *
+ * @see collect_matches apply_normal_declarations collect_imps apply_important_pass
+ */
 void hpe_css_compute(HpeStylesheet *sheet, const HpeDomNode *node, const HpeStyle *parent,
                      HpeStyle *out)
 {
@@ -2866,7 +4440,19 @@ void hpe_css_compute(HpeStylesheet *sheet, const HpeDomNode *node, const HpeStyl
     *out = style;
 }
 
-/* ---------------- inline style attribute helpers ---------------- */
+/**
+ * @brief 按格式串向输出缓冲追加文本 / Append formatted text to the output buffer
+ *
+ * @details 缓冲已满时直接返回，否则用 `vsnprintf` 追加并累加长度；写入长度会被夹到 `out_size` 以防越界。
+ *          It returns immediately when the buffer is full, otherwise appends through `vsnprintf` and accumulates the length, clamping the length to `out_size` to avoid overrun.
+ *
+ * @param[in,out] out 输出缓冲 / Output buffer
+ * @param[in]     out_size `out` 的容量 / Capacity of `out`
+ * @param[in,out] olen 已写入长度 / Length written so far
+ * @param[in]     fmt printf 风格格式串 / printf-style format string
+ *
+ * @see hpe_css_inline_set
+ */
 
 static void inline_append(char *out, size_t out_size, size_t *olen, const char *fmt, ...)
 {
@@ -2880,6 +4466,20 @@ static void inline_append(char *out, size_t out_size, size_t *olen, const char *
         *olen = out_size;
 }
 
+/**
+ * @brief 在元素的内联 `style` 属性中设置一个属性 / Set one property in an element's inline `style` attribute
+ *
+ * @details 扫描现有 `style` 属性，遇到同名属性就替换其值（值为空则删除），其余声明原样保留；没有同名属性时在末尾追加 `prop: value;`，最后整体写回属性。
+ *          The existing `style` attribute is scanned; a declaration with the same name has its value replaced (or removed when the new value is empty) while other declarations are kept verbatim, and when no match exists `prop: value;` is appended before the attribute is written back.
+ *
+ * @param[in,out] node 目标 DOM 元素 / Target DOM element
+ * @param[in]     prop CSS 属性名（小写、带连字符）/ CSS property name, lowercase and dashed
+ * @param[in]     value 属性值；空串或 `NULL` 表示删除该属性 / Property value; an empty string or `NULL` removes the property
+ *
+ * @note 供 JavaScript DOM 桥使用 / Used by the JavaScript DOM bridge
+ *
+ * @see inline_append hpe_css_inline_get
+ */
 void hpe_css_inline_set(HpeDomNode *node, const char *prop, const char *value)
 {
     char out[2048];
@@ -2925,6 +4525,23 @@ void hpe_css_inline_set(HpeDomNode *node, const char *prop, const char *value)
     hpe_dom_set_attr(node, "style", out);
 }
 
+/**
+ * @brief 读取元素内联 `style` 属性中的一个属性值 / Read one property value from an element's inline `style` attribute
+ *
+ * @details 按 `;` 拆分内联样式，逐个以大小写不敏感的方式比较属性名，命中后把去除首尾空白的值写入 `out` 并返回 1。
+ *          The inline style is split on `;` and property names are compared case-insensitively; on a hit the trimmed value is written to `out` and 1 is returned.
+ *
+ * @param[in]     node 目标 DOM 元素 / Target DOM element
+ * @param[in]     prop 要查询的 CSS 属性名 / CSS property name to look up
+ * @param[out]    out 接收属性值的缓冲区 / Buffer that receives the property value
+ * @param[in]     out_size 接收缓冲区容量（字节）/ Capacity of the output buffer in bytes
+ *
+ * @return 找到返回 1，否则返回 0 / 1 when found, 0 otherwise
+ *
+ * @note 属性值以去空白后的文本原样返回，不做规范化 / The value is returned as trimmed text without normalisation
+ *
+ * @see hpe_css_inline_set
+ */
 int hpe_css_inline_get(const HpeDomNode *node, const char *prop, char *out, size_t out_size)
 {
     const char *cur = hpe_dom_attr(node, "style");
@@ -2962,7 +4579,16 @@ int hpe_css_inline_get(const HpeDomNode *node, const char *prop, char *out, size
     return 0;
 }
 
-/* ---------------- user agent stylesheet ---------------- */
+/**
+ * @brief 返回内置的用户代理默认样式表文本 / Return the built-in user-agent stylesheet text
+ *
+ * @details 这份常量文本为 `html`/`body`、标题、列表、表格、表单控件等元素提供 `display`、`margin`、`font-size` 等浏览器默认值，在 `hpe_css_init` 时被解析进样式表。
+ *          This constant text supplies browser-default `display`, `margin`, `font-size` and similar values for `html`/`body`, headings, lists, tables and form controls; it is parsed into the sheet by `hpe_css_init`.
+ *
+ * @return 以 NUL 结尾的 UA 样式表 CSS 文本 / NUL-terminated CSS text of the user-agent stylesheet
+ *
+ * @see hpe_css_init
+ */
 
 const char *hpe_ua_stylesheet(void)
 {

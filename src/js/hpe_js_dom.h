@@ -14,17 +14,43 @@ enum {
     HPE_HOST_MUTATION_OBSERVER = 5
 };
 
-/* registers the "document" host object (plus element/style vtables) */
+/**
+ * @brief 注册 `document` 宿主对象及其虚表 / Register the `document` host object and its vtables
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] document 文档根 DOM 节点 / The document root DOM node
+ *
+ * @note 同时注册元素与样式表的属性拦截虚表 / Also registers the element and stylesheet property-access vtables
+ *
+ * @see hpe_js_dom_node_value
+ */
 void hpe_js_dom_install(HpeJs *js, HpeDomNode *document);
 
-/* wraps a DOM node in the host value scripts see (element or fragment vtable).
- * exposed so the MutationObserver bridge can hand back a fully usable node as a
- * MutationRecord's target. */
+/**
+ * @brief 把 DOM 节点包装成脚本可见的宿主值 / Wrap a DOM node in the host value scripts see
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node 待包装的 DOM 节点 / The DOM node to wrap
+ *
+ * @return 携带元素或片段虚表的宿主值 / The host value carrying the element or fragment vtable
+ *
+ * @note MutationObserver 桥用它把完全可用的节点作为记录 `target` 交回脚本 / The MutationObserver bridge uses it to hand a fully usable node back as a record's `target`
+ */
 JsValue hpe_js_dom_node_value(HpeJs *js, HpeDomNode *node);
 
-/* dispatches an event to `target` and its ancestors (bubbling); passes an
- * event object { type, clientX, clientY, target, currentTarget, preventDefault }.
- * returns 1 if any handler was invoked. */
+/**
+ * @brief 向目标节点及其祖先派发事件（冒泡）/ Dispatch an event to a target node and its ancestors with bubbling
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] target 事件目标节点 / The event target node
+ * @param[in]     type 事件类型名（如 `click`）/ The event type name, such as `click`
+ * @param[in]     clientX 客户端 X 坐标 / Client X coordinate
+ * @param[in]     clientY 客户端 Y 坐标 / Client Y coordinate
+ *
+ * @return 有处理函数被调用返回 1 / 1 when any handler was invoked
+ *
+ * @note 传给处理函数的事件对象为 `{ type, clientX, clientY, target, currentTarget, preventDefault }` / Handlers receive an event object shaped like `{ type, clientX, clientY, target, currentTarget, preventDefault }`
+ */
 int hpe_js_dom_dispatch(HpeJs *js, HpeDomNode *target, const char *type, int clientX,
                         int clientY);
 
