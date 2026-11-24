@@ -9,6 +9,7 @@
 #include "css/hpe_css.h"
 #include "dom/hpe_dom.h"
 #include "hope_internal.h"
+#include "html/hpe_encoding.h"
 #include "paint/hpe_svg.h"
 #include "html/hpe_html.h"
 #include "js/hpe_js.h"
@@ -39,6 +40,79 @@ static void print_text_by_id(HpeEngine *engine, const char *id);
 
 /* ---------------- stylesheets ---------------- */
 
+/* Finds the document's <base href> (the first one wins, per spec). Returns a
+ * pointer to the attribute value (owned by the DOM) or NULL. */
+static const char *find_base_href(HpeDomNode *node)
+{
+    HpeDomNode *child;
+    for (child = node->first_child; child; child = child->next_sibling) {
+        if (child->type == HPE_NODE_ELEMENT) {
+            const char *base = NULL;
+            if (strcmp(child->tag, "base") == 0)
+                base = hpe_dom_attr(child, "href");
+            if (base && *base)
+                return base;
+            {
+                const char *found = find_base_href(child);
+                if (found)
+                    return found;
+            }
+        }
+    }
+    return NULL;
+}
+
+/* Resolves a document-relative reference against <base href> (when present) and
+ * the document directory, writing the absolute result to `out`. */
+static void resolve_url(HpeEngine *engine, char *out, size_t out_size, const char *dir,
+                        const char *rel)
+{
+    if (engine->base_href[0] && !hpe_path_is_absolute(rel)) {
+        char basedir[HPE_MAX_PATH];
+        hpe_path_dir(engine->base_href, basedir, sizeof(basedir));
+        hpe_path_join(out, out_size, basedir, rel);
+    } else {
+        hpe_path_join(out, out_size, dir, rel);
+    }
+}
+
+/* normalises a rel attribute into a lowercase space-separated token string so
+ * `rel="ICON"` and `rel="shortcut icon"` compare predictably */
+static void normalize_rel(const char *rel, char *out, size_t out_size)
+{
+    size_t o = 0;
+    int last_space = 1;
+    for (; rel && *rel && o + 1 < out_size; rel++) {
+        if (hpe_is_space(*rel)) {
+            if (!last_space) {
+                out[o++] = ' ';
+                last_space = 1;
+            }
+        } else {
+            out[o++] = (char)hpe_ascii_lower((unsigned char)*rel);
+            last_space = 0;
+        }
+    }
+    while (o > 0 && out[o - 1] == ' ')
+        o--;
+    out[o] = '\0';
+}
+
+static int rel_has_token(const char *rel, const char *token)
+{
+    const char *p = rel;
+    size_t tl = strlen(token);
+    while (*p) {
+        while (*p == ' ')
+            p++;
+        if (hpe_str_ieq_n(p, token, tl) && (p[tl] == ' ' || p[tl] == '\0'))
+            return 1;
+        while (*p && *p != ' ')
+            p++;
+    }
+    return 0;
+}
+
 static void collect_styles(HpeEngine *engine, HpeDomNode *node, const char *dir)
 {
     HpeDomNode *child;
@@ -54,21 +128,347 @@ static void collect_styles(HpeEngine *engine, HpeDomNode *node, const char *dir)
         } else if (strcmp(child->tag, "link") == 0) {
             const char *rel = hpe_dom_attr(child, "rel");
             const char *href = hpe_dom_attr(child, "href");
-            if (rel && href && hpe_str_ieq(rel, "stylesheet")) {
-                char full[1024];
-                char *css;
-                hpe_path_join(full, sizeof(full), dir, href);
-                css = hpe_read_file(full, NULL);
-                if (css) {
-                    hpe_css_parse(&engine->sheet, css, strlen(css));
-                    hpe_free(css);
-                } else {
-                    fprintf(stderr, "hope: cannot open stylesheet %s\n", full);
+            if (rel && href) {
+                if (rel_has_token(rel, "stylesheet")) {
+                    char full[HPE_MAX_PATH];
+                    char *css;
+                    resolve_url(engine, full, sizeof(full), dir, href);
+                    css = hpe_read_file(full, NULL);
+                    if (css) {
+                        hpe_css_parse(&engine->sheet, css, strlen(css));
+                        hpe_free(css);
+                    } else {
+                        fprintf(stderr, "hope: cannot open stylesheet %s\n", full);
+                    }
+                } else if (engine->link_count < HPE_MAX_LINKS) {
+                    /* record non-stylesheet resource hints (icon/preload/...) */
+                    int idx = engine->link_count++;
+                    char tokens[24];
+                    normalize_rel(rel, tokens, sizeof(tokens));
+                    snprintf(engine->links[idx].rel, sizeof(engine->links[idx].rel), "%s",
+                             tokens);
+                    resolve_url(engine, engine->links[idx].href,
+                                sizeof(engine->links[idx].href), dir, href);
                 }
             }
         }
         collect_styles(engine, child, dir);
     }
+}
+
+/* A script can add/remove a <style>/<link> or rewrite a <style>'s text after the
+ * first collection. The DOM sink below reports exactly those edits; a later
+ * relayout then rebuilds the author rules. The sink fires before the sheet is
+ * touched, so it only records "a sheet-affecting change happened" + a signature
+ * of the last node involved; the real re-read happens in refresh_styles(). */
+static HpeDomNode *g_style_sig;
+static unsigned int g_style_rev;
+static int g_style_dirty;
+
+static int is_style_host(HpeDomNode *n)
+{
+    if (!n)
+        return 0;
+    if (n->type == HPE_NODE_ELEMENT)
+        return strcmp(n->tag, "style") == 0 || strcmp(n->tag, "link") == 0;
+    if (n->type == HPE_NODE_TEXT && n->parent)
+        return strcmp(n->parent->tag, "style") == 0;
+    return 0;
+}
+
+/* ---------------- mutation classification ----------------
+ * Every DOM change reports here. Two consumers share the record:
+ *   - the author-sheet tracker (a <style>/<link> touched -> re-read the sheet)
+ *   - the reflow tracker (how much layout/repaint the change needs)
+ * The reflow level only ever ratchets up; flush_mutations() acts on it and
+ * then resets. */
+/* Reflow needed by a style declaration diff. Any geometry-affecting property ->
+ * LAYOUT; a purely visual property (colour, opacity, shadow) -> PAINT; a value
+ * that only aliases something already painted (e.g. background-color on an
+ * element whose box draws a background-image) still needs the box tree, so the
+ * whole declaration set is conservatively treated as LAYOUT unless every single
+ * changed bit is known to be paint-only. */
+static int reflow_for_props(uint64_t set, uint64_t set2)
+{
+    /* geometry: box metrics, position, flow, typography (all change line boxes) */
+    const uint64_t geom =
+        HPE_PROP_DISPLAY | HPE_PROP_WIDTH | HPE_PROP_HEIGHT | HPE_PROP_MARGIN_TOP |
+        HPE_PROP_MARGIN_RIGHT | HPE_PROP_MARGIN_BOTTOM | HPE_PROP_MARGIN_LEFT |
+        HPE_PROP_PADDING_TOP | HPE_PROP_PADDING_RIGHT | HPE_PROP_PADDING_BOTTOM |
+        HPE_PROP_PADDING_LEFT | HPE_PROP_BORDER_WIDTH | HPE_PROP_FONT_SIZE |
+        HPE_PROP_FONT_WEIGHT | HPE_PROP_TEXT_ALIGN | HPE_PROP_LINE_HEIGHT |
+        HPE_PROP_WHITE_SPACE | HPE_PROP_FONT_FAMILY | HPE_PROP_POSITION |
+        HPE_PROP_INSET_TOP | HPE_PROP_INSET_RIGHT | HPE_PROP_INSET_BOTTOM |
+        HPE_PROP_INSET_LEFT | HPE_PROP_Z_INDEX | HPE_PROP_FLOAT | HPE_PROP_CLEAR |
+        HPE_PROP_BORDER_RADIUS | HPE_PROP_BORDER_TOP | HPE_PROP_BORDER_RIGHT |
+        HPE_PROP_BORDER_BOTTOM | HPE_PROP_BORDER_LEFT | HPE_PROP_FLEX_DIR |
+        HPE_PROP_ALIGN_ITEMS | HPE_PROP_JUSTIFY | HPE_PROP_GAP | HPE_PROP_FLEX_GROW |
+        HPE_PROP_ALIGN_SELF | HPE_PROP_MIN_WIDTH;
+    const uint64_t geom2 = HPE_PROP2_MIN_HEIGHT | HPE_PROP2_MAX_WIDTH | HPE_PROP2_MAX_HEIGHT |
+                           HPE_PROP2_BOX_SIZING | HPE_PROP2_OVERFLOW_X | HPE_PROP2_OVERFLOW_Y |
+                           HPE_PROP2_VISIBILITY | HPE_PROP2_LETTER_SPACING |
+                           HPE_PROP2_WORD_SPACING | HPE_PROP2_TEXT_INDENT |
+                           HPE_PROP2_VERTICAL_ALIGN | HPE_PROP2_LIST_STYLE_TYPE |
+                           HPE_PROP2_LIST_STYLE_POSITION | HPE_PROP2_BACKGROUND_IMAGE |
+                           HPE_PROP2_TRANSFORM;
+    if ((set & geom) || (set2 & geom2))
+        return HPE_REFLOW_LAYOUT;
+    if (set || set2)
+        return HPE_REFLOW_PAINT;
+    return HPE_REFLOW_NONE;
+}
+
+/* Does the style attribute change from old to new in any way that can affect
+ * layout or paint? Returns the reflow level. */
+static int reflow_for_inline_style(const char *old_value, const char *new_value)
+{
+    HpeStyle a, b;
+    a = hpe_style_default();
+    b = hpe_style_default();
+    if (old_value)
+        hpe_css_parse_declarations(old_value, strlen(old_value), &a);
+    if (new_value)
+        hpe_css_parse_declarations(new_value, strlen(new_value), &b);
+    if (a.set == b.set && a.set2 == b.set2)
+        return HPE_REFLOW_NONE;
+    return reflow_for_props(a.set ^ b.set, a.set2 ^ b.set2);
+}
+
+static int reflow_for_attr(HpeDomNode *target, const char *name, const char *old_value)
+{
+    const char *new_value;
+    if (!target || !name)
+        return HPE_REFLOW_LAYOUT;
+    if (target->type == HPE_NODE_ELEMENT && target->tag && strcmp(target->tag, "svg") == 0)
+        return HPE_REFLOW_LAYOUT; /* SVG geometry lives in attributes */
+    /* `style` is the only attribute that reaches the cascade; class/id change
+     * which rules match; everything else is inert for this engine. */
+    if (hpe_str_ieq(name, "style")) {
+        new_value = hpe_dom_attr(target, name);
+        return reflow_for_inline_style(old_value, new_value);
+    }
+    if (hpe_str_ieq(name, "class") || hpe_str_ieq(name, "id"))
+        return HPE_REFLOW_LAYOUT;
+    return HPE_REFLOW_NONE;
+}
+
+static void note_reflow(HpeEngine *engine, int need)
+{
+    if (!engine || need <= engine->reflow_need)
+        return;
+    engine->reflow_need = need;
+}
+
+/* true when `anc` is `node` itself or one of its DOM ancestors */
+static int dom_is_ancestor(HpeDomNode *anc, HpeDomNode *node)
+{
+    for (; node; node = node->parent)
+        if (node == anc)
+            return 1;
+    return 0;
+}
+
+/* Records the DOM node whose box subtree an incremental rebuild has to replace.
+ * Keeps the outermost (closest to the root) candidate seen, so a change nested
+ * deep inside an already-recorded subtree does not narrow the scope. The node
+ * must be a real element that is still attached; a fragment or a detached node
+ * carries no box information and is ignored. */
+static void note_reflow_node(HpeEngine *engine, HpeDomNode *node)
+{
+    if (!engine || !node)
+        return;
+    if (node->type == HPE_NODE_TEXT)
+        node = node->parent;
+    while (node && node->type != HPE_NODE_ELEMENT)
+        node = node->parent;
+    if (!node || node->type != HPE_NODE_ELEMENT || !node->parent)
+        return; /* detached: no box to splice against (a full build covers it) */
+    if (!engine->reflow_node || dom_is_ancestor(node, engine->reflow_node))
+        engine->reflow_node = node;
+}
+
+static void style_sink(void *ud, int kind, HpeDomNode *target, const char *name,
+                       const char *old_value, HpeDomNode *added, HpeDomNode *removed)
+{
+    HpeEngine *engine = (HpeEngine *)ud;
+    int need = HPE_REFLOW_NONE;
+
+    /* ---- author-sheet tracking ---- */
+    if (is_style_host(target) || is_style_host(added) || is_style_host(removed)) {
+        g_style_dirty = 1;
+        if (is_style_host(added))
+            g_style_sig = added;
+        else if (is_style_host(removed))
+            g_style_sig = removed;
+        else
+            g_style_sig = target;
+        g_style_rev++;
+        need = HPE_REFLOW_LAYOUT;
+    }
+
+    /* ---- reflow classification + scope ---- */
+    if (kind == HPE_MUT_CHILD_LIST) {
+        /* a node entering or leaving the tree moves boxes around its parent;
+         * `target` is that parent (the child-list owner) */
+        if (added || removed) {
+            note_reflow(engine, HPE_REFLOW_LAYOUT);
+            note_reflow_node(engine, target);
+        }
+    } else if (kind == HPE_MUT_ATTR) {
+        need = reflow_for_attr(target, name, old_value);
+        note_reflow(engine, need);
+        if (need == HPE_REFLOW_LAYOUT)
+            note_reflow_node(engine, target);
+    } else if (kind == HPE_MUT_TEXT) {
+        /* a text edit changes a line box's content -> relayout of its parent */
+        note_reflow(engine, HPE_REFLOW_LAYOUT);
+        note_reflow_node(engine, target);
+    }
+    if (need)
+        note_reflow(engine, need);
+    if (engine) {
+        engine->mutation_pending = 1;
+        /* any <style>/<link> edit changes every box: no partial rebuild possible */
+        if (is_style_host(target) || is_style_host(added) || is_style_host(removed))
+            engine->reflow_node = NULL;
+    }
+}
+
+/* Rebuilds author rules when a <style>/<link> appeared, vanished or changed.
+ * Returns 1 when the sheet was rebuilt (the caller must re-cascade). */
+static int refresh_styles(HpeEngine *engine)
+{
+    char dir[HPE_MAX_PATH];
+    if (!g_style_dirty)
+        return 0;
+    g_style_dirty = 0;
+
+    /* start from a clean sheet: hpe_css_init appends the user agent rules, then
+     * collect_styles walks the (possibly edited) tree for the author ones. */
+    hpe_css_free(&engine->sheet);
+    hpe_css_init(&engine->sheet);
+    engine->author_rule_base = engine->sheet.rule_count;
+    engine->link_count = 0; /* re-scan, so the hint list does not accumulate */
+    hpe_path_dir(engine->path ? engine->path : ".", dir, sizeof(dir));
+    collect_styles(engine, engine->doc, dir);
+    engine->style_sig = g_style_sig;
+    engine->style_rev = g_style_rev;
+    return 1;
+}
+
+/* Recomputes the style of every building block from the (possibly edited) DOM,
+ * leaving geometry untouched. Needed after a paint-only change so the colour/
+ * opacity/shadow a box carries stays in sync; a no-op when no such property
+ * exists, so pure-geometry edits pay nothing. Paint-only edits cannot change
+ * `display`, so the box tree's shape is stable and we only overwrite styles. */
+static void restyle_boxes(HpeBox *box, HpeStylesheet *sheet, const HpeStyle *parent)
+{
+    HpeBox *child;
+    HpeStyle style;
+    HpeStyle child_parent;
+
+    if (!box)
+        return;
+    if (box->kind == HPE_BOX_TEXT) {
+        if (parent) {
+            hpe_css_compute(sheet, NULL, parent, &style);
+            box->style = style;
+        }
+        return;
+    }
+    hpe_css_compute(sheet, box->node, parent, &style);
+    box->style = style;
+    child_parent = style;
+    for (child = box->first_child; child; child = child->next)
+        restyle_boxes(child, sheet, &child_parent);
+}
+
+/* Rebuilds the box tree for a LAYOUT-level flush: a partial subtree rebuild when
+ * a valid scope was recorded, otherwise a full rebuild. */
+static void flush_rebuild_layout(HpeEngine *engine, HpeDomNode *scope)
+{
+    HpeBox *partial = NULL;
+
+    if (scope && !getenv("HPE_NO_PARTIAL"))
+        partial = hpe_layout_rebuild(engine->doc, &engine->sheet, (float)engine->width,
+                                     (float)engine->height, engine->root, scope);
+    if (partial) {
+        if (getenv("HOPE_TRACE_REFLOW"))
+            fprintf(stderr, "hope: flush -> LAYOUT (partial)\n");
+    } else {
+        if (getenv("HOPE_TRACE_REFLOW"))
+            fprintf(stderr, "hope: flush -> LAYOUT (full)\n");
+        if (engine->root) {
+            hpe_layout_free(engine->root);
+            engine->root = NULL;
+        }
+        engine->root = hpe_layout_build(engine->doc, &engine->sheet, (float)engine->width,
+                                        (float)engine->height);
+    }
+    engine->content_height = hpe_layout_content_height(engine->root);
+}
+
+/* keeps the scroll offset inside [0, content_height - view_height] */
+static void clamp_scroll(HpeEngine *engine)
+{
+    float max_scroll =
+        HPE_MAX(0.0f, engine->content_height - (float)hpe_engine_view_height(engine));
+    if (engine->scroll_y > max_scroll)
+        engine->scroll_y = max_scroll;
+    if (engine->scroll_y < 0.0f)
+        engine->scroll_y = 0.0f;
+}
+
+/* Applies the mutations recorded since the last call. `force` (a fresh load or
+ * resize) requests a full rebuild regardless. Drives the lazy-relayout policy:
+ *   LAYOUT -> rebuild the affected box subtree (or everything when unbounded)
+ *   PAINT  -> recompute styles + repaint
+ *   NONE   -> nothing to do (the render step is skipped entirely). */
+void hpe_engine_flush(HpeEngine *engine, int force)
+{
+    int need;
+    HpeDomNode *scope = NULL;
+
+    if (!engine)
+        return;
+    if (force) {
+        need = HPE_REFLOW_LAYOUT;
+    } else {
+        need = engine->reflow_need;
+        scope = engine->reflow_node;
+        if (refresh_styles(engine))
+            need = HPE_REFLOW_LAYOUT; /* the sheet changed: scope is meaningless */
+        /* diagnostic/benchmark aid: force the eager path so the lazy result can
+         * be compared against a full rebuild */
+        if (getenv("HPE_FORCE_EAGER") && need != HPE_REFLOW_NONE) {
+            need = HPE_REFLOW_LAYOUT;
+            scope = NULL;
+        }
+    }
+    engine->reflow_need = HPE_REFLOW_NONE;
+    engine->reflow_node = NULL;
+    engine->mutation_pending = 0;
+    if (!engine->doc)
+        return;
+
+    hpe_css_set_viewport(&engine->sheet, (float)engine->width,
+                         (float)hpe_engine_view_height(engine));
+
+    if (need == HPE_REFLOW_LAYOUT) {
+        flush_rebuild_layout(engine, scope);
+    } else if (need == HPE_REFLOW_PAINT && engine->root) {
+        HpeStyle root_parent = hpe_style_default();
+        if (getenv("HOPE_TRACE_REFLOW"))
+            fprintf(stderr, "hope: flush -> PAINT (restyle only)\n");
+        restyle_boxes(engine->root, &engine->sheet, &root_parent);
+    } else {
+        if (getenv("HOPE_TRACE_REFLOW"))
+            fprintf(stderr, "hope: flush -> NONE\n");
+        return; /* nothing changed: leave the existing frame alone */
+    }
+
+    clamp_scroll(engine);
+    engine->dirty = HPE_DIRTY_FULL;
 }
 
 /* ---------------- status ---------------- */
@@ -181,6 +581,49 @@ static int hope_module_load(void *ud, const char *spec, const char *from_dir, ch
     return 1;
 }
 
+/* loads one <script>'s source: the `src` file when present, else its inline raw
+ * text. Returns a freshly allocated buffer (hpe_free it) or NULL. */
+static char *script_source(HpeDomNode *node, const char *dir, const char **is_module)
+{
+    const char *src_attr = hpe_dom_attr(node, "src");
+    const char *type_attr = hpe_dom_attr(node, "type");
+
+    *is_module = type_attr && strcmp(type_attr, "module") == 0 ? "1" : NULL;
+    if (src_attr && *src_attr) {
+        char full[1024];
+        char *code;
+        hpe_path_join(full, sizeof(full), dir, src_attr);
+        code = hpe_read_file(full, NULL);
+        if (!code)
+            fprintf(stderr, "hope: cannot open script %s\n", full);
+        return code;
+    }
+    {
+        HpeDomNode *text = node->first_child;
+        if (text && text->type == HPE_NODE_TEXT && text->text && text->text[0])
+            return hpe_strdup(text->text);
+    }
+    return NULL;
+}
+
+/* evaluates one already-collected <script> node in the engine's JS context */
+static void run_one_script(HpeEngine *engine, HpeDomNode *node, const char *dir)
+{
+    const char *is_module = NULL;
+    char errbuf[256];
+    char *code = script_source(node, dir, &is_module);
+    int rc;
+
+    if (!code)
+        return;
+    errbuf[0] = '\0';
+    rc = is_module ? hpe_js_eval_module(engine->js, code, dir, errbuf, sizeof(errbuf))
+                   : hpe_js_eval(engine->js, code, errbuf, sizeof(errbuf));
+    if (rc != 0)
+        fprintf(stderr, "hope: script error: %s\n", errbuf);
+    hpe_free(code);
+}
+
 static void run_scripts(HpeEngine *engine)
 {
     HpeDomNode *scripts[HPE_MAX_SCRIPTS];
@@ -206,34 +649,8 @@ static void run_scripts(HpeEngine *engine)
     loader.ud = dir;
     hpe_js_set_module_loader(engine->js, &loader);
 
-    for (i = 0; i < count; i++) {
-        const char *src_attr = hpe_dom_attr(scripts[i], "src");
-        const char *type_attr = hpe_dom_attr(scripts[i], "type");
-        int is_module = type_attr && strcmp(type_attr, "module") == 0;
-        char errbuf[256];
-        char *code = NULL;
-
-        if (src_attr && *src_attr) {
-            char full[1024];
-            hpe_path_join(full, sizeof(full), dir, src_attr);
-            code = hpe_read_file(full, NULL);
-            if (!code) {
-                fprintf(stderr, "hope: cannot open script %s\n", full);
-                continue;
-            }
-        } else {
-            HpeDomNode *text = scripts[i]->first_child;
-            if (text && text->type == HPE_NODE_TEXT && text->text && text->text[0])
-                code = hpe_strdup(text->text);
-        }
-        if (code) {
-            int rc = is_module ? hpe_js_eval_module(engine->js, code, dir, errbuf, sizeof(errbuf))
-                               : hpe_js_eval(engine->js, code, errbuf, sizeof(errbuf));
-            if (rc != 0)
-                fprintf(stderr, "hope: script error: %s\n", errbuf);
-            hpe_free(code);
-        }
-    }
+    for (i = 0; i < count; i++)
+        run_one_script(engine, scripts[i], dir);
 }
 
 /* ---------------- layout ---------------- */
@@ -258,27 +675,10 @@ static void dump_dom(HpeDomNode *node, int depth)
 
 void hpe_engine_relayout(HpeEngine *engine)
 {
-    engine->dirty = HPE_DIRTY_FULL;
-    if (engine->root) {
-        hpe_layout_free(engine->root);
-        engine->root = NULL;
-    }
-    if (!engine->doc)
-        return;
-    /* @media queries are evaluated against the page viewport during the cascade */
-    hpe_css_set_viewport(&engine->sheet, (float)engine->width,
-                         (float)hpe_engine_view_height(engine));
-    engine->root = hpe_layout_build(engine->doc, &engine->sheet, (float)engine->width,
-                                    (float)engine->height);
-    engine->content_height = hpe_layout_content_height(engine->root);
-    {
-        float max_scroll =
-            HPE_MAX(0.0f, engine->content_height - (float)hpe_engine_view_height(engine));
-        if (engine->scroll_y > max_scroll)
-            engine->scroll_y = max_scroll;
-        if (engine->scroll_y < 0.0f)
-            engine->scroll_y = 0.0f;
-    }
+    /* the eager entry point (load, resize, hover, timers, dev hooks): it always
+     * rebuilds. The lazy policy lives in hpe_engine_flush(), used by the event
+     * paths that can prove a mutation is paint-only or absent. */
+    hpe_engine_flush(engine, 1);
 }
 
 /* ---------------- public api ---------------- */
@@ -297,6 +697,7 @@ void hpe_engine_destroy(HpeEngine *engine)
 {
     if (!engine)
         return;
+    hpe_dom_clear_mutation_sinks();
     if (engine->root)
         hpe_layout_free(engine->root);
     if (engine->doc)
@@ -313,16 +714,9 @@ void hpe_engine_destroy(HpeEngine *engine)
     hpe_free(engine);
 }
 
-/* shared load pipeline: takes ownership of `src`; `path` may be NULL for the
- * built-in blank page (relative resources then resolve against "."). */
-static int load_source(HpeEngine *engine, char *src, size_t size, const char *path)
+/* tears down everything the previous document produced, ready for a new load */
+static void reset_document(HpeEngine *engine, const char *path)
 {
-    char dir[1024];
-    double t0;
-
-    t0 = hpe_time_seconds();
-    engine->error[0] = '\0'; /* a new document clears the previous load error */
-
     if (engine->path) {
         hpe_free(engine->path);
         engine->path = NULL;
@@ -339,41 +733,126 @@ static int load_source(HpeEngine *engine, char *src, size_t size, const char *pa
     }
     hpe_css_free(&engine->sheet);
     hpe_css_init(&engine->sheet); /* user agent styles */
+}
 
-    engine->doc = hpe_html_parse(src, size);
+/* decodes the raw bytes to utf-8, parses the tree, and resolves <base href>
+ * before the author stylesheet is collected (so relative refs rebase correctly) */
+static void parse_document(HpeEngine *engine, char *src, size_t size, const char *path)
+{
+    char dir[HPE_MAX_PATH];
+    char *utf8;
+    size_t declen = 0;
+    HpeDocEncoding enc = HPE_ENC_UTF8;
+    int from_meta = 0;
+    const char *base;
+
+    utf8 = hpe_html_decode(src, size, &declen, &enc, &from_meta);
     hpe_free(src);
+    snprintf(engine->doc_encoding, sizeof(engine->doc_encoding), "%s", hpe_encoding_name(enc));
+    engine->meta_charset = from_meta;
+    engine->link_count = 0;
+    engine->base_href[0] = '\0';
+
+    engine->doc = hpe_html_parse(utf8, declen);
+    hpe_free(utf8);
+
+    hpe_path_dir(path ? path : ".", dir, sizeof(dir));
+    base = find_base_href(engine->doc);
+    if (base) {
+        if (hpe_path_is_absolute(base))
+            snprintf(engine->base_href, sizeof(engine->base_href), "%s", base);
+        else
+            hpe_path_join(engine->base_href, sizeof(engine->base_href), dir, base);
+    }
+}
+
+/* collects author rules and installs the DOM sink that keeps them in sync with
+ * later <style>/<link> edits made by page scripts */
+static void install_styles(HpeEngine *engine, const char *path)
+{
+    char dir[HPE_MAX_PATH];
 
     hpe_path_dir(path ? path : ".", dir, sizeof(dir));
     collect_styles(engine, engine->doc, dir);
+    engine->author_rule_base = engine->sheet.rule_count;
+    engine->style_sig = NULL;
+    engine->style_rev = g_style_rev;
+    g_style_dirty = 0;
+    g_style_sig = NULL;
+    hpe_dom_add_mutation_sink(style_sink, engine);
+}
 
-    if (getenv("HOPE_DEBUG")) {
-        int ri;
-        dump_dom(engine->doc, 0);
-        fprintf(stderr, "hope: %d css rules after UA+author\n", engine->sheet.rule_count);
-        for (ri = 0; ri < engine->sheet.rule_count && ri < 40; ri++) {
-            HpeRule *r = &engine->sheet.rules[ri];
-            int si, di;
-            fprintf(stderr, "  rule %d: %d selectors, %d decls, spec=%d\n", ri,
-                    r->selector_count, r->decl_count,
-                    r->selector_count ? r->selectors[0].specificity : -1);
-            for (si = 0; si < r->selector_count; si++) {
-                HpeSelector *s = &r->selectors[si];
-                int pi;
-                fprintf(stderr, "    sel:");
-                for (pi = 0; pi < s->count; pi++) {
-                    HpeCompound *c = &s->parts[pi];
-                    fprintf(stderr, " [%s%s%s cls=%d]", c->tag ? c->tag : "*",
-                            c->id ? "#" : "", c->id ? c->id : "", c->class_count);
-                    if (c->class_count)
-                        fprintf(stderr, "(.%s)", c->classes[0]);
-                }
-                fprintf(stderr, "\n");
+/* HOPE_DEBUG: dumps the DOM tree and the first rules of the cascade */
+static void debug_dump_document(HpeEngine *engine)
+{
+    int ri;
+    if (!getenv("HOPE_DEBUG"))
+        return;
+    dump_dom(engine->doc, 0);
+    fprintf(stderr, "hope: %d css rules after UA+author\n", engine->sheet.rule_count);
+    for (ri = 0; ri < engine->sheet.rule_count && ri < 40; ri++) {
+        HpeRule *r = &engine->sheet.rules[ri];
+        int si, di;
+        fprintf(stderr, "  rule %d: %d selectors, %d decls, spec=%d\n", ri, r->selector_count,
+                r->decl_count, r->selector_count ? r->selectors[0].specificity : -1);
+        for (si = 0; si < r->selector_count; si++) {
+            HpeSelector *s = &r->selectors[si];
+            int pi;
+            fprintf(stderr, "    sel:");
+            for (pi = 0; pi < s->count; pi++) {
+                HpeCompound *c = &s->parts[pi];
+                fprintf(stderr, " [%s%s%s cls=%d]", c->tag ? c->tag : "*", c->id ? "#" : "",
+                        c->id ? c->id : "", c->class_count);
+                if (c->class_count)
+                    fprintf(stderr, "(.%s)", c->classes[0]);
             }
-            for (di = 0; di < r->decl_count; di++)
-                fprintf(stderr, "    decl set=0x%llx font=%.1f\n",
-                        (unsigned long long)r->decls[di].set, r->decls[di].font_size);
+            fprintf(stderr, "\n");
         }
+        for (di = 0; di < r->decl_count; di++)
+            fprintf(stderr, "    decl set=0x%llx font=%.1f\n",
+                    (unsigned long long)r->decls[di].set, r->decls[di].font_size);
     }
+}
+
+/* the synthetic-event dev hooks (HOPE_TEST_CLICK / HOVER / WAIT / TEXT), run
+ * once after layout so headless --dump can verify interactive pages */
+static void run_test_hooks(HpeEngine *engine)
+{
+    const char *test_click = getenv("HOPE_TEST_CLICK");
+    const char *test_hover = getenv("HOPE_TEST_HOVER");
+    const char *test_wait = getenv("HOPE_TEST_WAIT");
+    const char *test_text = getenv("HOPE_TEST_TEXT");
+
+    if (test_click && *test_click)
+        click_element_by_id(engine, test_click);
+    if (test_hover && *test_hover) {
+        int hx, hy;
+        if (sscanf(test_hover, "%d,%d", &hx, &hy) == 2)
+            hpe_engine_mouse_move(engine, hx, hy);
+    }
+    if (test_wait && *test_wait) {
+        double wait = atof(test_wait);
+        double t0 = hpe_time_seconds();
+        while (hpe_time_seconds() - t0 < wait)
+            hpe_engine_tick(engine);
+    }
+    if (test_text && *test_text)
+        print_text_by_id(engine, test_text);
+}
+
+/* shared load pipeline: takes ownership of `src`; `path` may be NULL for the
+ * built-in blank page (relative resources then resolve against "."). `src` is a
+ * raw byte buffer whose charset is detected here (BOM / <meta charset> / utf-8
+ * validation), then decoded to utf-8 before parsing. */
+static int load_source(HpeEngine *engine, char *src, size_t size, const char *path)
+{
+    double t0 = hpe_time_seconds();
+
+    engine->error[0] = '\0'; /* a new document clears the previous load error */
+    reset_document(engine, path);
+    parse_document(engine, src, size, path);
+    install_styles(engine, path);
+    debug_dump_document(engine);
 
     engine->scroll_y = 0.0f;
     /* lay out once before running page scripts: they read clientWidth /
@@ -382,42 +861,8 @@ static int load_source(HpeEngine *engine, char *src, size_t size, const char *pa
     hpe_engine_relayout(engine);
     run_scripts(engine);
     hpe_engine_relayout(engine);
+    run_test_hooks(engine);
 
-    /* dev/test hook: HOPE_TEST_CLICK=id fires a synthetic click on that element,
-       so headless --dump can verify event-driven DOM updates. */
-    {
-        const char *test_click = getenv("HOPE_TEST_CLICK");
-        if (test_click && *test_click)
-            click_element_by_id(engine, test_click);
-    }
-    /* dev/test hook: HOPE_TEST_HOVER=x,y moves the synthetic pointer so headless
-       --dump can verify :hover restyling. */
-    {
-        const char *test_hover = getenv("HOPE_TEST_HOVER");
-        if (test_hover && *test_hover) {
-            int hx, hy;
-            if (sscanf(test_hover, "%d,%d", &hx, &hy) == 2)
-                hpe_engine_mouse_move(engine, hx, hy);
-        }
-    }
-    /* dev/test hook: HOPE_TEST_WAIT=seconds busy-waits, draining timers, so a
-       headless --dump can verify setTimeout/setInterval/rAF callbacks. */
-    {
-        const char *test_wait = getenv("HOPE_TEST_WAIT");
-        if (test_wait && *test_wait) {
-            double wait = atof(test_wait);
-            double t0 = hpe_time_seconds();
-            while (hpe_time_seconds() - t0 < wait)
-                hpe_engine_tick(engine);
-        }
-    }
-    /* dev/test hook: HOPE_TEST_TEXT=id prints that element's textContent, so a
-       headless run can assert on script-driven DOM updates. */
-    {
-        const char *test_text = getenv("HOPE_TEST_TEXT");
-        if (test_text && *test_text)
-            print_text_by_id(engine, test_text);
-    }
     if (getenv("HOPE_DEBUG") && engine->root)
         dump_boxes(engine->root, 0);
     engine->load_ms = (hpe_time_seconds() - t0) * 1000.0;
@@ -584,6 +1029,13 @@ void hpe_engine_render(HpeEngine *engine)
     double t0;
     if (!engine)
         return;
+    /* nothing changed since the last frame: skip the whole paint (this is what
+     * makes a DOM mutation that turns out to be a no-op free) */
+    if (engine->dirty == HPE_DIRTY_NONE && engine->painted) {
+        if (getenv("HOPE_TRACE_REFLOW"))
+            fprintf(stderr, "hope: render -> skipped (no damage)\n");
+        return;
+    }
     t0 = hpe_time_seconds();
     if (engine->dirty == HPE_DIRTY_CHROME && engine->painted)
         hpe_chrome_paint(engine);
@@ -614,6 +1066,39 @@ const char *hpe_engine_status(HpeEngine *engine)
 float hpe_engine_scroll_offset(HpeEngine *engine)
 {
     return engine ? engine->scroll_y : 0.0f;
+}
+
+/* ---------------- document metadata ---------------- */
+
+const char *hpe_engine_document_encoding(HpeEngine *engine)
+{
+    return engine ? engine->doc_encoding : "";
+}
+
+int hpe_engine_meta_charset(HpeEngine *engine)
+{
+    return engine ? engine->meta_charset : 0;
+}
+
+const char *hpe_engine_base_href(HpeEngine *engine)
+{
+    return engine ? engine->base_href : "";
+}
+
+int hpe_engine_link_count(HpeEngine *engine)
+{
+    return engine ? engine->link_count : 0;
+}
+
+int hpe_engine_link_at(HpeEngine *engine, int index, const char **rel, const char **href)
+{
+    if (!engine || index < 0 || index >= engine->link_count)
+        return 0;
+    if (rel)
+        *rel = engine->links[index].rel;
+    if (href)
+        *href = engine->links[index].href;
+    return 1;
 }
 
 /* ---------------- hit testing & events ---------------- */
@@ -694,10 +1179,16 @@ int hpe_engine_mouse_move(HpeEngine *engine, int x, int y)
     if (engine->js && node)
         fired = hpe_js_dom_dispatch(engine->js, node, "mousemove", x, y - engine->chrome_h);
 
-    if (hover_changed || fired)
-        hpe_engine_relayout(engine); /* re-cascade for :hover and re-layout for DOM edits */
-    if (hover_changed || fired)
+    /* a hover change always needs a fresh cascade (":hover" is a selector the
+     * style resolver evaluates), so force; handlers may also have edited the DOM
+     * -- the flush picks those up at whatever depth the sink recorded. */
+    if (hover_changed) {
+        hpe_engine_relayout(engine);
         hpe_engine_refresh_status(engine);
+    } else if (fired && engine->reflow_need != HPE_REFLOW_NONE) {
+        hpe_engine_flush(engine, 0);
+        hpe_engine_refresh_status(engine);
+    }
     return hover_changed || fired;
 }
 
@@ -708,7 +1199,7 @@ int hpe_engine_tick(HpeEngine *engine)
         return 0;
     hpe_js_run_timers(engine->js, hpe_time_seconds(), &fired);
     if (fired) {
-        hpe_engine_relayout(engine);
+        hpe_engine_flush(engine, 0); /* only relayout if a timer touched the DOM */
         hpe_engine_refresh_status(engine);
     }
     return fired;
@@ -757,7 +1248,9 @@ int hpe_engine_mouse_event_mods(HpeEngine *engine, int x, int y, int button, int
     }
 
     if (fired) {
-        hpe_engine_relayout(engine);
+        /* the handlers may have changed the DOM; only do the work their
+         * mutations call for (a click that toggles a colour skips layout) */
+        hpe_engine_flush(engine, 0);
         hpe_engine_refresh_status(engine);
     }
     return fired || blurred;
@@ -801,7 +1294,7 @@ static int click_element_by_id(HpeEngine *engine, const char *id)
     hpe_js_dom_dispatch(engine->js, found, "mousedown", 0, 0);
     hpe_js_dom_dispatch(engine->js, found, "mouseup", 0, 0);
     hpe_js_dom_dispatch(engine->js, found, "click", 0, 0);
-    hpe_engine_relayout(engine);
+    hpe_engine_flush(engine, 0);
     hpe_engine_refresh_status(engine);
     return 1;
 }

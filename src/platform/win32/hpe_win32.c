@@ -43,13 +43,51 @@ static void utf8_to_wide(const char *s, wchar_t *out, int out_count)
 
 static LRESULT CALLBACK hope_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
 
+/* registers the shared window class once per process; idempotent */
+static int hope_register_class(HINSTANCE inst)
+{
+    static int registered = 0;
+    WNDCLASSEXW wc;
+    if (registered)
+        return 1;
+    ZeroMemory(&wc, sizeof(wc));
+    wc.cbSize = sizeof(wc);
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
+    wc.lpfnWndProc = hope_wnd_proc;
+    wc.hInstance = inst;
+    wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wc.lpszClassName = L"HopeWindowClass";
+    if (!RegisterClassExW(&wc)) {
+        fprintf(stderr, "hope: RegisterClassEx failed (%lu)\n", GetLastError());
+        return 0;
+    }
+    registered = 1;
+    return 1;
+}
+
+/* creates the OS window sized to hold `width`x`height` client pixels */
+static HWND hope_create_hwnd(HINSTANCE inst, const char *title, int width, int height,
+                             HpeWindow *win)
+{
+    wchar_t wtitle[512];
+    RECT rc;
+    utf8_to_wide(title ? title : "Hope", wtitle, 512);
+    rc.left = 0;
+    rc.top = 0;
+    rc.right = width;
+    rc.bottom = height;
+    AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
+    return CreateWindowExW(0, L"HopeWindowClass", wtitle, WS_OVERLAPPEDWINDOW,
+                           CW_USEDEFAULT, CW_USEDEFAULT,
+                           rc.right - rc.left, rc.bottom - rc.top,
+                           NULL, NULL, inst, win);
+}
+
 HpeWindow *hpe_window_create(const char *title, int width, int height,
                              const HpeWindowCallbacks *callbacks, void *user)
 {
-    static int registered = 0;
     HpeWindow *win;
-    RECT rc;
-    wchar_t wtitle[512];
     HINSTANCE inst = GetModuleHandleW(NULL);
 
     if (width < 64)
@@ -58,23 +96,8 @@ HpeWindow *hpe_window_create(const char *title, int width, int height,
         height = 64;
 
     SetProcessDPIAware();
-
-    if (!registered) {
-        WNDCLASSEXW wc;
-        ZeroMemory(&wc, sizeof(wc));
-        wc.cbSize = sizeof(wc);
-        wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
-        wc.lpfnWndProc = hope_wnd_proc;
-        wc.hInstance = inst;
-        wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
-        wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
-        wc.lpszClassName = L"HopeWindowClass";
-        if (!RegisterClassExW(&wc)) {
-            fprintf(stderr, "hope: RegisterClassEx failed (%lu)\n", GetLastError());
-            return NULL;
-        }
-        registered = 1;
-    }
+    if (!hope_register_class(inst))
+        return NULL;
 
     win = (HpeWindow *)hpe_calloc(1, sizeof(HpeWindow));
     win->cb = callbacks ? *callbacks : (HpeWindowCallbacks){0};
@@ -82,18 +105,7 @@ HpeWindow *hpe_window_create(const char *title, int width, int height,
     win->width = width;
     win->height = height;
 
-    utf8_to_wide(title ? title : "Hope", wtitle, 512);
-
-    rc.left = 0;
-    rc.top = 0;
-    rc.right = width;
-    rc.bottom = height;
-    AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
-
-    win->hwnd = CreateWindowExW(0, L"HopeWindowClass", wtitle, WS_OVERLAPPEDWINDOW,
-                                CW_USEDEFAULT, CW_USEDEFAULT,
-                                rc.right - rc.left, rc.bottom - rc.top,
-                                NULL, NULL, inst, win);
+    win->hwnd = hope_create_hwnd(inst, title, width, height, win);
     if (!win->hwnd) {
         fprintf(stderr, "hope: CreateWindowEx failed (%lu)\n", GetLastError());
         hpe_free(win);
@@ -185,20 +197,30 @@ static void hope_blit(HpeWindow *win)
     EndPaint(win->hwnd, &ps);
 }
 
-static LRESULT CALLBACK hope_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
+static LRESULT hope_on_mouse(HpeWindow *win, HWND hwnd, LPARAM lparam, int button, int down)
 {
-    HpeWindow *win;
+    if (button == 0 && down)
+        SetCapture(hwnd); /* keep tracking the drag outside the window */
+    else if (button == 0 && !down && GetCapture() == hwnd)
+        ReleaseCapture();
+    if (win->cb.on_mouse)
+        win->cb.on_mouse(win->user, (int)(short)LOWORD(lparam),
+                         (int)(short)HIWORD(lparam), button, down, hope_mods());
+    return 0;
+}
 
-    if (msg == WM_CREATE) {
-        CREATESTRUCTW *cs = (CREATESTRUCTW *)lparam;
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
-        return 0;
-    }
+static LRESULT hope_on_char(HpeWindow *win, WPARAM wparam)
+{
+    unsigned int ch = (unsigned int)wparam;
+    /* skip control chars (handled as VK_*) and UTF-16 surrogates */
+    if (win->cb.on_char && ch >= 32 && (ch < 0xD800 || ch > 0xDFFF))
+        win->cb.on_char(win->user, (int)ch);
+    return 0;
+}
 
-    win = (HpeWindow *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-    if (!win)
-        return DefWindowProcW(hwnd, msg, wparam, lparam);
-
+static LRESULT hope_wnd_dispatch(HpeWindow *win, HWND hwnd, UINT msg, WPARAM wparam,
+                                 LPARAM lparam)
+{
     switch (msg) {
     case WM_PAINT:
         if (win->cb.on_paint)
@@ -213,45 +235,24 @@ static LRESULT CALLBACK hope_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
         if (win->cb.on_resize)
             win->cb.on_resize(win->user, win->width, win->height);
         return 0;
-    case WM_MOUSEWHEEL: {
-        int delta = GET_WHEEL_DELTA_WPARAM(wparam);
+    case WM_MOUSEWHEEL:
         if (win->cb.on_scroll)
-            win->cb.on_scroll(win->user, -(float)delta / (float)WHEEL_DELTA * 3.0f);
+            win->cb.on_scroll(win->user, -(float)GET_WHEEL_DELTA_WPARAM(wparam) /
+                                           (float)WHEEL_DELTA * 3.0f);
         return 0;
-    }
-    case WM_KEYDOWN: {
-        int mods = hope_mods();
+    case WM_KEYDOWN:
         if (win->cb.on_key)
-            win->cb.on_key(win->user, (int)wparam, mods);
+            win->cb.on_key(win->user, (int)wparam, hope_mods());
         return 0;
-    }
     case WM_CHAR:
-        if (win->cb.on_char) {
-            unsigned int ch = (unsigned int)wparam;
-            /* skip control chars (handled as VK_*) and UTF-16 surrogates */
-            if (ch >= 32 && (ch < 0xD800 || ch > 0xDFFF))
-                win->cb.on_char(win->user, (int)ch);
-        }
-        return 0;
+        return hope_on_char(win, wparam);
     case WM_LBUTTONDOWN:
-        SetCapture(hwnd); /* keep tracking the drag outside the window */
-        if (win->cb.on_mouse)
-            win->cb.on_mouse(win->user, (int)(short)LOWORD(lparam),
-                            (int)(short)HIWORD(lparam), 0, 1, hope_mods());
-        return 0;
+        return hope_on_mouse(win, hwnd, lparam, 0, 1);
     case WM_LBUTTONUP:
-        if (GetCapture() == hwnd)
-            ReleaseCapture();
-        if (win->cb.on_mouse)
-            win->cb.on_mouse(win->user, (int)(short)LOWORD(lparam),
-                            (int)(short)HIWORD(lparam), 0, 0, hope_mods());
-        return 0;
+        return hope_on_mouse(win, hwnd, lparam, 0, 0);
     case WM_MOUSEMOVE:
         /* button = -1 signals a pointer move (no button state change) */
-        if (win->cb.on_mouse)
-            win->cb.on_mouse(win->user, (int)(short)LOWORD(lparam),
-                             (int)(short)HIWORD(lparam), -1, 0, hope_mods());
-        return 0;
+        return hope_on_mouse(win, hwnd, lparam, -1, 0);
     case WM_TIMER:
         if (wparam == 1 && win->cb.on_tick)
             win->cb.on_tick(win->user);
@@ -262,6 +263,22 @@ static LRESULT CALLBACK hope_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM
     default:
         return DefWindowProcW(hwnd, msg, wparam, lparam);
     }
+}
+
+static LRESULT CALLBACK hope_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
+{
+    HpeWindow *win;
+
+    if (msg == WM_CREATE) {
+        CREATESTRUCTW *cs = (CREATESTRUCTW *)lparam;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
+        return 0;
+    }
+
+    win = (HpeWindow *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if (!win)
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    return hope_wnd_dispatch(win, hwnd, msg, wparam, lparam);
 }
 
 int hpe_window_run(HpeWindow *win)
@@ -633,48 +650,24 @@ float hpe_plat_font_advance(HpePlatFont *font, uint32_t codepoint)
     return (float)sz.cx;
 }
 
-int hpe_plat_font_mask(HpePlatFont *font, const char *utf8, int len, HpeTextMask *out)
+/* a 1x1 fully-transparent mask stands in for empty / invalid input */
+static int mask_empty(HpeTextMask *out)
 {
-    wchar_t wbuf[8192];
-    int wlen, w, h, i;
-    SIZE sz;
+    out->width = 1;
+    out->height = 1;
+    out->coverage = (unsigned char *)hpe_calloc(1, 1);
+    return 1;
+}
+
+/* renders `wlen` wide chars onto a 32-bpp DIB and returns the pixel buffer */
+static void *mask_render(HpePlatFont *font, const wchar_t *wbuf, int wlen, int w, int h,
+                         HBITMAP *out_bm)
+{
     BITMAPINFO bmi;
     void *bits = NULL;
     HBITMAP hbm;
     HDC memdc;
     HGDIOBJ old_bm, old_font;
-    unsigned char *cov;
-
-    if (!out)
-        return 0;
-    memset(out, 0, sizeof(*out));
-    if (!font || !utf8 || len <= 0) {
-        out->width = 1;
-        out->height = 1;
-        out->coverage = (unsigned char *)hpe_calloc(1, 1);
-        return 1;
-    }
-
-    wlen = utf8_to_wide_n(utf8, len, wbuf, 8191);
-    if (wlen <= 0)
-        wlen = 0;
-
-    if (wlen == 0) {
-        out->width = 1;
-        out->height = 1;
-        out->coverage = (unsigned char *)hpe_calloc(1, 1);
-        return 1;
-    }
-
-    if (!GetTextExtentPoint32W(font->hdc, wbuf, wlen, &sz))
-        return 0;
-
-    w = sz.cx + 2;
-    h = font->ascent + font->descent + 2;
-    if (w < 1)
-        w = 1;
-    if (h < 1)
-        h = 1;
 
     ZeroMemory(&bmi, sizeof(bmi));
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
@@ -688,13 +681,12 @@ int hpe_plat_font_mask(HpePlatFont *font, const char *utf8, int len, HpeTextMask
     if (!hbm || !bits) {
         if (hbm)
             DeleteObject(hbm);
-        return 0;
+        return NULL;
     }
-
     memdc = CreateCompatibleDC(font->hdc);
     if (!memdc) {
         DeleteObject(hbm);
-        return 0;
+        return NULL;
     }
     old_bm = SelectObject(memdc, hbm);
     old_font = SelectObject(memdc, font->hfont);
@@ -705,18 +697,59 @@ int hpe_plat_font_mask(HpePlatFont *font, const char *utf8, int len, HpeTextMask
     SelectObject(memdc, old_font);
     SelectObject(memdc, old_bm);
     DeleteDC(memdc);
+    *out_bm = hbm;
+    return bits;
+}
 
-    cov = (unsigned char *)hpe_alloc((size_t)w * (size_t)h);
-    for (i = 0; i < w * h; i++) {
+/* max of the three colour channels per pixel = antialiased coverage */
+static unsigned char *mask_coverage(const void *bits, int count)
+{
+    unsigned char *cov = (unsigned char *)hpe_alloc((size_t)count);
+    int i;
+    for (i = 0; i < count; i++) {
         const unsigned char *px = (const unsigned char *)bits + (size_t)i * 4;
         unsigned char v = px[0] > px[1] ? px[0] : px[1];
         if (px[2] > v)
             v = px[2];
         cov[i] = v;
     }
-    DeleteObject(hbm);
+    return cov;
+}
 
-    out->coverage = cov;
+int hpe_plat_font_mask(HpePlatFont *font, const char *utf8, int len, HpeTextMask *out)
+{
+    wchar_t wbuf[8192];
+    int wlen, w, h;
+    SIZE sz;
+    void *bits;
+    HBITMAP hbm = NULL;
+
+    if (!out)
+        return 0;
+    memset(out, 0, sizeof(*out));
+    if (!font || !utf8 || len <= 0)
+        return mask_empty(out);
+
+    wlen = utf8_to_wide_n(utf8, len, wbuf, 8191);
+    if (wlen <= 0)
+        return mask_empty(out);
+
+    if (!GetTextExtentPoint32W(font->hdc, wbuf, wlen, &sz))
+        return 0;
+
+    w = sz.cx + 2;
+    h = font->ascent + font->descent + 2;
+    if (w < 1)
+        w = 1;
+    if (h < 1)
+        h = 1;
+
+    bits = mask_render(font, wbuf, wlen, w, h, &hbm);
+    if (!bits)
+        return 0;
+
+    out->coverage = mask_coverage(bits, w * h);
+    DeleteObject(hbm);
     out->width = w;
     out->height = h;
     out->baseline = 1 + font->ascent;

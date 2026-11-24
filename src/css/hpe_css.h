@@ -342,21 +342,24 @@ typedef struct HpeAttrSel {
 #define HPE_MEDIA_MAX_COND  4 /* `and`-joined conditions inside one alternative */
 #define HPE_MEDIA_MAX_DEPTH 2 /* nested @media blocks */
 
+/* one comma-separated alternative of an @media condition list */
+typedef struct HpeMediaAlt {
+    int negate;    /* leading `not` */
+    int type;      /* HPE_MTYPE_* */
+    int unknown;   /* an unrecognised type/feature forces a mismatch */
+    int cond_count;
+    struct {
+        int feature; /* HPE_MF_* */
+        float value; /* px */
+    } conds[HPE_MEDIA_MAX_COND];
+} HpeMediaAlt;
+
 /* one @media condition list, evaluated against the viewport at cascade time
  * (so a resize re-evaluates correctly without re-parsing the stylesheet). */
 typedef struct HpeMediaQuery {
     int present; /* 0 = the rule is unconditional */
     int alt_count;
-    struct {
-        int negate;    /* leading `not` */
-        int type;      /* HPE_MTYPE_* */
-        int unknown;   /* an unrecognised type/feature forces a mismatch */
-        int cond_count;
-        struct {
-            int feature; /* HPE_MF_* */
-            float value; /* px */
-        } conds[HPE_MEDIA_MAX_COND];
-    } alts[HPE_MEDIA_MAX_ALT];
+    HpeMediaAlt alts[HPE_MEDIA_MAX_ALT];
 } HpeMediaQuery;
 
 typedef struct HpeCompound {

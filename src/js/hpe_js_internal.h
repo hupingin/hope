@@ -368,6 +368,7 @@ struct HpeJs {
     const char *current_dir; /* directory of the module currently being evaluated */
     int strict;              /* global "use strict" */
     int array_methods_done;  /* Array.prototype methods installed once */
+    void *mutation_state;    /* HpeJsMutationState (see hpe_js_mutation.h) */
 };
 
 struct JsBlock {
@@ -392,6 +393,9 @@ int hpe_js_run_timers(HpeJs *js, double now, int *fired);
 /* microtasks (hpe_js_interp.c): runs queued Promise jobs to completion */
 void hpe_js_drain_jobs(HpeJs *js);
 void js_job_push(HpeJs *js, JsJob *job);
+/* queues `fn(arg)` as a microtask (a JOB_CALL job). used by MutationObserver to
+ * deliver records asynchronously, like the spec's observer microtask. */
+void hpe_js_queue_microtask(HpeJs *js, JsValue fn, JsValue arg);
 void js_settle_promise(HpeJs *js, JsObj *p, int state, JsValue value);
 void hpe_js_set_module_loader(HpeJs *js, const HpeJsModuleLoader *loader);
 void hpe_js_set_current_dir(HpeJs *js, const char *dir);

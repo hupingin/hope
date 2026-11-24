@@ -101,6 +101,80 @@ static int digits_in(const char *s, int len, int *out)
  *   2024-01-02            2024-01-02T03:04:05.678Z
  *   2024-01-02T03:04:05+08:00              2024/01/02 03:04:05
  * Returns NaN when nothing recognisable is found. */
+/* consumes YYYY[-/]MM[-/]DD, filling whichever components are present */
+static const char *parse_date_numeric(const char *p, int *y, int *mo, int *d)
+{
+    if (!digits_in(p, 4, y))
+        return NULL;
+    p += 4;
+    if (*p != '-' && *p != '/')
+        return p;
+    p++;
+    if (!digits_in(p, 2, mo))
+        return NULL;
+    p += 2;
+    if (*p == '-' || *p == '/') {
+        p++;
+        if (!digits_in(p, 2, d))
+            return NULL;
+        p += 2;
+    }
+    return p;
+}
+
+/* consumes HH[:MM[:SS[.fff]]] */
+static const char *parse_date_clock(const char *p, int *h, int *mi, int *se, int *ms)
+{
+    if (!digits_in(p, 2, h))
+        return NULL;
+    p += 2;
+    if (*p != ':')
+        return p;
+    p++;
+    if (!digits_in(p, 2, mi))
+        return NULL;
+    p += 2;
+    if (*p != ':')
+        return p;
+    p++;
+    if (!digits_in(p, 2, se))
+        return NULL;
+    p += 2;
+    if (*p == '.') {
+        int scale = 100;
+        p++;
+        while (*p >= '0' && *p <= '9') {
+            *ms += (*p - '0') * scale;
+            scale /= 10;
+            p++;
+        }
+    }
+    return p;
+}
+
+/* consumes Z or +HH[:MM] / -HH[:MM]; returns the sign (0 = UTC/absent) */
+static const char *parse_date_zone(const char *p, int *tzh, int *tzm, int *sign)
+{
+    if (*p == 'Z' || *p == 'z')
+        return p + 1;
+    if (*p != '+' && *p != '-')
+        return p;
+    *sign = (*p == '-') ? -1 : 1;
+    p++;
+    if (!digits_in(p, 2, tzh))
+        return NULL;
+    p += 2;
+    if (*p == ':')
+        p++;
+    if (digits_in(p, 2, tzm))
+        p += 2;
+    return p;
+}
+
+/* Parses the subset of the date-time string grammar tests rely on:
+ *   2024-01-02            2024-01-02T03:04:05.678Z
+ *   2024-01-02T03:04:05+08:00              2024/01/02 03:04:05
+ * Returns NaN when nothing recognisable is found. */
 static double parse_date_string(const char *s)
 {
     int y = 0, mo = 1, d = 1, h = 0, mi = 0, se = 0, ms = 0;
@@ -113,60 +187,17 @@ static double parse_date_string(const char *s)
         return NAN;
     while (*p == ' ' || *p == '\t')
         p++;
-    if (!digits_in(p, 4, &y))
+    p = parse_date_numeric(p, &y, &mo, &d);
+    if (!p)
         return NAN;
-    p += 4;
-    if (*p == '-' || *p == '/') {
-        p++;
-        if (!digits_in(p, 2, &mo))
-            return NAN;
-        p += 2;
-        if (*p == '-' || *p == '/') {
-            p++;
-            if (!digits_in(p, 2, &d))
-                return NAN;
-            p += 2;
-        }
-    }
     if (*p == 'T' || *p == 't' || *p == ' ') {
         p++;
-        if (!digits_in(p, 2, &h))
+        p = parse_date_clock(p, &h, &mi, &se, &ms);
+        if (!p)
             return NAN;
-        p += 2;
-        if (*p == ':') {
-            p++;
-            if (!digits_in(p, 2, &mi))
-                return NAN;
-            p += 2;
-            if (*p == ':') {
-                p++;
-                if (!digits_in(p, 2, &se))
-                    return NAN;
-                p += 2;
-                if (*p == '.') {
-                    int scale = 100;
-                    p++;
-                    while (*p >= '0' && *p <= '9') {
-                        ms += (*p - '0') * scale;
-                        scale /= 10;
-                        p++;
-                    }
-                }
-            }
-        }
-        if (*p == 'Z' || *p == 'z') {
-            p++;
-        } else if (*p == '+' || *p == '-') {
-            sign = (*p == '-') ? -1 : 1;
-            p++;
-            if (!digits_in(p, 2, &tzh))
-                return NAN;
-            p += 2;
-            if (*p == ':')
-                p++;
-            if (digits_in(p, 2, &tzm))
-                p += 2;
-        }
+        p = parse_date_zone(p, &tzh, &tzm, &sign);
+        if (!p)
+            return NAN;
     }
     while (*p == ' ')
         p++;
@@ -679,57 +710,84 @@ static void def_alias(HpeJs *js, JsObj *p, const char *name, const char *src_nam
         js_obj_set(js, p, name, prop->val);
 }
 
+typedef struct {
+    const char *name;
+    JsNativeFn fn;
+} DateMethodDef;
+
+static void date_def_methods(HpeJs *js, JsObj *p, const DateMethodDef *defs)
+{
+    int i;
+    for (i = 0; defs[i].name; i++)
+        d_def(js, p, defs[i].name, defs[i].fn);
+}
+
+static void date_def_aliases(HpeJs *js, JsObj *p, const char (*aliases)[2][24], int n)
+{
+    int i;
+    for (i = 0; i < n; i++)
+        def_alias(js, p, aliases[i][0], aliases[i][1]);
+}
+
+/* prototype methods; the getUTC* / setUTC* names alias these via alias_pairs */
+static const DateMethodDef date_proto_methods[] = {
+    { "getFullYear",        date_get_full_year },
+    { "getMonth",           date_get_month },
+    { "getDate",            date_get_date },
+    { "getDay",             date_get_day },
+    { "getHours",           date_get_hours },
+    { "getMinutes",         date_get_minutes },
+    { "getSeconds",         date_get_seconds },
+    { "getMilliseconds",    date_get_ms },
+    { "getTime",            date_get_time },
+    { "getTimezoneOffset",  date_get_tz_offset },
+    { "setTime",            date_set_time },
+    { "setFullYear",        date_set_full_year },
+    { "setMonth",           date_set_month },
+    { "setDate",            date_set_date },
+    { "setHours",           date_set_hours },
+    { "setMinutes",         date_set_minutes },
+    { "setSeconds",         date_set_seconds },
+    { "setMilliseconds",    date_set_ms },
+    { "toISOString",        date_to_iso },
+    { "toJSON",             date_to_json },
+    { "toString",           date_to_string },
+    { "toDateString",       date_to_date_string },
+    { "toTimeString",       date_to_time_string },
+    { "toLocaleDateString", date_to_locale_date },
+    { "toLocaleTimeString", date_to_locale_time },
+    { "toLocaleString",     date_to_locale_date },
+    { "valueOf",            date_value_of },
+    { NULL, NULL }
+};
+
+static const char date_alias_pairs[][2][24] = {
+    { "getUTCFullYear",     "getFullYear" },
+    { "getUTCMonth",        "getMonth" },
+    { "getUTCDate",         "getDate" },
+    { "getUTCDay",          "getDay" },
+    { "getUTCHours",        "getHours" },
+    { "getUTCMinutes",      "getMinutes" },
+    { "getUTCSeconds",      "getSeconds" },
+    { "getUTCMilliseconds", "getMilliseconds" },
+    { "setUTCFullYear",     "setFullYear" },
+    { "setUTCMonth",        "setMonth" },
+    { "setUTCDate",         "setDate" },
+    { "setUTCHours",        "setHours" },
+    { "setUTCMinutes",      "setMinutes" },
+    { "setUTCSeconds",      "setSeconds" },
+    { "setUTCMilliseconds", "setMilliseconds" },
+    { "getYear",            "getFullYear" }
+};
+
 void hpe_js_date_install(HpeJs *js)
 {
     JsObj *p = js->date_proto;
     JsValue ctor;
 
-    /* getters: the local-time name and the getUTC* alias share one implementation */
-    d_def(js, p, "getFullYear", date_get_full_year);
-    d_def(js, p, "getMonth", date_get_month);
-    d_def(js, p, "getDate", date_get_date);
-    d_def(js, p, "getDay", date_get_day);
-    d_def(js, p, "getHours", date_get_hours);
-    d_def(js, p, "getMinutes", date_get_minutes);
-    d_def(js, p, "getSeconds", date_get_seconds);
-    d_def(js, p, "getMilliseconds", date_get_ms);
-    d_def(js, p, "getTime", date_get_time);
-    d_def(js, p, "getTimezoneOffset", date_get_tz_offset);
-    def_alias(js, p, "getUTCFullYear", "getFullYear");
-    def_alias(js, p, "getUTCMonth", "getMonth");
-    def_alias(js, p, "getUTCDate", "getDate");
-    def_alias(js, p, "getUTCDay", "getDay");
-    def_alias(js, p, "getUTCHours", "getHours");
-    def_alias(js, p, "getUTCMinutes", "getMinutes");
-    def_alias(js, p, "getUTCSeconds", "getSeconds");
-    def_alias(js, p, "getUTCMilliseconds", "getMilliseconds");
-
-    d_def(js, p, "setTime", date_set_time);
-    d_def(js, p, "setFullYear", date_set_full_year);
-    d_def(js, p, "setMonth", date_set_month);
-    d_def(js, p, "setDate", date_set_date);
-    d_def(js, p, "setHours", date_set_hours);
-    d_def(js, p, "setMinutes", date_set_minutes);
-    d_def(js, p, "setSeconds", date_set_seconds);
-    d_def(js, p, "setMilliseconds", date_set_ms);
-    def_alias(js, p, "setUTCFullYear", "setFullYear");
-    def_alias(js, p, "setUTCMonth", "setMonth");
-    def_alias(js, p, "setUTCDate", "setDate");
-    def_alias(js, p, "setUTCHours", "setHours");
-    def_alias(js, p, "setUTCMinutes", "setMinutes");
-    def_alias(js, p, "setUTCSeconds", "setSeconds");
-    def_alias(js, p, "setUTCMilliseconds", "setMilliseconds");
-
-    d_def(js, p, "toISOString", date_to_iso);
-    d_def(js, p, "toJSON", date_to_json);
-    d_def(js, p, "toString", date_to_string);
-    d_def(js, p, "toDateString", date_to_date_string);
-    d_def(js, p, "toTimeString", date_to_time_string);
-    d_def(js, p, "toLocaleDateString", date_to_locale_date);
-    d_def(js, p, "toLocaleTimeString", date_to_locale_time);
-    d_def(js, p, "toLocaleString", date_to_locale_date);
-    d_def(js, p, "valueOf", date_value_of);
-    def_alias(js, p, "getYear", "getFullYear");
+    date_def_methods(js, p, date_proto_methods);
+    date_def_aliases(js, p, date_alias_pairs,
+                     (int)(sizeof(date_alias_pairs) / sizeof(date_alias_pairs[0])));
 
     ctor = js_objval(js_native_new(js, native_date_ctor, NULL));
     ctor.obj->name = hpe_js_strdup(js, "Date");

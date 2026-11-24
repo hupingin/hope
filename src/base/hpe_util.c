@@ -436,173 +436,241 @@ static int hex_val(char c)
     return -1;
 }
 
-int hpe_color_parse(const char *s, HpeColor *out)
+/* ---------- charset ---------- */
+
+char *hpe_latin1_to_utf8(const char *src, size_t len, size_t *out_len)
 {
-    size_t i, len;
-
-    if (!s || !out)
-        return 0;
-    while (*s && hpe_is_space(*s))
-        s++;
-    len = strlen(s);
-    while (len > 0 && hpe_is_space(s[len - 1]))
-        len--;
-
-    if (len == 0)
-        return 0;
-
-    if (s[0] == '#') {
-        if (len == 4 || len == 5) { /* #rgb / #rgba */
-            int v[4] = {0, 0, 0, 15};
-            int digits = (int)len - 1;
-            for (i = 0; i < (size_t)digits; i++) {
-                int h = hex_val(s[1 + i]);
-                if (h < 0)
-                    return 0;
-                v[i] = h;
-            }
-            out->r = (uint8_t)(v[0] * 17);
-            out->g = (uint8_t)(v[1] * 17);
-            out->b = (uint8_t)(v[2] * 17);
-            out->a = (uint8_t)((digits == 4 ? v[3] : 15) * 17);
-            return 1;
+    char *out = (char *)hpe_alloc(len * 2 + 1);
+    size_t i, o = 0;
+    for (i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)src[i];
+        uint32_t cp;
+        if (c < 0x80) {
+            out[o++] = (char)c;
+            continue;
         }
-        if (len == 7 || len == 9) {
-            uint8_t v[4] = {0, 0, 0, 255};
-            int digits = (int)len - 1;
-            for (i = 0; i < (size_t)digits; i += 2) {
-                int hi = hex_val(s[1 + i]);
-                int lo = hex_val(s[2 + i]);
-                if (hi < 0 || lo < 0)
-                    return 0;
-                v[i / 2] = (uint8_t)(hi * 16 + lo);
-            }
-            out->r = v[0];
-            out->g = v[1];
-            out->b = v[2];
-            out->a = (uint8_t)(digits == 8 ? v[3] : 255);
-            return 1;
+        cp = c;
+        /* windows-1252 remaps 0x80..0x9F away from the C1 control range */
+        if (c >= 0x80 && c <= 0x9F) {
+            static const uint16_t cp1252[32] = {
+                0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+                0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
+                0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+                0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178};
+            cp = cp1252[c - 0x80];
         }
-        return 0;
+        {
+            char tmp[4];
+            int n = hpe_utf8_encode(cp, tmp);
+            memcpy(out + o, tmp, (size_t)n);
+            o += (size_t)n;
+        }
     }
+    out[o] = '\0';
+    if (out_len)
+        *out_len = o;
+    return out;
+}
 
-    if (hpe_str_ieq_n(s, "rgb", 3)) {
-        const char *p = strchr(s, '(');
-        float comp[4] = {0, 0, 0, 1.0f};
-        int idx = 0;
-        int pct[4] = {0, 0, 0, 0};
-        if (!p)
+/* `#rgb` / `#rgba` (3/4 digits, each doubled) */
+static int color_parse_hex_short(const char *s, size_t len, HpeColor *out)
+{
+    int v[4] = {0, 0, 0, 15};
+    int digits = (int)len - 1;
+    size_t i;
+
+    for (i = 0; i < (size_t)digits; i++) {
+        int h = hex_val(s[1 + i]);
+        if (h < 0)
             return 0;
-        p++;
-        while (*p && *p != ')' && idx < 4) {
-            char *end = NULL;
-            float v;
-            while (*p == ' ' || *p == ',' || *p == '/')
-                p++;
-            if (!*p || *p == ')')
-                break;
-            v = (float)strtod(p, &end);
-            if (end == p)
-                break;
-            if (*end == '%') {
-                pct[idx] = 1;
-                if (idx == 3)
-                    v /= 100.0f;
-                else
-                    v = v * 255.0f / 100.0f;
-                end++;
-            }
-            comp[idx++] = v;
-            p = end;
-        }
-        if (idx < 3)
-            return 0;
-        out->r = (uint8_t)(comp[0] < 0 ? 0 : (comp[0] > 255 ? 255 : comp[0]));
-        out->g = (uint8_t)(comp[1] < 0 ? 0 : (comp[1] > 255 ? 255 : comp[1]));
-        out->b = (uint8_t)(comp[2] < 0 ? 0 : (comp[2] > 255 ? 255 : comp[2]));
-        if (idx >= 4)
-            out->a = (uint8_t)(comp[3] <= 1.0f ? comp[3] * 255.0f : comp[3]);
-        else
-            out->a = 255;
-        HPE_UNUSED(pct);
-        return 1;
+        v[i] = h;
     }
+    out->r = (uint8_t)(v[0] * 17);
+    out->g = (uint8_t)(v[1] * 17);
+    out->b = (uint8_t)(v[2] * 17);
+    out->a = (uint8_t)((digits == 4 ? v[3] : 15) * 17);
+    return 1;
+}
 
-    if (hpe_str_ieq_n(s, "hsl", 3)) {
-        const char *p = strchr(s, '(');
-        float hv = 0.0f, sv = 0.0f, lv = 0.0f, av = 1.0f;
-        int idx = 0;
-        int alpha_pct = 0;
-        float r, g, b;
-        float c, x, m;
-        float hh;
-        int sextant;
-        if (!p)
+/* `#rrggbb` / `#rrggbbaa` (6/8 digits) */
+static int color_parse_hex_long(const char *s, size_t len, HpeColor *out)
+{
+    uint8_t v[4] = {0, 0, 0, 255};
+    int digits = (int)len - 1;
+    size_t i;
+
+    for (i = 0; i < (size_t)digits; i += 2) {
+        int hi = hex_val(s[1 + i]);
+        int lo = hex_val(s[2 + i]);
+        if (hi < 0 || lo < 0)
             return 0;
-        p++;
-        while (*p && *p != ')' && idx < 4) {
-            char *end = NULL;
-            float v;
-            while (*p == ' ' || *p == ',' || *p == '/')
-                p++;
-            if (!*p || *p == ')')
-                break;
-            v = (float)strtod(p, &end);
-            if (end == p)
-                break;
-            if (*end == '%') {
-                if (idx == 3) {
-                    v /= 100.0f;
-                    alpha_pct = 1;
-                } else {
-                    v /= 100.0f;
-                }
-                end++;
-            }
-            if (idx == 0)
-                hv = v;
-            else if (idx == 1)
-                sv = v;
-            else if (idx == 2)
-                lv = v;
+        v[i / 2] = (uint8_t)(hi * 16 + lo);
+    }
+    out->r = v[0];
+    out->g = v[1];
+    out->b = v[2];
+    out->a = (uint8_t)(digits == 8 ? v[3] : 255);
+    return 1;
+}
+
+/* skips the separators (` `, `,`, `/`) that divide functional-notation parts */
+static void color_skip_seps(const char **pp)
+{
+    while (**pp == ' ' || **pp == ',' || **pp == '/')
+        (*pp)++;
+}
+
+/* reads up to four numeric components of a `rgb()` / `hsl()` argument list;
+ * `pct` receives 1 for each component written with a trailing '%'. Returns the
+ * number of components read. */
+static int color_read_components(const char *p, float *comp, int *pct)
+{
+    int idx = 0;
+
+    if (!p)
+        return 0;
+    p++; /* ( */
+    while (*p && *p != ')' && idx < 4) {
+        char *end = NULL;
+        float v;
+
+        color_skip_seps(&p);
+        if (!*p || *p == ')')
+            break;
+        v = (float)strtod(p, &end);
+        if (end == p)
+            break;
+        if (*end == '%') {
+            pct[idx] = 1;
+            if (idx == 3)
+                v /= 100.0f;
             else
-                av = v;
-            idx++;
-            p = end;
+                v = v * 255.0f / 100.0f;
+            end++;
         }
-        HPE_UNUSED(alpha_pct);
-        if (idx < 3)
-            return 0;
-        if (sv < 0.0f)
-            sv = 0.0f;
-        if (sv > 1.0f)
-            sv = 1.0f;
-        if (lv < 0.0f)
-            lv = 0.0f;
-        if (lv > 1.0f)
-            lv = 1.0f;
-        hv = fmodf(hv, 360.0f);
-        if (hv < 0.0f)
-            hv += 360.0f;
-        hh = hv / 60.0f;
-        c = (1.0f - fabsf(2.0f * lv - 1.0f)) * sv;
-        x = c * (1.0f - fabsf(fmodf(hh, 2.0f) - 1.0f));
-        sextant = (int)hh % 6;
-        switch (sextant) {
-        case 0: r = c; g = x; b = 0.0f; break;
-        case 1: r = x; g = c; b = 0.0f; break;
-        case 2: r = 0.0f; g = c; b = x; break;
-        case 3: r = 0.0f; g = x; b = c; break;
-        case 4: r = x; g = 0.0f; b = c; break;
-        default: r = c; g = 0.0f; b = x; break;
-        }
-        m = lv - c * 0.5f;
-        out->r = (uint8_t)((r + m) * 255.0f + 0.5f);
-        out->g = (uint8_t)((g + m) * 255.0f + 0.5f);
-        out->b = (uint8_t)((b + m) * 255.0f + 0.5f);
-        out->a = idx >= 4 ? (uint8_t)(av <= 1.0f ? av * 255.0f : av) : 255;
-        return 1;
+        comp[idx++] = v;
+        p = end;
     }
+    return idx;
+}
+
+static float clamp01(float v)
+{
+    if (v < 0.0f)
+        return 0.0f;
+    if (v > 1.0f)
+        return 1.0f;
+    return v;
+}
+
+static uint8_t clamp_byte(float v)
+{
+    if (v < 0.0f)
+        return 0;
+    if (v > 255.0f)
+        return 255;
+    return (uint8_t)v;
+}
+
+/* `rgb(r, g, b[, a])` and the `%`-based form */
+static int color_parse_rgb(const char *s, HpeColor *out)
+{
+    const char *p = strchr(s, '(');
+    float comp[4] = {0, 0, 0, 1.0f};
+    int pct[4] = {0, 0, 0, 0};
+    int idx = color_read_components(p, comp, pct);
+
+    if (!p || idx < 3)
+        return 0;
+    out->r = clamp_byte(comp[0]);
+    out->g = clamp_byte(comp[1]);
+    out->b = clamp_byte(comp[2]);
+    if (idx >= 4)
+        out->a = (uint8_t)(comp[3] <= 1.0f ? comp[3] * 255.0f : comp[3]);
+    else
+        out->a = 255;
+    HPE_UNUSED(pct);
+    return 1;
+}
+
+/* maps the hue sextant to the rgb chroma triple used by hsl→rgb */
+static void hsl_sextant_rgb(int sextant, float c, float x, float *r, float *g, float *b)
+{
+    switch (sextant) {
+    case 0: *r = c; *g = x; *b = 0.0f; break;
+    case 1: *r = x; *g = c; *b = 0.0f; break;
+    case 2: *r = 0.0f; *g = c; *b = x; break;
+    case 3: *r = 0.0f; *g = x; *b = c; break;
+    case 4: *r = x; *g = 0.0f; *b = c; break;
+    default: *r = c; *g = 0.0f; *b = x; break;
+    }
+}
+
+/* reads up to four components of a `hsl()` argument list, applying /100 to any
+ * component written with a trailing '%'; returns the count read */
+static int color_read_hsl_components(const char *p, float *comp)
+{
+    int idx = 0;
+
+    if (!p)
+        return 0;
+    p++; /* ( */
+    while (*p && *p != ')' && idx < 4) {
+        char *end = NULL;
+        float v;
+
+        color_skip_seps(&p);
+        if (!*p || *p == ')')
+            break;
+        v = (float)strtod(p, &end);
+        if (end == p)
+            break;
+        if (*end == '%') {
+            v /= 100.0f;
+            end++;
+        }
+        comp[idx++] = v;
+        p = end;
+    }
+    return idx;
+}
+
+/* `hsl(h, s%, l%[, a])` */
+static int color_parse_hsl(const char *s, HpeColor *out)
+{
+    const char *p = strchr(s, '(');
+    float comp[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    int idx = color_read_hsl_components(p, comp);
+    float hv, sv, lv, av;
+    float r, g, b, c, x, m, hh;
+    int sextant;
+
+    if (!p || idx < 3)
+        return 0;
+    hv = comp[0];
+    sv = clamp01(comp[1]);
+    lv = clamp01(comp[2]);
+    av = comp[3];
+    hv = fmodf(hv, 360.0f);
+    if (hv < 0.0f)
+        hv += 360.0f;
+    hh = hv / 60.0f;
+    c = (1.0f - fabsf(2.0f * lv - 1.0f)) * sv;
+    x = c * (1.0f - fabsf(fmodf(hh, 2.0f) - 1.0f));
+    sextant = (int)hh % 6;
+    hsl_sextant_rgb(sextant, c, x, &r, &g, &b);
+    m = lv - c * 0.5f;
+    out->r = (uint8_t)((r + m) * 255.0f + 0.5f);
+    out->g = (uint8_t)((g + m) * 255.0f + 0.5f);
+    out->b = (uint8_t)((b + m) * 255.0f + 0.5f);
+    out->a = idx >= 4 ? (uint8_t)(av <= 1.0f ? av * 255.0f : av) : 255;
+    return 1;
+}
+
+/* case-insensitive lookup of a CSS named colour */
+static int color_parse_named(const char *s, size_t len, HpeColor *out)
+{
+    size_t i;
 
     for (i = 0; i < sizeof(g_named_colors) / sizeof(g_named_colors[0]); i++) {
         if (strlen(g_named_colors[i].name) == len &&
@@ -616,4 +684,32 @@ int hpe_color_parse(const char *s, HpeColor *out)
         }
     }
     return 0;
+}
+
+int hpe_color_parse(const char *s, HpeColor *out)
+{
+    size_t len;
+
+    if (!s || !out)
+        return 0;
+    while (*s && hpe_is_space(*s))
+        s++;
+    len = strlen(s);
+    while (len > 0 && hpe_is_space(s[len - 1]))
+        len--;
+    if (len == 0)
+        return 0;
+
+    if (s[0] == '#') {
+        if (len == 4 || len == 5)
+            return color_parse_hex_short(s, len, out);
+        if (len == 7 || len == 9)
+            return color_parse_hex_long(s, len, out);
+        return 0;
+    }
+    if (hpe_str_ieq_n(s, "rgb", 3))
+        return color_parse_rgb(s, out);
+    if (hpe_str_ieq_n(s, "hsl", 3))
+        return color_parse_hsl(s, out);
+    return color_parse_named(s, len, out);
 }

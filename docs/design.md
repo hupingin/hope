@@ -29,11 +29,13 @@
 9. ✅ 样式属性批次：四色边框、min/max、box-sizing、overflow、opacity/visibility、渐变、阴影、transform、相对单位、间距、list-style（v0.9）
 10. ✅ 层叠与继承补全：`!important` 参与层叠、`@media` 条件求值、继承属性集合（v0.10）
 11. ✅ SVG 绘制子集扩展：仿射 transform、新图元、`defs`/`use`、线性/径向渐变、`path` 全命令与命中测试（v0.11）
-12. 🔲 布局补全（二）：grid、table、flex wrap/shrink/order、元素级滚动容器
-13. 🔲 绘制补全（二）：`<img>`、滚动条、页面内文本选中、radial 渐变、`background-position/size`
-14. 🔲 样式补全（三）：结构伪类、伪元素、状态伪类、`skew`/`matrix`、`transition` 时钟
-15. 🔲 JS 补全：`Proxy`/`Reflect`、`Intl`、`WeakMap`、TypedArray、真正的事件循环与 GC
-16. 🔲 基础设施：DOM/CSS 增量更新、JS GC、跨平台后端
+12. ✅ DOM 模型补全：脏标记驱动的惰性重排、局部子树增量布局、`MutationObserver`、`DocumentFragment`/`cloneNode`/`insertBefore`/`replaceChild`、CSS 增量样式刷新（v0.12）
+13. ✅ HTML 解析补全：容错自动闭合、`<table>`/`<select>`/`<template>` 专用规则、字符编码探测、`<base href>` 与 `<link>` 资源提示（v0.13）
+14. 🔲 布局补全（二）：grid、table、flex wrap/shrink/order、元素级滚动容器
+15. 🔲 绘制补全（二）：`<img>`、滚动条、页面内文本选中、radial 渐变、`background-position/size`
+16. 🔲 样式补全（三）：结构伪类、伪元素、状态伪类、`skew`/`matrix`、`transition` 时钟
+17. 🔲 JS 补全：`Proxy`/`Reflect`、`Intl`、`WeakMap`、TypedArray、真正的事件循环与 GC
+18. 🔲 基础设施：JS GC、跨平台后端
 
 > 注：早期规划中的「float / flex 属绘制补全」已在 v0.4 / v0.6 提前落地，本列表据实回填。
 
@@ -138,13 +140,69 @@ typedef struct HpePixmap {
 
 ## 6. HTML 解析（`src/html/hpe_html.c`）
 
-手写 **词法分析 + 简化树构建**（非完整 HTML5 状态机，但覆盖常见文档）：
+手写 **词法分析 + 简化树构建**（非完整 HTML5 状态机，但覆盖常见文档，并已补入主要的容错与专用解析规则）：
 
 - 标签 / 属性 / 注释 / DOCTYPE 识别。
-- **隐式结构**：自动补全 `<html><head></head><body>...</body></html>`。
+- **隐式结构**：自动补全 `<html><head></head><body>...</body></html>`；`<head>` 遇到 body 内容自动闭合
+  （`is_head_content` 白名单；`<html>/<head>/<body>` 起始标签折叠进合成骨架并合并其属性，不再产生重复节点）。
 - **原始文本元素（rawtext）**：`<style>` 与 `<script>` 的内容直接作为文本子节点挂到该元素下（早期 bug 曾把文本挂到 `head`，已修正——作者样式因此丢失的问题已解决）。
 - **实体解码**：`&amp; &lt; &gt; &quot; &#NN;` 等还原为字符。
-- 大小写：元素 `tag` 统一存为小写；属性名比较用 `hpe_str_ieq`（不区分大小写，符合 HTML 属性名语义）。
+- 大小写：元素 `tag` 统一存为小写；属性名比较用 `hpe_str_ieq`（不区分大小写，符合 HTML 属性名语义）。空 `<html>/<head>` 间的纯空白文本被丢弃。
+
+**容错恢复：错误嵌套的自动闭合（v0.13）**——`auto_close_for_start` 在压栈新起始标签前，反复弹出
+「被它隐式闭合」的栈顶元素。规则是**表驱动**的（`k_close_rules[]`），新增场景只改数据不改代码：
+
+| 开放元素 | 被这些起始标签关闭 |
+| --- | --- |
+| `p` | 块级起始标签集合 `k_closes_p`（browser「close a p element」触发集，`div`/`h1..h6`/`ul`/`li`…） |
+| `li` | `li` |
+| `dt` / `dd` | `dt` / `dd` |
+| `option` | `option` / `optgroup`；`optgroup` 被 `optgroup` 关闭 |
+| `td` / `th` | `k_closes_cell`（`td`/`th`/`tr`/`tbody`/`tfoot`/`thead`/`caption`…） |
+| `tr` | `k_closes_row` |
+| `tbody`/`thead`/`tfoot` | `k_closes_section` |
+| `h1`..`h6` | 任意标题（`is_heading`） |
+| `a` / `button` | 自身 |
+| `rt` / `rp` | `rt` / `rp` |
+
+另外两处 fault tolerance：**游离 `</p>`**（无开放段落时）插入一个空 `<p>`；**`</br>`** 视同 `<br>`。
+
+**`<table>` / `<select>` / `<template>` 专用解析规则（v0.13）**
+
+- **表格结构合成**（`synthesize_table_nodes`）：`<table><tr>` 隐式补 `<tbody>`；`<table><td>` / `<tbody><td>`
+  隐式补 `<tbody>+<tr>`。合成节点是合法表格内容，不触发 foster parenting。
+- **Foster parenting**（`insert_node`）：当前节点处于表格上下文（`table`/`tbody`/`thead`/`tfoot`/`tr`）而待插入的
+  文本/元素**不被该上下文接受**（`allowed_in_table` 按层用 `k_in_table`/`k_in_section`/`k_in_row` 判定）时，
+  把它**前移到最近的 `<table>` 之前**——这正是浏览器里表格中游离 `<div>` 会渲染到表格上方的原因。
+  表格上下文中的纯空白文本被直接丢弃。
+- **`<select>` 作用域**（`open_select`，到 `table`/`template` 为止）：只允许 `option`/`optgroup`/`hr`/`script`/
+  `style`/`template` 存活（`k_in_select`），其余起始标签**整段忽略**（不建节点也不压栈）；嵌套 `<select>`
+  视同外层 `</select>`；结束标签也只有 `select`/`option`/`optgroup`/`template` 被响应。
+- **`<template>`**：其子节点被改道到**脱离主树的 `content` 片段**（`HPE_NODE_FRAGMENT`，见 §7），
+  永不出现在主树、也不进盒树；UA 样式表给出 `template { display: none }`。JS 侧 `el.content` 暴露该片段
+  （见 §13.1）。
+
+**字符编码探测（v0.13，`src/html/hpe_encoding.c`）** —— `hpe_html_decode` 把原始字节解码为 UTF-8，
+嗅探顺序遵循 HTML 规范：
+
+1. **BOM 优先**：UTF-8（`EF BB BF`）/ UTF-16LE（`FF FE`）/ UTF-16BE（`FE FF`）——UTF-16 走 `utf16_to_utf8`
+   （含代理对重组），UTF-8 BOM 只跳过 3 字节。
+2. **`<meta charset>` 嗅探**：在**前 `HPE_SNIFF_BYTES`(1024) 字节**内查 `charset=` 关键字，兼容
+   `<meta charset=...>` 与 `content="text/html; charset=..."` 两种写法，带引号/无引号值皆可；
+   标签经小写归一映射到解码器（未知标签回落 UTF-8）。
+3. **无声明时**：严格 UTF-8 校验（`is_valid_utf8` 拒绝过长编码/代理项/越界码点）通过则按 UTF-8，
+   否则按 **Latin-1 / windows-1252** 解码（`hpe_latin1_to_utf8` 补齐 0x80..0x9F 的 cp1252 映射）。
+
+探测结果与是否来自文档声明暴露给引擎（`doc_encoding` / `meta_charset`，见 §14）。
+
+**`<base href>` 与 `<link>` 其它 `rel`（v0.13）**
+
+- `find_base_href` 取文档中**首个** `<base href>`（规范语义），相对值按文档目录绝对化后存入 `engine->base_href`。
+- `resolve_url` 统一解析资源引用：存在 base href 且引用为相对路径时按 **base 目录**拼接，否则按文档目录；
+  样式表（§14）与其它资源提示都走它。
+- `collect_styles` 把**非 stylesheet** 的 `<link>`（icon / preload…）记录为资源提示：`rel` 经
+  `normalize_rel` 归一为小写去重空格的 token 串，`href` 解析为绝对路径存入 `engine->links[]`
+  （上限 `HPE_MAX_LINKS`），供 `hpe_engine_link_at` 查询（见 §14）。
 
 输出：始终一个 `HpeDomNode`（document）节点，内部含 `<html>/<head>/<body>`。
 
@@ -153,7 +211,8 @@ typedef struct HpePixmap {
 ## 7. DOM 模型（`src/dom/hpe_dom.h`）
 
 ```c
-typedef enum HpeNodeType { HPE_NODE_DOCUMENT, HPE_NODE_ELEMENT, HPE_NODE_TEXT } HpeNodeType;
+typedef enum HpeNodeType { HPE_NODE_DOCUMENT, HPE_NODE_ELEMENT, HPE_NODE_TEXT,
+                           HPE_NODE_FRAGMENT } HpeNodeType;   /* FRAGMENT 为 v0.12 新增 */
 
 typedef struct HpeDomNode {
     HpeNodeType type;
@@ -161,14 +220,70 @@ typedef struct HpeDomNode {
     char *text;                /* 文本：解码后的内容 */
     HpeAttr *attrs; int attr_count;   /* 属性表（name/value） */
     struct HpeDomNode *parent, *first_child, *last_child, *next_sibling;
+    struct HpeDomNode *content;       /* <template>：脱离主树的 content 片段（v0.13） */
     void *listeners;           /* DOM 桥：每节点事件监听器链表（opaque） */
 } HpeDomNode;
 ```
 
-- 树操作：`hpe_dom_element / text / document / append / detach`。
-- 属性：`hpe_dom_attr`（名不区分大小写）/ `hpe_dom_set_attr`。
+- 树操作：`hpe_dom_element / text / document / fragment / append / insert_before / replace_child /
+  detach / clone`。
+- 属性：`hpe_dom_attr`（名不区分大小写）/ `hpe_dom_set_attr` / `hpe_dom_remove_attr`。
 - 兄弟遍历：`hpe_dom_prev_sibling` —— 为 CSS 相邻/通用兄弟组合符（`+` / `~`）提供支撑（详见 §8）。
 - `listeners` 指针由 JS DOM 桥使用，核心 DOM 不解释其内容。
+- **`DocumentFragment`（`HPE_NODE_FRAGMENT`，v0.12）**：仅作为子节点容器存在，永不进入盒树；
+  `append`/`insert_before` 遇到 fragment 时**搬运其全部子节点**（而非插入 fragment 本身），
+  搬运后 fragment 变空。`clone` 深拷贝时 fragment 与元素同样处理。
+- **`<template>.content`（v0.13）**：`hpe_dom_children_root(node)` 是统一的「子节点挂载点」——对
+  普通节点返回自身、对 `<template>` 元素**惰性创建并返回其 `content` 片段**。因此解析器把
+  `<template>` 的子节点挂到该片段上，它们天然脱离主树、不进盒树（UA 样式表 `template { display:none }`），
+  而 `appendChild`/`querySelector` 等对 template 的操作也自动落在 content 上。`hpe_dom_free` 先释放 `content`。
+
+### 7.1 变更通知与增量更新（v0.12 新增）
+
+DOM 层不自己做增量决策，而是通过**有序多订阅者**把三类变更广播出去：
+
+```c
+#define HPE_MUT_CHILD_LIST 1   /* 增删子节点 */
+#define HPE_MUT_ATTR 2         /* 属性增删改 */
+#define HPE_MUT_TEXT 3         /* 文本内容变化 */
+
+typedef void (*HpeDomMutationFn)(void *ud, int kind, HpeDomNode *target,
+                                 const char *name, const char *old_value,
+                                 HpeDomNode *added, HpeDomNode *removed);
+void hpe_dom_add_mutation_sink(HpeDomMutationFn fn, void *ud);
+void hpe_dom_remove_mutation_sink(HpeDomMutationFn fn, void *ud);
+void hpe_dom_clear_mutation_sinks(void);
+```
+
+- **订阅者 1（引擎内部）**：`style_sink`（`src/hope.c`）把每次变更**分类**为
+  `HPE_REFLOW_NONE / PAINT / LAYOUT` 并置脏标记；同时跟踪 `<style>`/`<link>` 的增删改
+  （`style_sig` / `style_rev` / `style_dirty`），命中则重收作者样式表（CSS 增量刷新）。
+- **订阅者 2（JS 桥）**：`hpe_js_mutation.c` 把变更累积为 `MutationRecord`，经**微任务队列**
+  （`hpe_js_queue_microtask`）异步批量投递给 `MutationObserver` 回调（详见 §13.5）。
+- 两个订阅者彼此独立，新增订阅者不影响既有逻辑（上限 `HPE_MAX_MUT_SINKS = 4`）。
+- `hpe_dom_detach` 会记录原 owner 并发出一次 `CHILD_LIST`-移除通知，使「移除节点」也能触发重排。
+
+### 7.2 脏标记与惰性重排（v0.12 新增）
+
+引擎侧脏标记为 `HPE_DIRTY_{NONE,SCROLL,FULL,CHROME}`，重排级别为
+`HPE_REFLOW_{NONE,PAINT,LAYOUT}`：
+
+- **PAINT 级**（仅颜色/可见性等不影响几何的属性）→ `restyle_boxes()` 只刷新盒上的样式，跳过布局。
+- **LAYOUT 级**（尺寸/结构变化）→ 走增量布局。
+- `hpe_engine_render` 在 `dirty == NONE && painted` 时直接早退，页面无变化则零成本重绘。
+
+### 7.3 增量布局：局部子树重排（v0.12 新增）
+
+```c
+HpeBox *hpe_layout_rebuild(HpeDomNode *document, HpeStylesheet *sheet,
+                           float vw, float vh, HpeBox *old_root, HpeDomNode *reflow_root);
+```
+
+- 在旧盒树上**定位变更节点的对应盒**，就地替换该子树（`rebuild_box_in_place`），
+  再对整棵盒树**重跑一遍几何（几何 pass）**，使兄弟推进、margin 塌陷、浮动清理仍然正确。
+- `reflow_root == NULL`（无法定位，如根节点/文档级改动）或 `HPE_NO_PARTIAL` 置位时返回 `NONE`，
+  由 `hpe_engine_flush` 回退到全量重建；`HPE_FORCE_EAGER` 则强制全量以做等价比对。
+- 结果与全量重建**逐字节一致**（见 §15 回归），只省下未受影响子树的盒构造开销。
 
 ---
 
@@ -684,12 +799,18 @@ UTF-8 字节上的**回溯匹配器**，用 CPS（continuation-passing，`ReK` �
 
 ### 13.1 DOM API
 
-- `document.getElementById / createElement / body`
+- `document.getElementById / createElement / body / head`
 - `document.querySelector(sel)`（返回首个匹配元素或 `null`）、`document.querySelectorAll(sel)`
   （返回数组式对象：数字键 + `length`；内部 DFS 收集元素后用 `hpe_css_selector_matches`
   逐个匹配——把选择器串解析成临时 `HpeRule`，逗号分隔的任一分支命中即算匹配）
 - 元素：`textContent`（读写）、`innerHTML`（读写）、`style.xxx`（驼峰属性名 → CSS 属性名，写回 `style` 属性）、
-  `setAttribute/getAttribute/appendChild/remove`
+  `setAttribute/getAttribute/removeAttribute/hasAttribute/appendChild/remove`
+- **变更 API（v0.12 新增）**：`document.createDocumentFragment()`、`node.cloneNode(deep)`、
+  `parent.insertBefore(newNode, refNode)`（`refNode == null` 时追加）、`parent.replaceChild(newNode, oldNode)`
+  （返回被替换的旧节点）、`node.hasChildNodes()`、`node.nodeType` / `tagName` / `nodeName`
+  （元素名按 HTML 文档惯例**大写**）。返回的节点与 `childNodes`/`firstChild`/`nextSibling`/`parentNode`
+  返回的都是 **host 包装对象**；每次属性读取会创建新的包装器，因此包装器的 `===` 同一性比较
+  只对同一次读取有效（已知限制，见 §17）。
 - **浏览器全局（v0.7 新增）**：`location`（`protocol/pathname/href/search/hash` + `reload/replace/assign` 空实现，
   `hash` 可写，供页面用 `#all` 之类的视图开关）、`navigator`（`userAgent/platform/language`）、
   `window`/`self`（`innerWidth/innerHeight/devicePixelRatio/scrollX/scrollY/pageYOffset`、
@@ -738,6 +859,33 @@ Win32 WM_LBUTTONDOWN/UP
   定时器/rAF 回调里的 DOM 与 `style` 改动即时上屏。Win32 层 `SetTimer(hwnd, 1, 15)`
   驱动 `WM_TIMER → on_tick`（约 60fps 上限），窗口销毁时 `KillTimer`。
 
+### 13.5 `MutationObserver`（v0.12 新增，`src/js/hpe_js_mutation.c`）
+
+标准 `MutationObserver` 子集，覆盖脚本框架的「观测 DOM 变化」场景：
+
+```js
+const mo = new MutationObserver((records, obs) => { /* records: MutationRecord[] */ });
+mo.observe(target, { childList:true, attributes:true, subtree:true,
+                     attributeFilter:["class"], attributeOldValue:true,
+                     characterData:true, characterDataOldValue:true });
+mo.takeRecords();   // 立即取出并清空当前批次
+mo.disconnect();    // 停止观测并丢弃挂起记录
+```
+
+- **记录类型**：`childList`、`attributes`、`characterData`；`MutationRecord` 暴露
+  `type / target / addedNodes / removedNodes / attributeName / oldValue`。
+  `target` 是完整可用的元素 host 包装器（用 `hpe_js_dom_node_value` 构造）。
+- **订阅方式**：`observer_ctor` 把 `observe`/`disconnect`/`takeRecords` 作为**自有原生属性**
+  挂在实例上（避免原型链查找问题）。同一实例可观察多个目标；`subtree` 置位时对整棵子树递归匹配。
+- **过滤器**：`attributeFilter`（属性名白名单，大小写不敏感）、`attributeOldValue`、
+  `characterDataOldValue` 按需填充 `oldValue`。
+- **投递时机（关键）**：与规范一致——**微任务批量投递**。变更发生时 `mutation_bridge`（DOM 变更订阅者）
+  只把记录累积到 pending 队列并**入队一个投递微任务**（`hpe_js_queue_microtask`）；微任务执行时
+  把 **N 条记录合并为一次回调**（`(records, observer)`），投递后清空队列。因此同一同步块内的
+  多次变更只触发 **1 次**回调。`takeRecords()` 可同步取走尚未投递的记录。
+- **现场**：`HpeJs.mutation_state` 持 `HpeJsMutationState`，安装时挂一个 DOM 变更订阅者；
+  `hpe_js_destroy` 先 `hpe_js_mutation_uninstall`（摘订阅者 + 释放 observer 链）。
+
 ---
 
 ## 14. 引擎门面与生命周期（`src/hope.h/.c`）
@@ -758,16 +906,26 @@ int  hpe_engine_chrome_height(HpeEngine*);
 const char *hpe_engine_address_text(HpeEngine*);
 int  hpe_engine_address_focused(HpeEngine*);
 int  hpe_engine_key(HpeEngine*, int key);        /* 可打印码点 / HPE_KEY_* */
+/* 文档元信息（v0.13） */
+const char *hpe_engine_document_encoding(HpeEngine*);   /* "utf-8"/"latin1"/"utf-16le"/"utf-16be" */
+int  hpe_engine_meta_charset(HpeEngine*);               /* 编码是否来自文档内 <meta> 声明 */
+const char *hpe_engine_base_href(HpeEngine*);           /* <base href> 绝对化结果，无则 "" */
+int  hpe_engine_link_count(HpeEngine*);                 /* 记录的 <link> 资源提示数 */
+int  hpe_engine_link_at(HpeEngine*, int index, const char **rel, const char **href);
 ```
 
 **`hpe_engine_load_file` 顺序（核心流水线）：**
-1. 读文件 → `hpe_html_parse` 生成 DOM；
-2. `collect_styles` 收集 `<style>` 文本与 `<link>` 本地 CSS（UA 样式表在 `hpe_css_init` 已就位）；
-3. `run_scripts`：重建 JS 环境，安装 DOM 桥，按文档序执行 `<script>`（内联 + 本地 `src`）；
-4. `relayout`：`hpe_layout_build` 建盒树并布局；
-5. 开发钩子：`HOPE_DEBUG=1` 打印 DOM 树与盒树坐标；`HOPE_TEST_CLICK=id` 触发对指定 `id` 元素的合成点击（无头验证事件驱动的 DOM 更新）；
+1. 读文件 → `hpe_html_decode` 按 BOM / `<meta charset>` / UTF-8 校验探测编码并解码为 UTF-8（§6）；
+2. `hpe_html_parse` 生成 DOM，并记录文档编码 / 是否来自 meta 声明；
+3. 定位 `<base href>`（绝对化）与文档目录；
+4. `collect_styles` 收集 `<style>` 文本与 `<link>` 本地 CSS（相对引用经 `resolve_url` 按 base href 解析），
+   其余 `<link>` 记为资源提示（UA 样式表在 `hpe_css_init` 已就位）；
+5. `run_scripts`：重建 JS 环境，安装 DOM 桥，按文档序执行 `<script>`（内联 + 本地 `src`）；
+6. `relayout`：`hpe_layout_build` 建盒树并布局；
+7. 开发钩子：`HOPE_DEBUG=1` 打印 DOM 树与盒树坐标；`HOPE_TEST_CLICK=id` 触发对指定 `id` 元素的合成点击（无头验证事件驱动的 DOM 更新）；
    `HOPE_TEST_HOVER=x,y` 无头模拟指针；`HOPE_TEST_WAIT=秒` 忙等并逐轮 `hpe_engine_tick` 泵定时器（验证 setTimeout/interval/rAF）；
-   `HOPE_TEST_TEXT=id` 打印该元素 textContent（断言脚本写入的 DOM 内容）。
+   `HOPE_TEST_TEXT=id` 打印该元素 textContent（断言脚本写入的 DOM 内容）；
+   `HOPE_TEST_META=1` 打印 `encoding=/meta=/base=` 与每个 `<link>` 的 `rel=`/`href=`（断言编码探测与资源提示）。
 
 **`hpe_engine_render` 与脏矩形滚动（v0.4 新增）**：引擎维护 `dirty` 标志
 （`NONE=0` 干净 / `SCROLL=1` 仅滚动偏移变化 / `FULL=2` 需全量重绘；`relayout` 置 FULL，
@@ -781,6 +939,18 @@ int  hpe_engine_key(HpeEngine*, int key);        /* 可打印码点 / HPE_KEY_* 
   4. 递归收集全部 `position:fixed` 盒，逐个以其视口 bbox 为 clip 重绘区域 —— fixed 盒不随内容平移，
      区域重绘会按绘制顺序重放其背后的全部文档内容，结果与全量绘制逐字节一致。
   `HPE_NO_DIRTY=1` 可旁路脏路径（基准对比用）。验证：8 示例 × 3 滚动量脏路径与全量输出逐字节一致。
+
+**`hpe_engine_flush` / 惰性重排（v0.12 新增）**：DOM 变更不再无条件整页重排。`hpe_engine_relayout`
+现为 `hpe_engine_flush(engine, /*force=*/1)` 的薄封装；鼠标/定时器/点击等热路径改用
+`hpe_engine_flush(engine, /*force=*/0)`：
+
+- 变更经 §7.1 的分类订阅者累积为 `reflow_need`（`NONE` / `PAINT` / `LAYOUT`）。
+- `NONE` → 直接返回（不做任何工作，`render` 也会早退）。
+- `PAINT` → `restyle_boxes()` 只重算盒上样式，跳过几何。
+- `LAYOUT` → `hpe_layout_rebuild`（§7.3）做局部子树增量布局；不可拆分时回退全量。
+- 调试开关：`HOPE_TRACE_REFLOW=1` 打印每次刷新的级别（`none/paint/layout (partial|full)`）；
+  `HPE_FORCE_EAGER=1` 强制走全量；`HPE_NO_PARTIAL=1` 禁用局部布局。
+
 **`resize`**：`hpe_pixmap_resize` + `relayout`。**`scroll_by`**：按 `HPE_SCROLL_LINE_PX`(48px) 滚动并夹紧到 `[0, content_height - height]`。
 **`mouse_event`**：返回 1 表示页面发生变更（窗口应重绘）；见 §13.3。
 **`mouse_move`（v0.4 新增）**：命中测试（fixed 盒按视口坐标比较）→ 更新 `hover_node` 与
@@ -876,6 +1046,8 @@ cmake --build build
   页头按钮等交互路径）；`HOPE_TRACE_SVG=1` 打印 `<svg>` 视口尺寸与 `viewBox`；
   `HOPE_TRACE_PAINT=1` 打印每个盒的几何与背景色。
 - 也可使用 MSVC 工具链；入口见 `src/main.c`。
+- 代码规范自查：`python3 docs/func_len_audit.py 50`（C 感知：剥离注释/字符串/字符字面量后再计花括号配平），
+  列出 `src/**/*.c` 中超过阈值行数的函数。当前全项目**无**函数超过 50 行。
 
 ### 示例页面（`examples/`）
 - `hello.html`：浅色卡片页
@@ -903,6 +1075,15 @@ cmake --build build
   radial，作为填充与描边）、`path` 全命令（C/S/Q/T/A/Z）、`defs`/`use`（含 `<g>` 属性继承）、
   `text` 的 anchor/dominant-baseline/textLength
 - `timers.html`：querySelector(All) + setTimeout / setInterval / rAF
+- `dom-mutation.html`：**DOM 变更与观测综合断言页**（v0.12）——35 项 `check()` 覆盖
+  `cloneNode(deep)`（浅/深、属性、脱离态）、`insertBefore`（头部/中间/`null` 追加/移动已有节点/ fragment）、
+  `replaceChild`（返回旧节点、就地去旧）、`createDocumentFragment`（搬运子节点后自身变空）、
+  `hasChildNodes` / `removeAttribute`（后 `getAttribute` 得 `null`、`hasAttribute` 为假）/
+  `node.nodeType`（元素 1 / fragment 11）、`tagName` 大写；
+  `MutationObserver` 的同步语义（`takeRecords` 排空、`observe`/`disconnect`、`subtree` 范围、
+  `attributeFilter` 过滤、`attributeName`/`oldValue`/`type`（attributes / childList）字段）与
+  **异步微任务批量投递**（同一同步块内多次变更合并为 1 次回调、N 条记录）。
+  因该页依赖真实脚本执行，被 `run_tests.sh` 同时列入**脚本断言项**（`PASS 35/35`）与**像素基线项**。
 - `js-modern.html`：**JS 语言特性综合断言页**（v0.7）——33 项 `check(label, got, want)` 覆盖
   `try/catch/finally`+`throw`+`Error`、`new`/原型链/`class`·`extends`·`instanceof`、
   `this` 绑定与 `call/apply/bind`、解构/`...` 展开/默认与剩余参数/模板字符串、
@@ -913,8 +1094,9 @@ cmake --build build
 **回归入口**：`docs/run_tests.sh`（脚本位于 `docs/`，内部自行 `cd` 到项目根后再操作
 `build/`、`examples/`）给出统一自检——
 ① 逐字节像素基线（`--width 400 --height 600 --dump`，与 `build/baseline/*.bmp` 比对，`--rebase` 刷新；
-含 `css-cascade`、`css-props`、`svg-shapes` 等 14 个页面）；
-② `HOPE_TEST_TEXT=out hope examples/js-modern.html` 断言 `PASS 33/33`、`js-builtins.html` 断言 `PASS 37/37`；
+含 `css-cascade`、`css-props`、`svg-shapes`、`dom-mutation` 等 15 个页面）；
+② `HOPE_TEST_TEXT=out hope examples/js-modern.html` 断言 `PASS 33/33`、`js-builtins.html` 断言 `PASS 37/37`、
+`dom-mutation.html` 断言 `PASS 35/35`；
 ③ headless ES 模块（`--module`）校验 `import`/`export`/默认导出与相对路径解析。
 
 ---
@@ -926,13 +1108,22 @@ cmake --build build
 | 自研软件光栅，不用 Skia/Direct2D | 零依赖、完全可控；像素格式与 GDI 直接互通 |
 | 抽象平台层 + `hpe_platform.h` | 系统相关代码隔离在 `platform/<os>/`，便于无头测试与跨平台 |
 | 像素 `0xAARRGGBB` top-down | 与 Win32 `StretchDIBits` 零转换上屏 |
+| 容错闭合规则表驱动（`k_close_rules[]`） | 「开放元素 × 关闭触发标签」是纯数据；新增/调整 HTML 容错场景只改表，不碰控制流（v0.13） |
+| foster parenting 在**插入点**统一处理 | 表格内的游离内容需要前移到 `<table>` 之前；与其在各分支散落判断，不如让唯一的 `insert_node` 出口按上下文决定落点（v0.13） |
+| `<template>` 用 `content` 片段 + `hpe_dom_children_root` 抽象挂载点 | 让「子节点挂到哪」成为每个节点可回答的问题，template 的子节点天然脱离主树/盒树，而 append/querySelector 等 API 无需特判（v0.13） |
+| 编码探测按规范顺序（BOM > meta > 校验） | BOM 是字节级铁证、`<meta>` 是作者显式声明、最终靠严格 UTF-8 校验兜底；三级顺序避免误判（v0.13） |
+| 未知编码标签与无声明时回落 UTF-8，仅**校验失败**才按 Latin-1 | 与浏览器「默认 windows-1252 但现代页面多为 UTF-8」的经验一致：合法 UTF-8 绝不被误当 Latin-1，只有非法字节流才解码为 cp1252（v0.13） |
 | GDI 字形覆盖率掩码 | 复用操作系统字体渲染，免自带字体文件；掩码按文本内容哈希缓存（v0.4，§9.1） |
 | JS bump arena 整块释放 | 分配快、零碎片；代价：运行期无单对象回收（待 GC） |
 | `HpeStyle.set` 位掩码 | 区分“未声明”与“声明为默认值”，保证层叠/继承正确 |
 | 层叠分两趟（normal 后 important） | `!important` 语义要求 important 胜全部 normal（与 specificity 无关），单趟按 specificity 排序无法表达；两趟各自排序最简洁且与规范一致（v0.10） |
 | `@media` 在层叠期求值而非解析期丢弃 | `viewport` 在重排时变化，样式表须保留全部规则、按 `HpeStylesheet.vw/vh` 逐次求值；解析期只记录条件不裁剪（v0.10） |
 | 解释器 + 宿主 vtable | 核心 JS 不耦合 DOM；DOM 桥通过 `HpeJsHostVt` 注入 |
-| 事件后整页 `relayout` | 简单正确；后续可演进为脏矩形/增量布局 |
+| DOM 变更经「多订阅者」广播，而非 DOM 自己决策 | 分离关注点：核心 DOM 只负责「变」，引擎订阅者负责「怎么重排」、JS 订阅者负责「怎么通知脚本」；新增订阅者零侵入（v0.12） |
+| 重排按 `NONE/PAINT/LAYOUT` 分级 | 颜色/可见性等不改几何的变更只需重刷样式，省掉整棵布局；无变更时 `render` 早退（v0.12） |
+| 增量布局「换子树 + 全量几何 pass」 | 只重建变更节点的盒子树、保留其余，既省盒构造又不牺牲兄弟推进/塌陷/浮动的正确性；结果与全量逐字节一致（v0.12） |
+| `MutationObserver` 走微任务批量投递 | 与规范一致：同一同步块内 N 次变更合并为 1 次回调，且不阻塞当前脚本；复用既有 `JOB_CALL` 微任务队列（v0.12） |
+| 事件后整页 `relayout`（v0.12 起改为分级 `flush`） | 早期简单正确；现演进为脏标记驱动的惰性/增量重排（见 §14 `hpe_engine_flush`） |
 | 地址栏由引擎自绘，不用 OS 控件 | 跨平台一致、无头可验证、与页面共用字体/光栅/裁剪；代价：需自己实现文本编辑与光标 |
 | 外壳用 `origin_y` 平移页面而非改造布局 | 布局仍以页面视口为坐标系，绘制层单点加偏移，命中测试单点减偏移，改动面最小 |
 | 设备 y 量化 1/64 px | 让绘制对整数平移严格不变，脏矩形与全量输出逐字节相等（否则近整数边缘会差 1 行） |
@@ -941,16 +1132,25 @@ cmake --build build
 | 插入符不闪烁 | 闪烁会让 `--dump` 的像素基线依赖时间相位。宁可牺牲这一点视觉真实度，保持回归可比 |
 | 局部重绘的裁剪必须**相交**而不能覆盖 | `hpe_pixmap_set_clip` 是替换语义，`<svg>` 视口裁剪若直接调用就会丢掉脏矩形，半透明描边被二次混合（滚动时连线逐次变深）。新增 `hpe_pixmap_intersect_clip` |
 | 以 Chrome 的渲染结果为对齐基准 | `copyResource/aim.html`（思维导图）这类真实页面会同时压到 JS 语法、flex、SVG、圆角、按边边框；逐区域比对能暴露「能跑但不对」的问题 |
+| 超长函数一律以「表驱动分发 + 内聚辅助函数」拆分 | 满足 `AI代码生成规范.md` 的「单函数 ≤50 行」；把「名字 → 处理函数」这类纯数据做成 `static const` 表（如 DOM 方法表、SVG 路径命令参数表），控制流只剩一次查表，既消除 if/else 长链又不改变行为（逐字节回归保持绿） |
 
 ---
 
 ## 17. 已知缺口与路线图（待补）
 
+0. **HTML 解析**（v0.13 已补齐四大类：容错自动闭合、`<table>`/`<select>`/`<template>` 专用规则、
+   字符编码探测、`<base href>` 与 `<link>` 资源提示，见 §6）：
+   仍**不是**完整 HTML5 状态机——未实现 `<frameset>`、`<form>` 的隐式闭合细节、`<math>`/`<svg>` 的
+   外来内容命名空间切换、`<textarea>`/`<title>` 的 RCDATA 转义规则、`<select>` 内 `<option>` 的 `label`
+   裁剪、`<colgroup>`/`<caption>` 的更细粒度插入模式、属性重复剔除、`<template>` 的模板内容惰性解析；
+   编码方面仅支持 UTF-8 / UTF-16 / Latin-1(cp1252)，未覆盖 GBK/Big5/Shift-JIS 等亚洲编码；
+   资源提示只记录 `rel`/`href`，不做实际加载（`icon`/`preload` 不参与绘制）。
 1. **JS**（v0.7 已补齐绝大多数语言特性：原型链/`class`/`extends`/`instanceof`、`try/catch/finally`、
    `this` 与 `call/apply/bind`、解构/展开/默认与剩余参数/模板字符串、`for-in`·`for-of`/`switch`/标签循环、
    位运算/`?.`/`??`、getter·setter、正则、`Promise`/`async await`、生成器、ES 模块；
-   v0.8 补齐内置库：`Date`、`Map`/`Set` 迭代协议、Array/String/Number/Math/Object 全量方法）：
-   仍缺 `getBoundingClientRect`；`tagName` 返回小写（规范大写）；脚本新增 `<style>` 不生效（未增量刷新样式）；
+   v0.8 补齐内置库：`Date`、`Map`/`Set` 迭代协议、Array/String/Number/Math/Object 全量方法；
+   v0.12 补齐 DOM 变更 API 与 `MutationObserver`）：
+   仍缺 `getBoundingClientRect`；节点 host 包装器每次读取都新建，`===` 同一性比较不可靠（见 §13.1）；
    生成器为**急切物化**（不支持 `yield` 中途暂停与无限生成器）；`await` 为同步 settle（无真正的事件循环挂起）；
    无 `Proxy`/`Reflect`/`Intl`/`WeakMap`·`WeakSet`/`Symbol.iterator` 之外的知名符号；
    `Date` 仅支持固定偏移而无历史时区库/夏令时规则，`Intl` 相关格式化未实现。
@@ -977,8 +1177,10 @@ cmake --build build
    （媒体类型/`and`/`not`/`only`/逗号或列表/区间特性/嵌套，按视口求值）、继承属性集合
    （`visibility`/`cursor`/`list-style-*`/`letter-spacing`/`word-spacing`/`text-indent`）、
    `visibility: hidden` 子树内 `visible` 重现。**）
-5. **基础设施**：DOM/CSS 增量更新、JS GC、事件内增量布局（当前事件/定时器后整页 relayout）。
-   （字体掩码缓存、脏矩形滚动重绘已于 v0.4 完成。）
+5. **基础设施**：JS GC、跨平台后端、真正的事件循环。
+   （**v0.12 已补齐 DOM/CSS 增量更新**：变更分类 + 脏标记惰性重排 + 局部子树增量布局 +
+   微任务批量 `MutationObserver` + 脚本新增/修改/移除 `<style>` 即时生效；
+   字体掩码缓存、脏矩形滚动重绘已于 v0.4 完成。）
 6. **浏览器外壳**（v0.6 后剩余）：地址栏已是完整文本编辑器（选区/双击选词/三击全选/Shift 扩展/
    `Ctrl+A/C/X/V`/方向键·Home·End·Ctrl+词移动/粘贴文件路径），仍缺**输入法组合输入**、
    插入符闪烁、鼠标 I 形光标、前进/后退历史与刷新按钮；滚轮在条带内仍会滚动页面

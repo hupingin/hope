@@ -72,6 +72,16 @@ typedef struct HpeBox {
 /* builds the box tree for a document and lays it out into `viewport_width` */
 HpeBox *hpe_layout_build(HpeDomNode *document, HpeStylesheet *sheet, float viewport_width,
                          float viewport_height);
+/* incremental counterpart used after a DOM mutation. `old_root` is the box tree
+ * of the previous pass and `reflow_root` the highest DOM node whose subtree
+ * changed. Boxes outside that subtree are reused verbatim (their styles cannot
+ * have changed because the stylesheet did not); only the path from the root down
+ * to `reflow_root` is rebuilt. Falls back to a full build when the inputs do not
+ * allow it. The ordering/positioning pass always runs, so the geometry is
+ * identical to hpe_layout_build(). */
+HpeBox *hpe_layout_rebuild(HpeDomNode *document, HpeStylesheet *sheet, float viewport_width,
+                           float viewport_height, HpeBox *old_root,
+                           HpeDomNode *reflow_root);
 void hpe_layout_free(HpeBox *box);
 float hpe_layout_content_height(HpeBox *root);
 

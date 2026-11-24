@@ -438,6 +438,62 @@ static void draw_run(HpePixmap *pm, HpeFont *font, const char *text, int len, fl
     hpe_draw_text_mask(pm, (int)x, (int)baseline, mask, color);
 }
 
+/* paints the field's text: hint, or selection + three text runs, or plain run */
+static void chrome_paint_field_text(HpeEngine *engine, HpePixmap *pm, const AddrLayout *L,
+                                    HpeColor text_color, HpeColor hint_color,
+                                    HpeColor sel_bg, HpeColor sel_fg)
+{
+    float scroll = engine->addr_scroll;
+    int sel_a = addr_sel_start(engine);
+    int sel_b = addr_sel_end(engine);
+
+    if (engine->addr_len == 0) {
+        draw_run(pm, L->font, PLACEHOLDER, (int)strlen(PLACEHOLDER), L->inner_x, L->baseline,
+                 hint_color);
+        return;
+    }
+    if (sel_b > sel_a && engine->addr_focus) {
+        /* an unfocused field shows no highlight (Chrome clears it on blur).
+         * highlight first, then three text runs: the selected one in white so
+         * the glyphs stay crisp on top of the selection colour */
+        float x0 = L->inner_x - scroll +
+                   addr_width_to(L->font, engine->addr, engine->addr_len, sel_a);
+        float x1 = L->inner_x - scroll +
+                   addr_width_to(L->font, engine->addr, engine->addr_len, sel_b);
+        int ix0 = (int)floorf(x0);
+        int ix1 = (int)ceilf(x1);
+
+        if (ix1 <= ix0)
+            ix1 = ix0 + 1;
+        hpe_fill_round_rect(pm,
+                            hpe_rect((float)ix0, L->field.y + 5.0f, (float)(ix1 - ix0),
+                                     L->field.h - 10.0f),
+                            SEL_RADIUS, sel_bg);
+        draw_run(pm, L->font, engine->addr, sel_a, L->inner_x - scroll, L->baseline, text_color);
+        draw_run(pm, L->font, engine->addr + sel_a, sel_b - sel_a, x0, L->baseline, sel_fg);
+        draw_run(pm, L->font, engine->addr + sel_b, engine->addr_len - sel_b, x1, L->baseline,
+                 text_color);
+        return;
+    }
+    draw_run(pm, L->font, engine->addr, engine->addr_len, L->inner_x - scroll, L->baseline,
+             text_color);
+}
+
+/* caret at the insertion point; a selection hides it (Chrome) */
+static void chrome_paint_caret(HpeEngine *engine, HpePixmap *pm, const AddrLayout *L,
+                               HpeColor color)
+{
+    float cx;
+    if (!engine->addr_focus || addr_sel_end(engine) != addr_sel_start(engine))
+        return;
+    cx = L->inner_x - engine->addr_scroll +
+         addr_width_to(L->font, engine->addr, engine->addr_len, engine->addr_caret);
+    if (cx < L->inner_x)
+        cx = L->inner_x;
+    if (cx <= L->inner_x + L->inner_w)
+        hpe_fill_rect(pm, hpe_rect(cx, L->field.y + 5.0f, 1.0f, L->field.h - 10.0f), color);
+}
+
 void hpe_chrome_paint(HpeEngine *engine)
 {
     HpePixmap *pm;
@@ -450,8 +506,6 @@ void hpe_chrome_paint(HpeEngine *engine)
     HpeColor sel_bg = hpe_rgb(26, 115, 232);
     HpeColor sel_fg = hpe_rgb(255, 255, 255);
     AddrLayout L;
-    int sel_a, sel_b;
-    float scroll;
 
     if (!engine || engine->chrome_h <= 0 || !engine->pm.pixels)
         return;
@@ -472,47 +526,9 @@ void hpe_chrome_paint(HpeEngine *engine)
                           field_border);
 
     addr_clamp_scroll(engine, &L);
-    scroll = engine->addr_scroll;
-    sel_a = addr_sel_start(engine);
-    sel_b = addr_sel_end(engine);
-
     hpe_pixmap_set_clip(pm, hpe_rect(L.inner_x, L.field.y + 2.0f, L.inner_w, L.field.h - 4.0f));
-    if (engine->addr_len == 0) {
-        draw_run(pm, L.font, PLACEHOLDER, (int)strlen(PLACEHOLDER), L.inner_x, L.baseline,
-                 hint_color);
-    } else if (sel_b > sel_a && engine->addr_focus) {
-        /* an unfocused field shows no highlight (Chrome clears it on blur) */
-        /* highlight first, then the three text runs: the selected one in white,
-         * so the glyphs stay crisp on top of the selection colour */
-        float x0 = L.inner_x - scroll + addr_width_to(L.font, engine->addr, engine->addr_len, sel_a);
-        float x1 = L.inner_x - scroll + addr_width_to(L.font, engine->addr, engine->addr_len, sel_b);
-        int ix0 = (int)floorf(x0);
-        int ix1 = (int)ceilf(x1);
-
-        if (ix1 <= ix0)
-            ix1 = ix0 + 1;
-        hpe_fill_round_rect(pm,
-                            hpe_rect((float)ix0, L.field.y + 5.0f, (float)(ix1 - ix0),
-                                     L.field.h - 10.0f),
-                            SEL_RADIUS, sel_bg);
-        draw_run(pm, L.font, engine->addr, sel_a, L.inner_x - scroll, L.baseline, text_color);
-        draw_run(pm, L.font, engine->addr + sel_a, sel_b - sel_a, x0, L.baseline, sel_fg);
-        draw_run(pm, L.font, engine->addr + sel_b, engine->addr_len - sel_b, x1, L.baseline,
-                 text_color);
-    } else {
-        draw_run(pm, L.font, engine->addr, engine->addr_len, L.inner_x - scroll, L.baseline,
-                 text_color);
-    }
-
-    /* caret at the insertion point; a selection hides it (Chrome) */
-    if (engine->addr_focus && sel_b == sel_a) {
-        float cx = L.inner_x - scroll +
-                   addr_width_to(L.font, engine->addr, engine->addr_len, engine->addr_caret);
-        if (cx < L.inner_x)
-            cx = L.inner_x;
-        if (cx <= L.inner_x + L.inner_w)
-            hpe_fill_rect(pm, hpe_rect(cx, L.field.y + 5.0f, 1.0f, L.field.h - 10.0f), text_color);
-    }
+    chrome_paint_field_text(engine, pm, &L, text_color, hint_color, sel_bg, sel_fg);
+    chrome_paint_caret(engine, pm, &L, text_color);
     hpe_pixmap_reset_clip(pm);
 }
 
@@ -684,11 +700,95 @@ int hpe_engine_key(HpeEngine *engine, int key)
     return hpe_engine_key_mods(engine, key, 0);
 }
 
+/* Backspace / Delete: delete the selection, else the char (or word) on each side */
+static int addr_key_delete(HpeEngine *engine, int key, int ctrl)
+{
+    int has_sel = addr_has_selection(engine);
+    if (has_sel)
+        return addr_delete_selection(engine);
+    if (key == HPE_KEY_BACKSPACE && engine->addr_caret > 0)
+        return addr_delete_range(
+            engine,
+            ctrl ? addr_word_left(engine->addr, engine->addr_caret)
+                 : addr_prev_index(engine->addr, engine->addr_caret),
+            engine->addr_caret);
+    if (key == HPE_KEY_DELETE && engine->addr_caret < engine->addr_len)
+        return addr_delete_range(
+            engine, engine->addr_caret,
+            ctrl ? addr_word_right(engine->addr, engine->addr_len, engine->addr_caret)
+                 : addr_next_index(engine->addr, engine->addr_caret, engine->addr_len));
+    return 0;
+}
+
+/* Left / Right / Home / End: move the caret, collapsing or extending a selection */
+static int addr_key_move(HpeEngine *engine, int key, int ctrl, int shift)
+{
+    int collapse = !shift && addr_has_selection(engine);
+    switch (key) {
+    case HPE_KEY_LEFT:
+        addr_set_caret(engine,
+                       collapse ? addr_sel_start(engine)
+                                : (ctrl ? addr_word_left(engine->addr, engine->addr_caret)
+                                        : addr_prev_index(engine->addr, engine->addr_caret)),
+                       shift);
+        return 1;
+    case HPE_KEY_RIGHT:
+        addr_set_caret(engine,
+                       collapse ? addr_sel_end(engine)
+                                : (ctrl ? addr_word_right(engine->addr, engine->addr_len,
+                                                          engine->addr_caret)
+                                        : addr_next_index(engine->addr, engine->addr_caret,
+                                                          engine->addr_len)),
+                       shift);
+        return 1;
+    case HPE_KEY_HOME:
+        addr_set_caret(engine, 0, shift);
+        return 1;
+    default: /* HPE_KEY_END */
+        addr_set_caret(engine, engine->addr_len, shift);
+        return 1;
+    }
+}
+
+/* the editing half of key handling (Backspace..Paste + text insertion);
+ * returns 1 when the address content changed */
+static int addr_key_edit(HpeEngine *engine, int key, int ctrl, int shift)
+{
+    switch (key) {
+    case HPE_KEY_BACKSPACE:
+    case HPE_KEY_DELETE:
+        return addr_key_delete(engine, key, ctrl);
+    case HPE_KEY_LEFT:
+    case HPE_KEY_RIGHT:
+    case HPE_KEY_HOME:
+    case HPE_KEY_END:
+        return addr_key_move(engine, key, ctrl, shift);
+    case HPE_KEY_SELECT_ALL:
+        engine->addr_anchor = 0;
+        engine->addr_caret = engine->addr_len;
+        engine->addr_drag_live = 0;
+        return 1;
+    case HPE_KEY_COPY:
+        return addr_copy(engine, 0);
+    case HPE_KEY_CUT:
+        return addr_copy(engine, 1);
+    case HPE_KEY_PASTE:
+        return addr_paste(engine);
+    default:
+        if (key >= 32 && key <= 0x10FFFF) {
+            char enc[4];
+            int n = hpe_utf8_encode((uint32_t)key, enc);
+            return addr_insert_at_caret(engine, enc, n);
+        }
+        return 0;
+    }
+}
+
 int hpe_engine_key_mods(HpeEngine *engine, int key, int mods)
 {
     int shift = (mods & HPE_MOD_SHIFT) != 0;
     int ctrl = (mods & HPE_MOD_CTRL) != 0;
-    int changed = 0;
+    int changed;
 
     if (!engine || engine->chrome_h <= 0 || !engine->addr_focus)
         return 0;
@@ -709,77 +809,7 @@ int hpe_engine_key_mods(HpeEngine *engine, int key, int mods)
         return 1;
     }
 
-    switch (key) {
-    case HPE_KEY_BACKSPACE:
-        if (addr_has_selection(engine))
-            changed = addr_delete_selection(engine);
-        else if (engine->addr_caret > 0)
-            changed = addr_delete_range(
-                engine,
-                ctrl ? addr_word_left(engine->addr, engine->addr_caret)
-                     : addr_prev_index(engine->addr, engine->addr_caret),
-                engine->addr_caret);
-        break;
-    case HPE_KEY_DELETE:
-        if (addr_has_selection(engine))
-            changed = addr_delete_selection(engine);
-        else if (engine->addr_caret < engine->addr_len)
-            changed = addr_delete_range(
-                engine, engine->addr_caret,
-                ctrl ? addr_word_right(engine->addr, engine->addr_len, engine->addr_caret)
-                     : addr_next_index(engine->addr, engine->addr_caret, engine->addr_len));
-        break;
-    case HPE_KEY_LEFT:
-        if (!shift && addr_has_selection(engine))
-            addr_set_caret(engine, addr_sel_start(engine), 0);
-        else
-            addr_set_caret(engine,
-                           ctrl ? addr_word_left(engine->addr, engine->addr_caret)
-                                : addr_prev_index(engine->addr, engine->addr_caret),
-                           shift);
-        changed = 1;
-        break;
-    case HPE_KEY_RIGHT:
-        if (!shift && addr_has_selection(engine))
-            addr_set_caret(engine, addr_sel_end(engine), 0);
-        else
-            addr_set_caret(engine,
-                           ctrl ? addr_word_right(engine->addr, engine->addr_len, engine->addr_caret)
-                                : addr_next_index(engine->addr, engine->addr_caret, engine->addr_len),
-                           shift);
-        changed = 1;
-        break;
-    case HPE_KEY_HOME:
-        addr_set_caret(engine, 0, shift);
-        changed = 1;
-        break;
-    case HPE_KEY_END:
-        addr_set_caret(engine, engine->addr_len, shift);
-        changed = 1;
-        break;
-    case HPE_KEY_SELECT_ALL:
-        engine->addr_anchor = 0;
-        engine->addr_caret = engine->addr_len;
-        engine->addr_drag_live = 0;
-        changed = 1;
-        break;
-    case HPE_KEY_COPY:
-        changed = addr_copy(engine, 0);
-        break;
-    case HPE_KEY_CUT:
-        changed = addr_copy(engine, 1);
-        break;
-    case HPE_KEY_PASTE:
-        changed = addr_paste(engine);
-        break;
-    default:
-        if (key >= 32 && key <= 0x10FFFF) {
-            char enc[4];
-            int n = hpe_utf8_encode((uint32_t)key, enc);
-            changed = addr_insert_at_caret(engine, enc, n);
-        }
-        break;
-    }
+    changed = addr_key_edit(engine, key, ctrl, shift);
 
     engine->addr_drag = 0;
     engine->addr_drag_live = 0;

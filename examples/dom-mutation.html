@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Hope Engine - DOM mutation</title>
+  <style>
+    body {
+      margin: 0;
+      background-color: #f5f6f8;
+      color: #202124;
+      font-size: 15px;
+      line-height: 1.55;
+      font-family: sans-serif;
+    }
+    .page { width: 720px; margin: 24px auto; }
+    h1 { font-size: 26px; margin: 0 0 6px 0; color: #14213d; }
+    .subtitle { color: #5f6368; font-size: 13px; margin: 0 0 18px 0; }
+    .card {
+      background-color: #ffffff;
+      border: 1px solid #dcdfe4;
+      padding: 12px 18px;
+      margin: 0 0 14px 0;
+    }
+    .card h2 { font-size: 16px; margin: 0 0 8px 0; color: #1a73e8; }
+    .row { font-family: monospace; font-size: 13px; white-space: pre; }
+    .fail { color: #d93025; font-weight: bold; }
+    .ok { color: #188038; }
+    .live { padding: 6px 10px; }
+    .live div { padding: 2px 4px; }
+    .box { background-color: #eef3ff; }
+    .hit { background-color: #d6f5d6; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <h1>DOM mutation</h1>
+    <p class="subtitle">cloneNode &middot; insertBefore &middot; replaceChild &middot; DocumentFragment &middot; MutationObserver &middot; incremental relayout</p>
+    <div class="card"><h2>Results</h2><div id="out"></div></div>
+    <div class="card"><h2>Live tree (script-built)</h2><div id="live" class="live"></div></div>
+  </div>
+<script>
+  var lines = [];
+  function check(label, got, want) {
+    var pass = String(got) === String(want);
+    lines.push((pass ? "  ok   " : "  FAIL ") + label + " = " + got + (pass ? "" : "   (want " + want + ")"));
+    return pass;
+  }
+  var passCount = 0, total = 0;
+
+  // ---- 1. cloneNode(deep) ----
+  var src = document.createElement("div");
+  src.setAttribute("class", "box");
+  src.textContent = "hello";
+  var shallow = src.cloneNode(false);
+  var deep = src.cloneNode(true);
+  total++; if (check("clone shallow has no children", shallow.firstChild, "null")) passCount++;
+  total++; if (check("clone deep text", deep.textContent, "hello")) passCount++;
+  total++; if (check("clone deep attr", deep.getAttribute("class"), "box")) passCount++;
+  total++; if (check("clone is detached", deep.parentNode, "null")) passCount++;
+  total++; if (check("original untouched", src.textContent, "hello")) passCount++;
+
+  // ---- 2. insertBefore ----
+  var list = document.createElement("ul");
+  var i1 = document.createElement("li"); i1.textContent = "1";
+  var i2 = document.createElement("li"); i2.textContent = "2";
+  var i3 = document.createElement("li"); i3.textContent = "3";
+  list.appendChild(i1);
+  list.appendChild(i3);
+  list.insertBefore(i2, i3);
+  total++; if (check("insertBefore middle", list.textContent, "123")) passCount++;
+  var i0 = document.createElement("li"); i0.textContent = "0";
+  list.insertBefore(i0, i1);
+  total++; if (check("insertBefore head", list.textContent, "0123")) passCount++;
+  var i9 = document.createElement("li"); i9.textContent = "9";
+  list.insertBefore(i9, null);
+  total++; if (check("insertBefore null appends", list.textContent, "01239")) passCount++;
+  list.insertBefore(i3, i1); // move the node holding "3" to just before "1"
+  // 0,1,2,3,9 -> 0,3,1,2,9
+  total++; if (check("insertBefore moves node", list.textContent, "03129")) passCount++;
+  // insertBefore returns the inserted node (checked by content, since each
+  // property read hands back a fresh wrapper object -- see README known gaps)
+  total++; if (check("insertBefore returns the node",
+        list.insertBefore(i9, null).textContent, "9")) passCount++;
+
+  // ---- 3. replaceChild ----
+  // list is 0,3,1,2,9; replace the leading "0" with "X"
+  var x = document.createElement("li"); x.textContent = "X";
+  var removed = list.replaceChild(x, list.firstChild);
+  total++; if (check("replaceChild returns old", removed.textContent, "0")) passCount++;
+  total++; if (check("replaceChild in place", list.textContent, "X3129")) passCount++;
+  total++; if (check("replaced detached", removed.parentNode, "null")) passCount++;
+
+  // ---- 4. DocumentFragment ----
+  var frag = document.createDocumentFragment();
+  var f1 = document.createElement("li"); f1.textContent = "A";
+  var f2 = document.createElement("li"); f2.textContent = "B";
+  frag.appendChild(f1);
+  frag.appendChild(f2);
+  total++; if (check("fragment nodeType", frag.nodeType, "11")) passCount++;
+  total++; if (check("fragment holds children", frag.textContent, "AB")) passCount++;
+  list.appendChild(frag);
+  total++; if (check("fragment spliced in", list.textContent, "X3129AB")) passCount++;
+  total++; if (check("fragment emptied after append", frag.firstChild, "null")) passCount++;
+  var frag2 = document.createDocumentFragment();
+  var m1 = document.createElement("li"); m1.textContent = "M";
+  frag2.appendChild(m1);
+  list.insertBefore(frag2, list.firstChild);
+  total++; if (check("fragment insertBefore", list.textContent, "MX3129AB")) passCount++;
+
+  // ---- 5. hasChildNodes / removeAttribute / hasAttribute ----
+  total++; if (check("hasChildNodes true", list.hasChildNodes(), "true")) passCount++;
+  var lone = document.createElement("span");
+  total++; if (check("hasChildNodes false", lone.hasChildNodes(), "false")) passCount++;
+  lone.setAttribute("data-k", "v");
+  total++; if (check("hasAttribute true", lone.hasAttribute("data-k"), "true")) passCount++;
+  lone.removeAttribute("data-k");
+  total++; if (check("removeAttribute gone", lone.hasAttribute("data-k"), "false")) passCount++;
+  total++; if (check("getAttribute after remove", lone.getAttribute("data-k"), "null")) passCount++;
+
+  // ---- 6. MutationObserver: synchronous queue + takeRecords ----
+  var host = document.getElementById("live");
+  var syncSeen = [];
+  var moSync = new MutationObserver(function (recs) {
+    for (var s = 0; s < recs.length; s++) syncSeen.push(recs[s].type);
+  });
+  total++; if (check("MutationObserver is a function", typeof MutationObserver, "function")) passCount++;
+  moSync.observe(host, { childList: true, attributes: true, subtree: true, attributeOldValue: true });
+  var h1 = document.createElement("div"); h1.className = "box"; h1.textContent = "first";
+  host.appendChild(h1);
+  h1.setAttribute("class", "box hit");
+  h1.setAttribute("data-n", "7");
+  var recs = moSync.takeRecords();
+  total++; if (check("observer record count", recs.length, 3)) passCount++;
+  total++; if (check("record childList type", recs[0].type, "childList")) passCount++;
+  total++; if (check("record attributes type", recs[1].type, "attributes")) passCount++;
+  total++; if (check("record attributeName", recs[1].attributeName, "class")) passCount++;
+  total++; if (check("record oldValue", recs[1].oldValue, "box")) passCount++;
+  total++; if (check("record target is element", recs[0].target.tagName, "DIV")) passCount++;
+  total++; if (check("takeRecords drains", moSync.takeRecords().length, 0)) passCount++;
+
+  // ---- 7. MutationObserver: asynchronous (microtask) delivery ----
+  var host2 = document.createElement("div");
+  document.getElementById("live").appendChild(host2);
+  var asyncCount = 0;
+  var moAsync = new MutationObserver(function (recs) { asyncCount = recs.length; });
+  moAsync.observe(host2, { childList: true, subtree: true });
+  var a1 = document.createElement("span"); a1.textContent = "async";
+  host2.appendChild(a1);
+  total++; if (check("not delivered synchronously", asyncCount, 0)) passCount++;
+
+  // ---- 8. attributeFilter + disconnect ----
+  var host3 = document.createElement("div");
+  document.getElementById("live").appendChild(host3);
+  var filterSeen = [];
+  var moF = new MutationObserver(function (recs) { filterSeen.push(recs.length); });
+  moF.observe(host3, { attributes: true, attributeFilter: ["data-keep"] });
+  host3.setAttribute("data-skip", "1");
+  host3.setAttribute("data-keep", "2");
+  total++; if (check("attributeFilter applied", moF.takeRecords().length, 1)) passCount++;
+  moF.disconnect();
+  host3.setAttribute("data-keep", "3");
+  total++; if (check("disconnect stops observation", moF.takeRecords().length, 0)) passCount++;
+
+  // ---- 9. observer only sees mutations below its target ----
+  var outside = document.createElement("p");
+  document.body.appendChild(outside);
+  var moScope = new MutationObserver(function () {});
+  moScope.observe(host3, { attributes: true, subtree: true });
+  outside.setAttribute("data-o", "x");
+  total++; if (check("outside target ignored", moScope.takeRecords().length, 0)) passCount++;
+  outside.remove();
+
+  // ---- summary ----
+  lines.unshift((passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total + " checks");
+  var cls = passCount === total ? "ok" : "fail";
+  var el = document.getElementById("out");
+  for (var li = 0; li < lines.length; li++) {
+    var row = document.createElement("div");
+    row.className = "row " + (li === 0 ? cls : "");
+    row.textContent = lines[li];
+    el.appendChild(row);
+  }
+
+  // The async observer's callback runs as a microtask, i.e. after this script
+  // finishes -- not synchronously when the mutation happens. It appends its own
+  // result, which is the end-to-end proof that deferred delivery happened.
+  (function () {
+    var asyncHost = document.getElementById("live");
+    var moAsync2 = new MutationObserver(function (recs) {
+      var row = document.createElement("div");
+      row.className = "row ok";
+      row.textContent = "  ok   async delivery = " + recs.length + " record(s), types=" +
+                        recs[0].type;
+      row.id = "async-result";
+      document.getElementById("out").appendChild(row);
+    });
+    moAsync2.observe(asyncHost, { childList: true });
+    var extra = document.createElement("div");
+    extra.className = "box";
+    extra.textContent = "appended for the async observer";
+    asyncHost.appendChild(extra);
+  })();
+</script>
+</body>
+</html>

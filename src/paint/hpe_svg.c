@@ -284,63 +284,165 @@ static void add_span(float *cov, int x0, int x1, float a, float b, float w)
 }
 
 /* even-odd scanline fill of every subpath; solid colour or gradient */
+/* device-space bounding box of every subpath, intersected with the clip rect
+ * and the caller's bbox limit */
+static void polys_bbox_clipped(Polys *p, HpePixmap *pm, float bx0, float by0, float bx1, float by1,
+                               int *ox0, int *oy0, int *ox1, int *oy1)
+{
+    float minx = 1e9f, miny = 1e9f, maxx = -1e9f, maxy = -1e9f;
+    int i;
+    for (i = 0; i < p->count; i++) {
+        SubPath *sp = &p->subs[i];
+        int k;
+        for (k = 0; k < sp->count; k++) {
+            float x = sp->pts[k * 2], y = sp->pts[k * 2 + 1];
+            if (x < minx)
+                minx = x;
+            if (x > maxx)
+                maxx = x;
+            if (y < miny)
+                miny = y;
+            if (y > maxy)
+                maxy = y;
+        }
+    }
+    if (bx0 > minx)
+        minx = bx0;
+    if (by0 > miny)
+        miny = by0;
+    if (bx1 < maxx)
+        maxx = bx1;
+    if (by1 < maxy)
+        maxy = by1;
+    *ox0 = (int)floorf(minx);
+    *ox1 = (int)ceilf(maxx);
+    *oy0 = (int)floorf(miny);
+    *oy1 = (int)ceilf(maxy);
+    if (*ox0 < pm->clip_x0)
+        *ox0 = pm->clip_x0;
+    if (*oy0 < pm->clip_y0)
+        *oy0 = pm->clip_y0;
+    if (*ox1 > pm->clip_x1)
+        *ox1 = pm->clip_x1;
+    if (*oy1 > pm->clip_y1)
+        *oy1 = pm->clip_y1;
+}
+
+/* gather the x-intersections of every edge with the horizontal line y = sy.
+ * `xs`/`ncap` are carried across calls so the scratch buffer is reused. */
+static void polys_scanline(Polys *p, float sy, float **pxs, int *pnx, int *pncap)
+{
+    float *xs = *pxs;
+    int nx = 0, ncap = *pncap, i;
+    for (i = 0; i < p->count; i++) {
+        SubPath *sp = &p->subs[i];
+        int k, n = sp->count;
+        for (k = 0; k < n; k++) {
+            int k2 = (k + 1) % n;
+            float ax = sp->pts[k * 2], ay = sp->pts[k * 2 + 1];
+            float bxp = sp->pts[k2 * 2], byp = sp->pts[k2 * 2 + 1];
+            float ymin = fminf(ay, byp), ymax = fmaxf(ay, byp);
+            if (sy < ymin || sy >= ymax)
+                continue;
+            if (nx + 1 > ncap) {
+                ncap = ncap ? ncap * 2 : 16;
+                xs = (float *)hpe_realloc(xs, (size_t)ncap * sizeof(float));
+            }
+            xs[nx++] = ax + (sy - ay) / (byp - ay) * (bxp - ax);
+        }
+    }
+    *pxs = xs;
+    *pnx = nx;
+    *pncap = ncap;
+}
+
+static void sort_floats(float *xs, int nx)
+{
+    int i;
+    for (i = 1; i < nx; i++) {
+        float key = xs[i];
+        int j = i - 1;
+        while (j >= 0 && xs[j] > key) {
+            xs[j + 1] = xs[j];
+            j--;
+        }
+        xs[j + 1] = key;
+    }
+}
+
+/* linear gradient: device-space origin (lin[0],lin[1]) and direction
+ * (lin[2],lin[3]) with squared length len2 */
+static void grad_linear_proj(Mat ctm, const SvgGrad *grad, float lin[4], float *len2)
+{
+    float gx0, gy0, gx1, gy1, dx, dy;
+    mat_apply(ctm, grad->x1, grad->y1, &gx0, &gy0);
+    mat_apply(ctm, grad->x2, grad->y2, &gx1, &gy1);
+    dx = gx1 - gx0;
+    dy = gy1 - gy0;
+    lin[0] = gx0;
+    lin[1] = gy0;
+    lin[2] = dx;
+    lin[3] = dy;
+    *len2 = dx * dx + dy * dy;
+}
+
+static void grad_radial_proj(Mat ctm, const SvgGrad *grad, float *pcx, float *pcy, float *pr)
+{
+    mat_apply(ctm, grad->cx, grad->cy, pcx, pcy);
+    *pr = grad->r * mat_scale(ctm);
+}
+
+/* resolve the fill colour at device pixel centre (dcx,dcy) */
+static HpeColor fill_grad_color(const SvgGrad *grad, HpeColor color, float dcx, float dcy,
+                                const float *lin, float len2, float rcx, float rcy, float rr)
+{
+    HpeColor c;
+    float t;
+    if (grad && grad->kind == 1) {
+        t = len2 > 1e-6f ? ((dcx - lin[0]) * lin[2] + (dcy - lin[1]) * lin[3]) / len2 : 0.0f;
+        if (t < 0.0f)
+            t = 0.0f;
+        if (t > 1.0f)
+            t = 1.0f;
+        hpe_sample_stops(grad->stops, grad->stop_count, t, &c);
+        return c;
+    }
+    if (grad && grad->kind == 2) {
+        float dx = dcx - rcx, dy = dcy - rcy;
+        t = rr > 1e-6f ? sqrtf(dx * dx + dy * dy) / rr : 0.0f;
+        if (t > 1.0f)
+            t = 1.0f;
+        hpe_sample_stops(grad->stops, grad->stop_count, t, &c);
+        return c;
+    }
+    return color;
+}
+
+/* even-odd scanline fill of every subpath; solid colour or gradient */
 static void fill_polys(SvgCtx *ctx, Polys *p, HpeColor color, const SvgGrad *grad, Mat ctm,
                        float bx0, float by0, float bx1, float by1)
 {
     HpePixmap *pm = ctx->pm;
-    int y0, y1, x0, x1, py;
+    int x0, y0, x1, y1, py;
     float *cov;
+    float lin[4] = {0, 0, 0, 0}, len2 = 0.0f, rcx = 0.0f, rcy = 0.0f, rr = 0.0f;
     int i, s;
 
     if (p->count == 0)
         return;
-    /* overall device bbox */
-    {
-        float minx = 1e9f, miny = 1e9f, maxx = -1e9f, maxy = -1e9f;
-        for (i = 0; i < p->count; i++) {
-            SubPath *sp = &p->subs[i];
-            int k;
-            for (k = 0; k < sp->count; k++) {
-                float x = sp->pts[k * 2], y = sp->pts[k * 2 + 1];
-                if (x < minx)
-                    minx = x;
-                if (x > maxx)
-                    maxx = x;
-                if (y < miny)
-                    miny = y;
-                if (y > maxy)
-                    maxy = y;
-            }
-        }
-        if (bx0 > minx)
-            minx = bx0;
-        if (by0 > miny)
-            miny = by0;
-        if (bx1 < maxx)
-            maxx = bx1;
-        if (by1 < maxy)
-            maxy = by1;
-        x0 = (int)floorf(minx);
-        x1 = (int)ceilf(maxx);
-        y0 = (int)floorf(miny);
-        y1 = (int)ceilf(maxy);
-    }
-    if (x0 < pm->clip_x0)
-        x0 = pm->clip_x0;
-    if (y0 < pm->clip_y0)
-        y0 = pm->clip_y0;
-    if (x1 > pm->clip_x1)
-        x1 = pm->clip_x1;
-    if (y1 > pm->clip_y1)
-        y1 = pm->clip_y1;
+    polys_bbox_clipped(p, pm, bx0, by0, bx1, by1, &x0, &y0, &x1, &y1);
     if (x0 >= x1 || y0 >= y1)
         return;
-
     if (ctx->cov_cap < x1 - x0) {
         ctx->cov_cap = x1 - x0;
-        ctx->cov_scratch = (float *)hpe_realloc(ctx->cov_scratch, (size_t)ctx->cov_cap * sizeof(float));
+        ctx->cov_scratch =
+                (float *)hpe_realloc(ctx->cov_scratch, (size_t)ctx->cov_cap * sizeof(float));
     }
     cov = ctx->cov_scratch;
+    if (grad && grad->kind == 1)
+        grad_linear_proj(ctm, grad, lin, &len2);
+    else if (grad && grad->kind == 2)
+        grad_radial_proj(ctm, grad, &rcx, &rcy, &rr);
 
     for (py = y0; py < y1; py++) {
         int px;
@@ -349,39 +451,12 @@ static void fill_polys(SvgCtx *ctx, Polys *p, HpeColor color, const SvgGrad *gra
         memset(cov, 0, (size_t)(x1 - x0) * sizeof(float));
         for (s = 0; s < 4; s++) {
             float sy = (float)py + ((float)s + 0.5f) * 0.25f;
-            nx = 0;
-            for (i = 0; i < p->count; i++) {
-                SubPath *sp = &p->subs[i];
-                int k, n = sp->count;
-                for (k = 0; k < n; k++) {
-                    int k2 = (k + 1) % n;
-                    float ax = sp->pts[k * 2], ay = sp->pts[k * 2 + 1];
-                    float bxp = sp->pts[k2 * 2], byp = sp->pts[k2 * 2 + 1];
-                    float ymin = fminf(ay, byp), ymax = fmaxf(ay, byp);
-                    if (sy < ymin || sy >= ymax)
-                        continue;
-                    if (nx + 1 > ncap) {
-                        ncap = ncap ? ncap * 2 : 16;
-                        xs = (float *)hpe_realloc(xs, (size_t)ncap * sizeof(float));
-                    }
-                    xs[nx++] = ax + (sy - ay) / (byp - ay) * (bxp - ax);
-                }
-            }
-            /* insertion sort the intersections */
-            for (i = 1; i < nx; i++) {
-                float key = xs[i];
-                int j = i - 1;
-                while (j >= 0 && xs[j] > key) {
-                    xs[j + 1] = xs[j];
-                    j--;
-                }
-                xs[j + 1] = key;
-            }
+            polys_scanline(p, sy, &xs, &nx, &ncap);
+            sort_floats(xs, nx);
             for (i = 0; i + 1 < nx; i += 2)
                 add_span(cov, x0, x1 - x0, xs[i], xs[i + 1], 0.25f);
         }
         hpe_free(xs);
-
         for (px = 0; px < x1 - x0; px++) {
             float cvg = cov[px];
             HpeColor c;
@@ -389,35 +464,8 @@ static void fill_polys(SvgCtx *ctx, Polys *p, HpeColor color, const SvgGrad *gra
                 continue;
             if (cvg > 1.0f)
                 cvg = 1.0f;
-            if (grad && grad->kind == 1) {
-                float gx0, gy0, gx1, gy1, dx, dy, len2, t;
-                mat_apply(ctm, grad->x1, grad->y1, &gx0, &gy0);
-                mat_apply(ctm, grad->x2, grad->y2, &gx1, &gy1);
-                dx = gx1 - gx0;
-                dy = gy1 - gy0;
-                len2 = dx * dx + dy * dy;
-                t = len2 > 1e-6f
-                        ? (((float)(x0 + px) + 0.5f - gx0) * dx +
-                           ((float)py + 0.5f - gy0) * dy) / len2
-                        : 0.0f;
-                if (t < 0.0f)
-                    t = 0.0f;
-                if (t > 1.0f)
-                    t = 1.0f;
-                hpe_sample_stops(grad->stops, grad->stop_count, t, &c);
-            } else if (grad && grad->kind == 2) {
-                float cx, cy, r, d, t;
-                mat_apply(ctm, grad->cx, grad->cy, &cx, &cy);
-                r = grad->r * mat_scale(ctm);
-                d = sqrtf(((float)(x0 + px) + 0.5f - cx) * ((float)(x0 + px) + 0.5f - cx) +
-                          ((float)py + 0.5f - cy) * ((float)py + 0.5f - cy));
-                t = r > 1e-6f ? d / r : 0.0f;
-                if (t > 1.0f)
-                    t = 1.0f;
-                hpe_sample_stops(grad->stops, grad->stop_count, t, &c);
-            } else {
-                c = color;
-            }
+            c = fill_grad_color(grad, color, (float)(x0 + px) + 0.5f, (float)py + 0.5f, lin, len2,
+                                rcx, rcy, rr);
             blend_px(pm, x0 + px, py, c, cvg);
         }
     }
@@ -501,6 +549,104 @@ static void ctx_apply_style(SvgCtx *ctx, HpeDomNode *n)
 
 /* ---------------- transform parsing ---------------- */
 
+/* the rotation about a point, when a 3-argument rotate() supplies one */
+static Mat transform_rotate(float ang_deg, const float *v, int vn)
+{
+    float ang = ang_deg * 3.14159265f / 180.0f;
+    float ca = cosf(ang), sa = sinf(ang);
+    Mat r = mat_identity();
+
+    r.a = ca;
+    r.b = sa;
+    r.c = -sa;
+    r.d = ca;
+    if (vn >= 3) {
+        Mat t1 = mat_identity(), t2 = mat_identity();
+        t1.e = v[1];
+        t1.f = v[2];
+        t2.e = -v[1];
+        t2.f = -v[2];
+        r = mat_mul(t1, mat_mul(r, t2));
+    }
+    return r;
+}
+
+/* maps one transform name + its parsed arguments to a matrix (identity when
+ * the name is unknown or the argument count is short) */
+static Mat transform_from_name(const char *name, const float *v, int vn)
+{
+    Mat t = mat_identity();
+    if (!strcmp(name, "translate") && vn >= 1) {
+        t.e = v[0];
+        t.f = vn >= 2 ? v[1] : 0.0f;
+    } else if (!strcmp(name, "scale") && vn >= 1) {
+        t.a = v[0];
+        t.d = vn >= 2 ? v[1] : v[0];
+    } else if (!strcmp(name, "rotate") && vn >= 1) {
+        t = transform_rotate(v[0], v, vn);
+    } else if (!strcmp(name, "skewX") && vn >= 1) {
+        t.c = tanf(v[0] * 3.14159265f / 180.0f);
+    } else if (!strcmp(name, "skewY") && vn >= 1) {
+        t.b = tanf(v[0] * 3.14159265f / 180.0f);
+    } else if (!strcmp(name, "matrix") && vn >= 6) {
+        t.a = v[0];
+        t.b = v[1];
+        t.c = v[2];
+        t.d = v[3];
+        t.e = v[4];
+        t.f = v[5];
+    }
+    return t;
+}
+
+/* reads the transform name at *pp into `name`; advances past it */
+static void transform_read_name(const char **pp, char *name, size_t cap)
+{
+    const char *p = *pp;
+    size_t n = 0;
+    while (*p && (hpe_ascii_lower((unsigned char)*p) >= 'a' &&
+                  hpe_ascii_lower((unsigned char)*p) <= 'z') && n + 1 < cap)
+        name[n++] = *p++;
+    name[n] = '\0';
+    *pp = p;
+}
+
+/* reads up to `cap` numeric arguments between the parentheses at *pp */
+static int transform_read_args(const char **pp, float *v, int cap)
+{
+    const char *p = *pp;
+    int vn = 0;
+    while (*p && *p != ')' && vn < cap) {
+        char *end = NULL;
+        double d;
+        while (*p == ' ' || *p == ',' || *p == '\t' || *p == '\n' || *p == '\r')
+            p++;
+        if (*p == ')')
+            break;
+        d = strtod(p, &end);
+        if (end == p)
+            break;
+        v[vn++] = (float)d;
+        p = end;
+    }
+    while (*p && *p != ')')
+        p++;
+    if (*p == ')')
+        p++;
+    *pp = p;
+    return vn;
+}
+
+/* skips a malformed entry's parenthesised argument list (avoids an endless loop) */
+static const char *transform_skip_parens(const char *p)
+{
+    while (*p && *p != ')')
+        p++;
+    if (*p == ')')
+        p++;
+    return p;
+}
+
 static Mat parse_transform(const char *s)
 {
     Mat acc = mat_identity();
@@ -510,85 +656,23 @@ static Mat parse_transform(const char *s)
         return acc;
     while (*p) {
         char name[16];
-        int n = 0;
         float v[6];
-        int vn = 0;
+        int vn;
         while (*p == ' ' || *p == '\t' || *p == ',' || *p == '\n' || *p == '\r')
             p++;
         if (!*p)
             break;
-        while (*p && (hpe_ascii_lower((unsigned char)*p) >= 'a' &&
-                      hpe_ascii_lower((unsigned char)*p) <= 'z') && n < 15)
-            name[n++] = *p++;
-        name[n] = '\0';
+        transform_read_name(&p, name, sizeof(name));
         while (*p == ' ' || *p == '\t')
             p++;
         if (*p != '(') {
             /* malformed: bail out to avoid an infinite loop */
-            while (*p && *p != ')')
-                p++;
-            if (*p == ')')
-                p++;
+            p = transform_skip_parens(p);
             continue;
         }
         p++;
-        while (*p && *p != ')' && vn < 6) {
-            char *end = NULL;
-            double d;
-            while (*p == ' ' || *p == ',' || *p == '\t' || *p == '\n' || *p == '\r')
-                p++;
-            if (*p == ')')
-                break;
-            d = strtod(p, &end);
-            if (end == p)
-                break;
-            v[vn++] = (float)d;
-            p = end;
-        }
-        while (*p && *p != ')')
-            p++;
-        if (*p == ')')
-            p++;
-
-        {
-            Mat t = mat_identity();
-            if (!strcmp(name, "translate") && vn >= 1) {
-                t.e = v[0];
-                t.f = vn >= 2 ? v[1] : 0.0f;
-            } else if (!strcmp(name, "scale") && vn >= 1) {
-                t.a = v[0];
-                t.d = vn >= 2 ? v[1] : v[0];
-            } else if (!strcmp(name, "rotate") && vn >= 1) {
-                float ang = v[0] * 3.14159265f / 180.0f;
-                float ca = cosf(ang), sa = sinf(ang);
-                Mat r = mat_identity();
-                r.a = ca;
-                r.b = sa;
-                r.c = -sa;
-                r.d = ca;
-                if (vn >= 3) {
-                    Mat t1 = mat_identity(), t2 = mat_identity();
-                    t1.e = v[1];
-                    t1.f = v[2];
-                    t2.e = -v[1];
-                    t2.f = -v[2];
-                    r = mat_mul(t1, mat_mul(r, t2));
-                }
-                t = r;
-            } else if (!strcmp(name, "skewX") && vn >= 1) {
-                t.c = tanf(v[0] * 3.14159265f / 180.0f);
-            } else if (!strcmp(name, "skewY") && vn >= 1) {
-                t.b = tanf(v[0] * 3.14159265f / 180.0f);
-            } else if (!strcmp(name, "matrix") && vn >= 6) {
-                t.a = v[0];
-                t.b = v[1];
-                t.c = v[2];
-                t.d = v[3];
-                t.e = v[4];
-                t.f = v[5];
-            }
-            acc = mat_mul(acc, t);
-        }
+        vn = transform_read_args(&p, v, 6);
+        acc = mat_mul(acc, transform_from_name(name, v, vn));
     }
     return acc;
 }
@@ -623,6 +707,46 @@ static float parse_offset(const char *s)
     return (float)d;
 }
 
+/* reads the geometry attributes of a linear (kind 1) or radial (kind 2) gradient */
+static void parse_gradient_geometry(HpeDomNode *n, SvgGrad *g)
+{
+    const char *v;
+    if (g->kind == 1) {
+        if ((v = attr(n, "x1")))
+            g->x1 = parse_offset(v);
+        if ((v = attr(n, "y1")))
+            g->y1 = parse_offset(v);
+        if ((v = attr(n, "x2")))
+            g->x2 = parse_offset(v);
+        if ((v = attr(n, "y2")))
+            g->y2 = parse_offset(v);
+    } else {
+        if ((v = attr(n, "cx")))
+            g->cx = parse_offset(v);
+        if ((v = attr(n, "cy")))
+            g->cy = parse_offset(v);
+        if ((v = attr(n, "r")))
+            g->r = parse_offset(v);
+    }
+}
+
+/* appends one <stop> child to the gradient's stop list */
+static void parse_gradient_stop(HpeDomNode *c, SvgGrad *g)
+{
+    HpeColor col = hpe_rgb(0, 0, 0);
+    float off = 0.0f;
+    const char *v = attr(c, "offset");
+    if (v)
+        off = parse_offset(v);
+    if ((v = attr(c, "stop-color")))
+        hpe_color_parse(v, &col);
+    if ((v = attr(c, "stop-opacity")))
+        col.a = (uint8_t)(col.a * strtod(v, NULL));
+    g->stops[g->stop_count].pos = off;
+    g->stops[g->stop_count].color = col;
+    g->stop_count++;
+}
+
 /* fills `g` from a <linearGradient>/<radialGradient> element */
 static int parse_gradient(HpeDomNode *n, SvgGrad *g)
 {
@@ -645,51 +769,13 @@ static int parse_gradient(HpeDomNode *n, SvgGrad *g)
     }
     units = attr(n, "gradientUnits");
     g->units = (units && !strcmp(units, "userSpaceOnUse")) ? 1 : 0;
-    if (g->kind == 1) {
-        const char *v;
-        if ((v = attr(n, "x1")))
-            g->x1 = parse_offset(v);
-        if ((v = attr(n, "y1")))
-            g->y1 = parse_offset(v);
-        if ((v = attr(n, "x2")))
-            g->x2 = parse_offset(v);
-        if ((v = attr(n, "y2")))
-            g->y2 = parse_offset(v);
-    } else {
-        const char *v;
-        if ((v = attr(n, "cx")))
-            g->cx = parse_offset(v);
-        if ((v = attr(n, "cy")))
-            g->cy = parse_offset(v);
-        if ((v = attr(n, "r")))
-            g->r = parse_offset(v);
-    }
+    parse_gradient_geometry(n, g);
     for (c = n->first_child; c; c = c->next_sibling) {
-        HpeColor col;
-        float off = 0.0f;
         if (c->type != HPE_NODE_ELEMENT || strcmp(c->tag, "stop"))
             continue;
         if (g->stop_count >= SVG_MAX_STOPS)
             break;
-        {
-            const char *v = attr(c, "offset");
-            if (v)
-                off = parse_offset(v);
-        }
-        col = hpe_rgb(0, 0, 0);
-        {
-            const char *v = attr(c, "stop-color");
-            if (v)
-                hpe_color_parse(v, &col);
-        }
-        {
-            const char *v = attr(c, "stop-opacity");
-            if (v)
-                col.a = (uint8_t)(col.a * strtod(v, NULL));
-        }
-        g->stops[g->stop_count].pos = off;
-        g->stops[g->stop_count].color = col;
-        g->stop_count++;
+        parse_gradient_stop(c, g);
     }
     return g->stop_count > 0;
 }
@@ -796,13 +882,59 @@ static void flatten_quad(Polys *p, SvgCtx *ctx, float x0, float y0, float x1, fl
     }
 }
 
+/* endpoint->center parameterisation of an SVG elliptical arc (spec note F.6.5).
+ * Fills the centre (cx,cy), the rotation trig, the start angle and the sweep. */
+static void arc_center_params(float x0, float y0, float *rx, float *ry, float phi, int large,
+                              int sweep, float x1, float y1, float trig[2], float *out_cx,
+                              float *out_cy, float *out_theta1, float *out_dtheta)
+{
+    float cosp = cosf(phi * 3.14159265f / 180.0f);
+    float sinp = sinf(phi * 3.14159265f / 180.0f);
+    float dx2 = (x0 - x1) * 0.5f, dy2 = (y0 - y1) * 0.5f;
+    float x1p = cosp * dx2 + sinp * dy2;
+    float y1p = -sinp * dx2 + cosp * dy2;
+    float rx2 = *rx * *rx, ry2 = *ry * *ry;
+    float lam = (x1p * x1p) / rx2 + (y1p * y1p) / ry2;
+    float cx1, cy1, ux, uy, vx, vy, dot, len, ang;
+
+    if (lam > 1.0f) {
+        float sc = sqrtf(lam);
+        *rx *= sc;
+        *ry *= sc;
+        rx2 = *rx * *rx;
+        ry2 = *ry * *ry;
+    }
+    {
+        float num = rx2 * ry2 - rx2 * y1p * y1p - ry2 * x1p * x1p;
+        float den = rx2 * y1p * y1p + ry2 * x1p * x1p;
+        float coef = den > 0.0f ? sqrtf(fmaxf(0.0f, num / den)) : 0.0f;
+        float sign = (large != sweep) ? 1.0f : -1.0f;
+        cx1 = coef * sign * (*rx * y1p / *ry);
+        cy1 = coef * sign * (-*ry * x1p / *rx);
+    }
+    *out_cx = cosp * cx1 - sinp * cy1 + (x0 + x1) * 0.5f;
+    *out_cy = sinp * cx1 + cosp * cy1 + (y0 + y1) * 0.5f;
+    ux = (x1p - cx1) / *rx, uy = (y1p - cy1) / *ry;
+    vx = (-x1p - cx1) / *rx, vy = (-y1p - cy1) / *ry;
+    dot = ux * vx + uy * vy;
+    len = sqrtf(ux * ux + uy * uy) * sqrtf(vx * vx + vy * vy);
+    ang = acosf(fmaxf(-1.0f, fminf(1.0f, len > 0.0f ? dot / len : 0.0f)));
+    *out_theta1 = acosf(fmaxf(-1.0f, fminf(1.0f, ux)));
+    if (uy < 0.0f)
+        *out_theta1 = -*out_theta1;
+    if (ux * vy - uy * vx < 0.0f)
+        ang = -ang;
+    *out_dtheta = ang;
+    trig[0] = cosp;
+    trig[1] = sinp;
+}
+
 /* endpoint->center parameterisation of an SVG elliptical arc, per the spec's
  * implementation notes; flattens the arc into line segments */
 static void flatten_arc(Polys *p, SvgCtx *ctx, float x0, float y0, float rx, float ry, float phi,
                         int large, int sweep, float x1, float y1)
 {
-    float cosp, sinp, dx2, dy2, x1p, y1p, rx2, ry2, lam, sign, cx1, cy1, cx, cy;
-    float theta1, dtheta, t;
+    float trig[2], cx, cy, theta1, dtheta, t;
     int steps, i;
 
     if (rx == 0.0f || ry == 0.0f) {
@@ -811,45 +943,9 @@ static void flatten_arc(Polys *p, SvgCtx *ctx, float x0, float y0, float rx, flo
     }
     rx = fabsf(rx);
     ry = fabsf(ry);
-    cosp = cosf(phi * 3.14159265f / 180.0f);
-    sinp = sinf(phi * 3.14159265f / 180.0f);
-    dx2 = (x0 - x1) * 0.5f;
-    dy2 = (y0 - y1) * 0.5f;
-    x1p = cosp * dx2 + sinp * dy2;
-    y1p = -sinp * dx2 + cosp * dy2;
-    rx2 = rx * rx;
-    ry2 = ry * ry;
-    lam = (x1p * x1p) / rx2 + (y1p * y1p) / ry2;
-    if (lam > 1.0f) {
-        float sc = sqrtf(lam);
-        rx *= sc;
-        ry *= sc;
-        rx2 = rx * rx;
-        ry2 = ry * ry;
-    }
-    {
-        float num = rx2 * ry2 - rx2 * y1p * y1p - ry2 * x1p * x1p;
-        float den = rx2 * y1p * y1p + ry2 * x1p * x1p;
-        float coef = den > 0.0f ? sqrtf(fmaxf(0.0f, num / den)) : 0.0f;
-        sign = (large != sweep) ? 1.0f : -1.0f;
-        cx1 = coef * sign * (rx * y1p / ry);
-        cy1 = coef * sign * (-ry * x1p / rx);
-    }
-    cx = cosp * cx1 - sinp * cy1 + (x0 + x1) * 0.5f;
-    cy = sinp * cx1 + cosp * cy1 + (y0 + y1) * 0.5f;
-    {
-        float ux = (x1p - cx1) / rx, uy = (y1p - cy1) / ry;
-        float vx = (-x1p - cx1) / rx, vy = (-y1p - cy1) / ry;
-        float dot = ux * vx + uy * vy;
-        float len = sqrtf(ux * ux + uy * uy) * sqrtf(vx * vx + vy * vy);
-        float ang = acosf(fmaxf(-1.0f, fminf(1.0f, len > 0.0f ? dot / len : 0.0f)));
-        theta1 = acosf(fmaxf(-1.0f, fminf(1.0f, ux)));
-        if (uy < 0.0f)
-            theta1 = -theta1;
-        if (ux * vy - uy * vx < 0.0f)
-            ang = -ang;
-        dtheta = ang;
-    }
+    arc_center_params(x0, y0, &rx, &ry, phi, large, sweep, x1, y1, trig, &cx, &cy, &theta1,
+                      &dtheta);
+
     steps = (int)(fabsf(dtheta) * fmaxf(rx, ry) * mat_scale(ctx->ctm) / 3.0f) + 4;
     if (steps > 200)
         steps = 200;
@@ -858,161 +954,266 @@ static void flatten_arc(Polys *p, SvgCtx *ctx, float x0, float y0, float rx, flo
         t = theta1 + dtheta * (float)i / (float)steps;
         ex = rx * cosf(t);
         ey = ry * sinf(t);
-        px = cosp * ex - sinp * ey + cx;
-        py = sinp * ex + cosp * ey + cy;
+        px = trig[0] * ex - trig[1] * ey + cx;
+        py = trig[1] * ex + trig[0] * ey + cy;
         dev_line(p, ctx, px, py);
     }
 }
 
+/* running state while walking an SVG path's `d` data */
+typedef struct {
+    Polys *p;
+    SvgCtx *ctx;
+    const char *q;
+    char cmd;              /* last command letter seen; 0 = none */
+    float cx, cy;          /* current point */
+    float sx, sy;          /* current subpath start */
+    float last_c1x, last_c1y; /* last cubic control point (for S) */
+    float last_qx, last_qy;   /* last quadratic control point (for T) */
+    int started;           /* a subpath has been opened */
+} PathBuild;
+
+static int path_cmd_argc(char upper)
+{
+    static const struct {
+        char cmd;
+        int argc;
+    } table[] = {
+        {'M', 2}, {'L', 2}, {'T', 2}, {'H', 1}, {'V', 1},
+        {'C', 6}, {'S', 4}, {'Q', 4}, {'A', 7}, {'Z', 0},
+    };
+    size_t i;
+    for (i = 0; i < sizeof(table) / sizeof(table[0]); i++)
+        if (table[i].cmd == upper)
+            return table[i].argc;
+    return -1;
+}
+
+static int path_isspace(char c)
+{
+    return c == ' ' || c == ',' || c == '\t' || c == '\n' || c == '\r';
+}
+
+static void path_skip_sep(PathBuild *pb)
+{
+    while (path_isspace(*pb->q))
+        pb->q++;
+}
+
+/* read up to `want` numbers; returns how many were actually parsed */
+static int path_read_args(PathBuild *pb, float *a, int want)
+{
+    int i, n = 0;
+    for (i = 0; i < want; i++) {
+        char *end = NULL;
+        double v;
+        path_skip_sep(pb);
+        v = strtod(pb->q, &end);
+        if (end == pb->q)
+            break;
+        a[n++] = (float)v;
+        pb->q = end;
+    }
+    return n;
+}
+
+static void path_cmd_z(PathBuild *pb)
+{
+    if (pb->started) {
+        SubPath *sp = &pb->p->subs[pb->p->count - 1];
+        sp->closed = 1;
+        pb->cx = pb->sx;
+        pb->cy = pb->sy;
+    }
+    pb->cmd = 0;
+}
+
+/* M: move; subsequent coordinate pairs are implicit line-tos per the spec */
+static void path_cmd_move(PathBuild *pb, float *a, int rel)
+{
+    float nx = rel ? pb->cx + a[0] : a[0];
+    float ny = rel ? pb->cy + a[1] : a[1];
+    pb->cx = pb->sx = nx;
+    pb->cy = pb->sy = ny;
+    dev_move(pb->p, pb->ctx, pb->cx, pb->cy);
+    pb->started = 1;
+    pb->cmd = rel ? 'l' : 'L';
+}
+
+static void path_cmd_line(PathBuild *pb, float *a, int rel)
+{
+    float nx = rel ? pb->cx + a[0] : a[0];
+    float ny = rel ? pb->cy + a[1] : a[1];
+    if (!pb->started) {
+        dev_move(pb->p, pb->ctx, nx, ny);
+        pb->sx = nx;
+        pb->sy = ny;
+        pb->started = 1;
+    } else {
+        dev_line(pb->p, pb->ctx, nx, ny);
+    }
+    pb->cx = nx;
+    pb->cy = ny;
+}
+
+static void path_cmd_h(PathBuild *pb, float *a, int rel)
+{
+    float nx = rel ? pb->cx + a[0] : a[0];
+    dev_line(pb->p, pb->ctx, nx, pb->cy);
+    pb->cx = nx;
+}
+
+static void path_cmd_v(PathBuild *pb, float *a, int rel)
+{
+    float ny = rel ? pb->cy + a[0] : a[0];
+    dev_line(pb->p, pb->ctx, pb->cx, ny);
+    pb->cy = ny;
+}
+
+static void path_cmd_cubic(PathBuild *pb, float *a, int rel)
+{
+    float x1 = rel ? pb->cx + a[0] : a[0], y1 = rel ? pb->cy + a[1] : a[1];
+    float x2 = rel ? pb->cx + a[2] : a[2], y2 = rel ? pb->cy + a[3] : a[3];
+    float x3 = rel ? pb->cx + a[4] : a[4], y3 = rel ? pb->cy + a[5] : a[5];
+    flatten_cubic(pb->p, pb->ctx, pb->cx, pb->cy, x1, y1, x2, y2, x3, y3);
+    pb->last_c1x = x2;
+    pb->last_c1y = y2;
+    pb->cx = x3;
+    pb->cy = y3;
+}
+
+static void path_cmd_smooth_cubic(PathBuild *pb, float *a, int rel)
+{
+    float x2 = rel ? pb->cx + a[0] : a[0], y2 = rel ? pb->cy + a[1] : a[1];
+    float x3 = rel ? pb->cx + a[2] : a[2], y3 = rel ? pb->cy + a[3] : a[3];
+    float x1 = 2 * pb->cx - pb->last_c1x, y1 = 2 * pb->cy - pb->last_c1y;
+    flatten_cubic(pb->p, pb->ctx, pb->cx, pb->cy, x1, y1, x2, y2, x3, y3);
+    pb->last_c1x = x2;
+    pb->last_c1y = y2;
+    pb->cx = x3;
+    pb->cy = y3;
+}
+
+static void path_cmd_quad(PathBuild *pb, float *a, int rel)
+{
+    float x1 = rel ? pb->cx + a[0] : a[0], y1 = rel ? pb->cy + a[1] : a[1];
+    float x2 = rel ? pb->cx + a[2] : a[2], y2 = rel ? pb->cy + a[3] : a[3];
+    flatten_quad(pb->p, pb->ctx, pb->cx, pb->cy, x1, y1, x2, y2);
+    pb->last_qx = x1;
+    pb->last_qy = y1;
+    pb->cx = x2;
+    pb->cy = y2;
+}
+
+static void path_cmd_smooth_quad(PathBuild *pb, float *a, int rel)
+{
+    float x2 = rel ? pb->cx + a[0] : a[0], y2 = rel ? pb->cy + a[1] : a[1];
+    float x1 = 2 * pb->cx - pb->last_qx, y1 = 2 * pb->cy - pb->last_qy;
+    flatten_quad(pb->p, pb->ctx, pb->cx, pb->cy, x1, y1, x2, y2);
+    pb->last_qx = x1;
+    pb->last_qy = y1;
+    pb->cx = x2;
+    pb->cy = y2;
+}
+
+static void path_cmd_arc(PathBuild *pb, float *a, int rel)
+{
+    float rx = a[0], ry = a[1], phi = a[2];
+    int large = a[3] != 0.0f, sweep = a[4] != 0.0f;
+    float x2 = rel ? pb->cx + a[5] : a[5], y2 = rel ? pb->cy + a[6] : a[6];
+    flatten_arc(pb->p, pb->ctx, pb->cx, pb->cy, rx, ry, phi, large, sweep, x2, y2);
+    pb->cx = x2;
+    pb->cy = y2;
+}
+
+static void path_skip_unknown(PathBuild *pb)
+{
+    char *end = NULL;
+    strtod(pb->q, &end);
+    pb->q = (end == pb->q) ? pb->q + 1 : end;
+}
+
+/* dispatch one command's argument list to its handler. Kept as a small if/else
+ * chain because each branch passes a different arity to a differently-typed
+ * fixpoint helper; a table of function pointers would need a common signature. */
+static void path_apply(PathBuild *pb, char upper, float *a, int rel)
+{
+    switch (upper) {
+    case 'M':
+        path_cmd_move(pb, a, rel);
+        break;
+    case 'L':
+        path_cmd_line(pb, a, rel);
+        break;
+    case 'H':
+        path_cmd_h(pb, a, rel);
+        break;
+    case 'V':
+        path_cmd_v(pb, a, rel);
+        break;
+    case 'C':
+        path_cmd_cubic(pb, a, rel);
+        break;
+    case 'S':
+        path_cmd_smooth_cubic(pb, a, rel);
+        break;
+    case 'Q':
+        path_cmd_quad(pb, a, rel);
+        break;
+    case 'T':
+        path_cmd_smooth_quad(pb, a, rel);
+        break;
+    default:
+        path_cmd_arc(pb, a, rel);
+        break;
+    }
+}
+
+/* consume the argument list of the current command and apply it */
+static void path_run_command(PathBuild *pb)
+{
+    char upper = (char)(pb->cmd >= 'a' && pb->cmd <= 'z' ? pb->cmd - 'a' + 'A' : pb->cmd);
+    int rel = pb->cmd >= 'a' && pb->cmd <= 'z';
+    int want = path_cmd_argc(upper);
+    float a[7];
+    int n;
+
+    if (want < 0) {
+        path_skip_unknown(pb);
+        return;
+    }
+    if (want == 0) {
+        path_cmd_z(pb);
+        return;
+    }
+    n = path_read_args(pb, a, want);
+    if (n < want) {
+        pb->q = ""; /* truncated command: stop the scan */
+        return;
+    }
+    path_apply(pb, upper, a, rel);
+}
+
 static void build_path(Polys *p, SvgCtx *ctx, const char *d)
 {
-    const char *q = d;
-    char cmd = 0;
-    float cx = 0.0f, cy = 0.0f, sx = 0.0f, sy = 0.0f;
-    float last_c1x = 0.0f, last_c1y = 0.0f, last_qx = 0.0f, last_qy = 0.0f;
-    int started = 0;
-
+    PathBuild pb;
     if (!d)
         return;
-    while (*q) {
-        while (*q == ' ' || *q == ',' || *q == '\t' || *q == '\n' || *q == '\r')
-            q++;
-        if (!*q)
+    memset(&pb, 0, sizeof(pb));
+    pb.p = p;
+    pb.ctx = ctx;
+    pb.q = d;
+    while (*pb.q) {
+        path_skip_sep(&pb);
+        if (!*pb.q)
             break;
-        if ((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z')) {
-            cmd = *q++;
+        if ((*pb.q >= 'A' && *pb.q <= 'Z') || (*pb.q >= 'a' && *pb.q <= 'z')) {
+            pb.cmd = *pb.q++;
             continue;
         }
-        if (!cmd)
+        if (!pb.cmd)
             break;
-        {
-            char upper = (char)(cmd >= 'a' && cmd <= 'z' ? cmd - 'a' + 'A' : cmd);
-            int rel = cmd >= 'a' && cmd <= 'z';
-            float a[7];
-            int want, n = 0, i;
-            switch (upper) {
-            case 'M':
-            case 'L':
-            case 'T':
-                want = 2;
-                break;
-            case 'H':
-            case 'V':
-                want = 1;
-                break;
-            case 'C':
-                want = 6;
-                break;
-            case 'S':
-            case 'Q':
-                want = 4;
-                break;
-            case 'A':
-                want = 7;
-                break;
-            case 'Z':
-                if (started) {
-                    SubPath *sp = &p->subs[p->count - 1];
-                    sp->closed = 1;
-                    cx = sx;
-                    cy = sy;
-                }
-                cmd = 0;
-                continue;
-            default:
-                /* unknown command: consume one number to make progress */
-                {
-                    char *end = NULL;
-                    strtod(q, &end);
-                    q = (end == q) ? q + 1 : end;
-                }
-                continue;
-            }
-            for (i = 0; i < want; i++) {
-                char *end = NULL;
-                double v;
-                while (*q == ' ' || *q == ',' || *q == '\t' || *q == '\n' || *q == '\r')
-                    q++;
-                v = strtod(q, &end);
-                if (end == q)
-                    break;
-                a[n++] = (float)v;
-                q = end;
-            }
-            if (n < want)
-                break;
-            if (upper == 'M') {
-                float nx = rel ? cx + a[0] : a[0];
-                float ny = rel ? cy + a[1] : a[1];
-                cx = sx = nx;
-                cy = sy = ny;
-                dev_move(p, ctx, cx, cy);
-                started = 1;
-                cmd = rel ? 'l' : 'L'; /* subsequent pairs are line-tos */
-            } else if (upper == 'L') {
-                float nx = rel ? cx + a[0] : a[0];
-                float ny = rel ? cy + a[1] : a[1];
-                if (!started) {
-                    dev_move(p, ctx, nx, ny);
-                    sx = nx;
-                    sy = ny;
-                    started = 1;
-                } else {
-                    dev_line(p, ctx, nx, ny);
-                }
-                cx = nx;
-                cy = ny;
-            } else if (upper == 'H') {
-                float nx = rel ? cx + a[0] : a[0];
-                dev_line(p, ctx, nx, cy);
-                cx = nx;
-            } else if (upper == 'V') {
-                float ny = rel ? cy + a[0] : a[0];
-                dev_line(p, ctx, cx, ny);
-                cy = ny;
-            } else if (upper == 'C') {
-                float x1 = rel ? cx + a[0] : a[0], y1 = rel ? cy + a[1] : a[1];
-                float x2 = rel ? cx + a[2] : a[2], y2 = rel ? cy + a[3] : a[3];
-                float x3 = rel ? cx + a[4] : a[4], y3 = rel ? cy + a[5] : a[5];
-                flatten_cubic(p, ctx, cx, cy, x1, y1, x2, y2, x3, y3);
-                last_c1x = x2;
-                last_c1y = y2;
-                cx = x3;
-                cy = y3;
-            } else if (upper == 'S') {
-                float x2 = rel ? cx + a[0] : a[0], y2 = rel ? cy + a[1] : a[1];
-                float x3 = rel ? cx + a[2] : a[2], y3 = rel ? cy + a[3] : a[3];
-                float x1 = 2 * cx - last_c1x, y1 = 2 * cy - last_c1y;
-                flatten_cubic(p, ctx, cx, cy, x1, y1, x2, y2, x3, y3);
-                last_c1x = x2;
-                last_c1y = y2;
-                cx = x3;
-                cy = y3;
-            } else if (upper == 'Q') {
-                float x1 = rel ? cx + a[0] : a[0], y1 = rel ? cy + a[1] : a[1];
-                float x2 = rel ? cx + a[2] : a[2], y2 = rel ? cy + a[3] : a[3];
-                flatten_quad(p, ctx, cx, cy, x1, y1, x2, y2);
-                last_qx = x1;
-                last_qy = y1;
-                cx = x2;
-                cy = y2;
-            } else if (upper == 'T') {
-                float x2 = rel ? cx + a[0] : a[0], y2 = rel ? cy + a[1] : a[1];
-                float x1 = 2 * cx - last_qx, y1 = 2 * cy - last_qy;
-                flatten_quad(p, ctx, cx, cy, x1, y1, x2, y2);
-                last_qx = x1;
-                last_qy = y1;
-                cx = x2;
-                cy = y2;
-            } else if (upper == 'A') {
-                float rx = a[0], ry = a[1], phi = a[2];
-                int large = a[3] != 0.0f, sweep = a[4] != 0.0f;
-                float x2 = rel ? cx + a[5] : a[5], y2 = rel ? cy + a[6] : a[6];
-                flatten_arc(p, ctx, cx, cy, rx, ry, phi, large, sweep, x2, y2);
-                cx = x2;
-                cy = y2;
-            }
-        }
+        path_run_command(&pb);
     }
 }
 
@@ -1037,90 +1238,123 @@ static void collect_text(HpeDomNode *n, char *buf, size_t cap, size_t *len)
     }
 }
 
-static void draw_text(SvgCtx *ctx, HpeDomNode *n)
-{
+/* resolved text-drawing attributes for one <text> element */
+typedef struct {
     char buf[1024];
-    size_t len = 0;
-    float x = 0.0f, y = 0.0f, size = 16.0f, text_len = 0.0f;
-    HpeColor color = ctx->fill;
-    int weight = 400;
-    HpeFont *font;
-    const char *anchor, *baseline;
-    float w, dev_x, dev_y;
-    float scale = mat_scale(ctx->ctm);
-    float font_dev;
+    size_t len;
+    float x, y, size, text_len;
+    int weight;
+    HpeColor color;
+    int align;    /* 0 start, 1 middle, 2 end */
+    int baseline; /* 0 none, 1 middle, 2 hanging, 3 after-edge */
+} TextDraw;
 
-    buf[0] = '\0';
-    collect_text(n, buf, sizeof(buf), &len);
-    if (len == 0)
-        return;
-    attr_num(n, "x", &x);
-    attr_num(n, "y", &y);
-    attr_num(n, "font-size", &size);
-    attr_num(n, "textLength", &text_len);
-    {
-        float fw;
-        if (attr_num(n, "font-weight", &fw))
-            weight = (int)fw;
-    }
-    {
-        HpeColor c;
-        if (attr_color(n, "fill", &c))
-            color = c;
-    }
-    font_dev = size * scale;
-    font = hpe_font_get(font_dev, weight, HPE_FONT_SANS);
-    if (!font)
-        return;
-    w = hpe_font_measure(font, buf, (int)len);
-    mat_apply(ctx->ctm, x, y, &dev_x, &dev_y);
+/* reads the text/anchor attributes into `dt`; returns 0 when there is no text */
+static int draw_text_read_attrs(HpeDomNode *n, SvgCtx *ctx, TextDraw *dt)
+{
+    const char *anchor, *baseline;
+    float fw;
+    HpeColor c;
+
+    dt->buf[0] = '\0';
+    dt->len = 0;
+    collect_text(n, dt->buf, sizeof(dt->buf), &dt->len);
+    if (dt->len == 0)
+        return 0;
+    attr_num(n, "x", &dt->x);
+    attr_num(n, "y", &dt->y);
+    attr_num(n, "font-size", &dt->size);
+    attr_num(n, "textLength", &dt->text_len);
+    if (attr_num(n, "font-weight", &fw))
+        dt->weight = (int)fw;
+    if (attr_color(n, "fill", &c))
+        dt->color = c;
 
     anchor = attr(n, "text-anchor");
+    dt->align = 0;
     if (anchor && !strcmp(anchor, "middle"))
-        dev_x -= w * 0.5f;
+        dt->align = 1;
     else if (anchor && !strcmp(anchor, "end"))
-        dev_x -= w;
+        dt->align = 2;
 
     baseline = attr(n, "dominant-baseline");
     if (!baseline)
         baseline = attr(n, "alignment-baseline");
+    dt->baseline = 0; /* 0 none, 1 middle, 2 hanging, 3 after-edge */
     if (baseline) {
         if (!strcmp(baseline, "middle") || !strcmp(baseline, "central"))
-            dev_y += hpe_font_ascent(font) * 0.5f - hpe_font_descent(font) * 0.25f;
+            dt->baseline = 1;
         else if (!strcmp(baseline, "hanging") || !strcmp(baseline, "text-before-edge"))
-            dev_y += hpe_font_ascent(font);
+            dt->baseline = 2;
         else if (!strcmp(baseline, "text-after-edge"))
-            dev_y -= hpe_font_descent(font);
+            dt->baseline = 3;
     }
+    return 1;
+}
 
-    if (text_len > 0.0f && len > 1) {
-        /* stretch the run by advancing each codepoint so the total matches
-         * textLength (lengthAdjust="spacing"); glyphs are drawn individually */
-        float target = text_len * (scale > 0.0f ? scale : 1.0f);
-        float ratio = w > 1.0f ? target / w : 1.0f;
-        const char *p = buf;
-        float pen = dev_x;
-        while ((int)(p - buf) < (int)len && *p) {
-            uint32_t cp = 0;
-            int adv = hpe_utf8_next(p, &cp);
-            const HpeTextMask *mask;
-            float cw;
-            if (adv <= 0)
-                break;
-            mask = hpe_font_mask(font, p, adv);
-            if (mask)
-                hpe_draw_text_mask(ctx->pm, (int)floorf(pen), (int)floorf(dev_y), mask, color);
-            cw = hpe_font_advance(font, cp) * ratio;
-            pen += cw;
-            p += adv;
-        }
+/* stretch the run by advancing each codepoint so the total matches textLength
+ * (lengthAdjust="spacing"); glyphs are drawn individually */
+static void draw_text_stretched(SvgCtx *ctx, HpeFont *font, const char *buf, int len, float dev_x,
+                                float dev_y, float w, float text_len, float scale, HpeColor color)
+{
+    float target = text_len * (scale > 0.0f ? scale : 1.0f);
+    float ratio = w > 1.0f ? target / w : 1.0f;
+    const char *p = buf;
+    float pen = dev_x;
+    while ((int)(p - buf) < (int)len && *p) {
+        uint32_t cp = 0;
+        int adv = hpe_utf8_next(p, &cp);
+        const HpeTextMask *mask;
+        float cw;
+        if (adv <= 0)
+            break;
+        mask = hpe_font_mask(font, p, adv);
+        if (mask)
+            hpe_draw_text_mask(ctx->pm, (int)floorf(pen), (int)floorf(dev_y), mask, color);
+        cw = hpe_font_advance(font, cp) * ratio;
+        pen += cw;
+        p += adv;
+    }
+}
+
+static void draw_text(SvgCtx *ctx, HpeDomNode *n)
+{
+    TextDraw dt;
+    HpeFont *font;
+    float w, dev_x, dev_y, font_dev;
+    float scale = mat_scale(ctx->ctm);
+
+    if (!draw_text_read_attrs(n, ctx, &dt))
+        return;
+    font_dev = dt.size * scale;
+    font = hpe_font_get(font_dev, dt.weight, HPE_FONT_SANS);
+    if (!font)
+        return;
+    w = hpe_font_measure(font, dt.buf, (int)dt.len);
+    mat_apply(ctx->ctm, dt.x, dt.y, &dev_x, &dev_y);
+
+    if (dt.align == 1)
+        dev_x -= w * 0.5f;
+    else if (dt.align == 2)
+        dev_x -= w;
+
+    if (dt.baseline == 1)
+        dev_y += hpe_font_ascent(font) * 0.5f - hpe_font_descent(font) * 0.25f;
+    else if (dt.baseline == 2)
+        dev_y += hpe_font_ascent(font);
+    else if (dt.baseline == 3)
+        dev_y -= hpe_font_descent(font);
+
+    if (dt.text_len > 0.0f && dt.len > 1) {
+        draw_text_stretched(ctx, font, dt.buf, (int)dt.len, dev_x, dev_y, w, dt.text_len, scale,
+                            dt.color);
         return;
     }
 
     {
-        const HpeTextMask *mask = hpe_font_mask(font, buf, (int)len);
+        const HpeTextMask *mask = hpe_font_mask(font, dt.buf, (int)dt.len);
         if (mask)
-            hpe_draw_text_mask(ctx->pm, (int)floorf(dev_x), (int)floorf(dev_y), mask, color);
+            hpe_draw_text_mask(ctx->pm, (int)floorf(dev_x), (int)floorf(dev_y), mask, dt.color);
     }
 }
 
@@ -1295,11 +1529,48 @@ static void path_bbox(const char *d, float *x0, float *y0, float *x1, float *y1)
 
 /* paint one shape: compute its user-space bbox for gradient mapping, build the
  * geometry, then fill and/or stroke */
+/* scales every gradient stop's alpha by `op` (percentage fill/stroke opacity) */
+static void grad_scale_alpha(SvgGrad *grad, float op)
+{
+    int i;
+    for (i = 0; i < grad->stop_count; i++)
+        grad->stops[i].color.a = (uint8_t)(grad->stops[i].color.a * op);
+}
+
+/* fill with a solid colour or gradient (gradient wins when resolve succeeded) */
+static void paint_shape_fill(SvgCtx *ctx, HpeDomNode *n, Polys *p, HpeColor fill, float fop,
+                             float ux0, float uy0, float ux1, float uy1)
+{
+    SvgGrad grad;
+    int have_grad = resolve_gradient(ctx, n, "fill", &grad, ux0, uy0, ux1, uy1);
+    if (have_grad)
+        grad_scale_alpha(&grad, fop);
+    else
+        fill.a = (uint8_t)(fill.a * fop);
+    fill_polys(ctx, p, fill, have_grad ? &grad : NULL, ctx->ctm, 0, 0, 1e9f, 1e9f);
+}
+
+/* stroke with a solid colour or gradient */
+static void paint_shape_stroke(SvgCtx *ctx, HpeDomNode *n, Polys *p, HpeColor stroke, float sop,
+                               float ux0, float uy0, float ux1, float uy1)
+{
+    float width = ctx->stroke_w * mat_scale(ctx->ctm);
+    SvgGrad sgrad;
+    int have_sgrad = resolve_gradient(ctx, n, "stroke", &sgrad, ux0, uy0, ux1, uy1);
+    if (have_sgrad) {
+        grad_scale_alpha(&sgrad, sop);
+        stroke_polys(ctx, p, stroke, width, &sgrad);
+    } else {
+        stroke.a = (uint8_t)(stroke.a * sop);
+        stroke_polys(ctx, p, stroke, width, NULL);
+    }
+}
+
+/* paint one shape: compute its user-space bbox for gradient mapping, build the
+ * geometry, then fill and/or stroke */
 static void paint_shape(SvgCtx *ctx, HpeDomNode *n, Polys *p, float ux0, float uy0, float ux1,
                         float uy1, int fillable, int strokable)
 {
-    SvgGrad grad;
-    int have_grad = 0;
     HpeColor fill = ctx->fill;
     HpeColor stroke = ctx->stroke;
     int has_fill = ctx->has_fill;
@@ -1326,30 +1597,10 @@ static void paint_shape(SvgCtx *ctx, HpeDomNode *n, Polys *p, float ux0, float u
         }
     }
 
-    if (fillable && has_fill) {
-        have_grad = resolve_gradient(ctx, n, "fill", &grad, ux0, uy0, ux1, uy1);
-        if (have_grad) {
-            int i;
-            for (i = 0; i < grad.stop_count; i++)
-                grad.stops[i].color.a = (uint8_t)(grad.stops[i].color.a * fop);
-        } else {
-            fill.a = (uint8_t)(fill.a * fop);
-        }
-        fill_polys(ctx, p, fill, have_grad ? &grad : NULL, ctx->ctm, 0, 0, 1e9f, 1e9f);
-    }
-    if (strokable && has_stroke) {
-        SvgGrad sgrad;
-        int have_sgrad = resolve_gradient(ctx, n, "stroke", &sgrad, ux0, uy0, ux1, uy1);
-        if (have_sgrad) {
-            int i;
-            for (i = 0; i < sgrad.stop_count; i++)
-                sgrad.stops[i].color.a = (uint8_t)(sgrad.stops[i].color.a * sop);
-            stroke_polys(ctx, p, stroke, ctx->stroke_w * mat_scale(ctx->ctm), &sgrad);
-        } else {
-            stroke.a = (uint8_t)(stroke.a * sop);
-            stroke_polys(ctx, p, stroke, ctx->stroke_w * mat_scale(ctx->ctm), NULL);
-        }
-    }
+    if (fillable && has_fill)
+        paint_shape_fill(ctx, n, p, fill, fop, ux0, uy0, ux1, uy1);
+    if (strokable && has_stroke)
+        paint_shape_stroke(ctx, n, p, stroke, sop, ux0, uy0, ux1, uy1);
 }
 
 static void draw_element(SvgCtx *ctx, HpeDomNode *n, Mat ctm);
@@ -1364,165 +1615,230 @@ static void draw_children(SvgCtx *ctx, HpeDomNode *parent, Mat ctm)
     }
 }
 
+static int use_ref_id(HpeDomNode *node, char *id, size_t cap); /* defined in hit testing */
+
+/* container tags that are never painted and whose content is metadata only */
+static int svg_is_metadata_tag(const char *tag)
+{
+    return !strcmp(tag, "title") || !strcmp(tag, "desc") || !strcmp(tag, "defs") ||
+           hpe_str_ieq(tag, "linearGradient") || hpe_str_ieq(tag, "radialGradient") ||
+           !strcmp(tag, "stop");
+}
+
+static void draw_use_ref(SvgCtx *ctx, SvgCtx *sub, HpeDomNode *n, Mat ctm)
+{
+    HpeDomNode *ref;
+    char id[128];
+    float x = 0.0f, y = 0.0f;
+    Mat t;
+    if (!use_ref_id(n, id, sizeof(id)))
+        return;
+    ref = find_by_id(ctx->root, id);
+    if (!ref)
+        return;
+    attr_num(n, "x", &x);
+    attr_num(n, "y", &y);
+    *sub = *ctx;
+    sub->ctm = ctm;
+    if (x != 0.0f || y != 0.0f) {
+        t = mat_identity();
+        t.e = x;
+        t.f = y;
+        sub->ctm = mat_mul(sub->ctm, t);
+    }
+    ctx_apply_style(sub, n);
+    sub->use_depth = ctx->use_depth + 1;
+    draw_element(sub, ref, sub->ctm);
+}
+
+/* <g>/<svg>: push style and recurse; <svg> also offsets by its x/y */
+static void draw_container(SvgCtx *ctx, SvgCtx *sub, HpeDomNode *n, Mat ctm, const char *tag)
+{
+    *sub = *ctx;
+    sub->ctm = ctm;
+    ctx_apply_style(sub, n);
+    if (!strcmp(tag, "svg")) {
+        float x = 0.0f, y = 0.0f;
+        if (attr_num(n, "x", &x) || attr_num(n, "y", &y)) {
+            Mat t = mat_identity();
+            t.e = x;
+            t.f = y;
+            sub->ctm = mat_mul(sub->ctm, t);
+        }
+    }
+    draw_children(sub, n, sub->ctm);
+}
+
+static void draw_rect_node(SvgCtx *sub, HpeDomNode *n)
+{
+    float x = 0.0f, y = 0.0f, w = 0.0f, h = 0.0f, r = 0.0f;
+    Polys p;
+    attr_num(n, "x", &x);
+    attr_num(n, "y", &y);
+    attr_num(n, "width", &w);
+    attr_num(n, "height", &h);
+    attr_num(n, "rx", &r);
+    if (!attr_num(n, "rx", &r))
+        attr_num(n, "ry", &r);
+    if (w <= 0.0f || h <= 0.0f)
+        return;
+    memset(&p, 0, sizeof(p));
+    round_rect_path(&p, sub, x, y, w, h, r);
+    paint_shape(sub, n, &p, x, y, x + w, y + h, 1, 1);
+    polys_free(&p);
+}
+
+static void draw_ellipse_node(SvgCtx *sub, HpeDomNode *n, const char *tag)
+{
+    float cx = 0.0f, cy = 0.0f, rx = 0.0f, ry = 0.0f;
+    Polys p;
+    attr_num(n, "cx", &cx);
+    attr_num(n, "cy", &cy);
+    if (!strcmp(tag, "circle")) {
+        attr_num(n, "r", &rx);
+        ry = rx;
+    } else {
+        attr_num(n, "rx", &rx);
+        attr_num(n, "ry", &ry);
+    }
+    if (rx <= 0.0f || ry <= 0.0f)
+        return;
+    memset(&p, 0, sizeof(p));
+    ellipse_path(&p, sub, cx, cy, rx, ry);
+    paint_shape(sub, n, &p, cx - rx, cy - ry, cx + rx, cy + ry, 1, 1);
+    polys_free(&p);
+}
+
+static void draw_line_node(SvgCtx *sub, HpeDomNode *n)
+{
+    float x1 = 0.0f, y1 = 0.0f, x2 = 0.0f, y2 = 0.0f;
+    Polys p;
+    SubPath *sp;
+    float ddx, ddy;
+    attr_num(n, "x1", &x1);
+    attr_num(n, "y1", &y1);
+    attr_num(n, "x2", &x2);
+    attr_num(n, "y2", &y2);
+    memset(&p, 0, sizeof(p));
+    sp = polys_new(&p);
+    mat_apply(sub->ctm, x1, y1, &ddx, &ddy);
+    sub_push(sp, ddx, ddy);
+    mat_apply(sub->ctm, x2, y2, &ddx, &ddy);
+    sub_push(sp, ddx, ddy);
+    paint_shape(sub, n, &p, fminf(x1, x2), fminf(y1, y2), fmaxf(x1, x2), fmaxf(y1, y2), 0, 1);
+    polys_free(&p);
+}
+
+static void draw_poly_node(SvgCtx *sub, HpeDomNode *n, const char *tag)
+{
+    Polys p;
+    int closed = !strcmp(tag, "polygon");
+    const char *pts = attr(n, "points");
+    float minx = 0.0f, miny = 0.0f, maxx = 0.0f, maxy = 0.0f;
+    memset(&p, 0, sizeof(p));
+    points_bbox(pts, &minx, &miny, &maxx, &maxy);
+    points_path(&p, sub, pts, closed);
+    if (p.count > 0)
+        paint_shape(sub, n, &p, minx, miny, maxx, maxy, closed, 1);
+    polys_free(&p);
+}
+
+static void draw_path_node(SvgCtx *sub, HpeDomNode *n)
+{
+    Polys p;
+    float bx0, by0, bx1, by1;
+    memset(&p, 0, sizeof(p));
+    build_path(&p, sub, attr(n, "d"));
+    path_bbox(attr(n, "d"), &bx0, &by0, &bx1, &by1);
+    if (p.count > 0)
+        paint_shape(sub, n, &p, bx0, by0, bx1, by1, 1, 1);
+    polys_free(&p);
+}
+
+/* a leaf shape in its own styled sub-context (fill/stroke/etc. inherited) */
+static void draw_shape(SvgCtx *ctx, HpeDomNode *n, Mat ctm, const char *tag)
+{
+    SvgCtx sub;
+    sub = *ctx;
+    sub.ctm = ctm;
+    ctx_apply_style(&sub, n);
+    if (!strcmp(tag, "text"))
+        draw_text(&sub, n);
+    else if (!strcmp(tag, "rect"))
+        draw_rect_node(&sub, n);
+    else if (!strcmp(tag, "circle") || !strcmp(tag, "ellipse"))
+        draw_ellipse_node(&sub, n, tag);
+    else if (!strcmp(tag, "line"))
+        draw_line_node(&sub, n);
+    else if (!strcmp(tag, "polygon") || !strcmp(tag, "polyline"))
+        draw_poly_node(&sub, n, tag);
+    else if (!strcmp(tag, "path"))
+        draw_path_node(&sub, n);
+    else /* unknown element: recurse so nested content is not lost */
+        draw_children(&sub, n, sub.ctm);
+}
+
 static void draw_element(SvgCtx *ctx, HpeDomNode *n, Mat ctm)
 {
     const char *tag = n->tag;
     SvgCtx sub;
 
-    if (!tag)
+    if (!tag || svg_is_metadata_tag(tag))
         return;
-    if (!strcmp(tag, "title") || !strcmp(tag, "desc") || !strcmp(tag, "defs") ||
-        hpe_str_ieq(tag, "linearGradient") || hpe_str_ieq(tag, "radialGradient") || !strcmp(tag, "stop"))
-        return;
-
     ctm = mat_mul(ctm, parse_transform(attr(n, "transform")));
 
     if (!strcmp(tag, "g") || !strcmp(tag, "svg")) {
-        sub = *ctx;
-        sub.ctm = ctm;
-        ctx_apply_style(&sub, n);
-        if (!strcmp(tag, "svg")) {
-            float x = 0.0f, y = 0.0f;
-            if (attr_num(n, "x", &x) || attr_num(n, "y", &y)) {
-                Mat t = mat_identity();
-                t.e = x;
-                t.f = y;
-                sub.ctm = mat_mul(sub.ctm, t);
-            }
-        }
-        draw_children(&sub, n, sub.ctm);
+        draw_container(ctx, &sub, n, ctm, tag);
         return;
     }
     if (!strcmp(tag, "use")) {
-        const char *href = attr(n, "href");
-        HpeDomNode *ref;
-        char id[128];
-        size_t len = 0;
-        float x = 0.0f, y = 0.0f;
-        const char *hash;
-        if (!href)
-            href = attr(n, "xlink:href");
-        if (!href || ctx->use_depth > 6)
-            return;
-        hash = strchr(href, '#');
-        if (!hash)
-            return;
-        hash++;
-        while (hash[len] && len < sizeof(id) - 1) {
-            id[len] = hash[len];
-            len++;
-        }
-        id[len] = '\0';
-        ref = find_by_id(ctx->root, id);
-        if (!ref)
-            return;
-        attr_num(n, "x", &x);
-        attr_num(n, "y", &y);
-        sub = *ctx;
-        sub.ctm = ctm;
-        if (x != 0.0f || y != 0.0f) {
-            Mat t = mat_identity();
-            t.e = x;
-            t.f = y;
-            sub.ctm = mat_mul(sub.ctm, t);
-        }
-        ctx_apply_style(&sub, n);
-        sub.use_depth = ctx->use_depth + 1;
-        draw_element(&sub, ref, sub.ctm);
+        if (ctx->use_depth <= 6)
+            draw_use_ref(ctx, &sub, n, ctm);
         return;
     }
+    draw_shape(ctx, n, ctm, tag);
+}
 
-    sub = *ctx;
-    sub.ctm = ctm;
-    ctx_apply_style(&sub, n);
+/* seeds the SVG drawing context from the <svg> box: device-space CTM origin,
+ * viewport size and default paint state */
+static void svg_ctx_init(SvgCtx *ctx, HpePixmap *pm, HpeBox *box, HpeDomNode *node, float y_dev)
+{
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->pm = pm;
+    ctx->ctm = mat_identity();
+    ctx->ctm.e = box->content_box.x;
+    ctx->ctm.f = y_dev + (box->content_box.y - box->border_box.y);
+    ctx->vp_w = box->content_box.w;
+    ctx->vp_h = box->content_box.h;
+    ctx->stroke_w = 1.0f;
+    ctx->has_stroke = 0;
+    ctx->has_fill = 0;
+    ctx->fill_opacity = 1.0f;
+    ctx->stroke_opacity = 1.0f;
+    ctx->root = node;
+}
 
-    if (!strcmp(tag, "text")) {
-        draw_text(&sub, n);
+/* applies the viewBox transform (uniform scale + centring); `vw`/`vh` receive the
+ * viewBox extent when present */
+static void svg_apply_viewbox(SvgCtx *ctx, HpeDomNode *node, float *vw, float *vh)
+{
+    const char *vbs = attr(node, "viewBox");
+    float a, b, c, d, sx, sy, scale;
+    if (!vbs)
         return;
-    }
-    if (!strcmp(tag, "rect")) {
-        float x = 0.0f, y = 0.0f, w = 0.0f, h = 0.0f, r = 0.0f;
-        Polys p;
-        attr_num(n, "x", &x);
-        attr_num(n, "y", &y);
-        attr_num(n, "width", &w);
-        attr_num(n, "height", &h);
-        attr_num(n, "rx", &r);
-        if (!attr_num(n, "rx", &r))
-            attr_num(n, "ry", &r);
-        if (w <= 0.0f || h <= 0.0f)
-            return;
-        memset(&p, 0, sizeof(p));
-        round_rect_path(&p, &sub, x, y, w, h, r);
-        paint_shape(&sub, n, &p, x, y, x + w, y + h, 1, 1);
-        polys_free(&p);
+    if (sscanf(vbs, "%f %f %f %f", &a, &b, &c, &d) != 4 || c <= 0.0f || d <= 0.0f)
         return;
-    }
-    if (!strcmp(tag, "circle") || !strcmp(tag, "ellipse")) {
-        float cx = 0.0f, cy = 0.0f, rx = 0.0f, ry = 0.0f;
-        Polys p;
-        attr_num(n, "cx", &cx);
-        attr_num(n, "cy", &cy);
-        if (!strcmp(tag, "circle")) {
-            attr_num(n, "r", &rx);
-            ry = rx;
-        } else {
-            attr_num(n, "rx", &rx);
-            attr_num(n, "ry", &ry);
-        }
-        if (rx <= 0.0f || ry <= 0.0f)
-            return;
-        memset(&p, 0, sizeof(p));
-        ellipse_path(&p, &sub, cx, cy, rx, ry);
-        paint_shape(&sub, n, &p, cx - rx, cy - ry, cx + rx, cy + ry, 1, 1);
-        polys_free(&p);
-        return;
-    }
-    if (!strcmp(tag, "line")) {
-        float x1 = 0.0f, y1 = 0.0f, x2 = 0.0f, y2 = 0.0f;
-        Polys p;
-        SubPath *sp;
-        float dx, dy;
-        attr_num(n, "x1", &x1);
-        attr_num(n, "y1", &y1);
-        attr_num(n, "x2", &x2);
-        attr_num(n, "y2", &y2);
-        memset(&p, 0, sizeof(p));
-        sp = polys_new(&p);
-        mat_apply(sub.ctm, x1, y1, &dx, &dy);
-        sub_push(sp, dx, dy);
-        mat_apply(sub.ctm, x2, y2, &dx, &dy);
-        sub_push(sp, dx, dy);
-        paint_shape(&sub, n, &p, fminf(x1, x2), fminf(y1, y2), fmaxf(x1, x2), fmaxf(y1, y2), 0, 1);
-        polys_free(&p);
-        return;
-    }
-    if (!strcmp(tag, "polygon") || !strcmp(tag, "polyline")) {
-        Polys p;
-        int closed = !strcmp(tag, "polygon");
-        const char *pts = attr(n, "points");
-        float minx = 0.0f, miny = 0.0f, maxx = 0.0f, maxy = 0.0f;
-        memset(&p, 0, sizeof(p));
-        points_bbox(pts, &minx, &miny, &maxx, &maxy);
-        points_path(&p, &sub, pts, closed);
-        if (p.count > 0)
-            paint_shape(&sub, n, &p, minx, miny, maxx, maxy, closed, 1);
-        polys_free(&p);
-        return;
-    }
-    if (!strcmp(tag, "path")) {
-        Polys p;
-        float bx0, by0, bx1, by1;
-        memset(&p, 0, sizeof(p));
-        build_path(&p, &sub, attr(n, "d"));
-        path_bbox(attr(n, "d"), &bx0, &by0, &bx1, &by1);
-        if (p.count > 0)
-            paint_shape(&sub, n, &p, bx0, by0, bx1, by1, 1, 1);
-        polys_free(&p);
-        return;
-    }
-    /* unknown element: recurse so nested content is not lost */
-    draw_children(&sub, n, sub.ctm);
+    *vw = c;
+    *vh = d;
+    sx = ctx->vp_w / *vw;
+    sy = ctx->vp_h / *vh;
+    scale = sx < sy ? sx : sy;
+    if (scale <= 0.0f)
+        scale = 1.0f;
+    ctx->ctm.e += (ctx->vp_w - *vw * scale) * 0.5f - a * scale;
+    ctx->ctm.f += (ctx->vp_h - *vh * scale) * 0.5f - b * scale;
+    ctx->ctm.a = scale;
+    ctx->ctm.d = scale;
 }
 
 void hpe_svg_paint(HpePixmap *pm, HpeBox *box, float y_dev)
@@ -1539,50 +1855,19 @@ void hpe_svg_paint(HpePixmap *pm, HpeBox *box, float y_dev)
     if (strcmp(node->tag, "svg") != 0)
         return;
 
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.pm = pm;
-    ctx.ctm = mat_identity();
-    ctx.ctm.e = box->content_box.x;
-    ctx.ctm.f = y_dev + (box->content_box.y - box->border_box.y);
-    ctx.vp_w = box->content_box.w;
-    ctx.vp_h = box->content_box.h;
-    ctx.stroke_w = 1.0f;
-    ctx.has_stroke = 0;
-    ctx.has_fill = 0;
-    ctx.fill_opacity = 1.0f;
-    ctx.stroke_opacity = 1.0f;
-    ctx.root = node;
+    svg_ctx_init(&ctx, pm, box, node, y_dev);
 
     if (getenv("HOPE_TRACE_SVG"))
         fprintf(stderr, "svg box=(%.1f,%.1f %.1fx%.1f) viewBox=%s\n", box->content_box.x,
                 box->content_box.y, ctx.vp_w, ctx.vp_h,
                 attr(node, "viewBox") ? attr(node, "viewBox") : "-");
 
-    if (attr(node, "viewBox")) {
-        float a, b, c, d;
-        if (sscanf(attr(node, "viewBox"), "%f %f %f %f", &a, &b, &c, &d) == 4 && c > 0.0f &&
-            d > 0.0f) {
-            float sx, sy, scale;
-            vw = c;
-            vh = d;
-            sx = ctx.vp_w / vw;
-            sy = ctx.vp_h / vh;
-            scale = sx < sy ? sx : sy;
-            if (scale <= 0.0f)
-                scale = 1.0f;
-            ctx.ctm.e += (ctx.vp_w - vw * scale) * 0.5f - a * scale;
-            ctx.ctm.f += (ctx.vp_h - vh * scale) * 0.5f - b * scale;
-            ctx.ctm.a = scale;
-            ctx.ctm.d = scale;
-        }
-    }
+    svg_apply_viewbox(&ctx, node, &vw, &vh);
+    HPE_UNUSED(vw);
+    HPE_UNUSED(vh);
 
     /* root <svg> style attributes apply to the whole subtree */
     ctx_apply_style(&ctx, node);
-    {
-        const char *vb = attr(node, "viewBox");
-        HPE_UNUSED(vb);
-    }
 
     /* clip to the SVG viewport *and* to the damage rect that is already active
      * (a partial repaint must not touch pixels outside it, or translucent
@@ -1633,139 +1918,186 @@ static int point_in_polys(Polys *p, float x, float y)
     return inside;
 }
 
-static HpeDomNode *hit_walk(SvgCtx *ctx, HpeDomNode *node, float dx, float dy)
+static HpeDomNode *hit_walk(SvgCtx *ctx, HpeDomNode *node, float dx, float dy);
+
+/* fragment id from a <use> href / xlink:href; returns 1 on success */
+static int use_ref_id(HpeDomNode *node, char *id, size_t cap)
+{
+    const char *href = attr(node, "href");
+    const char *hash;
+    size_t len = 0;
+    if (!href)
+        href = attr(node, "xlink:href");
+    if (!href)
+        return 0;
+    hash = strchr(href, '#');
+    if (!hash)
+        return 0;
+    hash++;
+    while (hash[len] && len < cap - 1) {
+        id[len] = hash[len];
+        len++;
+    }
+    id[len] = '\0';
+    return 1;
+}
+
+/* last matching child wins so later siblings paint on top */
+static HpeDomNode *hit_children(SvgCtx *ctx, HpeDomNode *node, float dx, float dy)
 {
     HpeDomNode *c, *best = NULL;
-    const char *tag;
+    for (c = node->first_child; c; c = c->next_sibling) {
+        HpeDomNode *r = hit_walk(ctx, c, dx, dy);
+        if (r)
+            best = r;
+    }
+    return best;
+}
 
+static HpeDomNode *hit_rect(HpeDomNode *n, float ux, float uy)
+{
+    float x = attr_f(n, "x", 0.0f), y = attr_f(n, "y", 0.0f);
+    float w = attr_f(n, "width", 0.0f), h = attr_f(n, "height", 0.0f);
+    if (w > 0.0f && h > 0.0f && ux >= x && ux <= x + w && uy >= y && uy <= y + h)
+        return n;
+    return NULL;
+}
+
+static HpeDomNode *hit_ellipse(HpeDomNode *n, float ux, float uy)
+{
+    float cx = attr_f(n, "cx", 0.0f), cy = attr_f(n, "cy", 0.0f);
+    float rx, ry, nx, ny;
+    if (!strcmp(n->tag, "circle"))
+        rx = ry = attr_f(n, "r", 0.0f);
+    else
+        rx = attr_f(n, "rx", 0.0f), ry = attr_f(n, "ry", 0.0f);
+    if (rx <= 0.0f || ry <= 0.0f)
+        return NULL;
+    nx = (ux - cx) / rx;
+    ny = (uy - cy) / ry;
+    return (nx * nx + ny * ny <= 1.0f) ? n : NULL;
+}
+
+/* ~3px tolerance around the segment */
+static HpeDomNode *hit_line(HpeDomNode *n, float ux, float uy)
+{
+    float x1 = attr_f(n, "x1", 0.0f), y1 = attr_f(n, "y1", 0.0f);
+    float x2 = attr_f(n, "x2", 0.0f), y2 = attr_f(n, "y2", 0.0f);
+    float vx = x2 - x1, vy = y2 - y1;
+    float len2 = vx * vx + vy * vy;
+    float t = len2 > 0.0f ? ((ux - x1) * vx + (uy - y1) * vy) / len2 : 0.0f;
+    float px, py;
+    if (t < 0.0f)
+        t = 0.0f;
+    if (t > 1.0f)
+        t = 1.0f;
+    px = x1 + t * vx;
+    py = y1 + t * vy;
+    return ((ux - px) * (ux - px) + (uy - py) * (uy - py) <= 9.0f) ? n : NULL;
+}
+
+/* build the polygon/polyline geometry in identity space, then test the point */
+static HpeDomNode *hit_points(SvgCtx *ctx, HpeDomNode *n, float ux, float uy)
+{
+    Polys pp;
+    SvgCtx tmp = *ctx;
+    int hit;
+    memset(&pp, 0, sizeof(pp));
+    tmp.cov_scratch = NULL;
+    tmp.cov_cap = 0;
+    tmp.ctm = mat_identity();
+    points_path(&pp, &tmp, attr(n, "points"), !strcmp(n->tag, "polygon"));
+    hit = point_in_polys(&pp, ux, uy);
+    polys_free(&pp);
+    return hit ? n : NULL;
+}
+
+static HpeDomNode *hit_path(SvgCtx *ctx, HpeDomNode *n, float ux, float uy)
+{
+    Polys pp;
+    SvgCtx tmp = *ctx;
+    int hit;
+    memset(&pp, 0, sizeof(pp));
+    tmp.cov_scratch = NULL;
+    tmp.cov_cap = 0;
+    tmp.ctm = mat_identity();
+    build_path(&pp, &tmp, attr(n, "d"));
+    hit = point_in_polys(&pp, ux, uy);
+    polys_free(&pp);
+    return hit ? n : NULL;
+}
+
+static HpeDomNode *hit_text(HpeDomNode *n, float ux, float uy)
+{
+    float x = attr_f(n, "x", 0.0f), y = attr_f(n, "y", 0.0f);
+    float fs = attr_f(n, "font-size", 12.0f);
+    if (ux >= x - 2.0f && uy >= y - fs && uy <= y + fs * 0.4f)
+        return n;
+    return NULL;
+}
+
+/* a shape carries its own transform; hit point is mapped into user space */
+static HpeDomNode *hit_shape(SvgCtx *ctx, HpeDomNode *node, const char *tag, float dx, float dy)
+{
+    Mat inv;
+    float ux, uy;
+    ctx->ctm = mat_mul(ctx->ctm, parse_transform(attr(node, "transform")));
+    inv = mat_invert(ctx->ctm);
+    mat_apply(inv, dx, dy, &ux, &uy);
+    if (!strcmp(tag, "rect"))
+        return hit_rect(node, ux, uy);
+    if (!strcmp(tag, "circle") || !strcmp(tag, "ellipse"))
+        return hit_ellipse(node, ux, uy);
+    if (!strcmp(tag, "line"))
+        return hit_line(node, ux, uy);
+    if (!strcmp(tag, "polygon") || !strcmp(tag, "polyline"))
+        return hit_points(ctx, node, ux, uy);
+    if (!strcmp(tag, "path"))
+        return hit_path(ctx, node, ux, uy);
+    if (!strcmp(tag, "text"))
+        return hit_text(node, ux, uy);
+    return NULL;
+}
+
+static HpeDomNode *hit_use(SvgCtx *ctx, HpeDomNode *node, float dx, float dy)
+{
+    HpeDomNode *ref, *best;
+    char id[128];
+    Mat saved = ctx->ctm, t;
+    if (!use_ref_id(node, id, sizeof(id)))
+        return NULL;
+    ref = find_by_id(ctx->root, id);
+    if (!ref)
+        return NULL;
+    ctx->ctm = mat_mul(ctx->ctm, parse_transform(attr(node, "transform")));
+    t = mat_identity();
+    t.e = attr_f(node, "x", 0.0f);
+    t.f = attr_f(node, "y", 0.0f);
+    ctx->ctm = mat_mul(ctx->ctm, t);
+    best = hit_walk(ctx, ref, dx, dy);
+    ctx->ctm = saved;
+    return best;
+}
+
+static HpeDomNode *hit_walk(SvgCtx *ctx, HpeDomNode *node, float dx, float dy)
+{
+    const char *tag;
+    Mat saved;
     if (!node || node->type != HPE_NODE_ELEMENT || !node->tag)
         return NULL;
     tag = node->tag;
     if (!strcmp(tag, "defs") || !strcmp(tag, "title") || !strcmp(tag, "desc"))
         return NULL;
     if (!strcmp(tag, "g") || !strcmp(tag, "svg")) {
-        Mat saved = ctx->ctm;
+        saved = ctx->ctm;
         ctx->ctm = mat_mul(ctx->ctm, parse_transform(attr(node, "transform")));
-        for (c = node->first_child; c; c = c->next_sibling) {
-            HpeDomNode *r = hit_walk(ctx, c, dx, dy);
-            if (r)
-                best = r;
-        }
+        node = hit_children(ctx, node, dx, dy);
         ctx->ctm = saved;
-        return best;
+        return node;
     }
-    if (!strcmp(tag, "use")) {
-        const char *href = attr(node, "href");
-        HpeDomNode *ref;
-        char id[128];
-        size_t len = 0;
-        const char *hash;
-        Mat saved = ctx->ctm;
-        if (!href)
-            href = attr(node, "xlink:href");
-        if (!href)
-            return NULL;
-        hash = strchr(href, '#');
-        if (!hash)
-            return NULL;
-        hash++;
-        while (hash[len] && len < sizeof(id) - 1) {
-            id[len] = hash[len];
-            len++;
-        }
-        id[len] = '\0';
-        ref = find_by_id(ctx->root, id);
-        if (!ref)
-            return NULL;
-        ctx->ctm = mat_mul(ctx->ctm, parse_transform(attr(node, "transform")));
-        {
-            float ux = attr_f(node, "x", 0.0f), uy = attr_f(node, "y", 0.0f);
-            Mat t = mat_identity();
-            t.e = ux;
-            t.f = uy;
-            ctx->ctm = mat_mul(ctx->ctm, t);
-        }
-        best = hit_walk(ctx, ref, dx, dy);
-        ctx->ctm = saved;
-        return best;
-    }
-
-    /* shapes */
-    ctx->ctm = mat_mul(ctx->ctm, parse_transform(attr(node, "transform")));
-    {
-        /* convert device point into this element's user space */
-        Mat inv = mat_invert(ctx->ctm);
-        float ux, uy;
-        mat_apply(inv, dx, dy, &ux, &uy);
-
-        if (!strcmp(tag, "rect")) {
-            float x = attr_f(node, "x", 0.0f), y = attr_f(node, "y", 0.0f);
-            float w = attr_f(node, "width", 0.0f), h = attr_f(node, "height", 0.0f);
-            if (w > 0.0f && h > 0.0f && ux >= x && ux <= x + w && uy >= y && uy <= y + h)
-                return node;
-        } else if (!strcmp(tag, "circle") || !strcmp(tag, "ellipse")) {
-            float cx = attr_f(node, "cx", 0.0f), cy = attr_f(node, "cy", 0.0f);
-            float rx, ry;
-            if (!strcmp(tag, "circle")) {
-                rx = ry = attr_f(node, "r", 0.0f);
-            } else {
-                rx = attr_f(node, "rx", 0.0f);
-                ry = attr_f(node, "ry", 0.0f);
-            }
-            if (rx > 0.0f && ry > 0.0f) {
-                float nx = (ux - cx) / rx, ny = (uy - cy) / ry;
-                if (nx * nx + ny * ny <= 1.0f)
-                    return node;
-            }
-        } else if (!strcmp(tag, "line")) {
-            float x1 = attr_f(node, "x1", 0.0f), y1 = attr_f(node, "y1", 0.0f);
-            float x2 = attr_f(node, "x2", 0.0f), y2 = attr_f(node, "y2", 0.0f);
-            float vx = x2 - x1, vy = y2 - y1;
-            float len2 = vx * vx + vy * vy;
-            float t = len2 > 0.0f ? ((ux - x1) * vx + (uy - y1) * vy) / len2 : 0.0f;
-            if (t < 0.0f)
-                t = 0.0f;
-            if (t > 1.0f)
-                t = 1.0f;
-            {
-                float px = x1 + t * vx, py = y1 + t * vy;
-                if ((ux - px) * (ux - px) + (uy - py) * (uy - py) <= 9.0f)
-                    return node;
-            }
-        } else if (!strcmp(tag, "polygon") || !strcmp(tag, "polyline")) {
-            Polys pp;
-            SvgCtx tmp = *ctx;
-            int hit;
-            memset(&pp, 0, sizeof(pp));
-            tmp.cov_scratch = NULL;
-            tmp.cov_cap = 0;
-            tmp.ctm = mat_identity();
-            points_path(&pp, &tmp, attr(node, "points"), !strcmp(tag, "polygon"));
-            hit = point_in_polys(&pp, ux, uy);
-            polys_free(&pp);
-            if (hit)
-                return node;
-        } else if (!strcmp(tag, "path")) {
-            Polys pp;
-            SvgCtx tmp = *ctx;
-            int hit;
-            memset(&pp, 0, sizeof(pp));
-            tmp.cov_scratch = NULL;
-            tmp.cov_cap = 0;
-            tmp.ctm = mat_identity();
-            build_path(&pp, &tmp, attr(node, "d"));
-            hit = point_in_polys(&pp, ux, uy);
-            polys_free(&pp);
-            if (hit)
-                return node;
-        } else if (!strcmp(tag, "text")) {
-            float x = attr_f(node, "x", 0.0f), y = attr_f(node, "y", 0.0f);
-            float fs = attr_f(node, "font-size", 12.0f);
-            if (ux >= x - 2.0f && uy >= y - fs && uy <= y + fs * 0.4f)
-                return node;
-        }
-    }
-    return NULL;
+    if (!strcmp(tag, "use"))
+        return hit_use(ctx, node, dx, dy);
+    return hit_shape(ctx, node, tag, dx, dy);
 }
 
 HpeDomNode *hpe_svg_hit_test(HpeBox *box, float x, float y)

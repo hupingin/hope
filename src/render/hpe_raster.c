@@ -309,15 +309,81 @@ void hpe_fill_linear_gradient(HpePixmap *pm, HpeRect rect, float angle_deg,
 }
 
 /* gradient clipped to a rounded rect: reuse the coverage of the filled rrect */
+/* fills a scratch pixmap with the linear gradient, sized to the rrect bounds */
+static void gradient_fill_scratch(HpePixmap *local, float dx, float dy, const HpeRasterStop *stops,
+                                  int stop_count)
+{
+    int w = local->width, h = local->height;
+    float cx = (float)w * 0.5f, cy = (float)h * 0.5f;
+    float len = fabsf((float)w * dx) + fabsf((float)h * dy);
+    float t0 = cx * dx + cy * dy - len * 0.5f;
+    int px, py;
+    for (py = 0; py < h; py++) {
+        uint32_t *row = local->pixels + (size_t)py * (size_t)w;
+        for (px = 0; px < w; px++) {
+            float proj = ((float)px + 0.5f) * dx + ((float)py + 0.5f) * dy;
+            float t = len > 0.0f ? (proj - t0) / len : 0.0f;
+            HpeColor c;
+            if (t < 0.0f)
+                t = 0.0f;
+            if (t > 1.0f)
+                t = 1.0f;
+            stop_sample(stops, stop_count, t, &c);
+            row[px] = hpe_argb(c);
+        }
+    }
+}
+
+/* composites the scratch gradient onto `pm` through the rrect's SDF coverage */
+static void gradient_composite_rrect(HpePixmap *pm, const HpePixmap *local, HpeRect rect,
+                                     float radius)
+{
+    int w = local->width, h = local->height;
+    float hw = rect.w * 0.5f, hh = rect.h * 0.5f;
+    float rcx = rect.x + hw, rcy = rect.y + hh;
+    float r = radius;
+    int x0, y0, x1, y1, px, py;
+    if (r > hw)
+        r = hw;
+    if (r > hh)
+        r = hh;
+    x0 = (int)floorf(rect.x) - 1;
+    y0 = (int)floorf(rect.y) - 1;
+    x1 = (int)ceilf(rect.x + rect.w) + 1;
+    y1 = (int)ceilf(rect.y + rect.h) + 1;
+    for (py = y0; py < y1; py++) {
+        for (px = x0; px < x1; px++) {
+            float d = rrect_sdf((float)px + 0.5f, (float)py + 0.5f, rcx, rcy, hw, hh, r);
+            float cov = 0.5f - d;
+            int sx, sy;
+            HpeColor c;
+            uint32_t p;
+            if (cov <= 0.0f)
+                continue;
+            if (cov > 1.0f)
+                cov = 1.0f;
+            sx = px - (int)floorf(rect.x) + 1;
+            sy = py - (int)floorf(rect.y) + 1;
+            if (sx < 0 || sy < 0 || sx >= w || sy >= h)
+                continue;
+            p = local->pixels[(size_t)sy * (size_t)w + (size_t)sx];
+            c.r = (uint8_t)((p >> 16) & 0xFFu);
+            c.g = (uint8_t)((p >> 8) & 0xFFu);
+            c.b = (uint8_t)(p & 0xFFu);
+            c.a = (uint8_t)((p >> 24) & 0xFFu);
+            blend_px_pm(pm, px, py, c, cov);
+        }
+    }
+}
+
+/* gradient clipped to a rounded rect: reuse the coverage of the filled rrect */
 void hpe_fill_round_rect_gradient(HpePixmap *pm, HpeRect rect, float radius, float angle_deg,
                                   const HpeRasterStop *stops, int stop_count)
 {
     HpePixmap local;
-    int px, py;
-    int x0, y0, x1, y1;
     float rad = angle_deg * 3.14159265f / 180.0f;
     float dx = sinf(rad), dy = -cosf(rad);
-    float cx, cy, len, t0;
+    int w, h;
 
     if (!pm || !pm->pixels || stop_count <= 0)
         return;
@@ -331,75 +397,19 @@ void hpe_fill_round_rect_gradient(HpePixmap *pm, HpeRect rect, float radius, flo
     /* Paint the gradient into a scratch pixmap the size of the rrect bounds so
      * the rounded coverage math stays in one place, then composite it back with
      * the same SDF coverage the solid fill uses. */
-    {
-        int w = (int)ceilf(rect.w) + 2;
-        int h = (int)ceilf(rect.h) + 2;
-        if (w <= 0 || h <= 0)
-            return;
-        memset(&local, 0, sizeof(local));
-        local.width = w;
-        local.height = h;
-        local.stride = w * 4;
-        local.pixels = (uint32_t *)hpe_calloc((size_t)w * (size_t)h, sizeof(uint32_t));
+    w = (int)ceilf(rect.w) + 2;
+    h = (int)ceilf(rect.h) + 2;
+    if (w <= 0 || h <= 0)
+        return;
+    memset(&local, 0, sizeof(local));
+    local.width = w;
+    local.height = h;
+    local.stride = w * 4;
+    local.pixels = (uint32_t *)hpe_calloc((size_t)w * (size_t)h, sizeof(uint32_t));
 
-        cx = (float)w * 0.5f;
-        cy = (float)h * 0.5f;
-        len = fabsf((float)w * dx) + fabsf((float)h * dy);
-        t0 = cx * dx + cy * dy - len * 0.5f;
-        for (py = 0; py < h; py++) {
-            uint32_t *row = local.pixels + (size_t)py * (size_t)w;
-            for (px = 0; px < w; px++) {
-                float proj = ((float)px + 0.5f) * dx + ((float)py + 0.5f) * dy;
-                float t = len > 0.0f ? (proj - t0) / len : 0.0f;
-                HpeColor c;
-                if (t < 0.0f)
-                    t = 0.0f;
-                if (t > 1.0f)
-                    t = 1.0f;
-                stop_sample(stops, stop_count, t, &c);
-                row[px] = hpe_argb(c);
-            }
-        }
-
-        {
-            float r = radius;
-            float hw = rect.w * 0.5f, hh = rect.h * 0.5f;
-            float rcx = rect.x + hw, rcy = rect.y + hh;
-            if (r > hw)
-                r = hw;
-            if (r > hh)
-                r = hh;
-            x0 = (int)floorf(rect.x) - 1;
-            y0 = (int)floorf(rect.y) - 1;
-            x1 = (int)ceilf(rect.x + rect.w) + 1;
-            y1 = (int)ceilf(rect.y + rect.h) + 1;
-            for (py = y0; py < y1; py++) {
-                for (px = x0; px < x1; px++) {
-                    float d = rrect_sdf((float)px + 0.5f, (float)py + 0.5f, rcx, rcy, hw, hh, r);
-                    float cov = 0.5f - d;
-                    int sx, sy;
-                    HpeColor c;
-                    if (cov <= 0.0f)
-                        continue;
-                    if (cov > 1.0f)
-                        cov = 1.0f;
-                    sx = px - (int)floorf(rect.x) + 1;
-                    sy = py - (int)floorf(rect.y) + 1;
-                    if (sx < 0 || sy < 0 || sx >= w || sy >= h)
-                        continue;
-                    {
-                        uint32_t p = local.pixels[(size_t)sy * (size_t)w + (size_t)sx];
-                        c.r = (uint8_t)((p >> 16) & 0xFFu);
-                        c.g = (uint8_t)((p >> 8) & 0xFFu);
-                        c.b = (uint8_t)(p & 0xFFu);
-                        c.a = (uint8_t)((p >> 24) & 0xFFu);
-                    }
-                    blend_px_pm(pm, px, py, c, cov);
-                }
-            }
-        }
-        hpe_free(local.pixels);
-    }
+    gradient_fill_scratch(&local, dx, dy, stops, stop_count);
+    gradient_composite_rrect(pm, &local, rect, radius);
+    hpe_free(local.pixels);
 }
 
 /* ---------------- soft shadow ----------------

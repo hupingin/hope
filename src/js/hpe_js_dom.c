@@ -8,6 +8,7 @@
 #include "css/hpe_css.h"
 #include "html/hpe_html.h"
 #include "js/hpe_js_internal.h"
+#include "js/hpe_js_mutation.h"
 #include "layout/hpe_layout.h"
 
 /* ---------------- small malloc string builder ---------------- */
@@ -49,17 +50,33 @@ static void sb_free(SB *sb)
 static const HpeJsHostVt g_element_vt;
 static const HpeJsHostVt g_style_vt;
 static const HpeJsHostVt g_document_vt;
+static const HpeJsHostVt g_fragment_vt;
 
-static JsValue element_value(HpeJs *js, HpeDomNode *node)
+/* wraps any DOM node in its host value. a DocumentFragment gets the fragment
+ * vtable (no tagName/id/style, but the child-list mutators); everything else is
+ * exposed through the element vtable. */
+static JsValue node_value(HpeJs *js, HpeDomNode *node)
 {
     if (!node)
         return js_null();
+    if (node->type == HPE_NODE_FRAGMENT)
+        return js_make_host(js, node, HPE_HOST_FRAGMENT, &g_fragment_vt);
     return js_make_host(js, node, HPE_HOST_ELEMENT, &g_element_vt);
 }
 
-static HpeDomNode *arg_element(JsValue v)
+/* unwraps a node argument; accepts both element and fragment hosts */
+static HpeDomNode *arg_node(JsValue v)
 {
-    return (HpeDomNode *)js_host_ptr(v, HPE_HOST_ELEMENT);
+    HpeDomNode *n = (HpeDomNode *)js_host_ptr(v, HPE_HOST_ELEMENT);
+    if (!n)
+        n = (HpeDomNode *)js_host_ptr(v, HPE_HOST_FRAGMENT);
+    return n;
+}
+
+/* public wrapper over node_value so the MutationObserver bridge can reuse it */
+JsValue hpe_js_dom_node_value(HpeJs *js, HpeDomNode *node)
+{
+    return node_value(js, node);
 }
 
 static char *arg_string(HpeJs *js, JsValue *args, int argc, int idx)
@@ -161,11 +178,13 @@ static JsValue element_get_html(HpeJs *js, HpeDomNode *node)
 static void node_replace_children_with_text(HpeDomNode *node, const char *text)
 {
     HpeDomNode *child, *next;
+    /* detach each child first so the mutation sink sees the removals
+     * (MutationObserver + engine dirty tracking); appending notifies the add. */
     for (child = node->first_child; child; child = next) {
         next = child->next_sibling;
+        hpe_dom_detach(child);
         hpe_dom_free(child);
     }
-    node->first_child = node->last_child = NULL;
     hpe_dom_append(node, hpe_dom_text(text ? text : ""));
 }
 
@@ -227,7 +246,7 @@ static JsValue query_selector_impl(HpeJs *js, HpeDomNode *node, JsValue *args, i
         for (i = 0; i < count; i++) {
             if (hpe_css_selector_matches(elems[i], sel, strlen(sel))) {
                 snprintf(key, sizeof(key), "%d", n++);
-                js_obj_set(js, arr, key, element_value(js, elems[i]));
+                js_obj_set(js, arr, key, node_value(js, elems[i]));
             }
         }
         js_obj_set(js, arr, "length", js_num((double)n));
@@ -236,7 +255,7 @@ static JsValue query_selector_impl(HpeJs *js, HpeDomNode *node, JsValue *args, i
         result = js_null();
         for (i = 0; i < count; i++) {
             if (hpe_css_selector_matches(elems[i], sel, strlen(sel))) {
-                result = element_value(js, elems[i]);
+                result = node_value(js, elems[i]);
                 break;
             }
         }
@@ -252,100 +271,227 @@ typedef struct {
     char *method;
 } DomMth;
 
+/* breadth-first search for the first element whose id attribute matches. */
+static HpeDomNode *dom_find_by_id(HpeDomNode *node, const char *id)
+{
+    HpeDomNode **queue;
+    int qh = 0, qt = 0, qcap = 1024;
+    HpeDomNode *found = NULL;
+
+    queue = (HpeDomNode **)malloc(sizeof(HpeDomNode *) * (size_t)qcap);
+    if (!queue)
+        return NULL;
+    queue[qt++] = node;
+    while (qh < qt) {
+        HpeDomNode *n = queue[qh++];
+        HpeDomNode *cur;
+        for (cur = n->first_child; cur; cur = cur->next_sibling) {
+            if (cur->type != HPE_NODE_ELEMENT)
+                continue;
+            const char *aid = hpe_dom_attr(cur, "id");
+            if (aid && strcmp(aid, id) == 0) {
+                found = cur;
+                break;
+            }
+            if (qt < qcap)
+                queue[qt++] = cur;
+        }
+        if (found)
+            break;
+    }
+    free(queue);
+    return found;
+}
+
+typedef JsValue (*DomMethodFn)(HpeJs *js, HpeDomNode *node, JsValue *args, int argc);
+
+static JsValue dm_get_element_by_id(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
+{
+    char *id = arg_string(js, args, argc, 0);
+    HpeDomNode *found;
+    if (!id)
+        return js_null();
+    found = dom_find_by_id(node, id);
+    return found ? node_value(js, found) : js_null();
+}
+
+static JsValue dm_create_element(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
+{
+    char *tag = arg_string(js, args, argc, 0);
+    HPE_UNUSED(node);
+    if (!tag || !*tag)
+        return js_null();
+    return node_value(js, hpe_dom_element(tag));
+}
+
+static JsValue dm_create_element_ns(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
+{
+    /* namespace is irrelevant for our element model (SVG children are
+     * drawn by tag name); only the tag matters */
+    char *tag = arg_string(js, args, argc, 1);
+    HPE_UNUSED(node);
+    if (!tag || !*tag)
+        return js_null();
+    return node_value(js, hpe_dom_element(tag));
+}
+
+static JsValue dm_create_fragment(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
+{
+    HPE_UNUSED(node);
+    HPE_UNUSED(args);
+    HPE_UNUSED(argc);
+    return node_value(js, hpe_dom_fragment());
+}
+
+static JsValue dm_remove_child(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
+{
+    HpeDomNode *child = argc > 0 ? arg_node(args[0]) : NULL;
+    HPE_UNUSED(js);
+    if (child && child->parent == node)
+        hpe_dom_detach(child);
+    return js_undef();
+}
+
+static JsValue dm_clone_node(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
+{
+    int deep = argc > 0 && js_truthy(args[0]);
+    return node_value(js, hpe_dom_clone(node, deep));
+}
+
+static JsValue dm_has_child_nodes(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
+{
+    HPE_UNUSED(js);
+    HPE_UNUSED(args);
+    HPE_UNUSED(argc);
+    return js_bool(node->first_child != NULL);
+}
+
+static JsValue dm_insert_before(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
+{
+    HpeDomNode *child = argc > 0 ? arg_node(args[0]) : NULL;
+    HpeDomNode *ref = argc > 1 ? arg_node(args[1]) : NULL;
+    HPE_UNUSED(js);
+    if (!child)
+        return js_null();
+    hpe_dom_insert_before(node, child, ref);
+    return node_value(js, child);
+}
+
+static JsValue dm_replace_child(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
+{
+    HpeDomNode *newc = argc > 0 ? arg_node(args[0]) : NULL;
+    HpeDomNode *oldc = argc > 1 ? arg_node(args[1]) : NULL;
+    HPE_UNUSED(js);
+    if (!oldc)
+        return js_null();
+    return node_value(js, hpe_dom_replace_child(node, newc, oldc));
+}
+
+static JsValue dm_get_attribute(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
+{
+    char *name = arg_string(js, args, argc, 0);
+    const char *v = name ? hpe_dom_attr(node, name) : NULL;
+    return v ? js_string(js, v) : js_null();
+}
+
+static JsValue dm_set_attribute(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
+{
+    char *name = arg_string(js, args, argc, 0);
+    char *value = arg_string(js, args, argc, 1);
+    HPE_UNUSED(js);
+    if (name)
+        hpe_dom_set_attr(node, name, value ? value : "");
+    return js_undef();
+}
+
+static JsValue dm_remove_attribute(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
+{
+    char *name = arg_string(js, args, argc, 0);
+    HPE_UNUSED(js);
+    if (name)
+        hpe_dom_remove_attr(node, name);
+    return js_undef();
+}
+
+static JsValue dm_has_attribute(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
+{
+    char *name = arg_string(js, args, argc, 0);
+    return js_bool(name && hpe_dom_attr(node, name) != NULL);
+}
+
+static JsValue dm_append_child(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
+{
+    HpeDomNode *child = argc > 0 ? arg_node(args[0]) : NULL;
+    if (child) {
+        hpe_dom_append(node, child);
+        return node_value(js, child);
+    }
+    return js_null();
+}
+
+static JsValue dm_remove_self(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
+{
+    HPE_UNUSED(js);
+    HPE_UNUSED(args);
+    HPE_UNUSED(argc);
+    hpe_dom_detach(node);
+    return js_undef();
+}
+
+static JsValue dm_query_selector(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
+{
+    return query_selector_impl(js, node, args, argc, 0);
+}
+
+static JsValue dm_query_selector_all(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
+{
+    return query_selector_impl(js, node, args, argc, 1);
+}
+
+static JsValue dm_add_event_listener(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
+{
+    char *type = arg_string(js, args, argc, 0);
+    JsValue handler = argc > 1 ? args[1] : js_undef();
+    if (type && *type)
+        listener_append(js, node, type, handler, 0);
+    return js_undef();
+}
+
+/* method-name -> handler registry; the dispatch below is pure table lookup so
+ * adding a DOM method is a one-line table edit, not a new branch. */
+static const struct {
+    const char *name;
+    DomMethodFn fn;
+} dom_method_table[] = {
+    { "getElementById",         dm_get_element_by_id },
+    { "createElement",          dm_create_element },
+    { "createElementNS",        dm_create_element_ns },
+    { "createDocumentFragment", dm_create_fragment },
+    { "removeChild",            dm_remove_child },
+    { "cloneNode",              dm_clone_node },
+    { "hasChildNodes",          dm_has_child_nodes },
+    { "insertBefore",           dm_insert_before },
+    { "replaceChild",           dm_replace_child },
+    { "getAttribute",           dm_get_attribute },
+    { "setAttribute",           dm_set_attribute },
+    { "removeAttribute",        dm_remove_attribute },
+    { "hasAttribute",           dm_has_attribute },
+    { "appendChild",            dm_append_child },
+    { "remove",                 dm_remove_self },
+    { "querySelector",          dm_query_selector },
+    { "querySelectorAll",       dm_query_selector_all },
+    { "addEventListener",       dm_add_event_listener },
+    { NULL, NULL }
+};
+
 static JsValue dom_method_dispatch(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *ud)
 {
     DomMth *m = (DomMth *)ud;
-    HpeDomNode *node = m->node;
-    const char *method = m->method;
+    int i;
     HPE_UNUSED(thisv);
-
-    if (!strcmp(method, "getElementById")) {
-        char *id = arg_string(js, args, argc, 0);
-        HpeDomNode *found = NULL;
-        HpeDomNode **queue;
-        int qh = 0, qt = 0, qcap = 1024;
-        if (!id)
-            return js_null();
-        queue = (HpeDomNode **)malloc(sizeof(HpeDomNode *) * (size_t)qcap);
-        if (!queue)
-            return js_null();
-        queue[qt++] = node;
-        while (qh < qt) {
-            HpeDomNode *n = queue[qh++];
-            HpeDomNode *cur;
-            for (cur = n->first_child; cur; cur = cur->next_sibling) {
-                if (cur->type == HPE_NODE_ELEMENT) {
-                    const char *aid = hpe_dom_attr(cur, "id");
-                    if (aid && strcmp(aid, id) == 0) {
-                        found = cur;
-                        break;
-                    }
-                    if (qt < qcap)
-                        queue[qt++] = cur;
-                }
-            }
-            if (found)
-                break;
-        }
-        free(queue);
-        return found ? element_value(js, found) : js_null();
-    }
-    if (!strcmp(method, "createElement")) {
-        char *tag = arg_string(js, args, argc, 0);
-        if (!tag || !*tag)
-            return js_null();
-        return element_value(js, hpe_dom_element(tag));
-    }
-    if (!strcmp(method, "createElementNS")) {
-        /* namespace is irrelevant for our element model (SVG children are
-         * drawn by tag name); only the tag matters */
-        char *tag = arg_string(js, args, argc, 1);
-        if (!tag || !*tag)
-            return js_null();
-        return element_value(js, hpe_dom_element(tag));
-    }
-    if (!strcmp(method, "removeChild")) {
-        HpeDomNode *child = argc > 0 ? arg_element(args[0]) : NULL;
-        if (child && child->parent == node)
-            hpe_dom_detach(child);
-        return js_undef();
-    }
-    if (!strcmp(method, "getAttribute")) {
-        char *name = arg_string(js, args, argc, 0);
-        const char *v = name ? hpe_dom_attr(node, name) : NULL;
-        return v ? js_string(js, v) : js_null();
-    }
-    if (!strcmp(method, "setAttribute")) {
-        char *name = arg_string(js, args, argc, 0);
-        char *value = arg_string(js, args, argc, 1);
-        if (name)
-            hpe_dom_set_attr(node, name, value ? value : "");
-        return js_undef();
-    }
-    if (!strcmp(method, "appendChild")) {
-        HpeDomNode *child = argc > 0 ? arg_element(args[0]) : NULL;
-        if (child) {
-            hpe_dom_append(node, child);
-            return element_value(js, child);
-        }
-        return js_null();
-    }
-    if (!strcmp(method, "remove")) {
-        hpe_dom_detach(node);
-        return js_undef();
-    }
-    if (!strcmp(method, "querySelector")) {
-        return query_selector_impl(js, node, args, argc, 0);
-    }
-    if (!strcmp(method, "querySelectorAll")) {
-        return query_selector_impl(js, node, args, argc, 1);
-    }
-    if (!strcmp(method, "addEventListener")) {
-        char *type = arg_string(js, args, argc, 0);
-        JsValue handler = argc > 1 ? args[1] : js_undef();
-        if (type && *type)
-            listener_append(js, node, type, handler, 0);
-        return js_undef();
+    for (i = 0; dom_method_table[i].name; i++) {
+        if (strcmp(m->method, dom_method_table[i].name) == 0)
+            return dom_method_table[i].fn(js, m->node, args, argc);
     }
     return js_undef();
 }
@@ -361,11 +507,14 @@ static JsValue bind_dom_method(HpeJs *js, HpeDomNode *node, const char *method)
 static int method_is(const char *prop)
 {
     return !strcmp(prop, "getElementById") || !strcmp(prop, "createElement") ||
-           !strcmp(prop, "createElementNS") || !strcmp(prop, "getAttribute") ||
-           !strcmp(prop, "setAttribute") || !strcmp(prop, "appendChild") ||
-           !strcmp(prop, "removeChild") || !strcmp(prop, "remove") ||
-           !strcmp(prop, "querySelector") || !strcmp(prop, "querySelectorAll") ||
-           !strcmp(prop, "addEventListener");
+           !strcmp(prop, "createElementNS") || !strcmp(prop, "createDocumentFragment") ||
+           !strcmp(prop, "getAttribute") || !strcmp(prop, "setAttribute") ||
+           !strcmp(prop, "removeAttribute") || !strcmp(prop, "hasAttribute") ||
+           !strcmp(prop, "appendChild") || !strcmp(prop, "removeChild") ||
+           !strcmp(prop, "insertBefore") || !strcmp(prop, "replaceChild") ||
+           !strcmp(prop, "cloneNode") || !strcmp(prop, "hasChildNodes") ||
+           !strcmp(prop, "remove") || !strcmp(prop, "querySelector") ||
+           !strcmp(prop, "querySelectorAll") || !strcmp(prop, "addEventListener");
 }
 
 /* ---------------- events ---------------- */
@@ -472,7 +621,7 @@ static JsValue event_object(HpeJs *js, const char *type, int x, int y, HpeDomNod
     js_obj_set(js, o, "type", js_string(js, type));
     js_obj_set(js, o, "clientX", js_num((double)x));
     js_obj_set(js, o, "clientY", js_num((double)y));
-    js_obj_set(js, o, "target", element_value(js, target));
+    js_obj_set(js, o, "target", node_value(js, target));
     js_obj_set(js, o, "preventDefault", js_objval(js_native_new(js, native_noop, NULL)));
     js_obj_set(js, o, "stopPropagation",
                js_objval(js_native_new(js, native_stop_propagation, NULL)));
@@ -492,7 +641,7 @@ int hpe_js_dom_dispatch(HpeJs *js, HpeDomNode *target, const char *type, int cli
     args[0] = event_object(js, type, clientX, clientY, target);
     while (node) {
         JsListener *l;
-        js_obj_set(js, args[0].obj, "currentTarget", element_value(js, node));
+        js_obj_set(js, args[0].obj, "currentTarget", node_value(js, node));
         for (l = node_listeners(node); l; l = l->next) {
             if (!strcmp(l->type, type)) {
                 hpe_js_call(js, l->handler, js_undef(), args, 1);
@@ -509,58 +658,142 @@ int hpe_js_dom_dispatch(HpeJs *js, HpeDomNode *target, const char *type, int cli
 
 /* ---------------- vtables ---------------- */
 
+static JsValue element_upper_tag(HpeJs *js, HpeDomNode *node)
+{
+    /* browsers report element names uppercased for HTML documents */
+    const char *t = node->tag ? node->tag : "";
+    char upper[64];
+    size_t u = 0;
+    while (t[u] && u + 1 < sizeof(upper)) {
+        char c = t[u];
+        upper[u] = (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : c;
+        u++;
+    }
+    upper[u] = '\0';
+    return js_string(js, upper);
+}
+
+static JsValue element_attr_str(HpeJs *js, HpeDomNode *node, const char *attr)
+{
+    const char *v = hpe_dom_attr(node, attr);
+    return js_string(js, v ? v : "");
+}
+
+static JsValue element_client_size(HpeJs *js, HpeDomNode *node, const char *prop)
+{
+    /* browsers force a layout here; we keep element -> box back pointers
+     * (set by hpe_layout_build) so the value is the laid-out content size */
+    HpeBox *box = (HpeBox *)node->box;
+    double v = 0.0;
+    if (box)
+        v = (double)(prop[6] == 'W' ? box->content_box.w : box->content_box.h);
+    return js_num(v);
+}
+
+typedef JsValue (*ElemGetFn)(HpeJs *js, HpeDomNode *node, const char *prop);
+
+static JsValue eg_node_type(HpeJs *js, HpeDomNode *node, const char *prop)
+{
+    HPE_UNUSED(node);
+    HPE_UNUSED(prop);
+    return js_num(1); /* ELEMENT_NODE */
+}
+
+static JsValue eg_tag_name(HpeJs *js, HpeDomNode *node, const char *prop)
+{
+    HPE_UNUSED(prop);
+    return element_upper_tag(js, node);
+}
+
+static JsValue eg_id(HpeJs *js, HpeDomNode *node, const char *prop)
+{
+    HPE_UNUSED(prop);
+    return element_attr_str(js, node, "id");
+}
+
+static JsValue eg_class_name(HpeJs *js, HpeDomNode *node, const char *prop)
+{
+    HPE_UNUSED(prop);
+    return element_attr_str(js, node, "class");
+}
+
+static JsValue eg_text_content(HpeJs *js, HpeDomNode *node, const char *prop)
+{
+    HPE_UNUSED(prop);
+    return element_get_text(js, node);
+}
+
+static JsValue eg_inner_html(HpeJs *js, HpeDomNode *node, const char *prop)
+{
+    HPE_UNUSED(prop);
+    return element_get_html(js, node);
+}
+
+static JsValue eg_style(HpeJs *js, HpeDomNode *node, const char *prop)
+{
+    HPE_UNUSED(prop);
+    return js_make_host(js, node, HPE_HOST_STYLE, &g_style_vt);
+}
+
+static JsValue eg_first_child(HpeJs *js, HpeDomNode *node, const char *prop)
+{
+    HPE_UNUSED(prop);
+    return node->first_child ? node_value(js, node->first_child) : js_null();
+}
+
+static JsValue eg_next_sibling(HpeJs *js, HpeDomNode *node, const char *prop)
+{
+    HPE_UNUSED(prop);
+    return node->next_sibling ? node_value(js, node->next_sibling) : js_null();
+}
+
+static JsValue eg_parent_node(HpeJs *js, HpeDomNode *node, const char *prop)
+{
+    HPE_UNUSED(prop);
+    return node->parent ? node_value(js, node->parent) : js_null();
+}
+
+static JsValue eg_client_size(HpeJs *js, HpeDomNode *node, const char *prop)
+{
+    return element_client_size(js, node, prop);
+}
+
+static const struct {
+    const char *name;
+    ElemGetFn fn;
+} elem_get_table[] = {
+    { "nodeType",     eg_node_type },
+    { "tagName",      eg_tag_name },
+    { "nodeName",     eg_tag_name },
+    { "id",           eg_id },
+    { "className",    eg_class_name },
+    { "textContent",  eg_text_content },
+    { "innerHTML",    eg_inner_html },
+    { "style",        eg_style },
+    { "firstChild",   eg_first_child },
+    { "nextSibling",  eg_next_sibling },
+    { "parentNode",   eg_parent_node },
+    { "clientWidth",  eg_client_size },
+    { "clientHeight", eg_client_size },
+    { NULL, NULL }
+};
+
 static int element_vt_get(HpeJs *js, void *target, const char *prop, JsValue *out)
 {
     HpeDomNode *node = (HpeDomNode *)target;
+    int i;
     if (!node || node->type != HPE_NODE_ELEMENT)
         return 0;
-    if (!strcmp(prop, "tagName")) {
-        *out = js_string(js, node->tag);
+    if (!strcmp(prop, "content") && node->tag && !strcmp(node->tag, "template")) {
+        /* <template>.content: the detached fragment holding its children */
+        *out = node_value(js, hpe_dom_children_root(node));
         return 1;
     }
-    if (!strcmp(prop, "id")) {
-        const char *id = hpe_dom_attr(node, "id");
-        *out = js_string(js, id ? id : "");
-        return 1;
-    }
-    if (!strcmp(prop, "className")) {
-        const char *cls = hpe_dom_attr(node, "class");
-        *out = js_string(js, cls ? cls : "");
-        return 1;
-    }
-    if (!strcmp(prop, "textContent")) {
-        *out = element_get_text(js, node);
-        return 1;
-    }
-    if (!strcmp(prop, "innerHTML")) {
-        *out = element_get_html(js, node);
-        return 1;
-    }
-    if (!strcmp(prop, "style")) {
-        *out = js_make_host(js, node, HPE_HOST_STYLE, &g_style_vt);
-        return 1;
-    }
-    if (!strcmp(prop, "firstChild")) {
-        *out = node->first_child ? element_value(js, node->first_child) : js_null();
-        return 1;
-    }
-    if (!strcmp(prop, "nextSibling")) {
-        *out = node->next_sibling ? element_value(js, node->next_sibling) : js_null();
-        return 1;
-    }
-    if (!strcmp(prop, "parentNode")) {
-        *out = node->parent ? element_value(js, node->parent) : js_null();
-        return 1;
-    }
-    if (!strcmp(prop, "clientWidth") || !strcmp(prop, "clientHeight")) {
-        /* browsers force a layout here; we keep element -> box back pointers
-         * (set by hpe_layout_build) so the value is the laid-out content size */
-        HpeBox *box = (HpeBox *)node->box;
-        double v = 0.0;
-        if (box)
-            v = (double)(prop[6] == 'W' ? box->content_box.w : box->content_box.h);
-        *out = js_num(v);
-        return 1;
+    for (i = 0; elem_get_table[i].name; i++) {
+        if (!strcmp(prop, elem_get_table[i].name)) {
+            *out = elem_get_table[i].fn(js, node, prop);
+            return 1;
+        }
     }
     if (method_is(prop)) {
         *out = bind_dom_method(js, node, prop);
@@ -613,6 +846,77 @@ static int element_vt_set(HpeJs *js, void *target, const char *prop, JsValue val
 
 static const HpeJsHostVt g_element_vt = {element_vt_get, element_vt_set};
 
+/* DocumentFragment host: shares the node-level accessors (children, tree links,
+ * methods) with elements but exposes no element-only members (tagName/id/style).
+ * A fragment never reaches the box tree, so clientWidth/Height stay 0. */
+static int fragment_vt_get(HpeJs *js, void *target, const char *prop, JsValue *out)
+{
+    HpeDomNode *node = (HpeDomNode *)target;
+    if (!node || node->type != HPE_NODE_FRAGMENT)
+        return 0;
+    if (!strcmp(prop, "nodeType")) {
+        *out = js_num(11); /* DOCUMENT_FRAGMENT_NODE */
+        return 1;
+    }
+    if (!strcmp(prop, "childNodes") || !strcmp(prop, "children")) {
+        /* a live-ish snapshot built on each read; enough for len/iteration */
+        JsObj *arr = js_array_new(js);
+        HpeDomNode *c;
+        char key[32];
+        int n = 0;
+        for (c = node->first_child; c; c = c->next_sibling) {
+            snprintf(key, sizeof(key), "%d", n++);
+            js_obj_set(js, arr, key, node_value(js, c));
+        }
+        js_obj_set(js, arr, "length", js_num((double)n));
+        *out = js_objval(arr);
+        return 1;
+    }
+    if (!strcmp(prop, "firstChild")) {
+        *out = node->first_child ? node_value(js, node->first_child) : js_null();
+        return 1;
+    }
+    if (!strcmp(prop, "nextSibling")) {
+        *out = node->next_sibling ? node_value(js, node->next_sibling) : js_null();
+        return 1;
+    }
+    if (!strcmp(prop, "parentNode")) {
+        *out = node->parent ? node_value(js, node->parent) : js_null();
+        return 1;
+    }
+    if (!strcmp(prop, "textContent")) {
+        *out = element_get_text(js, node);
+        return 1;
+    }
+    if (!strcmp(prop, "innerHTML")) {
+        *out = element_get_html(js, node);
+        return 1;
+    }
+    if (method_is(prop)) {
+        *out = bind_dom_method(js, node, prop);
+        return 1;
+    }
+    return 0;
+}
+
+static int fragment_vt_set(HpeJs *js, void *target, const char *prop, JsValue value)
+{
+    HpeDomNode *node = (HpeDomNode *)target;
+    if (!node || node->type != HPE_NODE_FRAGMENT)
+        return 0;
+    if (!strcmp(prop, "textContent")) {
+        node_replace_children_with_text(node, js_to_string(js, value));
+        return 1;
+    }
+    if (!strcmp(prop, "innerHTML")) {
+        node_set_inner_html(node, js_to_string(js, value));
+        return 1;
+    }
+    return 0;
+}
+
+static const HpeJsHostVt g_fragment_vt = {fragment_vt_get, fragment_vt_set};
+
 static int style_vt_get(HpeJs *js, void *target, const char *prop, JsValue *out)
 {
     HpeDomNode *node = (HpeDomNode *)target;
@@ -650,11 +954,15 @@ static int document_vt_get(HpeJs *js, void *target, const char *prop, JsValue *o
     if (!doc)
         return 0;
     if (!strcmp(prop, "body")) {
-        *out = element_value(js, hpe_dom_find_tag(doc, "body"));
+        *out = node_value(js, hpe_dom_find_tag(doc, "body"));
+        return 1;
+    }
+    if (!strcmp(prop, "head")) {
+        *out = node_value(js, hpe_dom_find_tag(doc, "head"));
         return 1;
     }
     if (!strcmp(prop, "documentElement")) {
-        *out = element_value(js, hpe_dom_find_tag(doc, "html"));
+        *out = node_value(js, hpe_dom_find_tag(doc, "html"));
         return 1;
     }
     if (method_is(prop)) {
@@ -787,4 +1095,7 @@ void hpe_js_dom_install(HpeJs *js, HpeDomNode *document)
     hpe_js_set_global_host(js, "document", document, HPE_HOST_DOCUMENT, &g_document_vt);
     install_window_builtins(js, document);
     hpe_js_timers_install(js);
+    /* DOM change notification: the sink forwards mutations to any observer */
+    hpe_js_mutation_install(js);
+    hpe_js_mutation_install_ctor(js);
 }

@@ -63,6 +63,13 @@ int hpe_len_is_px(HpeLength len);
 /* true when the length carries no value that can drive layout (auto) */
 int hpe_len_is_auto(HpeLength len);
 
+/* ---------- charset ---------- */
+/* Widens a legacy single-byte buffer (iso-8859-1 / windows-1252) into utf-8.
+ * Bytes 0x80..0x9F are mapped through the cp1252 table (curly quotes, dashes,
+ * ellipsis, euro ...), everything else is treated as latin-1. The caller owns
+ * the result (hpe_free it). */
+char *hpe_latin1_to_utf8(const char *src, size_t len, size_t *out_len);
+
 int hpe_color_parse(const char *s, HpeColor *out);
 
 #endif /* HPE_UTIL_H */

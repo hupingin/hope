@@ -76,4 +76,20 @@ const HpePixmap *hpe_engine_pixmap(HpeEngine *engine);
 const char *hpe_engine_status(HpeEngine *engine);
 float hpe_engine_scroll_offset(HpeEngine *engine);
 
+/* ---------------- document metadata ---------------- */
+
+/* charset the last document was decoded from ("utf-8" / "latin1" / "utf-16le" /
+ * "utf-16be"); valid until the next load */
+const char *hpe_engine_document_encoding(HpeEngine *engine);
+/* 1 when the charset came from an in-document <meta charset> (as opposed to a
+ * BOM or utf-8 validation) */
+int hpe_engine_meta_charset(HpeEngine *engine);
+/* the resolved <base href> ("" when the document declares none) */
+const char *hpe_engine_base_href(HpeEngine *engine);
+/* number of <link> elements with a rel other than "stylesheet" (icon/preload/
+ * alternate ...), plus accessors for their normalised rel token string and
+ * resolved absolute href. Returns 0 when `index` is out of range. */
+int hpe_engine_link_count(HpeEngine *engine);
+int hpe_engine_link_at(HpeEngine *engine, int index, const char **rel, const char **href);
+
 #endif /* HOPE_H */

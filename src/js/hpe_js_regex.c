@@ -164,10 +164,10 @@ static uint32_t re_hex(ReParser *rp, int digits)
     return v;
 }
 
-/* escape after '\': returns 1 when it is a class escape (fills cls) */
-static int re_escape(ReParser *rp, ReNode *cls, uint32_t *lit)
+/* the shorthand class escapes (\d \D \w \W \s \S) that expand to code-point
+ * ranges; returns 1 when `e` was one and the ranges were added to cls */
+static int re_add_class_escapes(ReNode *cls, char e)
 {
-    char e = rp->i < rp->len ? rp->p[rp->i++] : '\\';
     switch (e) {
     case 'd':
         re_add_range(cls, '0', '9');
@@ -200,34 +200,50 @@ static int re_escape(ReParser *rp, ReNode *cls, uint32_t *lit)
     case 'S':
         re_add_range(cls, 0x21, 0x10FFFF);
         return 1;
-    case 'n':
-        *lit = '\n';
-        return 0;
-    case 't':
-        *lit = '\t';
-        return 0;
-    case 'r':
-        *lit = '\r';
-        return 0;
-    case 'f':
-        *lit = '\f';
-        return 0;
-    case 'v':
-        *lit = '\v';
-        return 0;
-    case '0':
-        *lit = 0;
-        return 0;
-    case 'u':
-        *lit = re_hex(rp, 4);
-        return 0;
-    case 'x':
-        *lit = re_hex(rp, 2);
-        return 0;
     default:
-        *lit = (uint32_t)(unsigned char)e;
         return 0;
     }
+}
+
+/* the single-character escapes; \uXXXX and \xHH are handled by the caller since
+ * they consume input, and any unknown letter falls back to the raw character */
+static uint32_t re_escape_literal(char e)
+{
+    switch (e) {
+    case 'n':
+        return '\n';
+    case 't':
+        return '\t';
+    case 'r':
+        return '\r';
+    case 'f':
+        return '\f';
+    case 'v':
+        return '\v';
+    case '0':
+        return 0;
+    default:
+        return (uint32_t)(unsigned char)e;
+    }
+}
+
+/* escape after '\': returns 1 when it is a class escape (fills cls) */
+static int re_escape(ReParser *rp, ReNode *cls, uint32_t *lit)
+{
+    char e = rp->i < rp->len ? rp->p[rp->i++] : '\\';
+
+    if (re_add_class_escapes(cls, e))
+        return 1;
+    if (e == 'u') {
+        *lit = re_hex(rp, 4);
+        return 0;
+    }
+    if (e == 'x') {
+        *lit = re_hex(rp, 2);
+        return 0;
+    }
+    *lit = re_escape_literal(e);
+    return 0;
 }
 
 static ReNode *re_parse_alt(ReParser *rp);
@@ -312,111 +328,156 @@ static int re_parse_braces(ReParser *rp, int *out_min, int *out_max)
     return 1;
 }
 
+/* parses the `(?:`, `(?=`, `(?!`, `(?<=`, `(?<!` and `(?<name>` prefixes and
+ * reports which kind of group follows */
+typedef struct {
+    int capturing;
+    int look;
+    int behind;
+    int negative;
+} ReGroupHdr;
+
+static void re_parse_group_header(ReParser *rp, ReGroupHdr *h)
+{
+    char d;
+
+    if (!(rp->i + 1 < rp->len && rp->p[rp->i] == '?'))
+        return;
+    d = rp->p[rp->i + 1];
+    if (d == ':') {
+        h->capturing = 0;
+        rp->i += 2;
+    } else if (d == '=') {
+        h->capturing = 0;
+        h->look = 1;
+        rp->i += 2;
+    } else if (d == '!') {
+        h->capturing = 0;
+        h->look = 1;
+        h->negative = 1;
+        rp->i += 2;
+    } else if (d == '<' && rp->i + 2 < rp->len &&
+               (rp->p[rp->i + 2] == '=' || rp->p[rp->i + 2] == '!')) {
+        h->capturing = 0;
+        h->behind = 1;
+        h->negative = rp->p[rp->i + 2] == '!';
+        rp->i += 3;
+    } else if (d == '<') {
+        rp->i += 2; /* (?<name>…) — the name is not retained */
+        while (rp->i < rp->len && rp->p[rp->i] != '>')
+            rp->i++;
+        if (rp->i < rp->len)
+            rp->i++;
+    }
+}
+
+/* `(…)`, `(?:…)`, look-around and named groups all share one parse: the header
+ * decides the node kind, then a nested alternation is parsed as the child */
+static ReNode *re_parse_group(ReParser *rp)
+{
+    ReGroupHdr h = {1, 0, 0, 0};
+    ReNode *g;
+
+    rp->i++; /* ( */
+    re_parse_group_header(rp, &h);
+    if (h.look || h.behind) {
+        g = re_new(rp, h.behind ? RE_LBEHIND : RE_LOOK);
+        g->negative = h.negative;
+    } else {
+        g = re_new(rp, RE_GROUP);
+        if (h.capturing) {
+            if (rp->ngroups < RE_MAX_GROUPS)
+                rp->ngroups++;
+            g->group = rp->ngroups;
+        }
+    }
+    g->child = re_parse_alt(rp);
+    if (rp->i < rp->len && rp->p[rp->i] == ')')
+        rp->i++;
+    return g;
+}
+
+/* `\d \b \1` etc.; class escapes become RE_CLASS, \b/\B word boundaries get
+ * their own kind, a digit is a back-reference, everything else a literal */
+static ReNode *re_parse_backslash_atom(ReParser *rp)
+{
+    uint32_t lit = 0;
+    ReNode tmp;
+    ReNode *n;
+    char e;
+
+    rp->i++; /* \ */
+    e = rp->i < rp->len ? rp->p[rp->i] : '\0';
+    if (e == 'b') {
+        rp->i++;
+        return re_new(rp, RE_WORDB);
+    }
+    if (e == 'B') {
+        rp->i++;
+        return re_new(rp, RE_NWORDB);
+    }
+    if (re_isdigit(e) && e != '0') {
+        int ref = 0;
+        while (rp->i < rp->len && re_isdigit(rp->p[rp->i]))
+            ref = ref * 10 + (rp->p[rp->i++] - '0');
+        n = re_new(rp, RE_BACKREF);
+        n->ref = ref;
+        return n;
+    }
+    memset(&tmp, 0, sizeof(tmp));
+    if (re_escape(rp, &tmp, &lit)) {
+        int k;
+        n = re_new(rp, RE_CLASS);
+        n->negate = tmp.negate;
+        n->nr = tmp.nr;
+        for (k = 0; k < tmp.nr; k++)
+            n->ranges[k] = tmp.ranges[k];
+        return n;
+    }
+    n = re_new(rp, RE_CHAR);
+    n->ch = lit;
+    return n;
+}
+
+/* maps a bare punctuation/letter character to its zero-width anchor node, or
+ * NULL when it is an ordinary literal to be read as UTF-8 */
+static ReNode *re_parse_anchor(ReParser *rp, char c)
+{
+    int kind;
+
+    switch (c) {
+    case '.':
+        kind = RE_ANY;
+        break;
+    case '^':
+        kind = RE_BOL;
+        break;
+    case '$':
+        kind = RE_EOL;
+        break;
+    default:
+        return NULL;
+    }
+    rp->i++;
+    return re_new(rp, kind);
+}
+
 static ReNode *re_parse_atom(ReParser *rp)
 {
     char c = rp->i < rp->len ? rp->p[rp->i] : '\0';
-    if (c == '(') {
-        ReNode *g;
-        int capturing = 1;
-        int look = 0, behind = 0, negative = 0;
-        rp->i++;
-        if (rp->i + 1 < rp->len && rp->p[rp->i] == '?') {
-            char d = rp->p[rp->i + 1];
-            if (d == ':') {
-                capturing = 0;
-                rp->i += 2;
-            } else if (d == '=') {
-                capturing = 0;
-                look = 1;
-                rp->i += 2;
-            } else if (d == '!') {
-                capturing = 0;
-                look = 1;
-                negative = 1;
-                rp->i += 2;
-            } else if (d == '<' && rp->i + 2 < rp->len &&
-                       (rp->p[rp->i + 2] == '=' || rp->p[rp->i + 2] == '!')) {
-                capturing = 0;
-                behind = 1;
-                negative = rp->p[rp->i + 2] == '!';
-                rp->i += 3;
-            } else if (d == '<') {
-                rp->i += 2; /* (?<name>…) */
-                while (rp->i < rp->len && rp->p[rp->i] != '>')
-                    rp->i++;
-                if (rp->i < rp->len)
-                    rp->i++;
-            }
-        }
-        if (look || behind) {
-            g = re_new(rp, behind ? RE_LBEHIND : RE_LOOK);
-            g->negative = negative;
-        } else {
-            g = re_new(rp, RE_GROUP);
-            if (capturing) {
-                if (rp->ngroups < RE_MAX_GROUPS)
-                    rp->ngroups++;
-                g->group = rp->ngroups;
-            }
-        }
-        g->child = re_parse_alt(rp);
-        if (rp->i < rp->len && rp->p[rp->i] == ')')
-            rp->i++;
-        return g;
-    }
+    ReNode *anchor;
+
+    if (c == '(')
+        return re_parse_group(rp);
     if (c == '[') {
         rp->i++;
         return re_parse_class(rp);
     }
-    if (c == '.') {
-        rp->i++;
-        return re_new(rp, RE_ANY);
-    }
-    if (c == '^') {
-        rp->i++;
-        return re_new(rp, RE_BOL);
-    }
-    if (c == '$') {
-        rp->i++;
-        return re_new(rp, RE_EOL);
-    }
-    if (c == '\\') {
-        ReNode *n;
-        uint32_t lit = 0;
-        ReNode tmp;
-        char e;
-        rp->i++;
-        e = rp->i < rp->len ? rp->p[rp->i] : '\0';
-        if (e == 'b') {
-            rp->i++;
-            return re_new(rp, RE_WORDB);
-        }
-        if (e == 'B') {
-            rp->i++;
-            return re_new(rp, RE_NWORDB);
-        }
-        if (re_isdigit(e) && e != '0') {
-            int ref = 0;
-            while (rp->i < rp->len && re_isdigit(rp->p[rp->i]))
-                ref = ref * 10 + (rp->p[rp->i++] - '0');
-            n = re_new(rp, RE_BACKREF);
-            n->ref = ref;
-            return n;
-        }
-        memset(&tmp, 0, sizeof(tmp));
-        if (re_escape(rp, &tmp, &lit)) {
-            int k;
-            n = re_new(rp, RE_CLASS);
-            n->negate = tmp.negate;
-            n->nr = tmp.nr;
-            for (k = 0; k < tmp.nr; k++)
-                n->ranges[k] = tmp.ranges[k];
-            return n;
-        }
-        n = re_new(rp, RE_CHAR);
-        n->ch = lit;
-        return n;
-    }
+    if (c == '\\')
+        return re_parse_backslash_atom(rp);
+    anchor = re_parse_anchor(rp, c);
+    if (anchor)
+        return anchor;
     {
         ReNode *n = re_new(rp, RE_CHAR);
         n->ch = re_utf8(rp);
@@ -639,6 +700,83 @@ static int re_at_eol(ReCtx *c, size_t pos)
     return (c->flags & 2) && c->s[pos] == '\n';
 }
 
+/* zero-initialises a continuation kernel and links it to the following one.
+ * Every kind shares these neutral defaults; callers override only their own
+ * fields (kind, seq/rep, idx, count, …) which keeps each branch small. */
+static void re_k_init(ReK *k, int kind, ReK *next)
+{
+    memset(k, 0, sizeof(*k));
+    k->kind = kind;
+    k->target = -1;
+    k->next = next;
+}
+
+/* advances a K_SEQ kernel to the next element of its sequence, or hands off to
+ * the following kernel once the sequence is exhausted */
+static int re_cont_seq(ReK *k, ReCtx *c, size_t pos)
+{
+    ReK nk;
+
+    if (k->idx >= k->seq->n)
+        return re_cont(k->next, c, pos);
+    re_k_init(&nk, K_SEQ, k->next);
+    nk.seq = k->seq;
+    nk.idx = k->idx + 1;
+    return re_node(k->seq->kids[k->idx], &nk, c, pos);
+}
+
+/* a captured group restores its previous span when the continuation fails */
+static int re_cont_group(ReK *k, ReCtx *c, size_t pos)
+{
+    int g = k->group;
+    int os, oe;
+    int had = re_cap_get(c, g, &os, &oe);
+
+    if (g > 0)
+        re_set_cap(c, g, (int)k->gstart, (int)pos);
+    if (re_cont(k->next, c, pos))
+        return 1;
+    if (g > 0)
+        re_set_cap(c, g, had ? os : -1, had ? oe : -1);
+    return 0;
+}
+
+/* continues a K_REP kernel: a greedy quantifier first tries another iteration,
+ * a lazy one first tries the rest — and `progressed` guards against a body that
+ * consumed nothing (otherwise an unbounded `*` would spin forever) */
+static int re_cont_rep(ReK *k, ReCtx *c, size_t pos)
+{
+    ReNode *rep = k->rep;
+    int count = k->count;
+    int progressed = (count == 0) || (pos != k->at);
+
+    if (rep->greedy) {
+        if (progressed && count < rep->max) {
+            ReK rk;
+            re_k_init(&rk, K_REP, k->next);
+            rk.rep = rep;
+            rk.count = count + 1;
+            rk.at = pos;
+            if (re_node(rep->child, &rk, c, pos))
+                return 1;
+        }
+        if (count >= rep->min)
+            return re_cont(k->next, c, pos);
+        return 0;
+    }
+    if (count >= rep->min && re_cont(k->next, c, pos))
+        return 1;
+    if (progressed && count < rep->max) {
+        ReK rk;
+        re_k_init(&rk, K_REP, k->next);
+        rk.rep = rep;
+        rk.count = count + 1;
+        rk.at = pos;
+        return re_node(rep->child, &rk, c, pos);
+    }
+    return 0;
+}
+
 /* continue: resume the quants/branches scheduled after the current node */
 static int re_cont(ReK *k, ReCtx *c, size_t pos)
 {
@@ -653,76 +791,12 @@ static int re_cont(ReK *k, ReCtx *c, size_t pos)
             return 1;
         }
         return 0;
-    case K_SEQ: {
-        ReK nk;
-        if (k->idx >= k->seq->n)
-            return re_cont(k->next, c, pos);
-        nk.kind = K_SEQ;
-        nk.seq = k->seq;
-        nk.idx = k->idx + 1;
-        nk.rep = NULL;
-        nk.count = 0;
-        nk.at = 0;
-        nk.group = 0;
-        nk.gstart = 0;
-        nk.target = -1;
-        nk.next = k->next;
-        return re_node(k->seq->kids[k->idx], &nk, c, pos);
-    }
-    case K_GROUP: {
-        int g = k->group;
-        int os, oe;
-        int had = re_cap_get(c, g, &os, &oe);
-        if (g > 0)
-            re_set_cap(c, g, (int)k->gstart, (int)pos);
-        if (re_cont(k->next, c, pos))
-            return 1;
-        if (g > 0)
-            re_set_cap(c, g, had ? os : -1, had ? oe : -1);
-        return 0;
-    }
-    case K_REP: {
-        ReNode *rep = k->rep;
-        int count = k->count;
-        int progressed = (count == 0) || (pos != k->at);
-        if (rep->greedy) {
-            if (progressed && count < rep->max) {
-                ReK rk;
-                rk.kind = K_REP;
-                rk.seq = NULL;
-                rk.idx = 0;
-                rk.rep = rep;
-                rk.count = count + 1;
-                rk.at = pos;
-                rk.group = 0;
-                rk.gstart = 0;
-                rk.target = -1;
-                rk.next = k->next;
-                if (re_node(rep->child, &rk, c, pos))
-                    return 1;
-            }
-            if (count >= rep->min)
-                return re_cont(k->next, c, pos);
-            return 0;
-        }
-        if (count >= rep->min && re_cont(k->next, c, pos))
-            return 1;
-        if (progressed && count < rep->max) {
-            ReK rk;
-            rk.kind = K_REP;
-            rk.seq = NULL;
-            rk.idx = 0;
-            rk.rep = rep;
-            rk.count = count + 1;
-            rk.at = pos;
-            rk.group = 0;
-            rk.gstart = 0;
-            rk.target = -1;
-            rk.next = k->next;
-            return re_node(rep->child, &rk, c, pos);
-        }
-        return 0;
-    }
+    case K_SEQ:
+        return re_cont_seq(k, c, pos);
+    case K_GROUP:
+        return re_cont_group(k, c, pos);
+    case K_REP:
+        return re_cont_rep(k, c, pos);
     default:
         return 0;
     }
@@ -801,31 +875,14 @@ static int re_assert(ReNode *n, ReCtx *c, size_t pos)
     memcpy(saved, c->caps, (size_t)nc * sizeof(int));
     if (n->type == RE_LOOK) {
         ReK e;
-        e.kind = K_END;
-        e.seq = NULL;
-        e.idx = 0;
-        e.rep = NULL;
-        e.count = 0;
-        e.at = 0;
-        e.group = 0;
-        e.gstart = 0;
-        e.target = -1;
-        e.next = NULL;
+        re_k_init(&e, K_END, NULL);
         hit = re_node(n->child, &e, c, pos);
     } else {
         size_t start;
         for (start = 0; start <= pos; start++) {
             ReK e;
-            e.kind = K_END;
-            e.seq = NULL;
-            e.idx = 0;
-            e.rep = NULL;
-            e.count = 0;
-            e.at = 0;
-            e.group = 0;
-            e.gstart = 0;
+            re_k_init(&e, K_END, NULL);
             e.target = (int)pos;
-            e.next = NULL;
             if (re_node(n->child, &e, c, start)) {
                 hit = 1;
                 break;
@@ -836,6 +893,99 @@ static int re_assert(ReNode *n, ReCtx *c, size_t pos)
         memcpy(c->caps, saved, (size_t)nc * sizeof(int));
     c->match_end = saved_end;
     return n->negative ? !hit : hit;
+}
+
+/* matches `n->child` at pos, scheduling the rest of the sequence via a K_SEQ
+ * kernel; an empty sequence falls straight through */
+static int re_run_seq(ReNode *n, ReK *k, ReCtx *c, size_t pos)
+{
+    ReK nk;
+
+    if (n->n == 0)
+        return re_cont(k, c, pos);
+    re_k_init(&nk, K_SEQ, k);
+    nk.seq = n;
+    nk.idx = 1;
+    return re_node(n->kids[0], &nk, c, pos);
+}
+
+/* tries each alternative branch in order until one succeeds */
+static int re_run_alt(ReNode *n, ReK *k, ReCtx *c, size_t pos)
+{
+    int i;
+
+    for (i = 0; i < n->n; i++)
+        if (re_node(n->kids[i], k, c, pos))
+            return 1;
+    return 0;
+}
+
+/* a quantifier either uses the fast iterative path (single-codepoint bodies) or
+ * a K_REP kernel that re-enters through re_cont */
+static int re_run_rep(ReNode *n, ReK *k, ReCtx *c, size_t pos)
+{
+    ReNode *sub = n->child;
+    ReK rk;
+
+    if (n->max == 0)
+        return (n->min == 0) ? re_cont(k, c, pos) : 0;
+    if (sub->type == RE_CHAR || sub->type == RE_ANY || sub->type == RE_CLASS)
+        return re_rep_simple(n, k, c, pos);
+    re_k_init(&rk, K_REP, k);
+    rk.rep = n;
+    rk.at = pos;
+    return re_cont(&rk, c, pos);
+}
+
+/* a capturing group records its start and span; a plain group just recurses */
+static int re_run_group(ReNode *n, ReK *k, ReCtx *c, size_t pos)
+{
+    int g = n->group;
+    ReK gk;
+
+    if (g <= 0)
+        return re_node(n->child, k, c, pos);
+    re_set_cap(c, g, -1, -1);
+    re_k_init(&gk, K_GROUP, k);
+    gk.group = g;
+    gk.gstart = pos;
+    return re_node(n->child, &gk, c, pos);
+}
+
+/* zero-width word-boundary assertion (\b / \B) */
+static int re_run_wordb(ReNode *n, ReK *k, ReCtx *c, size_t pos)
+{
+    uint32_t cp = 0;
+    int before = re_is_word(re_prev_cp(c->s, pos));
+    int after;
+
+    if (pos < c->len)
+        re_decode_at(c->s, c->len, pos, &cp);
+    after = pos < c->len && re_is_word(cp);
+    if ((n->type == RE_WORDB) == (before != after))
+        return re_cont(k, c, pos);
+    return 0;
+}
+
+/* `^` / `$` anchors; multi-line mode makes them match around newlines */
+static int re_run_anchor(ReNode *n, ReK *k, ReCtx *c, size_t pos)
+{
+    if (n->type == RE_BOL) {
+        if (pos == 0 || ((c->flags & 2) && pos > 0 && c->s[pos - 1] == '\n'))
+            return re_cont(k, c, pos);
+        return 0;
+    }
+    return re_at_eol(c, pos) ? re_cont(k, c, pos) : 0;
+}
+
+/* single-codepoint consumers (\d, ., […]): advance by the matched width */
+static int re_run_single_node(ReNode *n, ReK *k, ReCtx *c, size_t pos)
+{
+    int adv = 0;
+
+    if (re_single(n, c, pos, &adv))
+        return re_cont(k, c, pos + (size_t)adv);
+    return 0;
 }
 
 static int re_node(ReNode *n, ReK *k, ReCtx *c, size_t pos)
@@ -850,113 +1000,35 @@ static int re_node(ReNode *n, ReK *k, ReCtx *c, size_t pos)
     }
     switch (n->type) {
     case RE_BOL:
-        if (pos == 0 || ((c->flags & 2) && pos > 0 && c->s[pos - 1] == '\n'))
-            r = re_cont(k, c, pos);
-        break;
     case RE_EOL:
-        if (re_at_eol(c, pos))
-            r = re_cont(k, c, pos);
+        r = re_run_anchor(n, k, c, pos);
         break;
     case RE_CHAR:
     case RE_ANY:
-    case RE_CLASS: {
-        int adv = 0;
-        if (re_single(n, c, pos, &adv))
-            r = re_cont(k, c, pos + (size_t)adv);
+    case RE_CLASS:
+        r = re_run_single_node(n, k, c, pos);
         break;
-    }
-    case RE_SEQ: {
-        ReK nk;
-        if (n->n == 0) {
-            r = re_cont(k, c, pos);
-            break;
-        }
-        nk.kind = K_SEQ;
-        nk.seq = n;
-        nk.idx = 1;
-        nk.rep = NULL;
-        nk.count = 0;
-        nk.at = 0;
-        nk.group = 0;
-        nk.gstart = 0;
-        nk.target = -1;
-        nk.next = k;
-        r = re_node(n->kids[0], &nk, c, pos);
+    case RE_SEQ:
+        r = re_run_seq(n, k, c, pos);
         break;
-    }
-    case RE_ALT: {
-        int i;
-        for (i = 0; i < n->n; i++) {
-            if (re_node(n->kids[i], k, c, pos)) {
-                r = 1;
-                break;
-            }
-        }
+    case RE_ALT:
+        r = re_run_alt(n, k, c, pos);
         break;
-    }
-    case RE_REP: {
-        ReNode *sub = n->child;
-        if (n->max == 0) {
-            r = (n->min == 0) ? re_cont(k, c, pos) : 0;
-            break;
-        }
-        if (sub->type == RE_CHAR || sub->type == RE_ANY || sub->type == RE_CLASS) {
-            r = re_rep_simple(n, k, c, pos);
-        } else {
-            ReK rk;
-            rk.kind = K_REP;
-            rk.seq = NULL;
-            rk.idx = 0;
-            rk.rep = n;
-            rk.count = 0;
-            rk.at = pos;
-            rk.group = 0;
-            rk.gstart = 0;
-            rk.target = -1;
-            rk.next = k;
-            r = re_cont(&rk, c, pos);
-        }
+    case RE_REP:
+        r = re_run_rep(n, k, c, pos);
         break;
-    }
-    case RE_GROUP: {
-        int g = n->group;
-        if (g > 0)
-            re_set_cap(c, g, -1, -1);
-        if (g > 0) {
-            ReK gk;
-            gk.kind = K_GROUP;
-            gk.seq = NULL;
-            gk.idx = 0;
-            gk.rep = NULL;
-            gk.count = 0;
-            gk.at = 0;
-            gk.group = g;
-            gk.gstart = pos;
-            gk.target = -1;
-            gk.next = k;
-            r = re_node(n->child, &gk, c, pos);
-        } else {
-            r = re_node(n->child, k, c, pos);
-        }
+    case RE_GROUP:
+        r = re_run_group(n, k, c, pos);
         break;
-    }
     case RE_LOOK:
     case RE_LBEHIND:
         if (re_assert(n, c, pos))
             r = re_cont(k, c, pos);
         break;
     case RE_WORDB:
-    case RE_NWORDB: {
-        uint32_t cp = 0;
-        int before = re_is_word(re_prev_cp(c->s, pos));
-        int after;
-        if (pos < c->len)
-            re_decode_at(c->s, c->len, pos, &cp);
-        after = pos < c->len && re_is_word(cp);
-        if ((n->type == RE_WORDB) == (before != after))
-            r = re_cont(k, c, pos);
+    case RE_NWORDB:
+        r = re_run_wordb(n, k, c, pos);
         break;
-    }
     case RE_BACKREF:
         r = re_backref(n, k, c, pos);
         break;

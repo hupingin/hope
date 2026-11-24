@@ -8,6 +8,7 @@
  * materialisation - see design doc §12.7) and ES modules.
  */
 #include "js/hpe_js_internal.h"
+#include "js/hpe_js_mutation.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -100,6 +101,11 @@ static JsValue run_function_body(HpeJs *js, JsObj *fn, JsEnv *closure, JsValue t
                                  int argc);
 static void bind_pattern(HpeJs *js, JsEnv *env, JsNode *pat, JsValue value, int declare);
 static void assign_pattern(HpeJs *js, JsEnv *env, JsNode *pat, JsValue value);
+/* shared destructuring walkers: `apply` is the leaf bind/assign operation */
+typedef void (*PatternApply)(HpeJs *js, JsEnv *env, JsNode *pat, JsValue value);
+static void pattern_each_array(HpeJs *js, JsEnv *env, JsNode *pat, JsValue value, PatternApply apply);
+static void pattern_each_object(HpeJs *js, JsEnv *env, JsNode *pat, JsValue value, JsObj *exclude,
+                                PatternApply apply);
 static JsValue member_get(HpeJs *js, JsEnv *env, JsValue base, const char *prop, int line);
 static void member_set(HpeJs *js, JsEnv *env, JsValue base, const char *prop, JsValue value,
                        int line);
@@ -218,6 +224,20 @@ static JsJob *job_new(HpeJs *js, int kind)
     j->arg = js_undef();
     j->value = js_undef();
     return j;
+}
+
+/* queues fn(arg) to run as a microtask (JOB_CALL). MutationObserver uses this to
+ * deliver records asynchronously, but any host binding may. The queue is drained
+ * by the interpreter after the current statement/script and by hpe_js_call(). */
+void hpe_js_queue_microtask(HpeJs *js, JsValue fn, JsValue arg)
+{
+    JsJob *j;
+    if (!js)
+        return;
+    j = job_new(js, JOB_CALL);
+    j->fn = fn;
+    j->arg = arg;
+    js_job_push(js, j);
 }
 
 static void reaction_push(HpeJs *js, JsObj *p, JsValue on_ok, JsValue on_err, JsObj *result)
@@ -758,6 +778,94 @@ static void bind_target(HpeJs *js, JsEnv *env, JsNode *id, JsValue v, int declar
         assign_pattern(js, env, id, v);
 }
 
+/* Destructuring is implemented twice — once for declarations (`declare != 0`,
+ * routed through bind_target) and once for assignments — but the traversal is
+ * identical. `apply` is the single leaf operation; the helpers below share all
+ * the structural walking. The walkers take a 4-argument callback, so the
+ * declaration form of bind_pattern (which also carries `declare`) is reached
+ * through these two adapters. */
+static void pattern_bind_decl(HpeJs *js, JsEnv *env, JsNode *pat, JsValue value)
+{
+    bind_pattern(js, env, pat, value, 1);
+}
+
+static void pattern_bind_plain(HpeJs *js, JsEnv *env, JsNode *pat, JsValue value)
+{
+    bind_pattern(js, env, pat, value, 0);
+}
+
+/* `[a, b, ...rest]` over an iterable value */
+static void pattern_each_array(HpeJs *js, JsEnv *env, JsNode *pat, JsValue value,
+                               void (*apply)(HpeJs *, JsEnv *, JsNode *, JsValue))
+{
+    int i, n = pat->kid_count;
+
+    for (i = 0; i < n; i++) {
+        JsNode *el = pat->kids[i];
+        if (!el)
+            continue; /* elision: skip this index */
+        if (el->kind == JS_N_PAT_REST) {
+            JsObj *rest = js_array_new(js);
+            int k, len = js_iter_len(js, value);
+            for (k = i; k < len; k++)
+                array_push_value(js, rest, js_iter_at(js, value, k));
+            apply(js, env, el->kids[0], js_objval(rest));
+            break;
+        }
+        apply(js, env, el, js_iter_at(js, value, i));
+    }
+}
+
+/* `{a, b: c, ...rest}` over an object value; `exclude` (may be NULL) collects
+ * the keys already destructured so a following `...rest` can skip them */
+static void pattern_each_object(HpeJs *js, JsEnv *env, JsNode *pat, JsValue value, JsObj *exclude,
+                                void (*apply)(HpeJs *, JsEnv *, JsNode *, JsValue))
+{
+    int i;
+
+    for (i = 0; i < pat->kid_count; i++) {
+        JsNode *pair = pat->kids[i];
+        if (!pair)
+            continue;
+        if (pair->kind == JS_N_PAT_REST) {
+            JsObj *rest = js_object_new(js);
+            if (value.t == JS_OBJ && value.obj) {
+                char **keys;
+                int nk, k;
+                js_obj_own_keys(value.obj, &keys, &nk);
+                for (k = 0; k < nk; k++) {
+                    if (exclude && js_obj_own_has(exclude, keys[k]))
+                        continue;
+                    js_obj_set(js, rest, keys[k],
+                               member_get(js, env, value, keys[k], pair->line));
+                }
+                free(keys);
+            }
+            apply(js, env, pair->kids[0], js_objval(rest));
+            continue;
+        }
+        /* `{a}` stores the key in pair->str; a bare `{a: b}` nests under kids[0] */
+        if (pair->str && pair->str[0]) {
+            JsValue v = member_get(js, env, value, pair->str, pair->line);
+            if (exclude)
+                js_obj_set(js, exclude, pair->str, js_bool(1));
+            apply(js, env, pair->kids[0], v);
+        } else if (pair->kind == JS_N_ASSIGN) {
+            /* `{a = 1}` with no source property: the default is applied by the
+             * caller's JS_N_PAT_DEFAULT arm, so seed an undefined value here */
+            apply(js, env, pair->kids[0], js_undef());
+        }
+    }
+}
+
+/* a `= default` pattern substitutes the default only for `undefined` */
+static JsValue pattern_default_value(HpeJs *js, JsEnv *env, JsNode *pat, JsValue value)
+{
+    if (value.t == JS_UNDEF)
+        return eval_expr(js, env, pat->kids[1]);
+    return value;
+}
+
 static void bind_pattern(HpeJs *js, JsEnv *env, JsNode *pat, JsValue value, int declare)
 {
     if (!pat)
@@ -766,67 +874,19 @@ static void bind_pattern(HpeJs *js, JsEnv *env, JsNode *pat, JsValue value, int 
     case JS_N_IDENT:
         bind_target(js, env, pat, value, declare);
         return;
-    case JS_N_PAT_DEFAULT: {
-        JsValue v = value;
-        if (v.t == JS_UNDEF)
-            v = eval_expr(js, env, pat->kids[1]);
-        bind_pattern(js, env, pat->kids[0], v, declare);
+    case JS_N_PAT_DEFAULT:
+        bind_pattern(js, env, pat->kids[0], pattern_default_value(js, env, pat, value), declare);
         return;
-    }
     case JS_N_PAT_REST:
         bind_pattern(js, env, pat->kids[0], value, declare);
         return;
-    case JS_N_PAT_ARR: {
-        int i, n = pat->kid_count;
-        for (i = 0; i < n; i++) {
-            JsNode *el = pat->kids[i];
-            if (!el)
-                continue;
-            if (el->kind == JS_N_PAT_REST) {
-                JsObj *rest = js_array_new(js);
-                int k, len = js_iter_len(js, value);
-                for (k = i; k < len; k++)
-                    array_push_value(js, rest, js_iter_at(js, value, k));
-                bind_pattern(js, env, el->kids[0], js_objval(rest), declare);
-                break;
-            }
-            bind_pattern(js, env, el, js_iter_at(js, value, i), declare);
-        }
+    case JS_N_PAT_ARR:
+        pattern_each_array(js, env, pat, value, declare ? pattern_bind_decl : pattern_bind_plain);
         return;
-    }
-    case JS_N_PAT_OBJ: {
-        int i;
-        JsObj *rest_excluded = js_object_new(js);
-        for (i = 0; i < pat->kid_count; i++) {
-            JsNode *pair = pat->kids[i];
-            if (!pair)
-                continue;
-            if (pair->kind == JS_N_PAT_REST) {
-                JsObj *rest = js_object_new(js);
-                if (value.t == JS_OBJ && value.obj) {
-                    char **keys;
-                    int nk, k;
-                    js_obj_own_keys(value.obj, &keys, &nk);
-                    for (k = 0; k < nk; k++) {
-                        if (!js_obj_own_has(rest_excluded, keys[k]))
-                            js_obj_set(js, rest, keys[k],
-                                       member_get(js, env, value, keys[k], pair->line));
-                    }
-                    free(keys);
-                }
-                bind_pattern(js, env, pair->kids[0], js_objval(rest), declare);
-                continue;
-            }
-            if (pair->kind == JS_N_ASSIGN && pair->str && pair->str[0]) {
-                JsValue v = member_get(js, env, value, pair->str, pair->line);
-                js_obj_set(js, rest_excluded, pair->str, js_bool(1));
-                bind_pattern(js, env, pair->kids[0], v, declare);
-            } else if (pair->kind == JS_N_ASSIGN) {
-                bind_pattern(js, env, pair->kids[0], js_undef(), declare);
-            }
-        }
+    case JS_N_PAT_OBJ:
+        pattern_each_object(js, env, pat, value, js_object_new(js),
+                            declare ? pattern_bind_decl : pattern_bind_plain);
         return;
-    }
     default:
         assign_pattern(js, env, pat, value);
         return;
@@ -853,60 +913,18 @@ static void assign_pattern(HpeJs *js, JsEnv *env, JsNode *pat, JsValue value)
     case JS_N_MEMBER:
         assign_member(js, env, pat, value);
         return;
-    case JS_N_PAT_DEFAULT: {
-        JsValue v = value;
-        if (v.t == JS_UNDEF)
-            v = eval_expr(js, env, pat->kids[1]);
-        assign_pattern(js, env, pat->kids[0], v);
+    case JS_N_PAT_DEFAULT:
+        assign_pattern(js, env, pat->kids[0], pattern_default_value(js, env, pat, value));
         return;
-    }
     case JS_N_PAT_REST:
         assign_pattern(js, env, pat->kids[0], value);
         return;
-    case JS_N_PAT_ARR: {
-        int i, n = pat->kid_count;
-        for (i = 0; i < n; i++) {
-            JsNode *el = pat->kids[i];
-            if (!el)
-                continue;
-            if (el->kind == JS_N_PAT_REST) {
-                JsObj *rest = js_array_new(js);
-                int k, len = js_iter_len(js, value);
-                for (k = i; k < len; k++)
-                    array_push_value(js, rest, js_iter_at(js, value, k));
-                assign_pattern(js, env, el->kids[0], js_objval(rest));
-                break;
-            }
-            assign_pattern(js, env, el, js_iter_at(js, value, i));
-        }
+    case JS_N_PAT_ARR:
+        pattern_each_array(js, env, pat, value, assign_pattern);
         return;
-    }
-    case JS_N_PAT_OBJ: {
-        int i;
-        for (i = 0; i < pat->kid_count; i++) {
-            JsNode *pair = pat->kids[i];
-            if (!pair)
-                continue;
-            if (pair->kind == JS_N_PAT_REST) {
-                JsObj *rest = js_object_new(js);
-                if (value.t == JS_OBJ && value.obj) {
-                    char **keys;
-                    int nk, k;
-                    js_obj_own_keys(value.obj, &keys, &nk);
-                    for (k = 0; k < nk; k++)
-                        js_obj_set(js, rest, keys[k],
-                                   member_get(js, env, value, keys[k], pair->line));
-                    free(keys);
-                }
-                assign_pattern(js, env, pair->kids[0], js_objval(rest));
-                continue;
-            }
-            if (pair->str)
-                assign_pattern(js, env, pair->kids[0],
-                               member_get(js, env, value, pair->str, pair->line));
-        }
+    case JS_N_PAT_OBJ:
+        pattern_each_object(js, env, pat, value, NULL, assign_pattern);
         return;
-    }
     default:
         return;
     }
@@ -949,129 +967,166 @@ static JsValue js_instanceof(HpeJs *js, JsValue obj, JsValue ctor, int line)
     return js_bool(0);
 }
 
+/* `a + b` where at least one string-converted operand is a string */
+static JsValue bin_concat(HpeJs *js, JsValue l, JsValue r)
+{
+    char *ls = js_to_string(js, l);
+    char *rs = js_to_string(js, r);
+    size_t ll = strlen(ls), rl = strlen(rs);
+    char *out = (char *)hpe_js_alloc(js, ll + rl + 1);
+
+    memcpy(out, ls, ll);
+    memcpy(out + ll, rs, rl);
+    out[ll + rl] = '\0';
+    return js_string_len(js, out, ll + rl);
+}
+
+/* `&&`, `||` and `??` short-circuit and yield the deciding operand itself
+ * rather than a coerced boolean */
+static JsValue eval_logical(HpeJs *js, JsEnv *env, JsNode *n, int op)
+{
+    JsValue l = eval_expr(js, env, n->kids[0]);
+
+    if (op == JS_OP_AND)
+        return js_truthy(l) ? eval_expr(js, env, n->kids[1]) : l;
+    if (op == JS_OP_OR)
+        return js_truthy(l) ? l : eval_expr(js, env, n->kids[1]);
+    /* nullish coalescing: only null and undefined fall through */
+    return (l.t == JS_NULL || l.t == JS_UNDEF) ? eval_expr(js, env, n->kids[1]) : l;
+}
+
+/* `<`, `>`, `<=`, `>=`; string operands compare lexicographically, everything
+ * else numerically, and a NaN operand always yields false */
+static JsValue eval_relational(HpeJs *js, JsNode *n, JsValue l, JsValue r)
+{
+    int op = n->op;
+    int res;
+
+    if (l.t == JS_STR && r.t == JS_STR) {
+        int c = strcmp(l.str ? l.str : "", r.str ? r.str : "");
+        res = op == JS_OP_LT ? c < 0 : op == JS_OP_GT ? c > 0 : op == JS_OP_LE ? c <= 0 : c >= 0;
+        return js_bool(res);
+    }
+    {
+        double a = js_to_number(js, l), b = js_to_number(js, r);
+        if (a != a || b != b)
+            return js_bool(0);
+        res = op == JS_OP_LT ? a < b : op == JS_OP_GT ? a > b : op == JS_OP_LE ? a <= b : a >= b;
+    }
+    return js_bool(res);
+}
+
+/* arithmetic, bitwise and shift operators that reduce both operands to numbers */
+static JsValue eval_arithmetic(HpeJs *js, JsNode *n, JsValue l, JsValue r)
+{
+    switch (n->op) {
+    case JS_OP_SUB:
+        return js_num(js_to_number(js, l) - js_to_number(js, r));
+    case JS_OP_MUL:
+        return js_num(js_to_number(js, l) * js_to_number(js, r));
+    case JS_OP_DIV:
+        return js_num(js_to_number(js, l) / js_to_number(js, r));
+    case JS_OP_MOD: {
+        double b = js_to_number(js, r); /* x % 0 is NaN, unlike C's UB */
+        return js_num(b == 0.0 ? NAN : fmod(js_to_number(js, l), b));
+    }
+    case JS_OP_EXP:
+        return js_num(pow(js_to_number(js, l), js_to_number(js, r)));
+    case JS_OP_BAND:
+        return js_num((double)(to_i32(js, l) & to_i32(js, r)));
+    case JS_OP_BOR:
+        return js_num((double)(to_i32(js, l) | to_i32(js, r)));
+    case JS_OP_BXOR:
+        return js_num((double)(to_i32(js, l) ^ to_i32(js, r)));
+    case JS_OP_SHL:
+        return js_num((double)(to_i32(js, l) << (to_u32(js, r) & 31)));
+    case JS_OP_SHR:
+        return js_num((double)(to_i32(js, l) >> (to_u32(js, r) & 31)));
+    case JS_OP_USHR:
+        return js_num((double)(to_u32(js, l) >> (to_u32(js, r) & 31)));
+    default:
+        return js_undef();
+    }
+}
+
+/* `x in obj`: integer keys are formatted without a fractional part */
+static JsValue eval_in_operator(HpeJs *js, JsNode *n, JsValue l, JsValue r)
+{
+    if (r.t != JS_OBJ || !r.obj)
+        js_error(js, n->line, "cannot use 'in' operator on a non-object");
+    if (l.t == JS_NUM && l.num == (double)(long long)l.num) {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%lld", (long long)l.num);
+        return js_bool(js_obj_has(r.obj, buf));
+    }
+    return js_bool(js_obj_has(r.obj, js_to_string(js, l)));
+}
+
+/* `+`: string concatenation when either side is (or degrades to) a string,
+ * otherwise numeric addition. Objects are coerced via ToPrimitive first. */
+static JsValue bin_add(HpeJs *js, JsValue l, JsValue r)
+{
+    if (l.t == JS_STR || r.t == JS_STR)
+        return bin_concat(js, l, r);
+    if ((l.t == JS_OBJ && l.obj) || (r.t == JS_OBJ && r.obj)) {
+        JsValue lp = js_primitive_of(js, l);
+        JsValue rp = js_primitive_of(js, r);
+        if (lp.t == JS_STR || rp.t == JS_STR)
+            return bin_concat(js, lp, rp);
+        return js_num(js_to_number(js, lp) + js_to_number(js, rp));
+    }
+    return js_num(js_to_number(js, l) + js_to_number(js, r));
+}
+
 static JsValue eval_bin(HpeJs *js, JsEnv *env, JsNode *n)
 {
     int op = n->op;
-    if (op == JS_OP_AND) {
-        JsValue l = eval_expr(js, env, n->kids[0]);
-        if (!js_truthy(l))
-            return l;
-        return eval_expr(js, env, n->kids[1]);
-    }
-    if (op == JS_OP_OR) {
-        JsValue l = eval_expr(js, env, n->kids[0]);
-        if (js_truthy(l))
-            return l;
-        return eval_expr(js, env, n->kids[1]);
-    }
-    if (op == JS_OP_NULLISH) {
-        JsValue l = eval_expr(js, env, n->kids[0]);
-        if (l.t != JS_NULL && l.t != JS_UNDEF)
-            return l;
-        return eval_expr(js, env, n->kids[1]);
-    }
-    {
-        JsValue l = eval_expr(js, env, n->kids[0]);
-        JsValue r;
-        if (op == JS_OP_INSTANCEOF) {
-            r = eval_expr(js, env, n->kids[1]);
-            return js_instanceof(js, l, r, n->line);
-        }
+    JsValue l;
+    JsValue r;
+
+    if (op == JS_OP_AND || op == JS_OP_OR || op == JS_OP_NULLISH)
+        return eval_logical(js, env, n, op);
+
+    l = eval_expr(js, env, n->kids[0]);
+    if (op == JS_OP_INSTANCEOF) {
         r = eval_expr(js, env, n->kids[1]);
-        switch (op) {
-        case JS_OP_ADD: {
-            if (l.t == JS_STR || r.t == JS_STR) {
-                char *ls = js_to_string(js, l);
-                char *rs = js_to_string(js, r);
-                size_t ll = strlen(ls), rl = strlen(rs);
-                char *out = (char *)hpe_js_alloc(js, ll + rl + 1);
-                memcpy(out, ls, ll);
-                memcpy(out + ll, rs, rl);
-                out[ll + rl] = '\0';
-                return js_string_len(js, out, ll + rl);
-            }
-            if ((l.t == JS_OBJ && l.obj) || (r.t == JS_OBJ && r.obj)) {
-                JsValue lp = js_primitive_of(js, l);
-                JsValue rp = js_primitive_of(js, r);
-                if (lp.t == JS_STR || rp.t == JS_STR) {
-                    char *ls = js_to_string(js, lp);
-                    char *rs = js_to_string(js, rp);
-                    size_t ll = strlen(ls), rl = strlen(rs);
-                    char *out = (char *)hpe_js_alloc(js, ll + rl + 1);
-                    memcpy(out, ls, ll);
-                    memcpy(out + ll, rs, rl);
-                    out[ll + rl] = '\0';
-                    return js_string_len(js, out, ll + rl);
-                }
-                return js_num(js_to_number(js, lp) + js_to_number(js, rp));
-            }
-            return js_num(js_to_number(js, l) + js_to_number(js, r));
-        }
-        case JS_OP_SUB:
-            return js_num(js_to_number(js, l) - js_to_number(js, r));
-        case JS_OP_MUL:
-            return js_num(js_to_number(js, l) * js_to_number(js, r));
-        case JS_OP_DIV:
-            return js_num(js_to_number(js, l) / js_to_number(js, r));
-        case JS_OP_MOD: {
-            double a = js_to_number(js, l), b = js_to_number(js, r);
-            return js_num(b == 0.0 ? NAN : fmod(a, b));
-        }
-        case JS_OP_EXP:
-            return js_num(pow(js_to_number(js, l), js_to_number(js, r)));
-        case JS_OP_BAND:
-            return js_num((double)(to_i32(js, l) & to_i32(js, r)));
-        case JS_OP_BOR:
-            return js_num((double)(to_i32(js, l) | to_i32(js, r)));
-        case JS_OP_BXOR:
-            return js_num((double)(to_i32(js, l) ^ to_i32(js, r)));
-        case JS_OP_SHL:
-            return js_num((double)(to_i32(js, l) << (to_u32(js, r) & 31)));
-        case JS_OP_SHR:
-            return js_num((double)(to_i32(js, l) >> (to_u32(js, r) & 31)));
-        case JS_OP_USHR:
-            return js_num((double)(to_u32(js, l) >> (to_u32(js, r) & 31)));
-        case JS_OP_IN: {
-            if (r.t != JS_OBJ || !r.obj)
-                js_error(js, n->line, "cannot use 'in' operator on a non-object");
-            if (l.t == JS_NUM && l.num == (double)(long long)l.num) {
-                char buf[32];
-                snprintf(buf, sizeof(buf), "%lld", (long long)l.num);
-                return js_bool(js_obj_has(r.obj, buf));
-            }
-            return js_bool(js_obj_has(r.obj, js_to_string(js, l)));
-        }
-        case JS_OP_LT:
-        case JS_OP_GT:
-        case JS_OP_LE:
-        case JS_OP_GE: {
-            int res = 0;
-            if (l.t == JS_STR && r.t == JS_STR) {
-                int c = strcmp(l.str ? l.str : "", r.str ? r.str : "");
-                res = op == JS_OP_LT ? c < 0 : op == JS_OP_GT ? c > 0 : op == JS_OP_LE ? c <= 0
-                                                                                       : c >= 0;
-            } else {
-                double a = js_to_number(js, l), b = js_to_number(js, r);
-                if (a != a || b != b)
-                    return js_bool(0);
-                res = op == JS_OP_LT ? a < b : op == JS_OP_GT ? a > b : op == JS_OP_LE ? a <= b
-                                                                                        : a >= b;
-            }
-            return js_bool(res);
-        }
-        case JS_OP_EQ:
-            return js_bool(js_values_equal(js, l, r, 0));
-        case JS_OP_NEQ:
-            return js_bool(!js_values_equal(js, l, r, 0));
-        case JS_OP_SEQ:
-            return js_bool(js_values_equal(js, l, r, 1));
-        case JS_OP_SNEQ:
-            return js_bool(!js_values_equal(js, l, r, 1));
-        default:
-            js_error(js, n->line, "unsupported binary operator");
-        }
+        return js_instanceof(js, l, r, n->line);
     }
-    return js_undef();
+    r = eval_expr(js, env, n->kids[1]);
+    switch (op) {
+    case JS_OP_ADD:
+        return bin_add(js, l, r);
+    case JS_OP_LT:
+    case JS_OP_GT:
+    case JS_OP_LE:
+    case JS_OP_GE:
+        return eval_relational(js, n, l, r);
+    case JS_OP_EQ:
+        return js_bool(js_values_equal(js, l, r, 0));
+    case JS_OP_NEQ:
+        return js_bool(!js_values_equal(js, l, r, 0));
+    case JS_OP_SEQ:
+        return js_bool(js_values_equal(js, l, r, 1));
+    case JS_OP_SNEQ:
+        return js_bool(!js_values_equal(js, l, r, 1));
+    case JS_OP_IN:
+        return eval_in_operator(js, n, l, r);
+    case JS_OP_SUB:
+    case JS_OP_MUL:
+    case JS_OP_DIV:
+    case JS_OP_MOD:
+    case JS_OP_EXP:
+    case JS_OP_BAND:
+    case JS_OP_BOR:
+    case JS_OP_BXOR:
+    case JS_OP_SHL:
+    case JS_OP_SHR:
+    case JS_OP_USHR:
+        return eval_arithmetic(js, n, l, r);
+    default:
+        js_error(js, n->line, "unsupported binary operator");
+        return js_undef();
+    }
 }
 
 static JsValue read_target(HpeJs *js, JsEnv *env, JsNode *target)
@@ -1113,6 +1168,68 @@ static void write_target(HpeJs *js, JsEnv *env, JsNode *target, JsValue value)
     assign_pattern(js, env, target, value);
 }
 
+/* `a += b` etc.: the same operators as eval_bin, applied to the read-back lvalue
+ * and the RHS. `+=` concatenates when either operand is a string. */
+static JsValue eval_compound(HpeJs *js, JsNode *n, JsValue old, JsValue rhs)
+{
+    double a, b;
+
+    switch (n->op) {
+    case JS_OP_ADDA:
+        if (old.t == JS_STR || rhs.t == JS_STR)
+            return bin_concat(js, old, rhs);
+        return js_num(js_to_number(js, old) + js_to_number(js, rhs));
+    case JS_OP_SUBA:
+        return js_num(js_to_number(js, old) - js_to_number(js, rhs));
+    case JS_OP_MULA:
+        return js_num(js_to_number(js, old) * js_to_number(js, rhs));
+    case JS_OP_DIVA:
+        return js_num(js_to_number(js, old) / js_to_number(js, rhs));
+    case JS_OP_MODA:
+        a = js_to_number(js, old);
+        b = js_to_number(js, rhs);
+        return js_num(b == 0.0 ? NAN : fmod(a, b));
+    case JS_OP_EXPA:
+        return js_num(pow(js_to_number(js, old), js_to_number(js, rhs)));
+    case JS_OP_LSHA:
+        return js_num((double)(to_i32(js, old) << (to_u32(js, rhs) & 31)));
+    case JS_OP_RSHA:
+        return js_num((double)(to_i32(js, old) >> (to_u32(js, rhs) & 31)));
+    case JS_OP_URSHA:
+        return js_num((double)(to_u32(js, old) >> (to_u32(js, rhs) & 31)));
+    case JS_OP_BANDA:
+        return js_num((double)(to_i32(js, old) & to_i32(js, rhs)));
+    case JS_OP_BORA:
+        return js_num((double)(to_i32(js, old) | to_i32(js, rhs)));
+    case JS_OP_BXORA:
+        return js_num((double)(to_i32(js, old) ^ to_i32(js, rhs)));
+    default:
+        js_error(js, n->line, "unsupported assignment operator");
+        return js_undef();
+    }
+}
+
+/* `a ??= b` / `||=` / `&&=`: assign only when the current value is nullish /
+ * falsy / truthy respectively, and yield the untouched value otherwise */
+static JsValue eval_shortassign(HpeJs *js, JsEnv *env, JsNode *n, JsValue old)
+{
+    int skip;
+
+    if (n->op == JS_OP_ANDASSIGN)
+        skip = !js_truthy(old);
+    else if (n->op == JS_OP_ORASSIGN)
+        skip = js_truthy(old);
+    else
+        skip = (old.t != JS_NULL && old.t != JS_UNDEF);
+    if (skip)
+        return old;
+    {
+        JsValue value = eval_expr(js, env, n->kids[1]);
+        write_target(js, env, n->kids[0], value);
+        return value;
+    }
+}
+
 static JsValue eval_assign(HpeJs *js, JsEnv *env, JsNode *n)
 {
     JsNode *target = n->kids[0];
@@ -1122,80 +1239,14 @@ static JsValue eval_assign(HpeJs *js, JsEnv *env, JsNode *n)
         if (target->kind == JS_N_IDENT || target->kind == JS_N_MEMBER)
             write_target(js, env, target, value);
         else
-            assign_pattern(js, env, target, value);
+            assign_pattern(js, env, target, value); /* destructuring target */
         return value;
     }
-    if (n->op == JS_OP_ANDASSIGN || n->op == JS_OP_ORASSIGN || n->op == JS_OP_NULLASSIGN) {
-        JsValue old = read_target(js, env, target);
-        int skip = (n->op == JS_OP_ANDASSIGN)  ? !js_truthy(old)
-                   : (n->op == JS_OP_ORASSIGN) ? js_truthy(old)
-                                               : (old.t != JS_NULL && old.t != JS_UNDEF);
-        JsValue value;
-        if (skip)
-            return old;
-        value = eval_expr(js, env, n->kids[1]);
-        write_target(js, env, target, value);
-        return value;
-    }
+    if (n->op == JS_OP_ANDASSIGN || n->op == JS_OP_ORASSIGN || n->op == JS_OP_NULLASSIGN)
+        return eval_shortassign(js, env, n, read_target(js, env, target));
     {
-        JsValue old = read_target(js, env, target);
-        JsValue rhs = eval_expr(js, env, n->kids[1]);
-        JsValue value = js_undef();
-        double a, b;
-        switch (n->op) {
-        case JS_OP_ADDA:
-            if (old.t == JS_STR || rhs.t == JS_STR) {
-                char *ls = js_to_string(js, old);
-                char *rs = js_to_string(js, rhs);
-                size_t ll = strlen(ls), rl = strlen(rs);
-                char *out = (char *)hpe_js_alloc(js, ll + rl + 1);
-                memcpy(out, ls, ll);
-                memcpy(out + ll, rs, rl);
-                out[ll + rl] = '\0';
-                value = js_string_len(js, out, ll + rl);
-            } else {
-                value = js_num(js_to_number(js, old) + js_to_number(js, rhs));
-            }
-            break;
-        case JS_OP_SUBA:
-            value = js_num(js_to_number(js, old) - js_to_number(js, rhs));
-            break;
-        case JS_OP_MULA:
-            value = js_num(js_to_number(js, old) * js_to_number(js, rhs));
-            break;
-        case JS_OP_DIVA:
-            value = js_num(js_to_number(js, old) / js_to_number(js, rhs));
-            break;
-        case JS_OP_MODA:
-            a = js_to_number(js, old);
-            b = js_to_number(js, rhs);
-            value = js_num(b == 0.0 ? NAN : fmod(a, b));
-            break;
-        case JS_OP_EXPA:
-            value = js_num(pow(js_to_number(js, old), js_to_number(js, rhs)));
-            break;
-        case JS_OP_LSHA:
-            value = js_num((double)(to_i32(js, old) << (to_u32(js, rhs) & 31)));
-            break;
-        case JS_OP_RSHA:
-            value = js_num((double)(to_i32(js, old) >> (to_u32(js, rhs) & 31)));
-            break;
-        case JS_OP_URSHA:
-            value = js_num((double)(to_u32(js, old) >> (to_u32(js, rhs) & 31)));
-            break;
-        case JS_OP_BANDA:
-            value = js_num((double)(to_i32(js, old) & to_i32(js, rhs)));
-            break;
-        case JS_OP_BORA:
-            value = js_num((double)(to_i32(js, old) | to_i32(js, rhs)));
-            break;
-        case JS_OP_BXORA:
-            value = js_num((double)(to_i32(js, old) ^ to_i32(js, rhs)));
-            break;
-        default:
-            js_error(js, n->line, "unsupported assignment operator");
-            break;
-        }
+        JsValue value = eval_compound(js, n, read_target(js, env, target),
+                                      eval_expr(js, env, n->kids[1]));
         write_target(js, env, target, value);
         return value;
     }
@@ -1260,13 +1311,113 @@ static int class_member_kind(JsNode *m)
     }
 }
 
+/* the four `static` member kinds install on the constructor; the rest go on the
+ * prototype */
+static int class_is_static_kind(int kind)
+{
+    return kind == K_STATIC_METHOD || kind == K_STATIC_GET || kind == K_STATIC_SET ||
+           kind == K_STATIC_FIELD;
+}
+
+/* bind one class member onto the prototype or the constructor, depending on the
+ * member kind */
+static void class_install_member(HpeJs *js, JsEnv *env, JsNode *m, JsObj *proto, JsObj *ctor)
+{
+    int kind = class_member_kind(m);
+    JsObj *home = class_is_static_kind(kind) ? ctor : proto;
+
+    switch (kind) {
+    case K_CTOR:
+        break; /* the constructor is installed by class_eval itself */
+    case K_METHOD:
+    case K_STATIC_METHOD:
+        js_obj_set(js, home, m->str, make_method_home(js, env, m, home));
+        break;
+    case K_GET:
+    case K_STATIC_GET:
+        js_obj_set_accessor(js, home, m->str, make_method_home(js, env, m, home), js_undef());
+        break;
+    case K_SET:
+    case K_STATIC_SET:
+        js_obj_set_accessor(js, home, m->str, js_undef(), make_method_home(js, env, m, home));
+        break;
+    case K_STATIC_FIELD: {
+        JsValue v = (m->kid_count > 0 && m->kids[0]) ? eval_expr(js, env, m->kids[0]) : js_undef();
+        js_obj_set(js, home, m->str, v);
+        break;
+    }
+    case K_STATIC_BLOCK: {
+        /* `static { ... }` runs with `this` bound to the constructor */
+        JsEnv *senv = js_env_new(js, env);
+        senv->has_this = 1;
+        senv->thisv = js_objval(ctor);
+        exec_stmt(js, senv, m);
+        break;
+    }
+    default:
+        break; /* instance fields are applied per instance, not here */
+    }
+}
+
+/* find the explicit `constructor(...)` member, or NULL when the class body
+ * omits one */
+static JsNode *class_find_ctor_node(JsNode *members)
+{
+    int i;
+
+    if (!members)
+        return NULL;
+    for (i = 0; i < members->kid_count; i++) {
+        JsNode *m = members->kids[i];
+
+        if (m && m->kind == JS_N_FUNC && class_member_kind(m) == K_CTOR)
+            return m;
+    }
+    return NULL;
+}
+
+/* a class without an explicit constructor gets a synthetic one so that `new`
+ * and `super()` still have a function object to run */
+static JsObj *class_synth_ctor(HpeJs *js, JsEnv *env, JsNode *n, JsObj *proto)
+{
+    JsNode *fn_node = js_node_new(js, JS_N_FUNC, n->line);
+    JsNode *params = js_node_new(js, JS_N_BLOCK, n->line);
+    JsNode *body = js_node_new(js, JS_N_BLOCK, n->line);
+    JsObj *ctor;
+
+    fn_node->op = FN_CLASS | FN_CTOR;
+    fn_node->str = n->str ? n->str : "constructor";
+    js_node_add(js, fn_node, params);
+    js_node_add(js, fn_node, body);
+    ctor = js_func_new(js, fn_node, env);
+    ctor->class_def = n;
+    ctor->home = proto;
+    return ctor;
+}
+
+static void class_install_members(HpeJs *js, JsEnv *env, JsNode *members, JsObj *proto,
+                                  JsObj *ctor)
+{
+    int i;
+
+    if (!members)
+        return;
+    for (i = 0; i < members->kid_count; i++) {
+        JsNode *m = members->kids[i];
+
+        if (!m || class_member_kind(m) == K_CTOR)
+            continue;
+        class_install_member(js, env, m, proto, ctor);
+    }
+}
+
 static JsValue class_eval(HpeJs *js, JsEnv *env, JsNode *n)
 {
     JsNode *members = n->kid_count > 1 ? n->kids[1] : NULL;
     JsValue super_v = n->kids[0] ? eval_expr(js, env, n->kids[0]) : js_undef();
-    JsObj *ctor = NULL;
     JsObj *proto = js_object_raw(js);
-    int i;
+    JsObj *ctor = NULL;
+    JsNode *ctor_node;
     int derived = (super_v.t == JS_OBJ && super_v.obj &&
                    member_get(js, NULL, super_v, "prototype", n->line).t == JS_OBJ);
 
@@ -1274,29 +1425,14 @@ static JsValue class_eval(HpeJs *js, JsEnv *env, JsNode *n)
     proto->proto = derived ? member_get(js, NULL, super_v, "prototype", n->line).obj
                            : js->object_proto;
 
-    if (members) {
-        for (i = 0; i < members->kid_count; i++) {
-            JsNode *m = members->kids[i];
-            if (m && m->kind == JS_N_FUNC && class_member_kind(m) == K_CTOR) {
-                ctor = js_func_new(js, m, env);
-                ctor->fn_flags = m->op;
-                ctor->class_def = n;
-                ctor->home = proto;
-                break;
-            }
-        }
-    }
-    if (!ctor) {
-        JsNode *fn_node = js_node_new(js, JS_N_FUNC, n->line);
-        JsNode *params = js_node_new(js, JS_N_BLOCK, n->line);
-        JsNode *body = js_node_new(js, JS_N_BLOCK, n->line);
-        fn_node->op = FN_CLASS | FN_CTOR;
-        fn_node->str = n->str ? n->str : "constructor";
-        js_node_add(js, fn_node, params);
-        js_node_add(js, fn_node, body);
-        ctor = js_func_new(js, fn_node, env);
+    ctor_node = class_find_ctor_node(members);
+    if (ctor_node) {
+        ctor = js_func_new(js, ctor_node, env);
+        ctor->fn_flags = ctor_node->op;
         ctor->class_def = n;
         ctor->home = proto;
+    } else {
+        ctor = class_synth_ctor(js, env, n, proto);
     }
     ctor->name = n->str ? n->str : "constructor";
     ctor->class_def = n;
@@ -1307,56 +1443,7 @@ static JsValue class_eval(HpeJs *js, JsEnv *env, JsNode *n)
     if (derived)
         ctor->proto = super_v.obj; /* static inheritance */
 
-    if (members) {
-        for (i = 0; i < members->kid_count; i++) {
-            JsNode *m = members->kids[i];
-            int kind;
-            if (!m)
-                continue;
-            kind = class_member_kind(m);
-            switch (kind) {
-            case K_CTOR:
-                break;
-            case K_METHOD:
-                js_obj_set(js, proto, m->str, make_method_home(js, env, m, proto));
-                break;
-            case K_GET:
-                js_obj_set_accessor(js, proto, m->str, make_method_home(js, env, m, proto),
-                                    js_undef());
-                break;
-            case K_SET:
-                js_obj_set_accessor(js, proto, m->str, js_undef(),
-                                    make_method_home(js, env, m, proto));
-                break;
-            case K_STATIC_METHOD:
-                js_obj_set(js, ctor, m->str, make_method_home(js, env, m, ctor));
-                break;
-            case K_STATIC_GET:
-                js_obj_set_accessor(js, ctor, m->str, make_method_home(js, env, m, ctor),
-                                    js_undef());
-                break;
-            case K_STATIC_SET:
-                js_obj_set_accessor(js, ctor, m->str, js_undef(),
-                                    make_method_home(js, env, m, ctor));
-                break;
-            case K_STATIC_FIELD: {
-                JsValue v = (m->kid_count > 0 && m->kids[0]) ? eval_expr(js, env, m->kids[0])
-                                                             : js_undef();
-                js_obj_set(js, ctor, m->str, v);
-                break;
-            }
-            case K_STATIC_BLOCK: {
-                JsEnv *senv = js_env_new(js, env);
-                senv->has_this = 1;
-                senv->thisv = js_objval(ctor);
-                exec_stmt(js, senv, m);
-                break;
-            }
-            default:
-                break; /* instance fields applied per instance */
-            }
-        }
-    }
+    class_install_members(js, env, members, proto, ctor);
     if (n->str)
         js_env_declare(js, env, n->str, js_objval(ctor));
     return js_objval(ctor);
@@ -1483,16 +1570,90 @@ static JsValue eval_super_member(HpeJs *js, JsEnv *env, JsNode *n)
 
 /* calls super(...) inside a derived constructor: runs the parent constructor
  * against the instance that is already bound to `this` */
+/* calls super(...) inside a derived constructor: runs the parent constructor
+ * against the instance that is already bound to `this` */
+/* growable argument vector shared by call / new / super(...) */
+typedef struct {
+    JsValue *items;
+    int count;
+    int cap;
+} ArgList;
+
+static void args_init(ArgList *al, HpeJs *js, int cap)
+{
+    if (cap < 1)
+        cap = 1;
+    al->cap = cap;
+    al->count = 0;
+    al->items = (JsValue *)hpe_js_alloc(js, (size_t)cap * sizeof(JsValue));
+}
+
+/* geometric-ish growth (+8) keeps the inner spread loop cheap */
+static void args_push(ArgList *al, HpeJs *js, JsValue v)
+{
+    if (al->count >= al->cap) {
+        int ncap = al->cap + 8;
+        JsValue *bigger = (JsValue *)hpe_js_alloc(js, (size_t)ncap * sizeof(JsValue));
+        memcpy(bigger, al->items, (size_t)al->count * sizeof(JsValue));
+        al->items = bigger;
+        al->cap = ncap;
+    }
+    al->items[al->count++] = v;
+}
+
+/* evaluates the argument nodes from `first` onward, flattening spread elements
+ * through the iterator protocol so calls and constructors share one code path */
+static void args_build(ArgList *al, HpeJs *js, JsEnv *env, JsNode *n, int first)
+{
+    int i;
+    for (i = first; i < n->kid_count; i++) {
+        JsNode *a = n->kids[i];
+        if (a && a->kind == JS_N_SPREAD) {
+            JsValue v = eval_expr(js, env, a->kids[0]);
+            int k, len = js_iter_len(js, v);
+            for (k = 0; k < len; k++)
+                args_push(al, js, js_iter_at(js, v, k));
+        } else {
+            args_push(al, js, eval_expr(js, env, a));
+        }
+    }
+}
+
+/* resolves the callee and its `this` binding. A method call binds `this` to the
+ * base object; `super.m()` binds the class's own `this`. Returns 0 only when an
+ * optional call (`?.`) short-circuits on a null/undefined callee. */
+static int eval_callee(HpeJs *js, JsEnv *env, JsNode *n, JsNode *callee_node, JsValue *callee,
+                       JsValue *thisv)
+{
+    if (callee_node->kind == JS_N_MEMBER) {
+        JsValue base = eval_expr(js, env, callee_node->kids[0]);
+        char *prop = callee_node->op == JS_OP_DOT
+                         ? callee_node->str
+                         : js_to_string(js, eval_expr(js, env, callee_node->kids[1]));
+        if (n->op == 1 && (base.t == JS_NULL || base.t == JS_UNDEF))
+            return 0;
+        *callee = member_get(js, env, base, prop, callee_node->line);
+        *thisv = base;
+    } else if (callee_node->kind == JS_N_SUPER_MEMBER) {
+        JsEnv *te = js_env_this_env(env);
+        *callee = eval_super_member(js, env, callee_node);
+        *thisv = te ? te->thisv : js_undef();
+    } else {
+        *callee = eval_expr(js, env, callee_node);
+    }
+    if (n->op == 1 && (callee->t == JS_NULL || callee->t == JS_UNDEF))
+        return 0;
+    return 1;
+}
+
 static JsValue super_call(HpeJs *js, JsEnv *env, JsNode *n)
 {
     JsEnv *e = env;
     JsObj *home = NULL;
     JsValue this_v = js_undef();
-    JsValue *args = NULL;
-    int argc = 0, capacity = n->kid_count > 0 ? n->kid_count : 1;
-    int i;
     JsValue parent_v;
     JsValue out;
+    ArgList al;
 
     while (e && !e->has_home)
         e = e->parent;
@@ -1507,34 +1668,9 @@ static JsValue super_call(HpeJs *js, JsEnv *env, JsNode *n)
     if (!js_is_callable(parent_v))
         js_error(js, n->line, "super class has no constructor");
 
-    args = (JsValue *)hpe_js_alloc(js, (size_t)capacity * sizeof(JsValue));
-    for (i = 0; i < n->kid_count; i++) {
-        JsNode *a = n->kids[i];
-        if (a && a->kind == JS_N_SPREAD) {
-            JsValue v = eval_expr(js, env, a->kids[0]);
-            int k, len = js_iter_len(js, v);
-            for (k = 0; k < len; k++) {
-                if (argc >= capacity) {
-                    JsValue *bigger =
-                        (JsValue *)hpe_js_alloc(js, (size_t)(capacity + 8) * sizeof(JsValue));
-                    memcpy(bigger, args, (size_t)argc * sizeof(JsValue));
-                    args = bigger;
-                    capacity += 8;
-                }
-                args[argc++] = js_iter_at(js, v, k);
-            }
-        } else {
-            if (argc >= capacity) {
-                JsValue *bigger =
-                    (JsValue *)hpe_js_alloc(js, (size_t)(capacity + 8) * sizeof(JsValue));
-                memcpy(bigger, args, (size_t)argc * sizeof(JsValue));
-                args = bigger;
-                capacity += 8;
-            }
-            args[argc++] = eval_expr(js, env, a);
-        }
-    }
-    out = run_ctor_body(js, parent_v.obj, this_v, args, argc, 1);
+    args_init(&al, js, n->kid_count > 0 ? n->kid_count : 1);
+    args_build(&al, js, env, n, 0);
+    out = run_ctor_body(js, parent_v.obj, this_v, al.items, al.count, 1);
     if (out.t == JS_OBJ)
         return out;
     return this_v;
@@ -1543,300 +1679,315 @@ static JsValue super_call(HpeJs *js, JsEnv *env, JsNode *n)
 static JsValue eval_call(HpeJs *js, JsEnv *env, JsNode *n)
 {
     JsNode *callee_node = n->kids[0];
-    JsValue callee;
+    JsValue callee = js_undef();
     JsValue thisv = js_undef();
-    JsValue *args = NULL;
-    int argc = 0, capacity = n->kid_count > 1 ? n->kid_count : 1;
-    int i;
+    ArgList al;
 
     if (callee_node->kind == JS_N_SUPER_CALL)
         return super_call(js, env, callee_node);
-
-    if (callee_node->kind == JS_N_MEMBER) {
-        JsValue base = eval_expr(js, env, callee_node->kids[0]);
-        char *prop = callee_node->op == JS_OP_DOT
-                         ? callee_node->str
-                         : js_to_string(js, eval_expr(js, env, callee_node->kids[1]));
-        if (n->op == 1 && (base.t == JS_NULL || base.t == JS_UNDEF))
-            return js_undef();
-        callee = member_get(js, env, base, prop, callee_node->line);
-        thisv = base;
-    } else if (callee_node->kind == JS_N_SUPER_MEMBER) {
-        JsValue base = eval_super_member(js, env, callee_node);
-        JsEnv *te = js_env_this_env(env);
-        callee = base;
-        thisv = te ? te->thisv : js_undef();
-    } else {
-        callee = eval_expr(js, env, callee_node);
-    }
-    if (n->op == 1 && (callee.t == JS_NULL || callee.t == JS_UNDEF))
+    if (!eval_callee(js, env, n, callee_node, &callee, &thisv))
         return js_undef();
-
-    args = (JsValue *)hpe_js_alloc(js, (size_t)capacity * sizeof(JsValue));
-    for (i = 1; i < n->kid_count; i++) {
-        JsNode *a = n->kids[i];
-        if (a && a->kind == JS_N_SPREAD) {
-            JsValue v = eval_expr(js, env, a->kids[0]);
-            int k, len = js_iter_len(js, v);
-            for (k = 0; k < len; k++) {
-                if (argc >= capacity) {
-                    JsValue *bigger =
-                        (JsValue *)hpe_js_alloc(js, (size_t)(capacity + 8) * sizeof(JsValue));
-                    memcpy(bigger, args, (size_t)argc * sizeof(JsValue));
-                    args = bigger;
-                    capacity += 8;
-                }
-                args[argc++] = js_iter_at(js, v, k);
-            }
-        } else {
-            if (argc >= capacity) {
-                JsValue *bigger =
-                    (JsValue *)hpe_js_alloc(js, (size_t)(capacity + 8) * sizeof(JsValue));
-                memcpy(bigger, args, (size_t)argc * sizeof(JsValue));
-                args = bigger;
-                capacity += 8;
-            }
-            args[argc++] = eval_expr(js, env, a);
-        }
-    }
-    return call_value(js, env, callee, thisv, args, argc, n->line);
+    args_init(&al, js, n->kid_count > 1 ? n->kid_count : 1);
+    args_build(&al, js, env, n, 1);
+    return call_value(js, env, callee, thisv, al.items, al.count, n->line);
 }
 
 static JsValue eval_new(HpeJs *js, JsEnv *env, JsNode *n)
 {
     JsNode *callee_node = n->kids[0];
     JsValue callee;
-    JsValue *args = NULL;
-    int argc = 0, capacity = 1, i;
+    ArgList al;
 
     if (callee_node->kind == JS_N_CALL) {
         callee = eval_expr(js, env, callee_node->kids[0]);
-        capacity = callee_node->kid_count > 1 ? callee_node->kid_count : 1;
-        args = (JsValue *)hpe_js_alloc(js, (size_t)capacity * sizeof(JsValue));
-        for (i = 1; i < callee_node->kid_count; i++) {
-            JsNode *a = callee_node->kids[i];
-            if (a && a->kind == JS_N_SPREAD) {
-                JsValue v = eval_expr(js, env, a->kids[0]);
-                int k, len = js_iter_len(js, v);
-                for (k = 0; k < len; k++) {
-                    if (argc >= capacity) {
-                        JsValue *bigger = (JsValue *)hpe_js_alloc(
-                            js, (size_t)(capacity + 8) * sizeof(JsValue));
-                        memcpy(bigger, args, (size_t)argc * sizeof(JsValue));
-                        args = bigger;
-                        capacity += 8;
-                    }
-                    args[argc++] = js_iter_at(js, v, k);
-                }
-            } else {
-                if (argc >= capacity) {
-                    JsValue *bigger =
-                        (JsValue *)hpe_js_alloc(js, (size_t)(capacity + 8) * sizeof(JsValue));
-                    memcpy(bigger, args, (size_t)argc * sizeof(JsValue));
-                    args = bigger;
-                    capacity += 8;
-                }
-                args[argc++] = eval_expr(js, env, a);
-            }
-        }
-    } else if (callee_node->kind == JS_N_MEMBER) {
-        callee = eval_member(js, env, callee_node);
-    } else {
-        callee = eval_expr(js, env, callee_node);
+        args_init(&al, js, callee_node->kid_count > 1 ? callee_node->kid_count : 1);
+        args_build(&al, js, env, callee_node, 1);
+        return js_construct(js, callee, al.items, al.count, n->line);
     }
-    return js_construct(js, callee, args, argc, n->line);
+    if (callee_node->kind == JS_N_MEMBER)
+        callee = eval_member(js, env, callee_node);
+    else
+        callee = eval_expr(js, env, callee_node);
+    return js_construct(js, callee, NULL, 0, n->line);
 }
+
+/* `typeof` result name for a runtime value, per the JS type table */
+static const char *typeof_name(JsValue v)
+{
+    switch (v.t) {
+    case JS_UNDEF:
+        return "undefined";
+    case JS_NULL:
+        return "object";
+    case JS_BOOL:
+        return "boolean";
+    case JS_NUM:
+        return "number";
+    case JS_STR:
+        return "string";
+    case JS_OBJ:
+        return js_is_callable(v) ? "function" : "object";
+    default:
+        return "undefined";
+    }
+}
+
+/* `delete obj.prop` / `delete obj[key]` / `delete someVar`: a failed delete of
+ * a non-configurable property is reported as success, matching the sloppy-mode
+ * behaviour the rest of the interpreter assumes. */
+static JsValue eval_delete(HpeJs *js, JsEnv *env, JsNode *target)
+{
+    if (target->kind == JS_N_MEMBER) {
+        JsValue base = eval_expr(js, env, target->kids[0]);
+        char *prop = target->op == JS_OP_DOT
+                         ? target->str
+                         : js_to_string(js, eval_expr(js, env, target->kids[1]));
+        if (base.t == JS_OBJ && base.obj)
+            js_obj_delete(js, base.obj, prop);
+        return js_bool(1);
+    }
+    if (target->kind == JS_N_IDENT) {
+        JsValue *slot = js_env_lookup(env, target->str);
+        if (slot)
+            *slot = js_undef();
+    }
+    return js_bool(1);
+}
+
+/* the four unary operators that are not `delete`/`typeof` */
+static JsValue eval_unary_arithmetic(HpeJs *js, JsNode *n, JsValue v)
+{
+    if (n->op == JS_OP_NOT)
+        return js_bool(!js_truthy(v));
+    if (n->op == JS_OP_VOID)
+        return js_undef();
+    if (n->op == JS_OP_NEG)
+        return js_num(-js_to_number(js, v));
+    if (n->op == JS_OP_POS)
+        return js_num(js_to_number(js, v));
+    if (n->op == JS_OP_BNOT)
+        return js_num((double)(~to_i32(js, v)));
+    return js_undef();
+}
+
+/* `[...a, b]`: spreads iterate the operand, holes and plain elements push as-is */
+static JsValue eval_array_literal(HpeJs *js, JsEnv *env, JsNode *n)
+{
+    JsObj *arr = js_array_new(js);
+    int i;
+
+    for (i = 0; i < n->kid_count; i++) {
+        JsNode *item = n->kids[i];
+        if (!item) {
+            array_push_value(js, arr, js_undef());
+            continue;
+        }
+        if (item->kind == JS_N_SPREAD) {
+            JsValue v = eval_expr(js, env, item->kids[0]);
+            int k, len = js_iter_len(js, v);
+            for (k = 0; k < len; k++)
+                array_push_value(js, arr, js_iter_at(js, v, k));
+        } else {
+            array_push_value(js, arr, eval_expr(js, env, item));
+        }
+    }
+    return js_objval(arr);
+}
+
+/* `await expr`: settle the promise job queue, then unwrap or rethrow */
+static JsValue eval_await(HpeJs *js, JsEnv *env, JsNode *n)
+{
+    JsValue v = eval_expr(js, env, n->kids[0]);
+
+    if (v.t == JS_OBJ && v.obj && v.obj->kind == JS_OBJ_PROMISE) {
+        hpe_js_drain_jobs(js);
+        if (v.obj->promise_state == 2)
+            js_throw_value(js, v.obj->promise_value);
+        return v.obj->promise_value;
+    }
+    return v;
+}
+
+/* `yield` / `yield*`: values are collected into the driver's yield sink */
+static JsValue eval_yield(HpeJs *js, JsEnv *env, JsNode *n, int delegate)
+{
+    JsValue v = n->kids[0] ? eval_expr(js, env, n->kids[0]) : js_undef();
+
+    if (js->yield_sink) {
+        if (delegate) {
+            int k, len = js_iter_len(js, v);
+            for (k = 0; k < len; k++)
+                array_push_value(js, js->yield_sink, js_iter_at(js, v, k));
+        } else {
+            array_push_value(js, js->yield_sink, v);
+        }
+    }
+    return js_undef();
+}
+
+/* resolve an identifier: the innermost binding, then the global object's
+ * properties (so `Math`, `undefined` etc. resolve), else a ReferenceError */
+static JsValue eval_ident(HpeJs *js, JsEnv *env, JsNode *n)
+{
+    JsValue *slot = js_env_lookup(env, n->str);
+
+    if (slot)
+        return *slot;
+    if (js_obj_has(js->global_obj, n->str))
+        return js_obj_get(js, js->global_obj, n->str);
+    js_error(js, n->line, "%s is not defined", n->str);
+    return js_undef();
+}
+
+/* `this` resolves to the nearest enclosing environment that bound one, falling
+ * back to the global object at the top level */
+static JsValue eval_this(HpeJs *js, JsEnv *env)
+{
+    JsEnv *e = env;
+
+    while (e && !e->has_this)
+        e = e->parent;
+    if (!e)
+        return js_objval(js->global_obj);
+    return e->thisv;
+}
+
+/* the comma operator: evaluate left to right, yield the last value */
+static JsValue eval_seq(HpeJs *js, JsEnv *env, JsNode *n)
+{
+    JsValue v = js_undef();
+    int i;
+
+    for (i = 0; i < n->kid_count; i++)
+        v = eval_expr(js, env, n->kids[i]);
+    return v;
+}
+
+/* `++`/`--`: read, compute, write back, and yield either the old (postfix) or
+ * the new (prefix) value */
+static JsValue eval_update(HpeJs *js, JsEnv *env, JsNode *n)
+{
+    JsNode *target = n->kids[0];
+    JsValue old = read_target(js, env, target);
+    double onum = js_to_number(js, old);
+    int is_inc = (n->op == JS_OP_PREINC || n->op == JS_OP_POSTINC);
+    int is_pre = (n->op == JS_OP_PREINC || n->op == JS_OP_PREDEC);
+    double nnum = is_inc ? onum + 1.0 : onum - 1.0;
+
+    write_target(js, env, target, js_num(nnum));
+    return js_num(is_pre ? nnum : onum);
+}
+
+static JsValue eval_unary(HpeJs *js, JsEnv *env, JsNode *n)
+{
+    if (n->op == JS_OP_DELETE)
+        return eval_delete(js, env, n->kids[0]);
+    if (n->op == JS_OP_TYPEOF)
+        return js_string(js, typeof_name(eval_expr(js, env, n->kids[0])));
+    return eval_unary_arithmetic(js, n, eval_expr(js, env, n->kids[0]));
+}
+
+/* one arm of the expression dispatch: a literal-valued node kind */
+static JsValue eval_literal(HpeJs *js, JsNode *n, const char *s)
+{
+    if (n->kind == JS_N_STR)
+        return js_string(js, s ? s : "");
+    if (n->kind == JS_N_NUM)
+        return js_num(n->num);
+    if (n->kind == JS_N_TRUE)
+        return js_bool(1);
+    if (n->kind == JS_N_FALSE)
+        return js_bool(0);
+    return js_null();
+}
+
+typedef JsValue (*EvalFn)(HpeJs *js, JsEnv *env, JsNode *n);
+
+static JsValue eval_this_node(HpeJs *js, JsEnv *env, JsNode *n)
+{
+    HPE_UNUSED(n);
+    return eval_this(js, env);
+}
+
+static JsValue eval_ternary(HpeJs *js, JsEnv *env, JsNode *n)
+{
+    return js_truthy(eval_expr(js, env, n->kids[0])) ? eval_expr(js, env, n->kids[1])
+                                                     : eval_expr(js, env, n->kids[2]);
+}
+
+static JsValue eval_regex_node(HpeJs *js, JsEnv *env, JsNode *n)
+{
+    /* the parser packs the pattern and its flags into one buffer */
+    const char *pat = n->str ? n->str : "";
+
+    HPE_UNUSED(env);
+    return js_regex_new(js, pat, pat + strlen(pat) + 1);
+}
+
+static JsValue eval_spread(HpeJs *js, JsEnv *env, JsNode *n)
+{
+    return eval_expr(js, env, n->kids[0]);
+}
+
+static JsValue eval_yield_node(HpeJs *js, JsEnv *env, JsNode *n)
+{
+    return eval_yield(js, env, n, n->op == 1);
+}
+
+/* `{ }` as an expression yields undefined; used for the empty statement body */
+static JsValue eval_empty_expr(HpeJs *js, JsEnv *env, JsNode *n)
+{
+    HPE_UNUSED(js);
+    HPE_UNUSED(env);
+    HPE_UNUSED(n);
+    return js_undef();
+}
+
+/* node kind -> evaluator. Literal kinds are resolved before this table so this
+ * one only carries nodes that need evaluation. */
+static const struct {
+    int kind;
+    EvalFn fn;
+} k_eval_table[] = {
+    { JS_N_IDENT, eval_ident },          { JS_N_THIS, eval_this_node },
+    { JS_N_ARRAY, eval_array_literal },  { JS_N_OBJECT, object_literal },
+    { JS_N_TEMPLATE, template_eval },    { JS_N_BIN, eval_bin },
+    { JS_N_UN, eval_unary },             { JS_N_TERNARY, eval_ternary },
+    { JS_N_SEQ, eval_seq },              { JS_N_ASSIGN, eval_assign },
+    { JS_N_MEMBER, eval_member },        { JS_N_SUPER_MEMBER, eval_super_member },
+    { JS_N_SUPER_CALL, super_call },     { JS_N_CALL, eval_call },
+    { JS_N_NEW, eval_new },              { JS_N_REGEX, eval_regex_node },
+    { JS_N_AWAIT, eval_await },          { JS_N_YIELD, eval_yield_node },
+    { JS_N_FUNC, make_method },          { JS_N_SPREAD, eval_spread },
+    { JS_N_UPDATE, eval_update },        { JS_N_CLASS, class_eval },
+    { JS_N_BLOCK, eval_empty_expr },
+};
 
 static JsValue eval_expr(HpeJs *js, JsEnv *env, JsNode *n)
 {
+    size_t i;
+
     if (!n)
         return js_undef();
+
+    /* literal nodes carry no side effects, so they share one entry point */
     switch (n->kind) {
     case JS_N_NUM:
-        return js_num(n->num);
     case JS_N_STR:
-        return js_string(js, n->str ? n->str : "");
-    case JS_N_IDENT: {
-        JsValue *slot = js_env_lookup(env, n->str);
-        if (slot)
-            return *slot;
-        if (js_obj_has(js->global_obj, n->str))
-            return js_obj_get(js, js->global_obj, n->str);
-        js_error(js, n->line, "%s is not defined", n->str);
-        return js_undef();
-    }
-    case JS_N_THIS: {
-        JsEnv *e = env;
-        while (e && !e->has_this)
-            e = e->parent;
-        if (!e)
-            return js_objval(js->global_obj);
-        return e->thisv;
-    }
     case JS_N_TRUE:
-        return js_bool(1);
     case JS_N_FALSE:
-        return js_bool(0);
     case JS_N_NULL:
-        return js_null();
-    case JS_N_ARRAY: {
-        JsObj *arr = js_array_new(js);
-        int i;
-        for (i = 0; i < n->kid_count; i++) {
-            JsNode *item = n->kids[i];
-            if (!item) {
-                array_push_value(js, arr, js_undef());
-                continue;
-            }
-            if (item->kind == JS_N_SPREAD) {
-                JsValue v = eval_expr(js, env, item->kids[0]);
-                int k, len = js_iter_len(js, v);
-                for (k = 0; k < len; k++)
-                    array_push_value(js, arr, js_iter_at(js, v, k));
-            } else {
-                array_push_value(js, arr, eval_expr(js, env, item));
-            }
-        }
-        return js_objval(arr);
-    }
-    case JS_N_OBJECT:
-        return object_literal(js, env, n);
-    case JS_N_TEMPLATE:
-        return template_eval(js, env, n);
-    case JS_N_BIN:
-        return eval_bin(js, env, n);
-    case JS_N_UN: {
-        if (n->op == JS_OP_DELETE) {
-            JsNode *t = n->kids[0];
-            if (t->kind == JS_N_MEMBER) {
-                JsValue base = eval_expr(js, env, t->kids[0]);
-                char *prop = t->op == JS_OP_DOT
-                                 ? t->str
-                                 : js_to_string(js, eval_expr(js, env, t->kids[1]));
-                if (base.t == JS_OBJ && base.obj)
-                    js_obj_delete(js, base.obj, prop);
-                return js_bool(1);
-            }
-            if (t->kind == JS_N_IDENT) {
-                JsValue *slot = js_env_lookup(env, t->str);
-                if (slot)
-                    *slot = js_undef();
-                return js_bool(1);
-            }
-            return js_bool(1);
-        }
-        {
-            JsValue v = eval_expr(js, env, n->kids[0]);
-            if (n->op == JS_OP_TYPEOF) {
-                const char *s;
-                switch (v.t) {
-                case JS_UNDEF:
-                    s = "undefined";
-                    break;
-                case JS_NULL:
-                    s = "object";
-                    break;
-                case JS_BOOL:
-                    s = "boolean";
-                    break;
-                case JS_NUM:
-                    s = "number";
-                    break;
-                case JS_STR:
-                    s = "string";
-                    break;
-                case JS_OBJ:
-                    s = js_is_callable(v) ? "function" : "object";
-                    break;
-                default:
-                    s = "undefined";
-                    break;
-                }
-                return js_string(js, s);
-            }
-            if (n->op == JS_OP_NOT)
-                return js_bool(!js_truthy(v));
-            if (n->op == JS_OP_VOID)
-                return js_undef();
-            if (n->op == JS_OP_NEG)
-                return js_num(-js_to_number(js, v));
-            if (n->op == JS_OP_POS)
-                return js_num(js_to_number(js, v));
-            if (n->op == JS_OP_BNOT)
-                return js_num((double)(~to_i32(js, v)));
-        }
-        return js_undef();
-    }
-    case JS_N_TERNARY:
-        return js_truthy(eval_expr(js, env, n->kids[0])) ? eval_expr(js, env, n->kids[1])
-                                                         : eval_expr(js, env, n->kids[2]);
-    case JS_N_SEQ: {
-        JsValue v = js_undef();
-        int i;
-        for (i = 0; i < n->kid_count; i++)
-            v = eval_expr(js, env, n->kids[i]);
-        return v;
-    }
-    case JS_N_ASSIGN:
-        return eval_assign(js, env, n);
-    case JS_N_MEMBER:
-        return eval_member(js, env, n);
-    case JS_N_SUPER_MEMBER:
-        return eval_super_member(js, env, n);
-    case JS_N_SUPER_CALL:
-        return super_call(js, env, n);
-    case JS_N_CALL:
-        return eval_call(js, env, n);
-    case JS_N_NEW:
-        return eval_new(js, env, n);
-    case JS_N_REGEX: {
-        const char *pat = n->str ? n->str : "";
-        const char *flags = pat + strlen(pat) + 1;
-        return js_regex_new(js, pat, flags);
-    }
-    case JS_N_AWAIT: {
-        JsValue v = eval_expr(js, env, n->kids[0]);
-        if (v.t == JS_OBJ && v.obj && v.obj->kind == JS_OBJ_PROMISE) {
-            hpe_js_drain_jobs(js);
-            if (v.obj->promise_state == 2)
-                js_throw_value(js, v.obj->promise_value);
-            return v.obj->promise_value;
-        }
-        return v;
-    }
-    case JS_N_YIELD: {
-        JsValue v = n->kids[0] ? eval_expr(js, env, n->kids[0]) : js_undef();
-        if (js->yield_sink) {
-            if (n->op == 1) {
-                int k, len = js_iter_len(js, v);
-                for (k = 0; k < len; k++)
-                    array_push_value(js, js->yield_sink, js_iter_at(js, v, k));
-            } else {
-                array_push_value(js, js->yield_sink, v);
-            }
-        }
-        return js_undef();
-    }
-    case JS_N_FUNC:
-        return make_method(js, env, n);
-    case JS_N_SPREAD:
-        return eval_expr(js, env, n->kids[0]);
-    case JS_N_UPDATE: {
-        JsNode *target = n->kids[0];
-        JsValue old = read_target(js, env, target);
-        double onum = js_to_number(js, old);
-        double nnum = (n->op == JS_OP_PREINC || n->op == JS_OP_POSTINC) ? onum + 1.0 : onum - 1.0;
-        write_target(js, env, target, js_num(nnum));
-        return js_num((n->op == JS_OP_PREINC || n->op == JS_OP_PREDEC) ? nnum : onum);
-    }
-    case JS_N_CLASS:
-        return class_eval(js, env, n);
-    case JS_N_BLOCK:
-        return js_undef();
+        return eval_literal(js, n, n->str);
     default:
-        js_error(js, n->line, "unsupported expression node %d", n->kind);
-        return js_undef();
+        break;
     }
+
+    for (i = 0; i < sizeof(k_eval_table) / sizeof(k_eval_table[0]); i++) {
+        if (k_eval_table[i].kind == n->kind)
+            return k_eval_table[i].fn(js, env, n);
+    }
+    js_error(js, n->line, "unsupported expression node %d", n->kind);
+    return js_undef();
 }
 /* ---------------- statements ---------------- */
 
@@ -1986,201 +2137,411 @@ static void loop_bind(HpeJs *js, JsEnv *env, JsNode *target, JsValue v, JsEnv **
     }
 }
 
+/* bind the loop variable (when the loop form has one), run one body statement
+ * and fold its Flow into `out`; returns the loop_flow act code
+ * (0 = keep going, 1 = break, 2 = propagate) */
+static int loop_body_step(HpeJs *js, JsEnv *env, JsNode *target, JsValue v, JsNode *body,
+                          const char *const *labels, int nlabels, Flow *out)
+{
+    JsEnv *iterv = env;
+    Flow f;
+
+    if (target)
+        loop_bind(js, env, target, v, &iterv);
+    f = exec_stmt(js, iterv, body);
+    return loop_flow(f, labels, nlabels, out);
+}
+
+static Flow exec_while(HpeJs *js, JsEnv *env, JsNode *n, const char *const *labels, int nlabels,
+                       Flow *out)
+{
+    while (js_truthy(eval_expr(js, env, n->kids[0]))) {
+        int act = loop_body_step(js, env, NULL, js_undef(), n->kids[1], labels, nlabels, out);
+        if (act == 1)
+            return flow_none();
+        if (act == 2)
+            return *out;
+    }
+    return flow_none();
+}
+
+static Flow exec_do(HpeJs *js, JsEnv *env, JsNode *n, const char *const *labels, int nlabels,
+                    Flow *out)
+{
+    do {
+        int act = loop_body_step(js, env, NULL, js_undef(), n->kids[0], labels, nlabels, out);
+        if (act == 1)
+            return flow_none();
+        if (act == 2)
+            return *out;
+    } while (js_truthy(eval_expr(js, env, n->kids[1])));
+    return flow_none();
+}
+
+static Flow exec_for(HpeJs *js, JsEnv *env, JsNode *n, const char *const *labels, int nlabels,
+                     Flow *out)
+{
+    JsNode *init = n->kids[0];
+    JsNode *test = n->kids[1];
+    JsNode *update = n->kids[2];
+    JsNode *body = n->kids[3];
+    /* `let` / `const` loop heads get a fresh scope so each iteration closes
+     * over its own copy; `var` (and bare expressions) stay in the outer scope */
+    JsEnv *lenv = env;
+
+    if (init && init->kind == JS_N_VAR && init->str && strcmp(init->str, "var") != 0)
+        lenv = js_env_new(js, env);
+    if (init) {
+        if (init->kind == JS_N_VAR)
+            exec_var_decl(js, lenv, init);
+        else
+            eval_expr(js, lenv, init);
+    }
+    for (;;) {
+        Flow f;
+        int act;
+
+        if (test && !js_truthy(eval_expr(js, lenv, test)))
+            break;
+        f = exec_stmt(js, lenv, body);
+        act = loop_flow(f, labels, nlabels, out);
+        if (act == 1)
+            return flow_none();
+        if (act == 2)
+            return *out;
+        if (update)
+            eval_expr(js, lenv, update);
+    }
+    return flow_none();
+}
+
+static Flow exec_forof(HpeJs *js, JsEnv *env, JsNode *n, const char *const *labels, int nlabels,
+                       Flow *out)
+{
+    JsValue it = eval_expr(js, env, n->kids[1]);
+    int len = js_iter_len(js, it), i;
+
+    for (i = 0; i < len; i++) {
+        int act = loop_body_step(js, env, n->kids[0], js_iter_at(js, it, i), n->kids[2], labels,
+                                 nlabels, out);
+        if (act == 1)
+            return flow_none();
+        if (act == 2)
+            return *out;
+    }
+    return flow_none();
+}
+
+/* `for (k in str)` enumerates the character indices as strings */
+static Flow exec_forin_string(HpeJs *js, JsEnv *env, JsNode *n, JsValue obj,
+                              const char *const *labels, int nlabels, Flow *out)
+{
+    int len = js_iter_len(js, obj), i;
+
+    for (i = 0; i < len; i++) {
+        char buf[32];
+        int act;
+
+        snprintf(buf, sizeof(buf), "%d", i);
+        act = loop_body_step(js, env, n->kids[0], js_string(js, buf), n->kids[2], labels, nlabels,
+                             out);
+        if (act == 1)
+            return flow_none();
+        if (act == 2)
+            return *out;
+    }
+    return flow_none();
+}
+
+/* `for (k in obj)` walks own enumerable keys; the key array must be freed on
+ * every exit path, including an early break/return */
+static Flow exec_forin_object(HpeJs *js, JsEnv *env, JsNode *n, JsValue obj,
+                              const char *const *labels, int nlabels, Flow *out)
+{
+    char **keys;
+    int nk = 0, k;
+
+    js_obj_own_keys(obj.obj, &keys, &nk);
+    for (k = 0; k < nk; k++) {
+        int act = loop_body_step(js, env, n->kids[0], js_string(js, keys[k]), n->kids[2], labels,
+                                 nlabels, out);
+        if (act != 0) {
+            free(keys);
+            return act == 1 ? flow_none() : *out;
+        }
+    }
+    free(keys);
+    return flow_none();
+}
+
+static Flow exec_forin(HpeJs *js, JsEnv *env, JsNode *n, const char *const *labels, int nlabels,
+                       Flow *out)
+{
+    JsValue obj = eval_expr(js, env, n->kids[1]);
+
+    if (obj.t == JS_STR)
+        return exec_forin_string(js, env, n, obj, labels, nlabels, out);
+    if (obj.t == JS_OBJ && obj.obj)
+        return exec_forin_object(js, env, n, obj, labels, nlabels, out);
+    return flow_none();
+}
+
 static Flow exec_loop(HpeJs *js, JsEnv *env, JsNode *n, const char *const *labels, int nlabels)
 {
     Flow out = flow_none();
+
     switch (n->kind) {
     case JS_N_WHILE:
-        while (js_truthy(eval_expr(js, env, n->kids[0]))) {
-            Flow f = exec_stmt(js, env, n->kids[1]);
-            int act = loop_flow(f, labels, nlabels, &out);
-            if (act == 1)
-                return flow_none();
-            if (act == 2)
-                return out;
-        }
-        return flow_none();
-
+        return exec_while(js, env, n, labels, nlabels, &out);
     case JS_N_DO:
-        do {
-            Flow f = exec_stmt(js, env, n->kids[0]);
-            int act = loop_flow(f, labels, nlabels, &out);
-            if (act == 1)
-                return flow_none();
-            if (act == 2)
-                return out;
-        } while (js_truthy(eval_expr(js, env, n->kids[1])));
-        return flow_none();
-
-    case JS_N_FOR: {
-        JsNode *init = n->kids[0];
-        JsNode *test = n->kids[1];
-        JsNode *update = n->kids[2];
-        JsNode *body = n->kids[3];
-        JsEnv *lenv = env;
-        if (init && init->kind == JS_N_VAR && init->str && strcmp(init->str, "var") != 0)
-            lenv = js_env_new(js, env);
-        if (init) {
-            if (init->kind == JS_N_VAR)
-                exec_var_decl(js, lenv, init);
-            else
-                eval_expr(js, lenv, init);
-        }
-        for (;;) {
-            Flow f;
-            int act;
-            if (test && !js_truthy(eval_expr(js, lenv, test)))
-                break;
-            f = exec_stmt(js, lenv, body);
-            act = loop_flow(f, labels, nlabels, &out);
-            if (act == 1)
-                return flow_none();
-            if (act == 2)
-                return out;
-            if (update)
-                eval_expr(js, lenv, update);
-        }
-        return flow_none();
-    }
-
-    case JS_N_FOROF: {
-        JsValue it = eval_expr(js, env, n->kids[1]);
-        JsNode *body = n->kids[2];
-        int len = js_iter_len(js, it), i;
-        for (i = 0; i < len; i++) {
-            JsEnv *iterv = env;
-            Flow f;
-            int act;
-            loop_bind(js, env, n->kids[0], js_iter_at(js, it, i), &iterv);
-            f = exec_stmt(js, iterv, body);
-            act = loop_flow(f, labels, nlabels, &out);
-            if (act == 1)
-                return flow_none();
-            if (act == 2)
-                return out;
-        }
-        return flow_none();
-    }
-
-    case JS_N_FORIN: {
-        JsValue obj = eval_expr(js, env, n->kids[1]);
-        JsNode *body = n->kids[2];
-        if (obj.t == JS_STR) {
-            int len = js_iter_len(js, obj), i;
-            for (i = 0; i < len; i++) {
-                JsEnv *iterv = env;
-                Flow f;
-                int act;
-                char buf[32];
-                snprintf(buf, sizeof(buf), "%d", i);
-                loop_bind(js, env, n->kids[0], js_string(js, buf), &iterv);
-                f = exec_stmt(js, iterv, body);
-                act = loop_flow(f, labels, nlabels, &out);
-                if (act == 1)
-                    return flow_none();
-                if (act == 2)
-                    return out;
-            }
-            return flow_none();
-        }
-        if (obj.t == JS_OBJ && obj.obj) {
-            char **keys;
-            int nk = 0, k;
-            js_obj_own_keys(obj.obj, &keys, &nk);
-            for (k = 0; k < nk; k++) {
-                JsEnv *iterv = env;
-                Flow f;
-                int act;
-                loop_bind(js, env, n->kids[0], js_string(js, keys[k]), &iterv);
-                f = exec_stmt(js, iterv, body);
-                act = loop_flow(f, labels, nlabels, &out);
-                if (act == 1) {
-                    free(keys);
-                    return flow_none();
-                }
-                if (act == 2) {
-                    free(keys);
-                    return out;
-                }
-            }
-            free(keys);
-        }
-        return flow_none();
-    }
-
+        return exec_do(js, env, n, labels, nlabels, &out);
+    case JS_N_FOR:
+        return exec_for(js, env, n, labels, nlabels, &out);
+    case JS_N_FOROF:
+        return exec_forof(js, env, n, labels, nlabels, &out);
+    case JS_N_FORIN:
+        return exec_forin(js, env, n, labels, nlabels, &out);
     default:
         return flow_none();
     }
 }
 
+/* runs one try/catch/finally block under its own landing pad. On a caught throw
+ * returns with *pending=1 and the value in *thrown; otherwise writes the block's
+ * flow into *flow. Keeping setjmp inside its own frame lets the longjmp land here. */
+static void exec_try_guard(HpeJs *js, JsEnv *env, JsNode *stmts, JsEnv *block_env, Flow *flow,
+                           int *pending, JsValue *thrown)
+{
+    JsTryFrame f;
+    f.prev = js->try_top;
+    js->try_top = &f;
+    if (setjmp(f.jmp) == 0) {
+        *flow = exec_block(js, block_env ? block_env : env, stmts);
+    } else {
+        *pending = 1;
+        *thrown = js->thrown;
+        js->thrown = js_undef();
+    }
+    js->try_top = f.prev;
+}
+
+/* establishes the catch scope, binds the thrown value to the pattern and runs
+ * the handler body */
+static void exec_try_catch(HpeJs *js, JsEnv *env, JsNode *cc, JsValue thrown, Flow *flow,
+                           int *pending, JsValue *rethrown)
+{
+    JsEnv *cenv = js_env_new(js, env);
+    JsTryFrame f;
+
+    *pending = 0;
+    f.prev = js->try_top;
+    js->try_top = &f;
+    if (setjmp(f.jmp) == 0) {
+        if (cc->kids[0])
+            bind_pattern(js, cenv, cc->kids[0], thrown, 1);
+        js->in_catch++;
+        *flow = exec_block(js, cenv, cc->kids[1]);
+        js->in_catch--;
+    } else {
+        *pending = 1;
+        *rethrown = js->thrown;
+        js->thrown = js_undef();
+    }
+    js->try_top = f.prev;
+}
+
+/* finally overrides the pending flow only when it itself completes abruptly,
+ * which also cancels an in-flight throw */
+static void exec_try_finally(HpeJs *js, JsEnv *env, JsNode *fb, Flow *flow, int *pending,
+                             JsValue *rethrown)
+{
+    JsTryFrame f;
+    f.prev = js->try_top;
+    js->try_top = &f;
+    if (setjmp(f.jmp) == 0) {
+        Flow ff = exec_block(js, env, fb);
+        if (ff.action != FLOW_NONE) {
+            *flow = ff;
+            *pending = 0;
+        }
+    } else {
+        *pending = 1;
+        *rethrown = js->thrown;
+        js->thrown = js_undef();
+    }
+    js->try_top = f.prev;
+}
+
 static Flow exec_try(HpeJs *js, JsEnv *env, JsNode *n)
 {
-    JsNode *tryblk = n->kids[0];
     JsNode *cc = n->kid_count > 1 ? n->kids[1] : NULL;
     JsNode *fb = n->kid_count > 2 ? n->kids[2] : NULL;
     Flow flow = flow_none();
     JsValue thrown = js_undef();
     int pending = 0;
 
-    {
-        JsTryFrame f;
-        f.prev = js->try_top;
-        js->try_top = &f;
-        if (setjmp(f.jmp) == 0) {
-            flow = exec_block(js, env, tryblk);
-        } else {
-            pending = 1;
-            thrown = js->thrown;
-            js->thrown = js_undef();
-        }
-        js->try_top = f.prev;
-    }
-    if (pending && cc) {
-        JsEnv *cenv = js_env_new(js, env);
-        JsTryFrame f;
-        pending = 0;
-        f.prev = js->try_top;
-        js->try_top = &f;
-        if (setjmp(f.jmp) == 0) {
-            if (cc->kids[0])
-                bind_pattern(js, cenv, cc->kids[0], thrown, 1);
-            js->in_catch++;
-            flow = exec_block(js, cenv, cc->kids[1]);
-            js->in_catch--;
-        } else {
-            pending = 1;
-            thrown = js->thrown;
-            js->thrown = js_undef();
-        }
-        js->try_top = f.prev;
-    }
-    if (fb) {
-        JsTryFrame f;
-        f.prev = js->try_top;
-        js->try_top = &f;
-        if (setjmp(f.jmp) == 0) {
-            Flow ff = exec_block(js, env, fb);
-            if (ff.action != FLOW_NONE) {
-                flow = ff;
-                pending = 0;
-            }
-        } else {
-            pending = 1;
-            thrown = js->thrown;
-            js->thrown = js_undef();
-        }
-        js->try_top = f.prev;
-    }
+    exec_try_guard(js, env, n->kids[0], NULL, &flow, &pending, &thrown);
+    if (pending && cc)
+        exec_try_catch(js, env, cc, thrown, &flow, &pending, &thrown);
+    if (fb)
+        exec_try_finally(js, env, fb, &flow, &pending, &thrown);
     if (pending)
         js_throw_value(js, thrown);
     return flow;
 }
 
-static Flow exec_stmt(HpeJs *js, JsEnv *env, JsNode *n)
+/* `switch` uses strict equality to find the entry clause, then falls through
+ * the remaining clauses until `break` (unlabelled) or a return/throw */
+static Flow exec_switch(HpeJs *js, JsEnv *env, JsNode *n)
+{
+    Flow none = flow_none();
+    JsValue test = eval_expr(js, env, n->kids[0]);
+    JsEnv *senv = js_env_new(js, env);
+    int i, matched = -1, default_idx = -1;
+
+    for (i = 1; i < n->kid_count; i++) {
+        JsNode *clause = n->kids[i];
+        JsNode *label = clause->kids[0];
+
+        if (!label) {
+            default_idx = i;
+            continue;
+        }
+        if (matched < 0 && js_values_equal(js, test, eval_expr(js, senv, label), 1))
+            matched = i;
+    }
+    if (matched < 0)
+        matched = default_idx;
+    if (matched < 0)
+        return none;
+    for (i = matched; i < n->kid_count; i++) {
+        JsNode *clause = n->kids[i];
+        int k;
+
+        for (k = 1; k < clause->kid_count; k++) {
+            Flow f = exec_stmt(js, senv, clause->kids[k]);
+
+            if (f.action == FLOW_RETURN)
+                return f;
+            /* an unlabelled break leaves the switch itself */
+            if (f.action == FLOW_BREAK) {
+                if (f.label)
+                    return f;
+                return none;
+            }
+        }
+    }
+    return none;
+}
+
+/* `label: stmt`. When the labelled statement is a loop the whole label chain is
+ * collected so `continue a` / `break a` from inside target that loop. */
+static Flow exec_label(HpeJs *js, JsEnv *env, JsNode *n)
+{
+    JsNode *inner = n->kids[0];
+
+    if (is_loop_node(inner)) {
+        const char *stack[32];
+        int depth = 0;
+        JsNode *cur = n;
+
+        while (cur && cur->kind == JS_N_LABEL && depth < 32) {
+            stack[depth++] = cur->str;
+            cur = cur->kids[0];
+        }
+        return exec_loop(js, env, cur, stack, depth);
+    }
+    {
+        Flow f = exec_stmt(js, env, inner);
+
+        /* a `break` naming this label is consumed here */
+        if (f.action == FLOW_BREAK && f.label && n->str && !strcmp(f.label, n->str)) {
+            f.action = FLOW_NONE;
+            f.label = NULL;
+        }
+        return f;
+    }
+}
+
+/* `return expr`: the promise job queue is drained so `.then` callbacks that
+ * observe the returned promise run before the caller resumes */
+static Flow exec_return(HpeJs *js, JsEnv *env, JsNode *n)
 {
     Flow flow = flow_none();
+
+    flow.action = FLOW_RETURN;
+    flow.ret = n->kids[0] ? eval_expr(js, env, n->kids[0]) : js_undef();
+    if (flow.ret.t == JS_OBJ && flow.ret.obj && flow.ret.obj->kind == JS_OBJ_PROMISE)
+        hpe_js_drain_jobs(js);
+    return flow;
+}
+
+/* `if (t) a else b`: both branches are ordinary statements */
+static Flow exec_if(HpeJs *js, JsEnv *env, JsNode *n)
+{
+    Flow flow = flow_none();
+
+    if (js_truthy(eval_expr(js, env, n->kids[0])))
+        return exec_stmt(js, env, n->kids[1]);
+    if (n->kid_count > 2)
+        return exec_stmt(js, env, n->kids[2]);
+    return flow;
+}
+
+/* `throw expr` unwinds to the nearest active try frame */
+static Flow exec_throw(HpeJs *js, JsEnv *env, JsNode *n)
+{
+    js_throw_value(js, eval_expr(js, env, n->kids[0]));
+    return flow_none();
+}
+
+/* an expression statement: a promise result is drained so its handlers settle */
+static Flow exec_expr_stmt(HpeJs *js, JsEnv *env, JsNode *n)
+{
+    JsValue v = eval_expr(js, env, n->kids[0]);
+
+    if (v.t == JS_OBJ && v.obj && v.obj->kind == JS_OBJ_PROMISE)
+        hpe_js_drain_jobs(js);
+    return flow_none();
+}
+
+static Flow exec_break(HpeJs *js, JsNode *n, int action)
+{
+    Flow flow = flow_none();
+
+    HPE_UNUSED(js);
+    flow.action = action;
+    flow.label = n->str;
+    return flow;
+}
+
+static Flow exec_noop(HpeJs *js, JsEnv *env, JsNode *n)
+{
+    HPE_UNUSED(js);
+    HPE_UNUSED(env);
+    HPE_UNUSED(n);
+    return flow_none();
+}
+
+/* statement kind -> executor; nodes that evaluate a subexpression as part of
+ * their own bookkeeping are handled before this table */
+static const struct {
+    int kind;
+    Flow (*fn)(HpeJs *js, JsEnv *env, JsNode *n);
+} k_stmt_table[] = {
+    { JS_N_SWITCH, exec_switch }, { JS_N_TRY, exec_try },
+    { JS_N_RETURN, exec_return }, { JS_N_LABEL, exec_label },
+    { JS_N_EXPORT, export_stmt }, { JS_N_IMPORT, import_stmt },
+    { JS_N_IF, exec_if },         { JS_N_THROW, exec_throw },
+    { JS_N_EXPR, exec_expr_stmt }, { JS_N_EMPTY, exec_noop },
+};
+
+static Flow exec_stmt(HpeJs *js, JsEnv *env, JsNode *n)
+{
+    size_t i;
+
     if (!n)
-        return flow;
+        return flow_none();
 
     switch (n->kind) {
     case JS_N_BLOCK: {
@@ -2190,115 +2551,31 @@ static Flow exec_stmt(HpeJs *js, JsEnv *env, JsNode *n)
     }
     case JS_N_VAR:
         exec_var_decl(js, env, n);
-        return flow;
+        return flow_none();
     case JS_N_FUNC:
         js_env_declare(js, env, n->str ? n->str : "", js_objval(js_func_new(js, n, env)));
-        return flow;
+        return flow_none();
     case JS_N_CLASS:
         class_eval(js, env, n);
-        return flow;
-    case JS_N_IF:
-        if (js_truthy(eval_expr(js, env, n->kids[0])))
-            return exec_stmt(js, env, n->kids[1]);
-        if (n->kid_count > 2)
-            return exec_stmt(js, env, n->kids[2]);
-        return flow;
+        return flow_none();
     case JS_N_WHILE:
     case JS_N_DO:
     case JS_N_FOR:
     case JS_N_FOROF:
     case JS_N_FORIN:
         return exec_loop(js, env, n, NULL, 0);
-    case JS_N_SWITCH: {
-        JsValue test = eval_expr(js, env, n->kids[0]);
-        int i, matched = -1, default_idx = -1;
-        JsEnv *senv = js_env_new(js, env);
-        for (i = 1; i < n->kid_count; i++) {
-            JsNode *clause = n->kids[i];
-            JsNode *label = clause->kids[0];
-            if (!label) {
-                default_idx = i;
-                continue;
-            }
-            if (matched < 0 && js_values_equal(js, test, eval_expr(js, senv, label), 1))
-                matched = i;
-        }
-        if (matched < 0)
-            matched = default_idx;
-        if (matched < 0)
-            return flow;
-        for (i = matched; i < n->kid_count; i++) {
-            JsNode *clause = n->kids[i];
-            int k;
-            for (k = 1; k < clause->kid_count; k++) {
-                Flow f = exec_stmt(js, senv, clause->kids[k]);
-                if (f.action == FLOW_RETURN)
-                    return f;
-                if (f.action == FLOW_BREAK) {
-                    if (f.label)
-                        return f;
-                    return flow;
-                }
-            }
-        }
-        return flow;
-    }
-    case JS_N_TRY:
-        return exec_try(js, env, n);
-    case JS_N_THROW:
-        js_throw_value(js, eval_expr(js, env, n->kids[0]));
-        return flow;
-    case JS_N_RETURN:
-        flow.action = FLOW_RETURN;
-        flow.ret = n->kids[0] ? eval_expr(js, env, n->kids[0]) : js_undef();
-        if (flow.ret.t == JS_OBJ && flow.ret.obj && flow.ret.obj->kind == JS_OBJ_PROMISE)
-            hpe_js_drain_jobs(js);
-        return flow;
     case JS_N_BREAK:
-        flow.action = FLOW_BREAK;
-        flow.label = n->str;
-        return flow;
+        return exec_break(js, n, FLOW_BREAK);
     case JS_N_CONTINUE:
-        flow.action = FLOW_CONTINUE;
-        flow.label = n->str;
-        return flow;
-    case JS_N_LABEL: {
-        JsNode *inner = n->kids[0];
-        /* `a: b: while (...)`: collect the whole label chain so that both
-         * `continue a` and `continue b` target the loop */
-        if (is_loop_node(inner)) {
-            const char *stack[32];
-            int depth = 0;
-            JsNode *cur = n;
-            while (cur && cur->kind == JS_N_LABEL && depth < 32) {
-                stack[depth++] = cur->str;
-                cur = cur->kids[0];
-            }
-            return exec_loop(js, env, cur, stack, depth);
-        }
-        {
-            Flow f = exec_stmt(js, env, inner);
-            if (f.action == FLOW_BREAK && f.label && n->str && !strcmp(f.label, n->str)) {
-                f.action = FLOW_NONE;
-                f.label = NULL;
-            }
-            return f;
-        }
-    }
-    case JS_N_EXPR: {
-        JsValue v = eval_expr(js, env, n->kids[0]);
-        if (v.t == JS_OBJ && v.obj && v.obj->kind == JS_OBJ_PROMISE)
-            hpe_js_drain_jobs(js);
-        return flow;
-    }
-    case JS_N_EXPORT:
-        return export_stmt(js, env, n);
-    case JS_N_IMPORT:
-        return import_stmt(js, env, n);
-    case JS_N_EMPTY:
+        return exec_break(js, n, FLOW_CONTINUE);
     default:
-        return flow;
+        break;
     }
+    for (i = 0; i < sizeof(k_stmt_table) / sizeof(k_stmt_table[0]); i++) {
+        if (k_stmt_table[i].kind == n->kind)
+            return k_stmt_table[i].fn(js, env, n);
+    }
+    return flow_none();
 }
 /* ---------------- es modules ---------------- */
 
@@ -2415,6 +2692,85 @@ static void ns_define(HpeJs *js, JsModule *m, const char *name, JsValue v)
     js_obj_set(js, m->ns, name, v);
 }
 
+/* publishes a single local declaration's binding into the namespace */
+static void ns_define_local_decl(HpeJs *js, JsModule *m, JsEnv *env, JsNode *d)
+{
+    if (d->kind == JS_N_FUNC || d->kind == JS_N_CLASS) {
+        JsValue *slot = d->str ? js_env_lookup(env, d->str) : NULL;
+        if (d->str && slot)
+            ns_define(js, m, d->str, *slot);
+    } else if (d->kind == JS_N_VAR) {
+        int k;
+        for (k = 0; k < d->kid_count; k++) {
+            JsNode *one = d->kids[k];
+            if (one && one->kids[0] && one->kids[0]->kind == JS_N_IDENT) {
+                JsValue *slot = js_env_lookup(env, one->kids[0]->str);
+                if (slot)
+                    ns_define(js, m, one->kids[0]->str, *slot);
+            }
+        }
+    }
+}
+
+/* op==0: `export <declaration>` — each declared name is copied from the env */
+static void ns_fill_local(HpeJs *js, JsModule *m, JsEnv *env, JsNode *ex)
+{
+    JsNode *d = ex->kids[0];
+    if (d)
+        ns_define_local_decl(js, m, env, d);
+}
+
+/* op==1: `export default <expr>` lives in the synthetic "*default*" slot */
+static void ns_fill_default(HpeJs *js, JsModule *m, JsEnv *env)
+{
+    JsValue *slot = js_env_lookup(env, "*default*");
+    ns_define(js, m, "default", slot ? *slot : js_undef());
+}
+
+/* op==2: `export { a, b as c } [from "src"]` — pairs may alias and re-source */
+static void ns_fill_reexport(HpeJs *js, JsModule *m, JsEnv *env, JsNode *ex)
+{
+    JsNode *list = ex->kids[0];
+    JsNode *src_expr = ex->kid_count > 1 ? ex->kids[1] : NULL;
+    JsModule *from = NULL;
+    int k;
+
+    if (src_expr && src_expr->kind == JS_N_STR)
+        from = module_run(js, module_load(js, src_expr->str, js->current_dir));
+    for (k = 0; list && k < list->kid_count; k++) {
+        JsNode *pair = list->kids[k];
+        const char *exported = (pair->kids[0] && pair->kids[0]->str) ? pair->kids[0]->str
+                                                                    : pair->str;
+        if (from)
+            ns_define(js, m, exported, js_obj_get(js, from->ns, pair->str));
+        else {
+            JsValue *slot = js_env_lookup(env, pair->str);
+            ns_define(js, m, exported, slot ? *slot : js_undef());
+        }
+    }
+}
+
+/* op==3: `export * from "src"` — re-export every key except `default` */
+static void ns_fill_star(HpeJs *js, JsModule *m, JsNode *ex)
+{
+    JsModule *from = (ex->kids[0] && ex->kids[0]->kind == JS_N_STR)
+                         ? module_run(js, module_load(js, ex->kids[0]->str, js->current_dir))
+                         : NULL;
+    char **keys;
+    int nk, k;
+
+    if (!from)
+        return;
+    js_obj_own_keys(from->ns, &keys, &nk);
+    for (k = 0; k < nk; k++) {
+        if (ex->num && !strcmp(keys[k], "default"))
+            continue;
+        ns_define(js, m, keys[k], js_obj_get(js, from->ns, keys[k]));
+    }
+    free(keys);
+}
+
+/* dispatches each `export` node to its kind-specific filler */
 static void module_fill_ns(HpeJs *js, JsModule *m, JsNode *prog)
 {
     JsEnv *env = m->env;
@@ -2423,61 +2779,12 @@ static void module_fill_ns(HpeJs *js, JsModule *m, JsNode *prog)
         JsNode *ex = prog->kids[i];
         if (!ex || ex->kind != JS_N_EXPORT)
             continue;
-        if (ex->op == 0) {
-            JsNode *d = ex->kids[0];
-            if (!d)
-                continue;
-            if (d->kind == JS_N_FUNC || d->kind == JS_N_CLASS) {
-                JsValue *slot = d->str ? js_env_lookup(env, d->str) : NULL;
-                if (d->str && slot)
-                    ns_define(js, m, d->str, *slot);
-            } else if (d->kind == JS_N_VAR) {
-                int k;
-                for (k = 0; k < d->kid_count; k++) {
-                    JsNode *one = d->kids[k];
-                    if (one && one->kids[0] && one->kids[0]->kind == JS_N_IDENT) {
-                        JsValue *slot = js_env_lookup(env, one->kids[0]->str);
-                        if (slot)
-                            ns_define(js, m, one->kids[0]->str, *slot);
-                    }
-                }
-            }
-        } else if (ex->op == 1) {
-            JsValue *slot = js_env_lookup(env, "*default*");
-            ns_define(js, m, "default", slot ? *slot : js_undef());
-        } else if (ex->op == 2) {
-            JsNode *list = ex->kids[0];
-            JsNode *src_expr = ex->kid_count > 1 ? ex->kids[1] : NULL;
-            JsModule *from = NULL;
-            int k;
-            if (src_expr && src_expr->kind == JS_N_STR)
-                from = module_run(js, module_load(js, src_expr->str, js->current_dir));
-            for (k = 0; list && k < list->kid_count; k++) {
-                JsNode *pair = list->kids[k];
-                const char *exported = (pair->kids[0] && pair->kids[0]->str) ? pair->kids[0]->str
-                                                                            : pair->str;
-                if (from)
-                    ns_define(js, m, exported, js_obj_get(js, from->ns, pair->str));
-                else {
-                    JsValue *slot = js_env_lookup(env, pair->str);
-                    ns_define(js, m, exported, slot ? *slot : js_undef());
-                }
-            }
-        } else if (ex->op == 3) {
-            JsModule *from = (ex->kids[0] && ex->kids[0]->kind == JS_N_STR)
-                                 ? module_run(js, module_load(js, ex->kids[0]->str, js->current_dir))
-                                 : NULL;
-            char **keys;
-            int nk, k;
-            if (!from)
-                continue;
-            js_obj_own_keys(from->ns, &keys, &nk);
-            for (k = 0; k < nk; k++) {
-                if (ex->num && !strcmp(keys[k], "default"))
-                    continue;
-                ns_define(js, m, keys[k], js_obj_get(js, from->ns, keys[k]));
-            }
-            free(keys);
+        switch (ex->op) {
+        case 0: ns_fill_local(js, m, env, ex); break;
+        case 1: ns_fill_default(js, m, env); break;
+        case 2: ns_fill_reexport(js, m, env, ex); break;
+        case 3: ns_fill_star(js, m, ex); break;
+        default: break;
         }
     }
 }
@@ -3219,84 +3526,106 @@ static JsValue string_trim_side(HpeJs *js, JsValue thisv, JsValue *a, int argc, 
 }
 
 /* replaces every occurrence of a substring (or of a global regex) */
+/* ensure `out` can hold `need` more bytes from `o`, doubling as needed */
+static char *repl_grow(HpeJs *js, char *out, size_t o, size_t *cap, size_t need)
+{
+    if (o + need + 1 <= *cap)
+        return out;
+    {
+        size_t ncap = *cap * 2;
+        char *bigger;
+
+        while (ncap < o + need + 1)
+            ncap *= 2;
+        bigger = (char *)hpe_js_alloc(js, ncap);
+        memcpy(bigger, out, o);
+        out = bigger;
+        *cap = ncap;
+    }
+    return out;
+}
+
+/* `rep` as a string, calling a replacement callback with (match, offset, input) */
+static char *repl_value(HpeJs *js, JsValue rep, const char *n, const char *s, const char *hit)
+{
+    if (js_is_callable(rep)) {
+        JsValue args[3];
+
+        args[0] = js_string(js, n);
+        args[1] = js_num((double)(hit - s));
+        args[2] = js_string(js, s);
+        return js_to_string(js, call_value(js, NULL, rep, js_undef(), args, 3, 0));
+    }
+    return js_to_string(js, rep);
+}
+
+/* empty search string: insert the replacement between every character */
+static JsValue replaceall_empty(HpeJs *js, const char *s, JsValue rep)
+{
+    char *rs = js_to_string(js, rep);
+    size_t rl = strlen(rs), sl = strlen(s), o;
+    char *out = (char *)hpe_js_alloc(js, (sl + 1) * (rl + 1) + 1);
+    const char *p;
+
+    memcpy(out, rs, rl);
+    o = rl;
+    for (p = s; *p; p++) {
+        out[o++] = *p;
+        memcpy(out + o, rs, rl);
+        o += rl;
+    }
+    out[o] = '\0';
+    return js_string_len(js, out, o);
+}
+
+/* replaces every occurrence of a non-empty substring */
+static JsValue replaceall_plain(HpeJs *js, const char *s, const char *n, JsValue rep)
+{
+    size_t nl = strlen(n), sl = strlen(s), o = 0, cap = sl + (sl / nl + 1) * 8 + 1;
+    char *out = (char *)hpe_js_alloc(js, cap);
+    const char *p = s;
+
+    for (;;) {
+        const char *hit = strstr(p, n);
+        char *rs;
+        size_t seg, rslen;
+
+        if (!hit) {
+            seg = strlen(p);
+            memcpy(out + o, p, seg);
+            o += seg;
+            break;
+        }
+        out = repl_grow(js, out, o, &cap, (size_t)(hit - p));
+        memcpy(out + o, p, (size_t)(hit - p));
+        o += (size_t)(hit - p);
+        rs = repl_value(js, rep, n, s, hit);
+        rslen = strlen(rs);
+        out = repl_grow(js, out, o, &cap, rslen);
+        memcpy(out + o, rs, rslen);
+        o += rslen;
+        p = hit + nl;
+    }
+    out[o] = '\0';
+    return js_string_len(js, out, o);
+}
+
+/* replaces every occurrence of a substring (or of a global regex) */
 static JsValue string_replaceAll(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     char *s = js_to_string(js, thisv);
     JsValue needle = arg_at(a, argc, 0);
     JsValue rep = arg_at(a, argc, 1);
+    char *n;
+
     HPE_UNUSED(ud);
+    /* a regex needle reuses string.replace, whose global path already loops */
     if (needle.t == JS_OBJ && needle.obj && needle.obj->kind == JS_OBJ_REGEX)
-        return string_replace(js, thisv, a, argc, NULL); /* global regex path already loops */
-    {
-        char *n = js_to_string(js, needle);
-        size_t nl = strlen(n), sl = strlen(s), o = 0, cap;
-        char *out;
-        const char *p;
-        if (nl == 0) {
-            /* empty search inserts the replacement between every character */
-            char *rs = js_to_string(js, rep);
-            size_t rl = strlen(rs);
-            cap = (sl + 1) * (rl + 1) + 1;
-            out = (char *)hpe_js_alloc(js, cap);
-            memcpy(out, rs, rl);
-            o = rl;
-            for (p = s; *p; p++) {
-                out[o++] = *p;
-                memcpy(out + o, rs, rl);
-                o += rl;
-            }
-            out[o] = '\0';
-            return js_string_len(js, out, o);
-        }
-        cap = sl + (sl / nl + 1) * 8 + 1;
-        out = (char *)hpe_js_alloc(js, cap);
-        p = s;
-        for (;;) {
-            const char *hit = strstr(p, n);
-            char *rs;
-            size_t seg;
-            if (!hit) {
-                seg = strlen(p);
-                memcpy(out + o, p, seg);
-                o += seg;
-                break;
-            }
-            if (o + (size_t)(hit - p) + 64 > cap) {
-                size_t ncap = cap * 2 + 64;
-                while (ncap < o + (size_t)(hit - p) + 64)
-                    ncap *= 2;
-                {
-                    char *bigger = (char *)hpe_js_alloc(js, ncap);
-                    memcpy(bigger, out, o);
-                    out = bigger;
-                    cap = ncap;
-                }
-            }
-            memcpy(out + o, p, (size_t)(hit - p));
-            o += (size_t)(hit - p);
-            if (js_is_callable(rep)) {
-                JsValue args[3];
-                args[0] = js_string(js, n);
-                args[1] = js_num((double)(hit - s));
-                args[2] = js_string(js, s);
-                rs = js_to_string(js, call_value(js, NULL, rep, js_undef(), args, 3, 0));
-            } else {
-                rs = js_to_string(js, rep);
-            }
-            while (o + strlen(rs) + 1 > cap) {
-                size_t ncap = cap * 2;
-                char *bigger = (char *)hpe_js_alloc(js, ncap);
-                memcpy(bigger, out, o);
-                out = bigger;
-                cap = ncap;
-            }
-            memcpy(out + o, rs, strlen(rs));
-            o += strlen(rs);
-            p = hit + nl;
-        }
-        out[o] = '\0';
-        return js_string_len(js, out, o);
-    }
+        return string_replace(js, thisv, a, argc, NULL);
+    n = js_to_string(js, needle);
+    if (*n == '\0')
+        return replaceall_empty(js, s, rep);
+    return replaceall_plain(js, s, n, rep);
 }
 
 /* index of the codepoint that starts at byte offset i (UTF-8 aware) */
@@ -4650,6 +4979,7 @@ static void jsbuf_free(JSBuf *b)
     b->s = NULL;
 }
 
+/* quotes and escapes one string per the JSON grammar */
 static void json_quote(JSBuf *b, const char *s)
 {
     const unsigned char *p = (const unsigned char *)(s ? s : "");
@@ -4690,23 +5020,82 @@ static void json_quote(JSBuf *b, const char *s)
     jsbuf_add(b, "\"", 1);
 }
 
+/* a function or native object is not serialisable and becomes null */
+static int json_is_function(JsValue v)
+{
+    return v.t == JS_OBJ && v.obj &&
+           (v.obj->kind == JS_OBJ_FUNC || v.obj->kind == JS_OBJ_NATIVE);
+}
+
+/* recursive value writer; forward-declared for the container helpers below */
+static int json_write(HpeJs *js, JSBuf *b, JsValue v, int depth);
+
+/* arrays serialise as `[e, ...]` with every hole at its index */
+static void json_write_array(HpeJs *js, JSBuf *b, JsObj *o, int depth)
+{
+    int len = array_length(js, o), i;
+
+    jsbuf_add(b, "[", 1);
+    for (i = 0; i < len; i++) {
+        if (i)
+            jsbuf_add(b, ",", 1);
+        json_write(js, b, array_get_index(js, o, i), depth + 1);
+    }
+    jsbuf_add(b, "]", 1);
+}
+
+/* objects serialise as `{"k":v, ...}`, skipping undefined/function values */
+static void json_write_object(HpeJs *js, JSBuf *b, JsValue v, JsObj *o, int depth)
+{
+    char **keys;
+    int nk, i, first = 1;
+
+    js_obj_own_keys(o, &keys, &nk);
+    jsbuf_add(b, "{", 1);
+    for (i = 0; i < nk; i++) {
+        JsValue pv = member_get(js, NULL, v, keys[i], 0);
+
+        if (pv.t == JS_UNDEF || json_is_function(pv))
+            continue;
+        if (!first)
+            jsbuf_add(b, ",", 1);
+        first = 0;
+        json_quote(b, keys[i]);
+        jsbuf_add(b, ":", 1);
+        json_write(js, b, pv, depth + 1);
+    }
+    free(keys);
+    jsbuf_add(b, "}", 1);
+}
+
+/* Date instances serialise as their toJSON() (an ISO-8601 string) */
+static int json_write_date(HpeJs *js, JSBuf *b, JsValue v, int depth)
+{
+    JsValue j = member_get(js, NULL, v, "toJSON", 0);
+
+    if (js_is_callable(j))
+        return json_write(js, b, call_value(js, NULL, j, v, NULL, 0, 0), depth + 1);
+    json_quote(b, js_to_string(js, v));
+    return 1;
+}
+
 static int json_write(HpeJs *js, JSBuf *b, JsValue v, int depth)
 {
     if (depth > 64)
         return 0;
     switch (v.t) {
     case JS_UNDEF:
-        jsbuf_add(b, "null", 4);
-        return 1;
     case JS_NULL:
         jsbuf_add(b, "null", 4);
         return 1;
-    case JS_BOOL:
-        jsbuf_add(b, v.num != 0.0 ? "true" : "false", v.num != 0.0 ? 4 : 5);
+    case JS_BOOL: {
+        const char *t = v.num != 0.0 ? "true" : "false";
+        jsbuf_add(b, t, strlen(t));
         return 1;
+    }
     case JS_NUM:
         if (v.num != v.num || isinf(v.num)) {
-            jsbuf_add(b, "null", 4);
+            jsbuf_add(b, "null", 4); /* NaN and Infinity are not valid JSON */
             return 1;
         }
         {
@@ -4719,61 +5108,25 @@ static int json_write(HpeJs *js, JSBuf *b, JsValue v, int depth)
         return 1;
     case JS_OBJ: {
         JsObj *o = v.obj;
-        if (!o) {
-            jsbuf_add(b, "null", 4);
-            return 1;
-        }
+
+        if (!o)
+            break;
         if (o->kind == JS_OBJ_ARRAY) {
-            int len = array_length(js, o), i;
-            jsbuf_add(b, "[", 1);
-            for (i = 0; i < len; i++) {
-                if (i)
-                    jsbuf_add(b, ",", 1);
-                json_write(js, b, array_get_index(js, o, i), depth + 1);
-            }
-            jsbuf_add(b, "]", 1);
+            json_write_array(js, b, o, depth);
             return 1;
         }
-        if (o->kind == JS_OBJ_FUNC || o->kind == JS_OBJ_NATIVE) {
-            jsbuf_add(b, "null", 4);
-            return 1;
-        }
-        if (o->kind == JS_OBJ_DATE) {
-            /* Date instances serialise as their toJSON() (an ISO-8601 string),
-             * or null for an invalid date */
-            JsValue j = member_get(js, NULL, v, "toJSON", 0);
-            if (js_is_callable(j))
-                return json_write(js, b, call_value(js, NULL, j, v, NULL, 0, 0), depth + 1);
-            json_quote(b, js_to_string(js, v));
-            return 1;
-        }
-        {
-            char **keys;
-            int nk, i, first = 1;
-            js_obj_own_keys(o, &keys, &nk);
-            jsbuf_add(b, "{", 1);
-            for (i = 0; i < nk; i++) {
-                JsValue pv = member_get(js, NULL, v, keys[i], 0);
-                if (pv.t == JS_UNDEF || (pv.t == JS_OBJ && pv.obj &&
-                                         (pv.obj->kind == JS_OBJ_FUNC ||
-                                          pv.obj->kind == JS_OBJ_NATIVE)))
-                    continue;
-                if (!first)
-                    jsbuf_add(b, ",", 1);
-                first = 0;
-                json_quote(b, keys[i]);
-                jsbuf_add(b, ":", 1);
-                json_write(js, b, pv, depth + 1);
-            }
-            free(keys);
-            jsbuf_add(b, "}", 1);
-        }
+        if (json_is_function(v))
+            break;
+        if (o->kind == JS_OBJ_DATE)
+            return json_write_date(js, b, v, depth);
+        json_write_object(js, b, v, o, depth);
         return 1;
     }
     default:
-        jsbuf_add(b, "null", 4);
-        return 1;
+        break;
     }
+    jsbuf_add(b, "null", 4);
+    return 1;
 }
 
 static JsValue json_stringify(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
@@ -4811,60 +5164,70 @@ static void json_ws(JsonP *j)
 
 static JsValue json_parse_value(JsonP *j);
 
+/* doubles the decode scratch buffer, preserving the `n` bytes already written */
+static void json_str_grow(JsonP *j, char **buf, size_t *cap, size_t n)
+{
+    char *nb = (char *)hpe_js_alloc(j->js, *cap * 2);
+    memcpy(nb, *buf, n);
+    *buf = nb;
+    *cap *= 2;
+}
+
+/* decodes one \uXXXX sequence to UTF-8 (left unpaired; \uD800 pairs are not
+ * combined), advancing j->p past up to four hex digits */
+static void json_str_unicode(JsonP *j, char **buf, size_t *cap, size_t *n)
+{
+    unsigned v = 0;
+    int k;
+    for (k = 0; k < 4 && *j->p; k++, j->p++) {
+        int d = uri_hex((unsigned char)*j->p);
+        if (d < 0)
+            break;
+        v = v * 16 + (unsigned)d;
+    }
+    if (*n + 6 > *cap)
+        json_str_grow(j, buf, cap, *n);
+    *n += (size_t)hpe_utf8_encode(v, *buf + *n);
+}
+
+/* the single-character escapes; anything else keeps the raw backslash, matching
+ * the tolerant parser that never rejects an unknown escape */
+static char json_escape_simple(char e, char c)
+{
+    switch (e) {
+    case 'n':
+        return '\n';
+    case 't':
+        return '\t';
+    case 'r':
+        return '\r';
+    case 'b':
+        return '\b';
+    case 'f':
+        return '\f';
+    default:
+        return c;
+    }
+}
+
 static JsValue json_parse_string(JsonP *j)
 {
     char *buf;
     size_t cap = 64, n = 0;
-    j->p++; /* " */
+    j->p++; /* opening quote */
     buf = (char *)hpe_js_alloc(j->js, cap);
     while (*j->p && *j->p != '"') {
         char c = *j->p++;
         if (c == '\\' && *j->p) {
             char e = *j->p++;
-            switch (e) {
-            case 'n':
-                c = '\n';
-                break;
-            case 't':
-                c = '\t';
-                break;
-            case 'r':
-                c = '\r';
-                break;
-            case 'b':
-                c = '\b';
-                break;
-            case 'f':
-                c = '\f';
-                break;
-            case 'u': {
-                unsigned v = 0;
-                int k;
-                for (k = 0; k < 4 && *j->p; k++, j->p++) {
-                    int d = uri_hex((unsigned char)*j->p);
-                    if (d < 0)
-                        break;
-                    v = v * 16 + (unsigned)d;
-                }
-                if (n + 6 > cap) {
-                    char *nb = (char *)hpe_js_alloc(j->js, cap * 2);
-                    memcpy(nb, buf, n);
-                    buf = nb;
-                    cap *= 2;
-                }
-                n += (size_t)hpe_utf8_encode(v, buf + n);
+            if (e == 'u') {
+                json_str_unicode(j, &buf, &cap, &n);
                 continue;
             }
-            default:
-                break;
-            }
+            c = json_escape_simple(e, c);
         }
-        if (n + 2 > cap) {
-            char *nb = (char *)hpe_js_alloc(j->js, cap * 2);
-            memcpy(nb, buf, n);
-            buf = nb;
-            cap *= 2;
-        }
+        if (n + 2 > cap)
+            json_str_grow(j, &buf, &cap, n);
         buf[n++] = c;
     }
     if (*j->p == '"')
@@ -5156,104 +5519,195 @@ static void repl_expand(HpeJs *js, JSBuf *b, const char *rep, const char *s, int
     HPE_UNUSED(js);
 }
 
+/* build the argument list for a replacement callback: the whole match, each
+ * capture group (undefined when unmatched), the offset, then the input string */
+static JsValue *repl_call_args(HpeJs *js, const char *s, int *caps, int total)
+{
+    JsValue *args = (JsValue *)hpe_js_alloc(js, (size_t)(total + 3) * sizeof(JsValue));
+    int i;
+
+    args[0] = js_string_len(js, s + caps[0], (size_t)(caps[1] - caps[0]));
+    for (i = 0; i < total; i++) {
+        int bi = 2 + i * 2, ei = bi + 1;
+
+        args[i + 1] = (bi + 1 < RE_CAPS && caps[bi] >= 0 && caps[ei] >= caps[bi])
+                          ? js_string_len(js, s + caps[bi], (size_t)(caps[ei] - caps[bi]))
+                          : js_undef();
+    }
+    args[total + 1] = js_num((double)caps[0]);
+    args[total + 2] = js_string(js, s);
+    return args;
+}
+
+/* append one match's replacement: either a callback result or the expanded
+ * `rep_s` template */
+static void repl_append_match(HpeJs *js, JSBuf *b, JsValue rep, const char *rep_s, const char *s,
+                              int *caps, int total)
+{
+    if (js_is_callable(rep)) {
+        JsValue *args = repl_call_args(js, s, caps, total);
+        JsValue r = call_value(js, NULL, rep, js_undef(), args, total + 3, 0);
+        char *rpc = js_to_string(js, r);
+
+        jsbuf_add(b, rpc, strlen(rpc));
+    } else {
+        repl_expand(js, b, rep_s, s, caps, total);
+    }
+}
+
+/* replace with a RegExp needle; walks the input when the regex is global */
+static JsValue string_replace_regex(HpeJs *js, const char *s, JsValue needle, JsValue rep)
+{
+    HpeRegex *re = (HpeRegex *)needle.obj->payload;
+    int total, global, off;
+    JSBuf b;
+    char *rep_s = NULL;
+
+    if (!re)
+        return js_string(js, s);
+    total = hpe_regex_group_count(re);
+    global = regex_is_global(needle);
+    if (!js_is_callable(rep))
+        rep_s = js_to_string(js, rep);
+    jsbuf_init(&b);
+    off = 0;
+    for (;;) {
+        int caps[RE_CAPS];
+        int m, i;
+
+        for (i = 0; i < RE_CAPS; i++)
+            caps[i] = -1;
+        m = hpe_regex_search(re, s, off, caps, RE_CAPS);
+        if (m < 0) {
+            jsbuf_add(&b, s + off, strlen(s + off));
+            break;
+        }
+        if (caps[1] < 0)
+            caps[1] = m; /* empty match: use the search start as the end */
+        jsbuf_add(&b, s + off, (size_t)(caps[0] - off));
+        repl_append_match(js, &b, rep, rep_s, s, caps, total);
+        /* advance past the match; an empty match advances one character to make
+         * progress without looping forever */
+        if (caps[1] > caps[0]) {
+            off = caps[1];
+        } else if ((size_t)off < strlen(s)) {
+            jsbuf_add(&b, s + off, 1);
+            off++;
+        } else {
+            break;
+        }
+        if (!global)
+            break;
+    }
+    {
+        JsValue out = js_string(js, b.s ? b.s : "");
+        jsbuf_free(&b);
+        return out;
+    }
+}
+
+/* replace with a plain-string needle: only the first occurrence is replaced */
+static JsValue string_replace_plain(HpeJs *js, const char *s, JsValue needle, JsValue rep)
+{
+    char *n = js_to_string(js, needle);
+    char *hit = strstr(s, n);
+    size_t out_len;
+    char *out;
+    char *rep_s;
+
+    if (!hit)
+        return js_string(js, s);
+    if (js_is_callable(rep)) {
+        JsValue args[3];
+        JsValue r;
+
+        args[0] = js_string(js, n);
+        args[1] = js_num((double)(hit - s));
+        args[2] = js_string(js, s);
+        r = call_value(js, NULL, rep, js_undef(), args, 3, 0);
+        rep_s = js_to_string(js, r);
+    } else {
+        rep_s = js_to_string(js, rep);
+    }
+    out_len = strlen(s) + strlen(rep_s) + 1;
+    out = (char *)hpe_js_alloc(js, out_len);
+    memcpy(out, s, (size_t)(hit - s));
+    memcpy(out + (hit - s), rep_s, strlen(rep_s));
+    strcpy(out + (hit - s) + strlen(rep_s), hit + strlen(n));
+    return js_string(js, out);
+}
+
 /* string.replace(needle, replacement) */
 static JsValue string_replace(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     char *s = js_to_string(js, thisv);
     JsValue needle = arg_at(a, argc, 0);
     JsValue rep = arg_at(a, argc, 1);
+
     HPE_UNUSED(ud);
-    if (needle.t == JS_OBJ && needle.obj && needle.obj->kind == JS_OBJ_REGEX) {
-        HpeRegex *re = (HpeRegex *)needle.obj->payload;
-        int total, global, off;
-        JSBuf b;
-        char *rep_s = NULL;
-        if (!re)
-            return js_string(js, s);
-        total = hpe_regex_group_count(re);
-        global = regex_is_global(needle);
-        if (!js_is_callable(rep))
-            rep_s = js_to_string(js, rep);
-        jsbuf_init(&b);
-        off = 0;
-        for (;;) {
-            int caps[RE_CAPS];
-            int m, i;
-            for (i = 0; i < RE_CAPS; i++)
-                caps[i] = -1;
-            m = hpe_regex_search(re, s, off, caps, RE_CAPS);
-            if (m < 0) {
-                jsbuf_add(&b, s + off, strlen(s + off));
-                break;
-            }
-            if (caps[1] < 0)
-                caps[1] = m;
-            jsbuf_add(&b, s + off, (size_t)(caps[0] - off));
-            if (js_is_callable(rep)) {
-                JsValue *args = (JsValue *)hpe_js_alloc(js, (size_t)(total + 3) * sizeof(JsValue));
-                JsValue r;
-                char *rpc;
-                args[0] = js_string_len(js, s + caps[0], (size_t)(caps[1] - caps[0]));
-                for (i = 0; i < total; i++) {
-                    int bi = 2 + i * 2, ei = bi + 1;
-                    args[i + 1] = (bi + 1 < RE_CAPS && caps[bi] >= 0 && caps[ei] >= caps[bi])
-                                      ? js_string_len(js, s + caps[bi],
-                                                      (size_t)(caps[ei] - caps[bi]))
-                                      : js_undef();
-                }
-                args[total + 1] = js_num((double)caps[0]);
-                args[total + 2] = js_string(js, s);
-                r = call_value(js, NULL, rep, js_undef(), args, total + 3, 0);
-                rpc = js_to_string(js, r);
-                jsbuf_add(&b, rpc, strlen(rpc));
-            } else {
-                repl_expand(js, &b, rep_s, s, caps, total);
-            }
-            if (caps[1] > caps[0]) {
-                off = caps[1];
-            } else if ((size_t)off < strlen(s)) {
-                jsbuf_add(&b, s + off, 1);
-                off++;
-            } else {
-                break;
-            }
-            if (!global)
-                break;
-        }
-        {
-            JsValue out = js_string(js, b.s ? b.s : "");
-            jsbuf_free(&b);
-            return out;
-        }
-    }
-    {
-        char *n = js_to_string(js, needle);
-        char *hit = strstr(s, n);
-        size_t out_len;
-        char *out;
-        char *rep_s;
-        if (!hit)
-            return js_string(js, s);
-        if (js_is_callable(rep)) {
-            JsValue args[3];
-            JsValue r;
-            args[0] = js_string(js, n);
-            args[1] = js_num((double)(hit - s));
-            args[2] = js_string(js, s);
-            r = call_value(js, NULL, rep, js_undef(), args, 3, 0);
-            rep_s = js_to_string(js, r);
-        } else {
-            rep_s = js_to_string(js, rep);
-        }
-        out_len = strlen(s) + strlen(rep_s) + 1;
-        out = (char *)hpe_js_alloc(js, out_len);
-        memcpy(out, s, (size_t)(hit - s));
-        memcpy(out + (hit - s), rep_s, strlen(rep_s));
-        strcpy(out + (hit - s) + strlen(rep_s), hit + strlen(n));
-        return js_string(js, out);
-    }
+    if (needle.t == JS_OBJ && needle.obj && needle.obj->kind == JS_OBJ_REGEX)
+        return string_replace_regex(js, s, needle, rep);
+    return string_replace_plain(js, s, needle, rep);
 }
 
+/* global regex: collect every non-overlapping match into an array, or null */
+static JsValue match_regex_global(HpeJs *js, HpeRegex *re, const char *s)
+{
+    JsObj *out = js_array_new(js);
+    int off = 0, any = 0;
+    for (;;) {
+        int caps[RE_CAPS];
+        int m, i;
+        for (i = 0; i < RE_CAPS; i++)
+            caps[i] = -1;
+        m = hpe_regex_search(re, s, off, caps, RE_CAPS);
+        if (m < 0)
+            break;
+        if (caps[1] < 0)
+            caps[1] = m;
+        array_push_value(js, out,
+                         js_string_len(js, s + caps[0], (size_t)(caps[1] - caps[0])));
+        any = 1;
+        off = caps[1] > caps[0] ? caps[1] : caps[0] + 1;
+        if ((size_t)off > strlen(s))
+            break;
+    }
+    return any ? js_objval(out) : js_null();
+}
+
+/* non-global regex: a single match result object (with capture groups), or null */
+static JsValue match_regex_once(HpeJs *js, HpeRegex *re, const char *s, int total)
+{
+    int caps[RE_CAPS];
+    int i, m;
+    for (i = 0; i < RE_CAPS; i++)
+        caps[i] = -1;
+    m = hpe_regex_search(re, s, 0, caps, RE_CAPS);
+    if (m < 0)
+        return js_null();
+    if (caps[1] < 0)
+        caps[1] = m;
+    return regex_make_result(js, s, caps, total);
+}
+
+/* plain-string needle: emulate the match array (with index/input) or null */
+static JsValue match_plain(HpeJs *js, const char *s, JsValue needle)
+{
+    char *n = js_to_string(js, needle);
+    char *hit = strstr(s, n);
+    JsObj *out = js_array_new(js);
+
+    if (!hit) {
+        js_obj_set(js, out, "index", js_num(-1));
+        return js_objval(out);
+    }
+    array_push_value(js, out, js_string(js, n));
+    js_obj_set(js, out, "index", js_num((double)(hit - s)));
+    js_obj_set(js, out, "input", js_string(js, s));
+    return js_objval(out);
+}
+
+/* string.match(needle): regex -> match array/result; string -> match array */
 static JsValue string_match(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     char *s = js_to_string(js, thisv);
@@ -5264,57 +5718,11 @@ static JsValue string_match(HpeJs *js, JsValue thisv, JsValue *a, int argc, void
         int total = hpe_regex_group_count(re);
         if (!re)
             return js_null();
-        if (regex_is_global(needle)) {
-            JsObj *out = js_array_new(js);
-            int off = 0, any = 0;
-            for (;;) {
-                int caps[RE_CAPS];
-                int m, i;
-                for (i = 0; i < RE_CAPS; i++)
-                    caps[i] = -1;
-                m = hpe_regex_search(re, s, off, caps, RE_CAPS);
-                if (m < 0)
-                    break;
-                if (caps[1] < 0)
-                    caps[1] = m;
-                array_push_value(js, out,
-                                 js_string_len(js, s + caps[0], (size_t)(caps[1] - caps[0])));
-                any = 1;
-                off = caps[1] > caps[0] ? caps[1] : caps[0] + 1;
-                if ((size_t)off > strlen(s))
-                    break;
-            }
-            return any ? js_objval(out) : js_null();
-        }
-        {
-            int caps[RE_CAPS];
-            int i, m;
-            for (i = 0; i < RE_CAPS; i++)
-                caps[i] = -1;
-            m = hpe_regex_search(re, s, 0, caps, RE_CAPS);
-            if (m < 0)
-                return js_null();
-            if (caps[1] < 0)
-                caps[1] = m;
-            return regex_make_result(js, s, caps, total);
-        }
+        if (regex_is_global(needle))
+            return match_regex_global(js, re, s);
+        return match_regex_once(js, re, s, total);
     }
-    {
-        char *n = js_to_string(js, needle);
-        char *hit = strstr(s, n);
-        if (!hit) {
-            JsObj *out = js_array_new(js);
-            js_obj_set(js, out, "index", js_num(-1));
-            return js_objval(out);
-        }
-        {
-            JsObj *out = js_array_new(js);
-            array_push_value(js, out, js_string(js, n));
-            js_obj_set(js, out, "index", js_num((double)(hit - s)));
-            js_obj_set(js, out, "input", js_string(js, s));
-            return js_objval(out);
-        }
-    }
+    return match_plain(js, s, needle);
 }
 
 static JsValue string_search(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
@@ -6001,90 +6409,107 @@ static int utf8_strlen_n(const char *s, size_t bytes)
     return n;
 }
 
+/* split on a RegExp separator, interleaving the capture groups per spec */
+static void string_split_regex(HpeJs *js, JsObj *out, const char *s, JsValue sep, int limit)
+{
+    HpeRegex *re = (HpeRegex *)sep.obj->payload;
+    int off = 0, n = 0, m, total = hpe_regex_group_count(re);
+    size_t sl = strlen(s);
+
+    for (;;) {
+        int caps[RE_CAPS];
+        int i;
+
+        for (i = 0; i < RE_CAPS; i++)
+            caps[i] = -1;
+        m = re ? hpe_regex_search(re, s, off, caps, RE_CAPS) : -1;
+        if (m < 0) {
+            if (limit < 0 || n < limit)
+                array_push_value(js, out, js_string(js, s + off));
+            break;
+        }
+        if (caps[1] < 0)
+            caps[1] = m;
+        if (limit >= 0 && n >= limit)
+            break;
+        array_push_value(js, out, js_string_len(js, s + off, (size_t)(caps[0] - off)));
+        n++;
+        for (i = 0; i < total; i++) {
+            int bi = 2 + i * 2, ei = bi + 1;
+
+            if (limit >= 0 && n >= limit)
+                break;
+            if (bi + 1 < RE_CAPS && caps[bi] >= 0 && caps[ei] >= caps[bi])
+                array_push_value(js, out,
+                                 js_string_len(js, s + caps[bi], (size_t)(caps[ei] - caps[bi])));
+            else
+                array_push_value(js, out, js_undef());
+            n++;
+        }
+        if (caps[1] > caps[0])
+            off = caps[1];
+        else
+            off = caps[0] + 1; /* empty match: advance one byte */
+        if ((size_t)off > sl)
+            break;
+    }
+}
+
+/* split on a plain separator; an empty separator splits into codepoints */
+static void string_split_plain(HpeJs *js, JsObj *out, const char *s, JsValue sep, int limit)
+{
+    char *sep_s = js_to_string(js, sep);
+    size_t sl = strlen(sep_s);
+    const char *p = s;
+    int n = 0;
+
+    if (sl == 0) {
+        int len = utf8_len(s), i;
+
+        for (i = 0; i < len; i++) {
+            if (limit >= 0 && n >= limit)
+                break;
+            array_push_value(js, out, utf8_char_at(js, s, i));
+            n++;
+        }
+        return;
+    }
+    for (;;) {
+        const char *hit;
+
+        if (limit >= 0 && n >= limit)
+            break;
+        hit = strstr(p, sep_s);
+        if (!hit) {
+            array_push_value(js, out, js_string(js, p));
+            break;
+        }
+        array_push_value(js, out, js_string_len(js, p, (size_t)(hit - p)));
+        n++;
+        p = hit + sl;
+    }
+}
+
 static JsValue string_split(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     char *s = str_arg(js, thisv);
     JsObj *out = js_array_new(js);
     JsValue sep = arg_at(a, argc, 0);
     int limit = argc > 1 && a[1].t != JS_UNDEF ? (int)js_to_number(js, a[1]) : -1;
+
     HPE_UNUSED(ud);
     if (limit == 0)
         return js_objval(out);
     if (sep.t == JS_UNDEF) {
+        /* no separator: the whole string is the single element */
         array_push_value(js, out, js_string(js, s));
         return js_objval(out);
     }
-    if (sep.t == JS_OBJ && sep.obj && sep.obj->kind == JS_OBJ_REGEX) {
-        HpeRegex *re = (HpeRegex *)sep.obj->payload;
-        int off = 0, n = 0, m, total = hpe_regex_group_count(re);
-        size_t sl = strlen(s);
-        for (;;) {
-            int caps[RE_CAPS];
-            int i;
-            for (i = 0; i < RE_CAPS; i++)
-                caps[i] = -1;
-            m = re ? hpe_regex_search(re, s, off, caps, RE_CAPS) : -1;
-            if (m < 0) {
-                if (limit < 0 || n < limit)
-                    array_push_value(js, out, js_string(js, s + off));
-                break;
-            }
-            if (caps[1] < 0)
-                caps[1] = m;
-            if (limit >= 0 && n >= limit)
-                break;
-            array_push_value(js, out, js_string_len(js, s + off, (size_t)(caps[0] - off)));
-            n++;
-            for (i = 0; i < total; i++) {
-                int bi = 2 + i * 2, ei = bi + 1;
-                if (limit >= 0 && n >= limit)
-                    break;
-                if (bi + 1 < RE_CAPS && caps[bi] >= 0 && caps[ei] >= caps[bi])
-                    array_push_value(js, out,
-                                     js_string_len(js, s + caps[bi], (size_t)(caps[ei] - caps[bi])));
-                else
-                    array_push_value(js, out, js_undef());
-                n++;
-            }
-            if (caps[1] > caps[0])
-                off = caps[1];
-            else
-                off = caps[0] + 1;
-            if ((size_t)off > sl)
-                break;
-        }
-        return js_objval(out);
-    }
-    {
-        char *sep_s = js_to_string(js, sep);
-        size_t sl = strlen(sep_s);
-        const char *p = s;
-        int n = 0;
-        if (sl == 0) {
-            int len = utf8_len(s), i;
-            for (i = 0; i < len; i++) {
-                if (limit >= 0 && n >= limit)
-                    break;
-                array_push_value(js, out, utf8_char_at(js, s, i));
-                n++;
-            }
-            return js_objval(out);
-        }
-        for (;;) {
-            const char *hit;
-            if (limit >= 0 && n >= limit)
-                break;
-            hit = strstr(p, sep_s);
-            if (!hit) {
-                array_push_value(js, out, js_string(js, p));
-                break;
-            }
-            array_push_value(js, out, js_string_len(js, p, (size_t)(hit - p)));
-            n++;
-            p = hit + sl;
-        }
-        return js_objval(out);
-    }
+    if (sep.t == JS_OBJ && sep.obj && sep.obj->kind == JS_OBJ_REGEX)
+        string_split_regex(js, out, s, sep, limit);
+    else
+        string_split_plain(js, out, s, sep, limit);
+    return js_objval(out);
 }
 
 static JsValue string_concat(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
@@ -6703,208 +7128,265 @@ static void install_map_proto(HpeJs *js)
     }
 }
 
-static void install_global_object(HpeJs *js)
+/* install statics on the constructor object looked up by name in `global` */
+static JsObj *ctor_of(HpeJs *js, const char *name)
 {
-    JsValue global = js_objval(js->global_obj);
-    JsObj *math;
-    JsObj *json;
+    return js_obj_get(js, js->global_obj, name).obj;
+}
 
-    /* Object */
+static void install_object_ctor(HpeJs *js)
+{
+    JsObj *oc;
+
     make_ctor(js, "Object", native_object_ctor, NULL, js->object_proto);
-    {
-        JsValue obj_ctor = js_obj_get(js, js->global_obj, "Object");
-        JsObj *oc = obj_ctor.obj;
-        def_method(js, oc, "keys", object_keys, NULL);
-        def_method(js, oc, "values", object_values, NULL);
-        def_method(js, oc, "entries", object_entries, NULL);
-        def_method(js, oc, "fromEntries", object_from_entries, NULL);
-        def_method(js, oc, "getOwnPropertyNames", object_get_own_property_names, NULL);
-        def_method(js, oc, "assign", object_assign, NULL);
-        def_method(js, oc, "freeze", object_freeze, NULL);
-        def_method(js, oc, "seal", object_seal, NULL);
-        def_method(js, oc, "isSealed", object_is_sealed, NULL);
-        def_method(js, oc, "isFrozen", object_is_frozen, NULL);
-        def_method(js, oc, "create", object_create, NULL);
-        def_method(js, oc, "defineProperty", object_define_property, NULL);
-        def_method(js, oc, "getOwnPropertyDescriptor", object_get_property_descriptor, NULL);
-        def_method(js, oc, "hasOwn", object_has_own, NULL);
-        def_method(js, oc, "getPrototypeOf", object_get_prototype_of, NULL);
-        def_method(js, oc, "setPrototypeOf", object_set_prototype_of, NULL);
-        def_method(js, oc, "is", NULL, NULL);
-        js_obj_set(js, oc, "is", mk_native(js, object_is_value, NULL));
-    }
+    oc = ctor_of(js, "Object");
+    def_method(js, oc, "keys", object_keys, NULL);
+    def_method(js, oc, "values", object_values, NULL);
+    def_method(js, oc, "entries", object_entries, NULL);
+    def_method(js, oc, "fromEntries", object_from_entries, NULL);
+    def_method(js, oc, "getOwnPropertyNames", object_get_own_property_names, NULL);
+    def_method(js, oc, "assign", object_assign, NULL);
+    def_method(js, oc, "freeze", object_freeze, NULL);
+    def_method(js, oc, "seal", object_seal, NULL);
+    def_method(js, oc, "isSealed", object_is_sealed, NULL);
+    def_method(js, oc, "isFrozen", object_is_frozen, NULL);
+    def_method(js, oc, "create", object_create, NULL);
+    def_method(js, oc, "defineProperty", object_define_property, NULL);
+    def_method(js, oc, "getOwnPropertyDescriptor", object_get_property_descriptor, NULL);
+    def_method(js, oc, "hasOwn", object_has_own, NULL);
+    def_method(js, oc, "getPrototypeOf", object_get_prototype_of, NULL);
+    def_method(js, oc, "setPrototypeOf", object_set_prototype_of, NULL);
+    def_method(js, oc, "is", NULL, NULL);
+    js_obj_set(js, oc, "is", mk_native(js, object_is_value, NULL));
+}
 
-    /* Function */
-    make_ctor(js, "Function", function_ctor, NULL, js->func_proto);
+static void install_array_ctor(HpeJs *js)
+{
+    JsObj *ac;
 
-    /* Array */
     make_ctor(js, "Array", native_array_ctor, NULL, js->array_proto);
-    {
-        JsObj *ac = js_obj_get(js, js->global_obj, "Array").obj;
-        def_method(js, ac, "from", native_array_from, NULL);
-        def_method(js, ac, "of", native_array_of, NULL);
-        def_method(js, ac, "isArray", native_array_is_array, NULL);
-    }
+    ac = ctor_of(js, "Array");
+    def_method(js, ac, "from", native_array_from, NULL);
+    def_method(js, ac, "of", native_array_of, NULL);
+    def_method(js, ac, "isArray", native_array_is_array, NULL);
+}
 
-    /* String / Number / Boolean */
+static void install_string_ctor(HpeJs *js)
+{
+    JsObj *sc;
+
     make_ctor(js, "String", native_string_ctor, NULL, js->string_proto);
-    make_ctor(js, "Number", native_number_ctor, NULL, js->number_proto);
-    make_ctor(js, "Boolean", native_boolean_ctor, NULL, js->bool_proto);
-    {
-        JsObj *sc = js_obj_get(js, js->global_obj, "String").obj;
-        def_method(js, sc, "fromCharCode", string_from_char_code, NULL);
-        def_method(js, sc, "fromCodePoint", string_from_code_point, NULL);
-    }
-    {
-        JsObj *nc = js_obj_get(js, js->global_obj, "Number").obj;
-        def_method(js, nc, "isInteger", number_is_integer, NULL);
-        def_method(js, nc, "isFinite", number_is_finite_fn, NULL);
-        def_method(js, nc, "isNaN", number_is_nan_fn, NULL);
-        def_method(js, nc, "isSafeInteger", number_is_safe_integer, NULL);
-        def_method(js, nc, "parseInt", native_parse_int, NULL);
-        def_method(js, nc, "parseFloat", native_parse_float, NULL);
-        def_value(js, nc, "MAX_SAFE_INTEGER", js_num(9007199254740991.0));
-        def_value(js, nc, "MIN_SAFE_INTEGER", js_num(-9007199254740991.0));
-        def_value(js, nc, "MAX_VALUE", js_num(1.7976931348623157e308));
-        def_value(js, nc, "MIN_VALUE", js_num(5e-324));
-        def_value(js, nc, "POSITIVE_INFINITY", js_num(INFINITY));
-        def_value(js, nc, "NEGATIVE_INFINITY", js_num(-INFINITY));
-        def_value(js, nc, "NaN", js_num(NAN));
-        def_value(js, nc, "EPSILON", js_num(2.220446049250313e-16));
-    }
+    sc = ctor_of(js, "String");
+    def_method(js, sc, "fromCharCode", string_from_char_code, NULL);
+    def_method(js, sc, "fromCodePoint", string_from_code_point, NULL);
+}
 
-    /* Error family */
+static void install_number_ctor(HpeJs *js)
+{
+    JsObj *nc;
+
+    make_ctor(js, "Number", native_number_ctor, NULL, js->number_proto);
+    nc = ctor_of(js, "Number");
+    def_method(js, nc, "isInteger", number_is_integer, NULL);
+    def_method(js, nc, "isFinite", number_is_finite_fn, NULL);
+    def_method(js, nc, "isNaN", number_is_nan_fn, NULL);
+    def_method(js, nc, "isSafeInteger", number_is_safe_integer, NULL);
+    def_method(js, nc, "parseInt", native_parse_int, NULL);
+    def_method(js, nc, "parseFloat", native_parse_float, NULL);
+    def_value(js, nc, "MAX_SAFE_INTEGER", js_num(9007199254740991.0));
+    def_value(js, nc, "MIN_SAFE_INTEGER", js_num(-9007199254740991.0));
+    def_value(js, nc, "MAX_VALUE", js_num(1.7976931348623157e308));
+    def_value(js, nc, "MIN_VALUE", js_num(5e-324));
+    def_value(js, nc, "POSITIVE_INFINITY", js_num(INFINITY));
+    def_value(js, nc, "NEGATIVE_INFINITY", js_num(-INFINITY));
+    def_value(js, nc, "NaN", js_num(NAN));
+    def_value(js, nc, "EPSILON", js_num(2.220446049250313e-16));
+}
+
+static void install_error_ctors(HpeJs *js)
+{
     make_ctor(js, "Error", error_ctor, (void *)"Error", js->error_proto);
     make_ctor(js, "TypeError", error_ctor, (void *)"TypeError", js->type_error_proto);
     make_ctor(js, "RangeError", error_ctor, (void *)"RangeError", js->range_error_proto);
     make_ctor(js, "SyntaxError", error_ctor, (void *)"SyntaxError", js->syntax_error_proto);
     make_ctor(js, "ReferenceError", error_ctor, (void *)"ReferenceError", js->ref_error_proto);
+}
 
-    /* Promise */
+static void install_promise_ctor(HpeJs *js)
+{
+    JsObj *pc;
+
     make_ctor(js, "Promise", promise_ctor_native, NULL, js->promise_proto);
-    {
-        JsObj *pc = js_obj_get(js, js->global_obj, "Promise").obj;
-        def_method(js, pc, "resolve", promise_static_resolve, NULL);
-        def_method(js, pc, "reject", promise_static_reject, NULL);
-        def_method(js, pc, "all", promise_static_all, NULL);
-        def_method(js, pc, "race", promise_static_race, NULL);
-        def_method(js, pc, "allSettled", promise_static_all, NULL);
-    }
+    pc = ctor_of(js, "Promise");
+    def_method(js, pc, "resolve", promise_static_resolve, NULL);
+    def_method(js, pc, "reject", promise_static_reject, NULL);
+    def_method(js, pc, "all", promise_static_all, NULL);
+    def_method(js, pc, "race", promise_static_race, NULL);
+    def_method(js, pc, "allSettled", promise_static_all, NULL);
+}
 
-    /* RegExp */
-    make_ctor(js, "RegExp", native_regexp_ctor, NULL, js->regex_proto);
+static void install_set_statics(HpeJs *js)
+{
+    JsObj *sc = ctor_of(js, "Set");
 
-    /* Map / Set */
+    def_method(js, sc, "add", set_add, NULL);
+    def_method(js, sc, "has", set_has, NULL);
+    def_method(js, sc, "delete", set_delete, NULL);
+    def_method(js, sc, "clear", set_clear, NULL);
+    def_method(js, sc, "forEach", set_foreach, NULL);
+    /* `values`/`keys`/`entries` all share the value iterator per the spec */
+    def_value(js, sc, "values", mk_native(js, set_values, NULL));
+    def_value(js, sc, "keys", mk_native(js, set_values, NULL));
+    def_value(js, sc, "entries", mk_native(js, set_values, NULL));
+}
+
+static void install_map_set_ctors(HpeJs *js)
+{
     make_ctor(js, "Map", native_map_ctor, NULL, js->map_proto);
     make_ctor(js, "Set", native_set_ctor, NULL, js->set_proto);
-    {
-        JsObj *sc = js_obj_get(js, js->global_obj, "Set").obj;
-        def_method(js, sc, "add", set_add, NULL);
-        def_method(js, sc, "has", set_has, NULL);
-        def_method(js, sc, "delete", set_delete, NULL);
-        def_method(js, sc, "clear", set_clear, NULL);
-        def_method(js, sc, "forEach", set_foreach, NULL);
-        def_value(js, sc, "values", mk_native(js, set_values, NULL));
-        def_value(js, sc, "keys", mk_native(js, set_values, NULL));
-        def_value(js, sc, "entries", mk_native(js, set_values, NULL));
-    }
+    install_set_statics(js);
+}
 
-    /* Symbol */
+static void install_symbol_ctor(HpeJs *js)
+{
+    JsObj *sc;
+
     make_ctor(js, "Symbol", native_symbol, NULL, js->symbol_proto);
-    {
-        JsObj *sc = js_obj_get(js, js->global_obj, "Symbol").obj;
-        def_value(js, sc, "iterator", symbol_brand(js, "Symbol.iterator"));
-        def_value(js, sc, "toStringTag", symbol_brand(js, "Symbol.toStringTag"));
-        def_value(js, sc, "asyncIterator", symbol_brand(js, "Symbol.asyncIterator"));
-        def_method(js, sc, "for", native_symbol, NULL);
-    }
+    sc = ctor_of(js, "Symbol");
+    def_value(js, sc, "iterator", symbol_brand(js, "Symbol.iterator"));
+    def_value(js, sc, "toStringTag", symbol_brand(js, "Symbol.toStringTag"));
+    def_value(js, sc, "asyncIterator", symbol_brand(js, "Symbol.asyncIterator"));
+    def_method(js, sc, "for", native_symbol, NULL);
     def_method(js, js->symbol_proto, "toString", symbol_toString, NULL);
+}
 
-    /* Math */
-    math = js_object_new(js);
-    math->class_name = "Math";
-    def_method(js, math, "abs", math_abs, NULL);
-    def_method(js, math, "ceil", math_ceil, NULL);
-    def_method(js, math, "floor", math_floor, NULL);
-    def_method(js, math, "trunc", math_trunc, NULL);
-    def_method(js, math, "round", math_round, NULL);
-    def_method(js, math, "sqrt", math_sqrt, NULL);
-    def_method(js, math, "cbrt", math_cbrt, NULL);
-    def_method(js, math, "exp", math_exp, NULL);
-    def_method(js, math, "log", math_log, NULL);
-    def_method(js, math, "log2", math_log2, NULL);
-    def_method(js, math, "log10", math_log10, NULL);
-    def_method(js, math, "sin", math_sin, NULL);
-    def_method(js, math, "cos", math_cos, NULL);
-    def_method(js, math, "tan", math_tan, NULL);
-    def_method(js, math, "asin", math_asin, NULL);
-    def_method(js, math, "acos", math_acos, NULL);
-    def_method(js, math, "atan", math_atan, NULL);
-    def_method(js, math, "atan2", math_atan2, NULL);
-    def_method(js, math, "sinh", math_sinh, NULL);
-    def_method(js, math, "cosh", math_cosh, NULL);
-    def_method(js, math, "tanh", math_tanh, NULL);
-    def_method(js, math, "sign", math_sign, NULL);
-    def_method(js, math, "pow", math_pow, NULL);
-    def_method(js, math, "hypot", math_hypot, NULL);
-    def_method(js, math, "min", math_minmax, NULL);
-    def_method(js, math, "max", math_minmax, (void *)1);
-    def_method(js, math, "random", math_random, NULL);
-    def_method(js, math, "clz32", math_clz32, NULL);
-    def_method(js, math, "imul", math_imul, NULL);
-    def_method(js, math, "fround", math_fround, NULL);
-    def_method(js, math, "log1p", math_extra, (void *)(intptr_t)MF_LOG1P);
-    def_method(js, math, "expm1", math_extra, (void *)(intptr_t)MF_EXPM1);
-    def_method(js, math, "acosh", math_extra, (void *)(intptr_t)MF_ACOSH);
-    def_method(js, math, "asinh", math_extra, (void *)(intptr_t)MF_ASINH);
-    def_method(js, math, "atanh", math_extra, (void *)(intptr_t)MF_ATANH);
+/* one row per `Math` function whose signature is `(x)` or `(x,y)`; the last
+ * argument threads the `Math.max` / `Math.min` selection flag through. */
+typedef struct MathFn {
+    const char *name;
+    JsNativeFn fn;
+    void *ud;
+} MathFn;
+
+static void install_math_fn_table(HpeJs *js, JsObj *math)
+{
+    size_t i;
+    static const MathFn fns[] = {
+        { "abs", math_abs, NULL },     { "ceil", math_ceil, NULL },
+        { "floor", math_floor, NULL }, { "trunc", math_trunc, NULL },
+        { "round", math_round, NULL }, { "sqrt", math_sqrt, NULL },
+        { "cbrt", math_cbrt, NULL },   { "exp", math_exp, NULL },
+        { "log", math_log, NULL },     { "log2", math_log2, NULL },
+        { "log10", math_log10, NULL }, { "sin", math_sin, NULL },
+        { "cos", math_cos, NULL },     { "tan", math_tan, NULL },
+        { "asin", math_asin, NULL },   { "acos", math_acos, NULL },
+        { "atan", math_atan, NULL },   { "atan2", math_atan2, NULL },
+        { "sinh", math_sinh, NULL },   { "cosh", math_cosh, NULL },
+        { "tanh", math_tanh, NULL },   { "sign", math_sign, NULL },
+        { "pow", math_pow, NULL },     { "hypot", math_hypot, NULL },
+        { "min", math_minmax, NULL },  { "max", math_minmax, (void *)1 },
+        { "random", math_random, NULL },
+        { "clz32", math_clz32, NULL }, { "imul", math_imul, NULL },
+        { "fround", math_fround, NULL },
+        { "log1p", math_extra, (void *)(intptr_t)MF_LOG1P },
+        { "expm1", math_extra, (void *)(intptr_t)MF_EXPM1 },
+        { "acosh", math_extra, (void *)(intptr_t)MF_ACOSH },
+        { "asinh", math_extra, (void *)(intptr_t)MF_ASINH },
+        { "atanh", math_extra, (void *)(intptr_t)MF_ATANH },
+    };
+
+    for (i = 0; i < sizeof(fns) / sizeof(fns[0]); i++)
+        def_method(js, math, fns[i].name, fns[i].fn, fns[i].ud);
+}
+
+static void install_math_consts(HpeJs *js, JsObj *math)
+{
     def_value(js, math, "PI", js_num(3.141592653589793));
     def_value(js, math, "E", js_num(2.718281828459045));
     def_value(js, math, "LN2", js_num(0.6931471805599453));
     def_value(js, math, "LN10", js_num(2.302585092994046));
     def_value(js, math, "SQRT2", js_num(1.4142135623730951));
     def_value(js, math, "SQRT1_2", js_num(0.7071067811865476));
-    js_obj_set(js, js->global_obj, "Math", js_objval(math));
+}
 
-    /* JSON */
-    json = js_object_new(js);
+static void install_math(HpeJs *js)
+{
+    JsObj *math = js_object_new(js);
+
+    math->class_name = "Math";
+    install_math_fn_table(js, math);
+    install_math_consts(js, math);
+    js_obj_set(js, js->global_obj, "Math", js_objval(math));
+}
+
+static void install_json(HpeJs *js)
+{
+    JsObj *json = js_object_new(js);
+
     json->class_name = "JSON";
     def_method(js, json, "stringify", json_stringify, NULL);
     def_method(js, json, "parse", json_parse, NULL);
     js_obj_set(js, js->global_obj, "JSON", js_objval(json));
+}
 
-    /* Date */
+/* `parseInt` / `isNaN` / URI codecs shared by the global object and `Number` */
+static void install_global_functions(HpeJs *js)
+{
+    JsObj *g = js->global_obj;
+
+    def_value(js, g, "parseInt", mk_native(js, native_parse_int, NULL));
+    def_value(js, g, "parseFloat", mk_native(js, native_parse_float, NULL));
+    def_value(js, g, "isNaN", mk_native(js, native_is_nan, NULL));
+    def_value(js, g, "isFinite", mk_native(js, native_is_finite, NULL));
+    def_value(js, g, "encodeURIComponent", mk_native(js, native_encode_uri_component, NULL));
+    def_value(js, g, "decodeURIComponent", mk_native(js, native_decode_uri_component, NULL));
+    /* `encodeURI` reuses the component codec with the "keep reserved chars" flag */
+    def_value(js, g, "encodeURI", mk_native(js, native_encode_uri_component, (void *)1));
+    def_value(js, g, "decodeURI", mk_native(js, native_decode_uri_component, NULL));
+    def_value(js, g, "NaN", js_num(NAN));
+    def_value(js, g, "Infinity", js_num(INFINITY));
+    def_value(js, g, "undefined", js_undef());
+}
+
+/* `console` methods all route to native_console; `ud` selects the stderr stream */
+static void install_console(HpeJs *js)
+{
+    static const MathFn methods[] = {
+        { "log", native_console, NULL },    { "info", native_console, NULL },
+        { "debug", native_console, NULL },  { "warn", native_console, (void *)1 },
+        { "error", native_console, (void *)1 },
+        { "assert", native_console, NULL }, { "trace", native_console, (void *)1 },
+        { "dir", native_console, NULL },
+    };
+    JsObj *console = js_object_new(js);
+    size_t i;
+
+    console->class_name = "Console";
+    for (i = 0; i < sizeof(methods) / sizeof(methods[0]); i++)
+        def_method(js, console, methods[i].name, methods[i].fn, methods[i].ud);
+    js_obj_set(js, js->global_obj, "console", js_objval(console));
+}
+
+static void install_global_object(HpeJs *js)
+{
+    JsValue global = js_objval(js->global_obj);
+
+    install_object_ctor(js);
+    make_ctor(js, "Function", function_ctor, NULL, js->func_proto);
+    install_array_ctor(js);
+    install_string_ctor(js);
+    install_number_ctor(js);
+    make_ctor(js, "Boolean", native_boolean_ctor, NULL, js->bool_proto);
+    install_error_ctors(js);
+    install_promise_ctor(js);
+    make_ctor(js, "RegExp", native_regexp_ctor, NULL, js->regex_proto);
+    install_map_set_ctors(js);
+    install_symbol_ctor(js);
+    install_math(js);
+    install_json(js);
     hpe_js_date_install(js);
-
-    /* global functions */
-    def_value(js, js->global_obj, "parseInt", mk_native(js, native_parse_int, NULL));
-    def_value(js, js->global_obj, "parseFloat", mk_native(js, native_parse_float, NULL));
-    def_value(js, js->global_obj, "isNaN", mk_native(js, native_is_nan, NULL));
-    def_value(js, js->global_obj, "isFinite", mk_native(js, native_is_finite, NULL));
-    def_value(js, js->global_obj, "encodeURIComponent",
-              mk_native(js, native_encode_uri_component, NULL));
-    def_value(js, js->global_obj, "decodeURIComponent",
-              mk_native(js, native_decode_uri_component, NULL));
-    def_value(js, js->global_obj, "encodeURI", mk_native(js, native_encode_uri_component, (void *)1));
-    def_value(js, js->global_obj, "decodeURI", mk_native(js, native_decode_uri_component, NULL));
-    def_value(js, js->global_obj, "NaN", js_num(NAN));
-    def_value(js, js->global_obj, "Infinity", js_num(INFINITY));
-    def_value(js, js->global_obj, "undefined", js_undef());
-
-    /* console / alert */
-    {
-        JsObj *console = js_object_new(js);
-        console->class_name = "Console";
-        def_method(js, console, "log", native_console, NULL);
-        def_method(js, console, "info", native_console, NULL);
-        def_method(js, console, "debug", native_console, NULL);
-        def_method(js, console, "warn", native_console, (void *)1);
-        def_method(js, console, "error", native_console, (void *)1);
-        def_method(js, console, "assert", native_console, NULL);
-        def_method(js, console, "trace", native_console, (void *)1);
-        def_method(js, console, "dir", native_console, NULL);
-        js_obj_set(js, js->global_obj, "console", js_objval(console));
-    }
+    install_global_functions(js);
+    install_console(js);
     def_value(js, js->global_obj, "alert", mk_native(js, native_alert, NULL));
     def_value(js, js->global_obj, "globalThis", global);
     HPE_UNUSED(global);
@@ -6952,6 +7434,9 @@ void hpe_js_destroy(HpeJs *js)
     JsModule *m;
     if (!js)
         return;
+    /* drop the DOM mutation sink: the js arena (and its observer state) is about
+     * to be freed, so the DOM must stop forwarding to it */
+    hpe_js_mutation_uninstall(js);
     b = js->blocks;
     while (b) {
         JsBlock *next = b->next;

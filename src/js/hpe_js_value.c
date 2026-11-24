@@ -514,6 +514,106 @@ static const char *obj_class_name(JsObj *o)
     return (o && o->class_name) ? o->class_name : "Object";
 }
 
+/* Array#toString: comma-joined elements, skipping null/undefined holes. */
+static char *js_array_to_string(HpeJs *js, JsValue v)
+{
+    int i, len = js_iter_len(js, v);
+    size_t total = 1;
+    char *out, *p;
+    for (i = 0; i < len; i++) {
+        JsValue e = js_iter_at(js, v, i);
+        total += strlen(e.t == JS_UNDEF || e.t == JS_NULL ? "" : js_to_string(js, e)) + 1;
+    }
+    out = (char *)hpe_js_alloc(js, total);
+    p = out;
+    for (i = 0; i < len; i++) {
+        JsValue e = js_iter_at(js, v, i);
+        char *s;
+        size_t sl;
+        if (e.t == JS_UNDEF || e.t == JS_NULL)
+            continue;
+        s = js_to_string(js, e);
+        sl = strlen(s);
+        if (p != out)
+            *p++ = ',';
+        memcpy(p, s, sl);
+        p += sl;
+    }
+    *p = '\0';
+    return out;
+}
+
+static char *js_symbol_to_string(HpeJs *js, JsObj *o)
+{
+    /* symbols key properties by their description string, so a computed
+     * access `obj[Symbol.iterator]` reaches the same slot that
+     * `obj["Symbol.iterator"]` writes */
+    JsProp *d = js_obj_find_prop(o, "description");
+    if (d && d->val.t == JS_STR)
+        return d->val.str ? d->val.str : hpe_js_strdup(js, "");
+    return hpe_js_strdup(js, "Symbol()");
+}
+
+static char *js_date_to_string(HpeJs *js, JsValue v)
+{
+    /* String(date) uses ToPrimitive with the string hint, so the
+     * prototype's toString() wins (it renders "Invalid Date" for NaN) */
+    JsProp *p = js_obj_find_prop(v.obj, "toString");
+    if (p && p->getter.t == JS_UNDEF && js_is_callable(p->val)) {
+        JsValue r = js_invoke(js, p->val, v, NULL, 0, 0);
+        if (r.t == JS_STR)
+            return r.str ? r.str : hpe_js_strdup(js, "");
+    }
+    return hpe_js_strdup(js, "Invalid Date");
+}
+
+static char *js_error_to_string(HpeJs *js, JsObj *o)
+{
+    JsValue nm = js_obj_get(js, o, "name");
+    JsValue ms = js_obj_get(js, o, "message");
+    char *ns = js_to_string(js, nm.t == JS_UNDEF ? js_string(js, "Error") : nm);
+    char *mes = js_to_string(js, ms.t == JS_UNDEF ? js_string(js, "") : ms);
+    size_t n = strlen(ns), m = strlen(mes);
+    char *out = (char *)hpe_js_alloc(js, n + m + 4);
+    memcpy(out, ns, n);
+    if (m) {
+        out[n] = ':';
+        out[n + 1] = ' ';
+        memcpy(out + n + 2, mes, m);
+        out[n + m + 2] = '\0';
+    } else {
+        out[n] = '\0';
+    }
+    return out;
+}
+
+static char *js_obj_to_string(HpeJs *js, JsObj *o)
+{
+    char buf[64];
+    const char *cn = obj_class_name(o);
+    if (!strcmp(cn, "Object") || !strcmp(cn, "Module"))
+        return hpe_js_strdup(js, "[object Object]");
+    snprintf(buf, sizeof(buf), "[object %s]", cn);
+    return hpe_js_strdup(js, buf);
+}
+
+static char *js_object_value_to_string(HpeJs *js, JsValue v)
+{
+    if (!v.obj)
+        return hpe_js_strdup(js, "[object Object]");
+    if (v.obj->kind == JS_OBJ_ARRAY)
+        return js_array_to_string(js, v);
+    if (v.obj->kind == JS_OBJ_FUNC)
+        return hpe_js_strdup(js, "function");
+    if (v.obj->class_name && !strcmp(v.obj->class_name, "Symbol"))
+        return js_symbol_to_string(js, v.obj);
+    if (v.obj->kind == JS_OBJ_DATE)
+        return js_date_to_string(js, v);
+    if (v.obj->kind == JS_OBJ_ERROR)
+        return js_error_to_string(js, v.obj);
+    return js_obj_to_string(js, v.obj);
+}
+
 char *js_to_string(HpeJs *js, JsValue v)
 {
     switch (v.t) {
@@ -528,132 +628,47 @@ char *js_to_string(HpeJs *js, JsValue v)
     case JS_STR:
         return v.str ? v.str : hpe_js_strdup(js, "");
     case JS_OBJ:
-        if (v.obj && v.obj->kind == JS_OBJ_ARRAY) {
-            int i, len = js_iter_len(js, v);
-            size_t total = 1;
-            char *out, *p;
-            for (i = 0; i < len; i++) {
-                JsValue e = js_iter_at(js, v, i);
-                total += strlen(e.t == JS_UNDEF || e.t == JS_NULL ? "" : js_to_string(js, e)) + 1;
-            }
-            out = (char *)hpe_js_alloc(js, total);
-            p = out;
-            for (i = 0; i < len; i++) {
-                JsValue e = js_iter_at(js, v, i);
-                char *s;
-                size_t sl;
-                if (e.t == JS_UNDEF || e.t == JS_NULL)
-                    continue;
-                s = js_to_string(js, e);
-                sl = strlen(s);
-                if (p != out)
-                    *p++ = ',';
-                memcpy(p, s, sl);
-                p += sl;
-            }
-            *p = '\0';
-            return out;
-        }
-        if (v.obj && v.obj->kind == JS_OBJ_FUNC)
-            return hpe_js_strdup(js, "function");
-        if (v.obj && v.obj->class_name && !strcmp(v.obj->class_name, "Symbol")) {
-            /* symbols key properties by their description string, so a computed
-             * access `obj[Symbol.iterator]` reaches the same slot that
-             * `obj["Symbol.iterator"]` writes */
-            JsProp *d = js_obj_find_prop(v.obj, "description");
-            if (d && d->val.t == JS_STR)
-                return d->val.str ? d->val.str : hpe_js_strdup(js, "");
-            return hpe_js_strdup(js, "Symbol()");
-        }
-        if (v.obj && v.obj->kind == JS_OBJ_DATE) {
-            /* String(date) uses ToPrimitive with the string hint, so the
-             * prototype's toString() wins (it renders "Invalid Date" for NaN) */
-            JsProp *p = js_obj_find_prop(v.obj, "toString");
-            if (p && p->getter.t == JS_UNDEF && js_is_callable(p->val)) {
-                JsValue r = js_invoke(js, p->val, v, NULL, 0, 0);
-                if (r.t == JS_STR)
-                    return r.str ? r.str : hpe_js_strdup(js, "");
-            }
-            return hpe_js_strdup(js, "Invalid Date");
-        }
-        if (v.obj && v.obj->kind == JS_OBJ_ERROR) {
-            JsValue nm = js_obj_get(js, v.obj, "name");
-            JsValue ms = js_obj_get(js, v.obj, "message");
-            char *ns = js_to_string(js, nm.t == JS_UNDEF ? js_string(js, "Error") : nm);
-            char *mes = js_to_string(js, ms.t == JS_UNDEF ? js_string(js, "") : ms);
-            size_t n = strlen(ns), m = strlen(mes);
-            char *out = (char *)hpe_js_alloc(js, n + m + 4);
-            memcpy(out, ns, n);
-            if (m) {
-                out[n] = ':';
-                out[n + 1] = ' ';
-                memcpy(out + n + 2, mes, m);
-                out[n + m + 2] = '\0';
-            } else {
-                out[n] = '\0';
-            }
-            return out;
-        }
-        if (v.obj) {
-            char buf[64];
-            const char *cn = obj_class_name(v.obj);
-            if (!strcmp(cn, "Object") || !strcmp(cn, "Module"))
-                return hpe_js_strdup(js, "[object Object]");
-            snprintf(buf, sizeof(buf), "[object %s]", cn);
-            return hpe_js_strdup(js, buf);
-        }
-        return hpe_js_strdup(js, "[object Object]");
+        return js_object_value_to_string(js, v);
     default:
         return hpe_js_strdup(js, "undefined");
     }
 }
 
 /* parses a numeric literal out of the head of `s`; returns 0 when no digits */
-static int parse_number_prefix(const char *s, double *out, const char **end)
+static int parse_hex_prefix(const char *p, int sign, double *out, const char **end)
+{
+    char *e = NULL;
+    unsigned long long v = strtoull(p + 2, &e, 16);
+    *out = (double)(long long)v * (double)sign;
+    *end = e;
+    return 1;
+}
+
+/* shared low-radix digit loop for 0b/0o literals */
+static int parse_radix_prefix(const char *digits, int base, int sign, double *out,
+                              const char **end)
+{
+    unsigned long long v = 0;
+    const char *q = digits;
+    for (;;) {
+        int d;
+        if (!(*q >= '0' && *q <= '9'))
+            break;
+        d = *q - '0';
+        if (d >= base)
+            break;
+        v = v * (unsigned)base + (unsigned)d;
+        q++;
+    }
+    *out = (double)(long long)v * (double)sign;
+    *end = q;
+    return 1;
+}
+
+static int parse_decimal_prefix(const char *p, int sign, double *out, const char **end)
 {
     char buf[64];
     size_t n = 0;
-    const char *p = s;
-    int sign = 1;
-    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
-        p++;
-    if (*p == '+' || *p == '-') {
-        sign = (*p == '-') ? -1 : 1;
-        p++;
-    }
-    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
-        char *e = NULL;
-        unsigned long long v = strtoull(p + 2, &e, 16);
-        *out = (double)(long long)v * (double)sign;
-        *end = e;
-        return 1;
-    }
-    if (p[0] == '0' && (p[1] == 'b' || p[1] == 'B')) {
-        unsigned long long v = 0;
-        const char *q = p + 2;
-        while (*q == '0' || *q == '1') {
-            v = v * 2 + (unsigned)(*q - '0');
-            q++;
-        }
-        *out = (double)(long long)v * (double)sign;
-        *end = q;
-        return 1;
-    }
-    if (p[0] == '0' && (p[1] == 'o' || p[1] == 'O')) {
-        unsigned long long v = 0;
-        const char *q = p + 2;
-        while (*q >= '0' && *q <= '7') {
-            v = v * 8 + (unsigned)(*q - '0');
-            q++;
-        }
-        *out = (double)(long long)v * (double)sign;
-        *end = q;
-        return 1;
-    }
-    if (!(*p >= '0' && *p <= '9') && !(*p == '.' && p[1] >= '0' && p[1] <= '9')) {
-        *end = s;
-        return 0;
-    }
     while ((*p >= '0' && *p <= '9') || *p == '.') {
         if (n < sizeof(buf) - 1)
             buf[n++] = *p;
@@ -670,6 +685,30 @@ static int parse_number_prefix(const char *s, double *out, const char **end)
     *out = strtod(buf, NULL) * (double)sign;
     *end = p;
     return 1;
+}
+
+/* parses a numeric literal out of the head of `s`; returns 0 when no digits */
+static int parse_number_prefix(const char *s, double *out, const char **end)
+{
+    const char *p = s;
+    int sign = 1;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+        p++;
+    if (*p == '+' || *p == '-') {
+        sign = (*p == '-') ? -1 : 1;
+        p++;
+    }
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
+        return parse_hex_prefix(p, sign, out, end);
+    if (p[0] == '0' && (p[1] == 'b' || p[1] == 'B'))
+        return parse_radix_prefix(p + 2, 2, sign, out, end);
+    if (p[0] == '0' && (p[1] == 'o' || p[1] == 'O'))
+        return parse_radix_prefix(p + 2, 8, sign, out, end);
+    if (!(*p >= '0' && *p <= '9') && !(*p == '.' && p[1] >= '0' && p[1] <= '9')) {
+        *end = s;
+        return 0;
+    }
+    return parse_decimal_prefix(p, sign, out, end);
 }
 
 double js_to_number(HpeJs *js, JsValue v)

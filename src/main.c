@@ -141,23 +141,30 @@ static int chrome_key_for_vk(int vk)
     }
 }
 
+/* Ctrl+<letter> editing shortcuts; returns 0 when the combo is not one of them */
+static int chrome_key_for_ctrl(int vk)
+{
+    switch (vk) {
+    case 'V':
+    case 'v': return HPE_KEY_PASTE;
+    case 'C':
+    case 'c': return HPE_KEY_COPY;
+    case 'X':
+    case 'x': return HPE_KEY_CUT;
+    case 'A':
+    case 'a': return HPE_KEY_SELECT_ALL;
+    default: return 0;
+    }
+}
+
 static void app_key(void *user, int vk, int mods)
 {
     App *app = (App *)user;
     int key = 0;
-    int ctrl = (mods & HPE_MOD_CTRL) != 0;
 
     /* editing shortcuts first: they all act on the address-bar selection */
-    if (ctrl) {
-        if (vk == 'V' || vk == 'v')
-            key = HPE_KEY_PASTE;
-        else if (vk == 'C' || vk == 'c')
-            key = HPE_KEY_COPY;
-        else if (vk == 'X' || vk == 'x')
-            key = HPE_KEY_CUT;
-        else if (vk == 'A' || vk == 'a')
-            key = HPE_KEY_SELECT_ALL;
-    }
+    if (mods & HPE_MOD_CTRL)
+        key = chrome_key_for_ctrl(vk);
     if (!key)
         key = chrome_key_for_vk(vk);
 
@@ -197,6 +204,71 @@ static void app_tick(void *user)
     App *app = (App *)user;
     if (hpe_engine_tick(app->engine))
         hpe_window_invalidate(app->window);
+}
+
+/* ---------------- command line ---------------- */
+
+typedef struct {
+    const char *path;
+    const char *dump;
+    int width;
+    int height;
+    int bench;
+    int chrome;
+    float scroll_lines;
+} Options;
+
+static void print_usage(void)
+{
+    printf("usage: hope [file.html] [--width N] [--height N] [--dump out.bmp] "
+           "[--bench N] [--scroll-lines N] [--chrome]\n"
+           "       hope --js script.js | --module module.js   (run a script only)\n"
+           "       with no file argument the built-in blank page is shown\n");
+}
+
+/* returns the process exit code when the run should stop here, or -1 to continue */
+static int parse_args(int argc, char **argv, Options *o)
+{
+    int i;
+    for (i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--width") && i + 1 < argc) {
+            o->width = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--height") && i + 1 < argc) {
+            o->height = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--dump") && i + 1 < argc) {
+            o->dump = argv[++i];
+        } else if (!strcmp(argv[i], "--bench") && i + 1 < argc) {
+            o->bench = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--chrome")) {
+            o->chrome = 1;
+        } else if (!strcmp(argv[i], "--js") && i + 1 < argc) {
+            return run_js_file(argv[++i], 0);
+        } else if (!strcmp(argv[i], "--module") && i + 1 < argc) {
+            return run_js_file(argv[++i], 1);
+        } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
+            print_usage();
+            return 0;
+        } else if (!strcmp(argv[i], "--scroll-lines") && i + 1 < argc) {
+            o->scroll_lines = (float)atof(argv[++i]);
+        } else {
+            o->path = argv[i];
+        }
+    }
+    return -1;
+}
+
+/* window mode always shows the address bar; headless --dump stays page-only
+ * unless --chrome is passed (keeps pixel baselines stable) */
+static void load_start_document(HpeEngine *engine, const Options *o)
+{
+    if (!o->dump || o->chrome)
+        hpe_engine_enable_chrome(engine);
+    if (o->path) {
+        if (!hpe_engine_load_file(engine, o->path))
+            fprintf(stderr, "hope: %s\n", hpe_engine_status(engine));
+    } else if (!hpe_engine_load_blank(engine)) {
+        fprintf(stderr, "hope: %s\n", hpe_engine_status(engine));
+    }
 }
 
 /* ---------------- address-bar test helpers ---------------- */
@@ -262,212 +334,204 @@ static int key_named(const char *name, int *key, int *mods)
     return 0;
 }
 
-int main(int argc, char **argv)
+/* feed a UTF-8 string into the engine as individual key strokes */
+static void synth_type(HpeEngine *engine, const char *s)
 {
-    const char *path = NULL;
-    const char *dump = NULL;
-    int width = 1000, height = 700;
-    int bench = 0;
-    int chrome = 0;
-    int i;
-    float scroll_lines = 0.0f;
-    HpeEngine *engine;
+    const char *p = s;
+    uint32_t cp;
+    while (*p) {
+        int n = hpe_utf8_next(p, &cp);
+        if (n <= 0)
+            break;
+        hpe_engine_key(engine, (int)cp);
+        p += n;
+    }
+}
+
+/* dev/test hook: drive the address bar exactly like a user would (focus by
+ * clicking the strip, then type + Enter) so headless dumps can verify
+ * navigation. HOPE_TEST_ADDR=/path/to/page.html */
+static void hook_test_addr(HpeEngine *engine)
+{
+    const char *typed = getenv("HOPE_TEST_ADDR");
+    if (!typed || !*typed)
+        return;
+    synth_click(engine, 20, ADDR_TEST_Y, 0); /* focus the field */
+    synth_type(engine, typed);
+    if (getenv("HOPE_TEST_ADDR_ENTER"))
+        hpe_engine_key(engine, HPE_KEY_RETURN);
+}
+
+/* dev/test hook: seed the clipboard, then paste with Ctrl+V semantics.
+ * HOPE_TEST_CLIPBOARD=text [HOPE_TEST_PASTE=1] [HOPE_TEST_PASTE_ENTER=1] */
+static void hook_test_clipboard(HpeEngine *engine)
+{
+    const char *seed = getenv("HOPE_TEST_CLIPBOARD");
+    if (seed)
+        hpe_clipboard_set_text(seed);
+    if (getenv("HOPE_TEST_PASTE")) {
+        synth_click(engine, 20, ADDR_TEST_Y, 0); /* focus the field */
+        hpe_engine_key(engine, HPE_KEY_PASTE);
+        if (getenv("HOPE_TEST_PASTE_ENTER"))
+            hpe_engine_key(engine, HPE_KEY_RETURN);
+    }
+}
+
+static void hook_addr_click(HpeEngine *engine, const char *click)
+{
+    char buf[256];
+    char *tok;
+    snprintf(buf, sizeof(buf), "%s", click);
+    for (tok = strtok(buf, ";"); tok; tok = strtok(NULL, ";")) {
+        int cx = 0, mods = 0;
+        if (sscanf(tok, "%d,%d", &cx, &mods) >= 1)
+            synth_click(engine, cx, ADDR_TEST_Y, mods);
+    }
+}
+
+static void hook_addr_dblclick(HpeEngine *engine, const char *dbl)
+{
+    int x1 = 0, x2 = 0;
+    if (sscanf(dbl, "%d,%d", &x1, &x2) >= 1) {
+        if (x2 == 0)
+            x2 = x1;
+        synth_click(engine, x1, ADDR_TEST_Y, 0);
+        synth_click(engine, x2, ADDR_TEST_Y, 0);
+    }
+}
+
+static void hook_addr_drag(HpeEngine *engine, const char *drag)
+{
+    int x1 = 0, x2 = 0, dy = ADDR_TEST_Y;
+    if (sscanf(drag, "%d,%d,%d", &x1, &x2, &dy) >= 2)
+        synth_drag(engine, x1, x2, dy);
+}
+
+static void hook_addr_keys(HpeEngine *engine, const char *keys)
+{
+    char buf[512];
+    char *tok;
+    snprintf(buf, sizeof(buf), "%s", keys);
+    for (tok = strtok(buf, ";"); tok; tok = strtok(NULL, ";")) {
+        int key = 0, mods = 0;
+        if (key_named(tok, &key, &mods))
+            hpe_engine_key_mods(engine, key, mods);
+    }
+}
+
+/* dev/test hooks for the address-bar text editor:
+ *   HOPE_TEST_ADDR_CLICK=x[,mods]     one click into the field
+ *   HOPE_TEST_ADDR_DBLCLICK=x[,x2]    two clicks (word selection)
+ *   HOPE_TEST_ADDR_DRAG=x1,x2[,y]     press, drag, release
+ *   HOPE_TEST_TYPE=text               typed characters
+ *   HOPE_TEST_KEYS="LEFT;SHIFT_RIGHT;CTRL_C;BACKSPACE"   named keys */
+static void hook_test_addr_editor(HpeEngine *engine)
+{
+    const char *click = getenv("HOPE_TEST_ADDR_CLICK");
+    const char *dbl = getenv("HOPE_TEST_ADDR_DBLCLICK");
+    const char *drag = getenv("HOPE_TEST_ADDR_DRAG");
+    const char *type = getenv("HOPE_TEST_TYPE");
+    const char *keys = getenv("HOPE_TEST_KEYS");
+
+    if (click && *click)
+        hook_addr_click(engine, click);
+    if (dbl && *dbl)
+        hook_addr_dblclick(engine, dbl);
+    if (drag && *drag)
+        hook_addr_drag(engine, drag);
+    if (type && *type)
+        synth_type(engine, type);
+    if (keys && *keys)
+        hook_addr_keys(engine, keys);
+}
+
+/* dev/test hook: synthesise a click so headless dumps can drive interactive
+ * pages (a mind-map node collapses, a button fires). HOPE_TEST_CLICK_AT=x,y[,button] */
+static void hook_test_click_at(HpeEngine *engine)
+{
+    const char *click = getenv("HOPE_TEST_CLICK_AT");
+    char buf[256];
+    char *tok;
+    if (!click || !*click)
+        return;
+    snprintf(buf, sizeof(buf), "%s", click);
+    for (tok = strtok(buf, ";"); tok; tok = strtok(NULL, ";")) {
+        int cx = 0, cy = 0, btn = 1;
+        if (sscanf(tok, "%d,%d,%d", &cx, &cy, &btn) < 2)
+            continue;
+        hpe_engine_mouse_move(engine, cx, cy);
+        hpe_engine_mouse_event(engine, cx, cy, btn, 1);
+        hpe_engine_mouse_event(engine, cx, cy, btn, 0);
+    }
+}
+
+/* report the address-bar state once every hook above has run */
+static void report_addr_text(HpeEngine *engine)
+{
+    int a = 0, b = 0, sel;
+    if (!getenv("HOPE_TEST_ADDR_TEXT"))
+        return;
+    sel = hpe_engine_address_selection(engine, &a, &b);
+    printf("addr: [%s] len=%d sel=%d..%d caret=%d focus=%d\n", hpe_engine_address_text(engine),
+           (int)strlen(hpe_engine_address_text(engine)), sel ? a : -1, sel ? b : -1,
+           hpe_engine_address_caret(engine), hpe_engine_address_focused(engine));
+}
+
+/* dev/test hook: print document metadata detected at load time (encoding,
+ * <meta charset>, <base href>, <link> resource hints). HOPE_TEST_META=1 */
+static void report_meta(HpeEngine *engine)
+{
+    int lc, li;
+    if (!getenv("HOPE_TEST_META"))
+        return;
+    lc = hpe_engine_link_count(engine);
+    printf("encoding=%s meta=%d base=%s\n", hpe_engine_document_encoding(engine),
+           hpe_engine_meta_charset(engine), hpe_engine_base_href(engine));
+    printf("links=%d\n", lc);
+    for (li = 0; li < lc; li++) {
+        const char *rel = "";
+        const char *href = "";
+        if (hpe_engine_link_at(engine, li, &rel, &href))
+            printf("link[%d] rel=%s href=%s\n", li, rel, href);
+    }
+}
+
+/* ---------------- run modes ---------------- */
+
+static int run_headless(HpeEngine *engine, const Options *o)
+{
+    if (o->scroll_lines != 0.0f) {
+        /* paint a full frame first so the scroll below goes through the
+         * damage-rect path — this is what makes --scroll-lines a real test
+         * of incremental scrolling (compare with HPE_NO_DIRTY=1) */
+        hpe_engine_render(engine);
+        hpe_engine_scroll_by(engine, o->scroll_lines);
+    }
+    hpe_engine_render(engine);
+    if (o->bench > 1) {
+        double t0 = hpe_time_seconds();
+        double t_last, avg;
+        int n;
+        for (n = 1; n < o->bench; n++)
+            hpe_engine_render(engine);
+        t_last = hpe_time_seconds();
+        avg = (t_last - t0) * 1000.0 / (o->bench - 1);
+        fprintf(stderr, "bench: %d repaints, avg paint %.4f ms\n", o->bench - 1, avg);
+    }
+    if (o->dump) {
+        if (write_bmp(o->dump, hpe_engine_pixmap(engine)))
+            printf("%s\n", hpe_engine_status(engine));
+        else
+            fprintf(stderr, "hope: cannot write %s\n", o->dump);
+    }
+    hpe_engine_destroy(engine);
+    return 0;
+}
+
+static int run_window(HpeEngine *engine, int width, int height)
+{
     HpeWindowCallbacks callbacks;
     App app;
-
-    for (i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--width") && i + 1 < argc) {
-            width = atoi(argv[++i]);
-        } else if (!strcmp(argv[i], "--height") && i + 1 < argc) {
-            height = atoi(argv[++i]);
-        } else if (!strcmp(argv[i], "--dump") && i + 1 < argc) {
-            dump = argv[++i];
-        } else if (!strcmp(argv[i], "--bench") && i + 1 < argc) {
-            bench = atoi(argv[++i]);
-        } else if (!strcmp(argv[i], "--chrome")) {
-            chrome = 1;
-        } else if (!strcmp(argv[i], "--js") && i + 1 < argc) {
-            return run_js_file(argv[++i], 0);
-        } else if (!strcmp(argv[i], "--module") && i + 1 < argc) {
-            return run_js_file(argv[++i], 1);
-        } else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) {
-            printf("usage: hope [file.html] [--width N] [--height N] [--dump out.bmp] "
-                   "[--bench N] [--scroll-lines N] [--chrome]\n"
-                   "       hope --js script.js | --module module.js   (run a script only)\n"
-                   "       with no file argument the built-in blank page is shown\n");
-            return 0;
-        } else if (!strcmp(argv[i], "--scroll-lines") && i + 1 < argc) {
-            scroll_lines = (float)atof(argv[++i]);
-        } else {
-            path = argv[i];
-        }
-    }
-
-    engine = hpe_engine_create(width, height);
-    /* window mode always shows the address bar; headless --dump stays page-only
-     * unless --chrome is passed (keeps pixel baselines stable) */
-    if (!dump || chrome)
-        hpe_engine_enable_chrome(engine);
-    if (path) {
-        if (!hpe_engine_load_file(engine, path))
-            fprintf(stderr, "hope: %s\n", hpe_engine_status(engine));
-    } else if (!hpe_engine_load_blank(engine)) {
-        fprintf(stderr, "hope: %s\n", hpe_engine_status(engine));
-    }
-
-    /* dev/test hooks: drive the address bar exactly like a user would
-     * (focus by clicking the strip, then type + Enter) so headless dumps can
-     * verify navigation. HOPE_TEST_ADDR=/path/to/page.html */
-    {
-        const char *typed = getenv("HOPE_TEST_ADDR");
-        if (typed && *typed) {
-            const char *p = typed;
-            uint32_t cp;
-            synth_click(engine, 20, ADDR_TEST_Y, 0); /* focus the field */
-            while (*p) {
-                int n = hpe_utf8_next(p, &cp);
-                if (n <= 0)
-                    break;
-                hpe_engine_key(engine, (int)cp);
-                p += n;
-            }
-            if (getenv("HOPE_TEST_ADDR_ENTER"))
-                hpe_engine_key(engine, HPE_KEY_RETURN);
-        }
-    }
-
-    /* dev/test hook: seed the clipboard, then paste with Ctrl+V semantics.
-     * HOPE_TEST_CLIPBOARD=text [HOPE_TEST_PASTE=1] [HOPE_TEST_PASTE_ENTER=1] */
-    {
-        const char *seed = getenv("HOPE_TEST_CLIPBOARD");
-        if (seed)
-            hpe_clipboard_set_text(seed);
-        if (getenv("HOPE_TEST_PASTE")) {
-            synth_click(engine, 20, ADDR_TEST_Y, 0); /* focus the field */
-            hpe_engine_key(engine, HPE_KEY_PASTE);
-            if (getenv("HOPE_TEST_PASTE_ENTER"))
-                hpe_engine_key(engine, HPE_KEY_RETURN);
-        }
-    }
-
-    /* dev/test hooks for the address-bar text editor:
-     *   HOPE_TEST_ADDR_CLICK=x[,mods]     one click into the field
-     *   HOPE_TEST_ADDR_DBLCLICK=x[,x2]    two clicks (word selection)
-     *   HOPE_TEST_ADDR_DRAG=x1,x2[,y]     press, drag, release
-     *   HOPE_TEST_KEYS="LEFT;SHIFT_RIGHT;CTRL_C;BACKSPACE"   named keys
-     *   HOPE_TEST_ADDR_TEXT=1             print text / selection / caret */
-    {
-        const char *click = getenv("HOPE_TEST_ADDR_CLICK");
-        const char *dbl = getenv("HOPE_TEST_ADDR_DBLCLICK");
-        const char *drag = getenv("HOPE_TEST_ADDR_DRAG");
-        const char *keys = getenv("HOPE_TEST_KEYS");
-
-        if (click && *click) {
-            char buf[256];
-            char *tok;
-            snprintf(buf, sizeof(buf), "%s", click);
-            for (tok = strtok(buf, ";"); tok; tok = strtok(NULL, ";")) {
-                int cx = 0, mods = 0;
-                if (sscanf(tok, "%d,%d", &cx, &mods) >= 1)
-                    synth_click(engine, cx, ADDR_TEST_Y, mods);
-            }
-        }
-        if (dbl && *dbl) {
-            int x1 = 0, x2 = 0;
-            if (sscanf(dbl, "%d,%d", &x1, &x2) >= 1) {
-                if (x2 == 0)
-                    x2 = x1;
-                synth_click(engine, x1, ADDR_TEST_Y, 0);
-                synth_click(engine, x2, ADDR_TEST_Y, 0);
-            }
-        }
-        if (drag && *drag) {
-            int x1 = 0, x2 = 0, dy = ADDR_TEST_Y;
-            if (sscanf(drag, "%d,%d,%d", &x1, &x2, &dy) >= 2)
-                synth_drag(engine, x1, x2, dy);
-        }
-        {
-            const char *type = getenv("HOPE_TEST_TYPE");
-            if (type && *type) {
-                const char *p = type;
-                uint32_t cp;
-                while (*p) {
-                    int n = hpe_utf8_next(p, &cp);
-                    if (n <= 0)
-                        break;
-                    hpe_engine_key(engine, (int)cp);
-                    p += n;
-                }
-            }
-        }
-        if (keys && *keys) {
-            char buf[512];
-            char *tok;
-            snprintf(buf, sizeof(buf), "%s", keys);
-            for (tok = strtok(buf, ";"); tok; tok = strtok(NULL, ";")) {
-                int key = 0, mods = 0;
-                if (key_named(tok, &key, &mods))
-                    hpe_engine_key_mods(engine, key, mods);
-            }
-        }
-    }
-
-    /* dev/test hook: synthesise a click so headless dumps can drive interactive
-     * pages (a mind-map node collapses, a button fires). HOPE_TEST_CLICK_AT=x,y[,button] */
-    {
-        const char *click = getenv("HOPE_TEST_CLICK_AT");
-        if (click && *click) {
-            char buf[256];
-            char *tok;
-            snprintf(buf, sizeof(buf), "%s", click);
-            for (tok = strtok(buf, ";"); tok; tok = strtok(NULL, ";")) {
-                int cx = 0, cy = 0, btn = 1;
-                if (sscanf(tok, "%d,%d,%d", &cx, &cy, &btn) < 2)
-                    continue;
-                hpe_engine_mouse_move(engine, cx, cy);
-                hpe_engine_mouse_event(engine, cx, cy, btn, 1);
-                hpe_engine_mouse_event(engine, cx, cy, btn, 0);
-            }
-        }
-    }
-
-    /* report the address-bar state once every hook above has run */
-    if (getenv("HOPE_TEST_ADDR_TEXT")) {
-        int a = 0, b = 0;
-        int sel = hpe_engine_address_selection(engine, &a, &b);
-        printf("addr: [%s] len=%d sel=%d..%d caret=%d focus=%d\n", hpe_engine_address_text(engine),
-               (int)strlen(hpe_engine_address_text(engine)), sel ? a : -1, sel ? b : -1,
-               hpe_engine_address_caret(engine), hpe_engine_address_focused(engine));
-    }
-
-    if (dump || bench) {
-        double t0, t_last, avg;
-        int n;
-        if (scroll_lines != 0.0f) {
-            /* paint a full frame first so the scroll below goes through the
-             * damage-rect path — this is what makes --scroll-lines a real test
-             * of incremental scrolling (compare with HPE_NO_DIRTY=1) */
-            hpe_engine_render(engine);
-            hpe_engine_scroll_by(engine, scroll_lines);
-        }
-        hpe_engine_render(engine);
-        if (bench > 1) {
-            t0 = hpe_time_seconds();
-            for (n = 1; n < bench; n++)
-                hpe_engine_render(engine);
-            t_last = hpe_time_seconds();
-            avg = (t_last - t0) * 1000.0 / (bench - 1);
-            fprintf(stderr, "bench: %d repaints, avg paint %.4f ms\n", bench - 1, avg);
-        }
-        if (dump) {
-            if (write_bmp(dump, hpe_engine_pixmap(engine)))
-                printf("%s\n", hpe_engine_status(engine));
-            else
-                fprintf(stderr, "hope: cannot write %s\n", dump);
-        }
-        hpe_engine_destroy(engine);
-        return 0;
-    }
 
     memset(&app, 0, sizeof(app));
     app.engine = engine;
@@ -493,4 +557,32 @@ int main(int argc, char **argv)
     hpe_window_destroy(app.window);
     hpe_engine_destroy(engine);
     return 0;
+}
+
+int main(int argc, char **argv)
+{
+    Options o;
+    HpeEngine *engine;
+    int rc;
+
+    memset(&o, 0, sizeof(o));
+    o.width = 1000;
+    o.height = 700;
+    rc = parse_args(argc, argv, &o);
+    if (rc >= 0)
+        return rc;
+
+    engine = hpe_engine_create(o.width, o.height);
+    load_start_document(engine, &o);
+
+    hook_test_addr(engine);
+    hook_test_clipboard(engine);
+    hook_test_addr_editor(engine);
+    hook_test_click_at(engine);
+    report_addr_text(engine);
+    report_meta(engine);
+
+    if (o.dump || o.bench)
+        return run_headless(engine, &o);
+    return run_window(engine, o.width, o.height);
 }

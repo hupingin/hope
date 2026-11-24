@@ -31,7 +31,7 @@ fail=0
 
 # ---------------- 1. pixel baselines ----------------
 # `--dump` is headless and chrome-less, so identical geometry gives identical bytes.
-for f in boxes css css-cascade css-props event hello hover js-arrow js-features js js-builtins layout svg-shapes timers; do
+for f in boxes css css-cascade css-props dom-mutation event hello hover html-parse js-arrow js-features js js-builtins layout svg-shapes timers; do
   html="examples/$f.html"
   [ -f "$html" ] || continue
   bmp="$OUT/$f.bmp"
@@ -58,7 +58,9 @@ done
 # #out; HOPE_TEST_TEXT dumps that element's text so we can assert on it.
 # js-modern  : syntax + language semantics
 # js-builtins: standard built-in library (Date/Map/Set/Array/String/Number/Math/Object)
-for f in js-modern js-builtins; do
+# dom-mutation: DOM mutation APIs + MutationObserver (needs live JS, so it is a script check)
+# html-parse : parser fault-tolerance (auto-closing, table/select/template)
+for f in js-modern js-builtins dom-mutation html-parse; do
   html="examples/$f.html"
   [ -f "$html" ] || continue
   out="$(HOPE_TEST_TEXT=out "$BIN" "$html" --width 400 --height 600 \

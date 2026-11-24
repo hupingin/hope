@@ -18,12 +18,21 @@
 
 #define HPE_SCROLL_LINE_PX 48.0f
 #define HPE_ADDR_MAX 1024
+/* <link> resource hints we record (stylesheet excluded -- it is consumed) */
+#define HPE_MAX_LINKS 32
+#define HPE_MAX_PATH 1024
 
 /* dirty flags: what the next render() has to do */
 #define HPE_DIRTY_NONE 0
 #define HPE_DIRTY_SCROLL 1 /* only the scroll offset moved */
 #define HPE_DIRTY_FULL 2   /* full repaint (load, resize, DOM/style mutation) */
 #define HPE_DIRTY_CHROME 3 /* only the address bar needs repainting */
+
+/* how much work the accumulated DOM mutations require on the next flush.
+ * Ordered: a larger value subsumes the smaller one. */
+#define HPE_REFLOW_NONE 0   /* nothing changed: skip layout and repaint */
+#define HPE_REFLOW_PAINT 1  /* paint-only change (colour, opacity, shadow): restyle, no geometry */
+#define HPE_REFLOW_LAYOUT 2 /* geometry may have changed: rebuild the box tree */
 
 struct HpeEngine {
     HpePixmap pm;
@@ -40,10 +49,33 @@ struct HpeEngine {
     int dirty;
     HpeDomNode *hover_node; /* element currently under the pointer (:hover) */
     float content_height;
+    /* author stylesheet bookkeeping: the number of rules parsed after the
+     * user-agent sheet and the last (dom node, text revision) that produced
+     * them. lets re-collection skip when nothing about <style>/<link> changed. */
+    int author_rule_base;
+    HpeDomNode *style_sig;
+    unsigned int style_rev;
+    /* DOM-mutation tracker: the maximum reflow the mutations since the last
+     * flush require, whether a flush has a pending change at all, and the DOM
+     * element whose box subtree has to be rebuilt (NULL => full rebuild). */
+    int reflow_need;
+    int mutation_pending;
+    HpeDomNode *reflow_node;
     double load_ms;
     double render_ms;
     char status[512];
     char error[256]; /* sticky load error, cleared on the next successful load */
+
+    /* document metadata resolved at load time */
+    char doc_encoding[16];      /* detected charset label, e.g. "utf-8" */
+    int meta_charset;           /* 1 when <meta charset> declared the encoding */
+    char base_href[HPE_MAX_PATH]; /* <base href> ("" when absent) */
+    /* <link> resources other than the stylesheet, kept for resource hints */
+    struct {
+        char rel[24];  /* lowercased rel tokens joined by space */
+        char href[HPE_MAX_PATH]; /* resolved absolute path */
+    } links[HPE_MAX_LINKS];
+    int link_count;
 
     /* browser chrome (address bar), disabled while chrome_h == 0 */
     int chrome_h;
@@ -68,6 +100,9 @@ struct HpeEngine {
 
 /* re-builds the box tree and clamps the scroll offset (hope.c) */
 void hpe_engine_relayout(HpeEngine *engine);
+/* applies the DOM mutations recorded since the last call, doing only as much
+ * layout/repaint as they require (hope.c). `force` requests a full rebuild. */
+void hpe_engine_flush(HpeEngine *engine, int force);
 /* refreshes the status line (hope.c) */
 void hpe_engine_refresh_status(HpeEngine *engine);
 /* height of the page viewport (window height minus chrome) */

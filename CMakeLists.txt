@@ -12,6 +12,7 @@ set(HOPE_CORE_SOURCES
     src/render/hpe_font.c
     src/dom/hpe_dom.c
     src/html/hpe_html.c
+    src/html/hpe_encoding.c
     src/css/hpe_css.c
     src/layout/hpe_layout.c
     src/paint/hpe_paint.c
@@ -20,6 +21,7 @@ set(HOPE_CORE_SOURCES
     src/js/hpe_js_parser.c
     src/js/hpe_js_interp.c
     src/js/hpe_js_dom.c
+    src/js/hpe_js_mutation.c
     src/js/hpe_js_timers.c
     src/js/hpe_js_regex.c
     src/js/hpe_js_date.c

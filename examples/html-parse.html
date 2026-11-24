@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Hope Engine - HTML parsing</title>
+  <style>
+    body {
+      margin: 0;
+      background-color: #f5f6f8;
+      color: #202124;
+      font-size: 15px;
+      line-height: 1.55;
+      font-family: sans-serif;
+    }
+    .page { width: 720px; margin: 24px auto; }
+    h1 { font-size: 26px; margin: 0 0 6px 0; color: #14213d; }
+    .subtitle { color: #5f6368; font-size: 13px; margin: 0 0 18px 0; }
+    .card {
+      background-color: #ffffff;
+      border: 1px solid #dcdfe4;
+      padding: 12px 18px;
+      margin: 0 0 14px 0;
+    }
+    .card h2 { font-size: 16px; margin: 0 0 8px 0; color: #1a73e8; }
+    .row { font-family: monospace; font-size: 13px; white-space: pre; }
+    .fail { color: #d93025; font-weight: bold; }
+    .ok { color: #188038; }
+    .muted { color: #9aa0a6; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <h1>HTML parsing</h1>
+    <p class="subtitle">fault-tolerant auto-closing &middot; table structure &middot; select &middot; template</p>
+    <div class="card"><h2>Results</h2><div id="out"></div></div>
+    <div class="card">
+      <h2>Fixture markup (parsed literally below)</h2>
+      <p class="muted">Every element under this heading is deliberately malformed; the parser repairs it in place.</p>
+
+      <!-- 1. paragraphs: the 2nd <p> implicitly closes the 1st -->
+      <div id="fx-p"><p>one<p>two</div>
+      <!-- 2. a block start closes an open paragraph -->
+      <div id="fx-pblock"><p>text<div>div</div></div>
+      <!-- 3. list items close each other -->
+      <ul id="fx-li"><li>a<li>b<li>c</ul>
+      <!-- 4. dt/dd close each other -->
+      <dl id="fx-dl"><dt>t1<dd>d1<dt>t2</dl>
+      <!-- 5. a heading is closed by the next heading -->
+      <div id="fx-h"><h1>a<h2>b</h2></div>
+      <!-- 6. a nested <a> closes the outer one -->
+      <div id="fx-a"><a href="#1">x<a href="#2">y</a></a></div>
+      <!-- 7. button likewise -->
+      <div id="fx-btn"><button>1<button>2</button></div>
+      <!-- 8. a stray </p> inserts an empty paragraph -->
+      <div id="fx-emptyp">a</p>b</div>
+      <!-- 9. </br> behaves like <br> -->
+      <div id="fx-br">x</br>y</div>
+
+      <!-- 10. <table><tr> implies <tbody>, <td> closes a previous cell -->
+      <table id="fx-table"><tr><td>a<td>b<tr><td>c</table>
+      <!-- 11. non-table content is foster-parented before the table -->
+      <div id="fx-foster-host"><table id="fx-foster"><div class="foster">F</div><tr><td>c</td></tr></table></div>
+
+      <!-- 12. <select> keeps only option/optgroup; junk is dropped -->
+      <select id="fx-select"><option>a<option>b<div class="junk">junk</div><option>c</select>
+      <!-- 13. a nested <select> is treated as the end tag -->
+      <select id="fx-select2"><option>x<select><option>y</select>
+
+      <!-- 14. <template> content lives in a detached fragment -->
+      <template id="fx-template"><div id="tpl-child">hidden</div></template>
+    </div>
+  </div>
+
+<script>
+  var lines = [];
+  var passCount = 0, total = 0;
+
+  function check(label, got, want) {
+    var pass = String(got) === String(want);
+    lines.push((pass ? "  ok   " : "  FAIL ") + label + " = " + got +
+               (pass ? "" : "   (want " + want + ")"));
+    total++;
+    if (pass) passCount++;
+    return pass;
+  }
+
+  function el(id) { return document.getElementById(id); }
+  function inner(id) { var e = el(id); return e ? e.innerHTML : "<null>"; }
+  function count(rootId, sel) {
+    var root = el(rootId);
+    if (!root) return -1;
+    return root.querySelectorAll(sel).length;
+  }
+
+  // ---- 1..2. paragraph auto-closing ----
+  check("p closes p (count)", count("fx-p", "p"), 2);
+  check("p closes p (html)", inner("fx-p"), "<p>one</p><p>two</p>");
+  check("div closes p (count)", count("fx-pblock", "p"), 1);
+  check("div closes p (html)", inner("fx-pblock"), "<p>text</p><div>div</div>");
+
+  // ---- 3..5. list / definition / heading ----
+  check("li closes li", inner("fx-li"), "<li>a</li><li>b</li><li>c</li>");
+  check("dt/dd close each other", count("fx-dl", "dt") + "/" + count("fx-dl", "dd"), "2/1");
+  check("dt/dd html", inner("fx-dl"), "<dt>t1</dt><dd>d1</dd><dt>t2</dt>");
+  check("heading closes heading", count("fx-h", "h1") + "/" + count("fx-h", "h2"), "1/1");
+
+  // ---- 6..7. a / button nesting ----
+  check("a closes a", count("fx-a", "a"), 2);
+  check("button closes button", count("fx-btn", "button"), 2);
+
+  // ---- 8..9. stray end tags ----
+  check("stray </p> inserts empty p", count("fx-emptyp", "p"), 1);
+  check("</br> becomes <br>", count("fx-br", "br"), 1);
+
+  // ---- 10..11. tables ----
+  check("implicit tbody", count("fx-table", "tbody"), 1);
+  check("implicit tbody wraps rows", count("fx-table", "tr"), 2);
+  check("td closes previous cell", count("fx-table", "td"), 3);
+  check("table html", inner("fx-table"),
+        "<tbody><tr><td>a</td><td>b</td></tr><tr><td>c</td></tr></tbody>");
+  check("fostered div is outside the table", count("fx-foster", ".foster"), 0);
+  check("fostered div precedes the table",
+        document.querySelector(".foster") !== null ? "found" : "null", "found");
+
+  // ---- 12..13. select ----
+  check("select groups options", count("fx-select", "option"), 3);
+  check("select drops stray <div>", count("fx-select", ".junk"), 0);
+  check("select html", inner("fx-select"),
+        "<option>a</option><option>bjunk</option><option>c</option>");
+  check("nested select ends the outer", count("fx-select2", "option"), 1);
+
+  // ---- 14. template ----
+  var tpl = el("fx-template");
+  check("template.content exists", tpl && tpl.content ? "yes" : "no", "yes");
+  check("template.content nodeType", tpl && tpl.content ? tpl.content.nodeType : -1, 11);
+  check("template children are detached",
+        document.getElementById("tpl-child") !== null ? "found" : "null", "null");
+  check("template.content holds the child", tpl && tpl.content ? tpl.content.textContent : "", "hidden");
+
+  // ---- summary ----
+  lines.unshift((passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total + " checks");
+  var cls = passCount === total ? "ok" : "fail";
+  var out = el("out");
+  for (var i = 0; i < lines.length; i++) {
+    var row = document.createElement("div");
+    row.className = "row" + (i === 0 ? " " + cls : "");
+    row.textContent = lines[i];
+    out.appendChild(row);
+  }
+</script>
+</body>
+</html>
