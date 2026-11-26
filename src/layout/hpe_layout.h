@@ -59,6 +59,9 @@ typedef struct HpeBox {
     HpeRect pad_box;     /* padding box in document coords (containing block for abspos) */
     const char *text;
     int text_len;
+    /* generated content (`::before` / `::after`) owns its text; text borrowed
+     * from a DOM text node must not be freed by hpe_layout_free */
+    int owns_text;
     HpeLine *lines;
     int line_count;
     size_t line_cap;
@@ -67,6 +70,26 @@ typedef struct HpeBox {
     struct HpeBox *last_child;
     struct HpeBox *next;
     HpeFloatBand floats; /* floated children of this block container */
+    /* replaced element (`<img>`): the intrinsic pixel size of the decoded
+     * content plus the size the author asked for (`auto` when none was given).
+     * `repl_css_*` is kept verbatim so the used size can be recomputed on every
+     * layout pass without the previously written px value being mistaken for an
+     * author declaration. */
+    int is_replaced;
+    int repl_w;
+    int repl_h;
+    HpeLength repl_css_w;
+    HpeLength repl_css_h;
+    float repl_used_w; /* last solved used content width */
+    float repl_used_h; /* last solved used content height */
+    /* element-level scrolling: set when `overflow` is `scroll`/`auto` and the
+     * content overflows. `scroll_max` is the largest legal `scroll_y`, and
+     * `scroll_y` is the live offset the engine mutates on wheel input. */
+    float scroll_y;
+    float scroll_max;
+    float scroll_port_h; /* the visible (padding-box) height used to clamp */
+    float scroll_content_h; /* natural (unclamped) content height */
+    int is_scroll_container;
 } HpeBox;
 
 /**

@@ -117,10 +117,44 @@ static int utf8_strlen_n(const char *s, size_t bytes);
 static JsValue set_add(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud);
 static JsValue native_set_ctor(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud);
 static JsValue map_size_fn(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud);
-static JsValue symbol_brand(HpeJs *js, const char *desc);
 static size_t utf8_offset(const char *s, int i);
 static JsValue string_replace(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud);
-static JsValue regex_make_result(HpeJs *js, const char *s, int *caps, int total);
+static JsValue regex_make_result(HpeJs *js, HpeRegex *re, const char *s, int *caps, int total,
+                                 int flags);
+static JsValue regex_make_groups(HpeJs *js, HpeRegex *re, const char *s, int *caps, int total);
+static JsValue regex_make_indices(HpeJs *js, HpeRegex *re, int *caps, int total);
+static JsValue regex_index_pair(HpeJs *js, int start, int end);
+
+/**
+ * @brief 把一个键表达式求值成属性键 / Evaluate a key expression into a property key
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     keyv 键表达式的结果 / The result of the key expression
+ *
+ * @return 符号走合成键 `"\x01#<id>"`，其余走 `ToString` / A symbol becomes the synthetic key `"\x01#<id>"`, everything else goes through `ToString`
+ *
+ * @note 属性表以 `char *` 为键，所以符号必须先编码；隐式 `ToString` 对符号会抛错，故此处必须先行判断 / The property table is keyed by `char *`, so symbols must be encoded first; implicit `ToString` throws on a symbol, so this check has to come first
+ */
+static char *key_of_value(HpeJs *js, JsValue keyv)
+{
+    return js_is_symbol(keyv) ? js_symbol_key(js, keyv) : js_to_string(js, keyv);
+}
+/* Proxy trap helpers: the call/construct paths need these before their own
+ * definitions further down, so they are forward declared here. */
+static JsValue proxy_trap(HpeJs *js, JsObj *proxy, const char *name);
+static int trap_ready(JsValue t);
+static int proxy_is(JsObj *o);
+static int proxy_get(HpeJs *js, JsObj *proxy, JsValue receiver, const char *prop, JsValue *out);
+static int proxy_set(HpeJs *js, JsObj *proxy, JsValue receiver, const char *prop, JsValue value);
+static int proxy_bool_trap(HpeJs *js, JsObj *proxy, const char *name, const char *prop, int *out);
+static JsValue fund_get(HpeJs *js, JsValue target, const char *key, JsValue receiver);
+static int fund_set(HpeJs *js, JsValue target, const char *key, JsValue value, JsValue receiver);
+static int fund_has(HpeJs *js, JsValue target, const char *key);
+static JsValue fund_own_keys(HpeJs *js, JsValue target);
+static JsValue proxy_apply_call(HpeJs *js, JsObj *proxy, JsValue thisv, JsValue *args, int argc,
+                                int line);
+static JsValue proxy_new_call(HpeJs *js, JsObj *proxy, JsValue *args, int argc, int line);
+static JsValue reflect_get_proto(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud);
 
 /* maximum capture slots a single regex match writes into `caps` (group 0 + pairs) */
 static JsValue utf8_char_at(HpeJs *js, const char *s, int i);
@@ -139,7 +173,10 @@ static void member_set(HpeJs *js, JsEnv *env, JsValue base, const char *prop, Js
                        int line);
 static JsValue class_eval(HpeJs *js, JsEnv *env, JsNode *n);
 static JsValue make_iterable(HpeJs *js, JsObj *items);
+static JsObj *iter_expand(HpeJs *js, JsValue v);
+static int iter_is_pullable(JsValue v);
 static JsValue promise_then(HpeJs *js, JsObj *p, JsValue on_ok, JsValue on_err);
+static JsValue native_iter_self(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *ud);
 
 /**
  * @brief 把一个原生 C 函数包装成可调用的 JS 函数值 / Wrap a native C function into a callable JS function value
@@ -616,7 +653,11 @@ static JsValue promise_then(HpeJs *js, JsObj *p, JsValue on_ok, JsValue on_err)
  *
  * @return `{ done, value }` 结果对象 / A `{ done, value }` result object
  *
- * @note 游标存放在对象的 `_i` 上；越界时返回 `done: true` 且 value 为 undefined / The cursor lives in the object's `_i`; past the end it returns `done: true` with value undefined
+ * @note 游标存放在对象的 `_i` 上；越界时返回 `done: true` 且 value 为 undefined。
+ *       元素按需经由 `js_iter_at`/`iter_source_item` 取值，因此活集合（Map/Set）的迭代是惰性的：
+ *       中途 `break` 不会比已取出的项多做任何工作。The cursor lives on the object's `_i` and running
+ *       past the end yields `done: true` with an undefined value. Items are pulled on demand, so
+ *       iterating a live collection is lazy — breaking early does no extra work.
  */
 
 static JsValue native_iter_next(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *ud)
@@ -625,10 +666,24 @@ static JsValue native_iter_next(HpeJs *js, JsValue thisv, JsValue *args, int arg
     int i = (int)js_to_number(js, js_obj_get(js, self, "_i"));
     JsObj *items = self->items;
     JsObj *res = js_object_new(js);
-    int len = items ? array_length(js, items) : 0;
+    int len;
     HPE_UNUSED(thisv);
     HPE_UNUSED(args);
     HPE_UNUSED(argc);
+    if (self->kind == JS_OBJ_ITER) {
+        JsValue src = js_objval(self->payload_obj);
+        len = self->payload_obj ? js_iter_len(js, src) : 0;
+        if (i >= len) {
+            js_obj_set(js, res, "done", js_bool(1));
+            js_obj_set(js, res, "value", js_undef());
+            return js_objval(res);
+        }
+        js_obj_set(js, self, "_i", js_num((double)(i + 1)));
+        js_obj_set(js, res, "done", js_bool(0));
+        js_obj_set(js, res, "value", js_iter_source_item(js, src, i, self->length_hint));
+        return js_objval(res);
+    }
+    len = items ? array_length(js, items) : 0;
     if (i >= len) {
         js_obj_set(js, res, "done", js_bool(1));
         js_obj_set(js, res, "value", js_undef());
@@ -638,6 +693,34 @@ static JsValue native_iter_next(HpeJs *js, JsValue thisv, JsValue *args, int arg
     js_obj_set(js, res, "done", js_bool(0));
     js_obj_set(js, res, "value", array_get_index(js, items, i));
     return js_objval(res);
+}
+
+/**
+ * @brief 构造遍历 Map / Set 的惰性迭代器 / Build a lazy iterator over a Map / Set
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     src Map / Set 接收者 / The Map / Set receiver
+ * @param[in]     mode 迭代模式，见 `js_iter_source_item` / Iteration mode, see `js_iter_source_item`
+ *
+ * @return 携带 `next` 与 `Symbol.iterator` 的迭代器对象 / An iterator object carrying `next` and `Symbol.iterator`
+ *
+ * @note 迭代器持有数据源指针而非快照，因此是「活视图」：迭代期间对集合的增删可见，
+ *       与规范的实现一致。中途 `break` 只取出已消费的项。The iterator holds a pointer to the
+ *       source rather than a snapshot, so it is a live view: mutations during iteration are
+ *       visible, matching the spec. Breaking early only pays for the items consumed.
+ */
+static JsValue make_collection_iter(HpeJs *js, JsValue src, int mode)
+{
+    JsObj *o = js_object_raw(js);
+    o->kind = JS_OBJ_ITER;
+    o->class_name = "MapIterator";
+    o->proto = js->object_proto;
+    o->payload_obj = (src.t == JS_OBJ) ? src.obj : NULL;
+    o->length_hint = mode;
+    js_obj_set(js, o, "_i", js_num(0.0));
+    js_obj_set(js, o, "next", bind_native(js, native_iter_next, o));
+    js_obj_set(js, o, "Symbol.iterator", bind_native(js, native_iter_self, NULL));
+    return js_objval(o);
 }
 
 /**
@@ -693,11 +776,6 @@ static JsValue make_iterable(HpeJs *js, JsObj *items)
  * @return `String.prototype` 对象 / The `String.prototype` object
  */
 
-static JsObj *proto_of_string(HpeJs *js)
-{
-    return js->string_proto;
-}
-
 /**
  * @brief 按原始值类型选择对应的原型对象 / Pick the prototype matching a primitive value's type
  *
@@ -715,6 +793,10 @@ static JsObj *proto_for(HpeJs *js, JsValue base)
         return js->number_proto;
     case JS_BOOL:
         return js->bool_proto;
+    case JS_BIGINT:
+        return js->bigint_proto;
+    case JS_SYMBOL:
+        return js->symbol_proto;
     default:
         return js->object_proto;
     }
@@ -769,10 +851,15 @@ static JsValue member_get(HpeJs *js, JsEnv *env, JsValue base, const char *prop,
             return utf8_char_at(js, base.str, atoi(prop));
         return proto_lookup(js, js->string_proto, base, prop, line);
     }
-    if (base.t == JS_NUM || base.t == JS_BOOL)
+    if (base.t == JS_NUM || base.t == JS_BOOL || base.t == JS_BIGINT || base.t == JS_SYMBOL)
         return proto_lookup(js, proto_for(js, base), base, prop, line);
     if (base.t == JS_OBJ && base.obj) {
         JsObj *o = base.obj;
+        if (o->kind == JS_OBJ_PROXY) {
+            JsValue out;
+            if (proxy_get(js, o, base, prop, &out))
+                return out;
+        }
         if (o->kind == JS_OBJ_HOST && o->vt && o->vt->get) {
             JsValue out = js_undef();
             if (o->vt->get(js, o->host_ptr, prop, &out))
@@ -817,6 +904,10 @@ static void member_set(HpeJs *js, JsEnv *env, JsValue base, const char *prop, Js
     if (base.t == JS_OBJ && base.obj) {
         JsObj *o = base.obj;
         JsProp *p;
+        if (o->kind == JS_OBJ_PROXY) {
+            if (proxy_set(js, o, base, prop, value))
+                return;
+        }
         if (o->kind == JS_OBJ_HOST) {
             if (o->vt && o->vt->set && o->vt->set(js, o->host_ptr, prop, value))
                 return;
@@ -838,7 +929,7 @@ static void member_set(HpeJs *js, JsEnv *env, JsValue base, const char *prop, Js
         js_obj_set(js, o, prop, value);
         return;
     }
-    if (base.t == JS_STR || base.t == JS_NUM || base.t == JS_BOOL)
+    if (base.t == JS_STR || base.t == JS_NUM || base.t == JS_BOOL || base.t == JS_BIGINT)
         return;
     if (base.t == JS_NULL || base.t == JS_UNDEF)
         js_error(js, line, "cannot set property '%s' of %s", prop,
@@ -977,7 +1068,7 @@ static JsValue run_function_body(HpeJs *js, JsObj *fn, JsEnv *closure, JsValue t
 }
 
 /**
- * @brief 以急切求值方式运行生成器函数 / Run a generator function by materialising its yields eagerly
+ * @brief 生成器函数体入口（在协程自己的栈上运行）/ Generator body entry, run on the coroutine's own stack
  *
  * @param[in,out] js JS 运行时上下文 / JS runtime context
  * @param[in,out] fn 生成器函数对象 / Generator function object
@@ -986,19 +1077,14 @@ static JsValue run_function_body(HpeJs *js, JsObj *fn, JsEnv *closure, JsValue t
  * @param[in,out] args 实参数组 / Actual argument array
  * @param[in]     argc 实参个数 / Argument count
  *
- * @return 包裹已收集产出值的可迭代对象 / An iterable wrapping the collected yielded values
+ * @return 函数体的返回值（`return` 的值）/ The body's return value
  *
- * @note 所有 yield 立即收集到数组（设计文档 §12.7），暂停后恢复的 `yield_sink` 会被还原 / All yields are collected into an array up front (design §12.7); the previous `yield_sink` is restored afterwards
+ * @note 只负责执行函数体；`yield` 的挂起与恢复由 `hpe_js_gen.c` 的协程驱动 / Only runs the body; suspending and resuming at `yield` is driven by the coroutine in `hpe_js_gen.c`
  */
-static JsValue run_generator(HpeJs *js, JsObj *fn, JsEnv *closure, JsValue this_v, JsValue *args,
-                             int argc)
+JsValue js_run_generator_body(HpeJs *js, JsObj *fn, JsEnv *closure, JsValue this_v, JsValue *args,
+                              int argc)
 {
-    JsObj *collected = js_array_new(js);
-    JsObj *prev = js->yield_sink;
-    js->yield_sink = collected;
-    run_function_body(js, fn, closure, this_v, args, argc);
-    js->yield_sink = prev;
-    return make_iterable(js, collected);
+    return run_function_body(js, fn, closure, this_v, args, argc);
 }
 
 /**
@@ -1086,6 +1172,8 @@ static JsValue call_value(HpeJs *js, JsEnv *env, JsValue callee, JsValue thisv, 
 {
     JsObj *fn;
     HPE_UNUSED(env);
+    if (callee.t == JS_OBJ && callee.obj && callee.obj->kind == JS_OBJ_PROXY)
+        return proxy_apply_call(js, callee.obj, thisv, args, argc, line);
     if (!js_is_callable(callee))
         js_error(js, line, "value is not a function");
     fn = callee.obj;
@@ -1108,7 +1196,7 @@ static JsValue call_value(HpeJs *js, JsEnv *env, JsValue callee, JsValue thisv, 
         return fn->native(js, thisv, args, argc, fn->native_ud);
     if (fn->kind == JS_OBJ_FUNC) {
         if (fn->fn_flags & FN_GEN)
-            return run_generator(js, fn, fn->closure, thisv, args, argc);
+            return hpe_js_gen_create(js, fn, fn->closure, thisv, args, argc);
         if (fn->fn_flags & FN_ASYNC)
             return run_async(js, fn, fn->closure, thisv, args, argc);
         return run_function_body(js, fn, fn->closure, thisv, args, argc);
@@ -1184,6 +1272,8 @@ JsValue js_construct(HpeJs *js, JsValue callee, JsValue *args, int argc, int lin
     if (!js_is_callable(callee))
         js_error(js, line, "value is not a constructor");
     fn = callee.obj;
+    if (fn->kind == JS_OBJ_PROXY)
+        return proxy_new_call(js, fn, args, argc, line);
     if (fn->kind == JS_OBJ_NATIVE)
         return fn->native(js, js_undef(), args, argc, fn->native_ud);
     if (fn->fn_flags & FN_BOUND) {
@@ -1291,22 +1381,32 @@ static void pattern_bind_plain(HpeJs *js, JsEnv *env, JsNode *pat, JsValue value
  * @param[in]     value 被解构的可迭代值 / Iterable value being destructured
  * @param[in,out] apply 对每个叶子目标执行绑定/赋值的回调 / Callback performing the bind or assign for each leaf target
  *
- * @note 空位（elision）跳过对应下标；遇到 rest 元素时把从该下标起的所有元素收集成数组后交给回调并结束遍历 / Elisions skip their index; a rest element gathers everything from that index into an array, is handed to the callback, and the walk ends
+ * @note 空位（elision）跳过对应下标；遇到 rest 元素时把从该下标起的所有元素收集成数组后交给回调并结束遍历。
+ *       生成器先整体展开成数组再按下标取，因此无限生成器在此处会一直拉到结束（与规范一致）。
+ *       Elisions skip their index; a rest element gathers everything from that index into an array,
+ *       is handed to the callback, and the walk ends. A generator is expanded into an array first,
+ *       so an endless one is pulled until it stops — matching the spec.
  */
 static void pattern_each_array(HpeJs *js, JsEnv *env, JsNode *pat, JsValue value,
                                void (*apply)(HpeJs *, JsEnv *, JsNode *, JsValue))
 {
     int i, n = pat->kid_count;
+    JsObj *expanded = NULL;
 
+    if (iter_is_pullable(value)) {
+        expanded = iter_expand(js, value);
+        value = js_objval(expanded);
+    }
     for (i = 0; i < n; i++) {
         JsNode *el = pat->kids[i];
         if (!el)
             continue; /* elision: skip this index */
         if (el->kind == JS_N_PAT_REST) {
+            JsObj *all = iter_expand(js, value);
             JsObj *rest = js_array_new(js);
-            int k, len = js_iter_len(js, value);
+            int k, len = array_length(js, all);
             for (k = i; k < len; k++)
-                array_push_value(js, rest, js_iter_at(js, value, k));
+                array_push_value(js, rest, array_get_index(js, all, k));
             apply(js, env, el->kids[0], js_objval(rest));
             break;
         }
@@ -1438,7 +1538,7 @@ static void assign_member(HpeJs *js, JsEnv *env, JsNode *target, JsValue value)
     JsValue base = eval_expr(js, env, target->kids[0]);
     char *prop = target->op == JS_OP_DOT
                      ? target->str
-                     : js_to_string(js, eval_expr(js, env, target->kids[1]));
+                     : key_of_value(js, eval_expr(js, env, target->kids[1]));
     member_set(js, env, base, prop, value, target->line);
 }
 
@@ -1616,6 +1716,22 @@ static JsValue eval_relational(HpeJs *js, JsNode *n, JsValue l, JsValue r)
         res = op == JS_OP_LT ? c < 0 : op == JS_OP_GT ? c > 0 : op == JS_OP_LE ? c <= 0 : c >= 0;
         return js_bool(res);
     }
+    if (l.t == JS_BIGINT && r.t == JS_BIGINT) {
+        int c = js_bigint_cmp(l, r);
+        res = op == JS_OP_LT ? c < 0 : op == JS_OP_GT ? c > 0 : op == JS_OP_LE ? c <= 0 : c >= 0;
+        return js_bool(res);
+    }
+    if (l.t == JS_BIGINT || r.t == JS_BIGINT) {
+        /* ToNumeric turns a string into a number, so the comparison is numeric.
+         * The BigInt is narrowed to a double here, which only loses precision
+         * for values above 2^53 — acceptable for this engine. */
+        double a = l.t == JS_BIGINT ? js_bigint_to_number(l) : js_to_number(js, l);
+        double b = r.t == JS_BIGINT ? js_bigint_to_number(r) : js_to_number(js, r);
+        if (a != a || b != b)
+            return js_bool(0);
+        res = op == JS_OP_LT ? a < b : op == JS_OP_GT ? a > b : op == JS_OP_LE ? a <= b : a >= b;
+        return js_bool(res);
+    }
     {
         double a = js_to_number(js, l), b = js_to_number(js, r);
         if (a != a || b != b)
@@ -1684,14 +1800,16 @@ static JsValue eval_arithmetic(HpeJs *js, JsNode *n, JsValue l, JsValue r)
  */
 static JsValue eval_in_operator(HpeJs *js, JsNode *n, JsValue l, JsValue r)
 {
+    const char *key;
     if (r.t != JS_OBJ || !r.obj)
         js_error(js, n->line, "cannot use 'in' operator on a non-object");
     if (l.t == JS_NUM && l.num == (double)(long long)l.num) {
         char buf[32];
         snprintf(buf, sizeof(buf), "%lld", (long long)l.num);
-        return js_bool(js_obj_has(r.obj, buf));
+        return js_bool(fund_has(js, r, buf));
     }
-    return js_bool(js_obj_has(r.obj, js_to_string(js, l)));
+    key = key_of_value(js, l);
+    return js_bool(fund_has(js, r, key));
 }
 
 /**
@@ -1705,16 +1823,91 @@ static JsValue eval_in_operator(HpeJs *js, JsNode *n, JsValue l, JsValue r)
  *
  * @note 对象先经 ToPrimitive 转换，转换后若任一侧为字符串仍走拼接 / Objects are coerced with ToPrimitive and still concatenate when either coerced side is a string
  */
+/**
+ * @brief 报告 BigInt 与其它类型混用 / Report a mix of BigInt with another type
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     l 左操作数 / Left operand
+ * @param[in]     r 右操作数 / Right operand
+ *
+ * @note 规范要求除比较之外的混用一律抛 `TypeError` / The spec requires a `TypeError` for every mix except comparison
+ */
+static void bigint_mix_error(HpeJs *js, JsValue l, JsValue r)
+{
+    HPE_UNUSED(l);
+    HPE_UNUSED(r);
+    js_throw_value(js, js_make_error(js, "TypeError", "Cannot mix BigInt and other types, use explicit conversions"));
+}
+
+/**
+ * @brief 求值 BigInt 参与的算术、位与移位运算 / Evaluate arithmetic, bitwise and shift operators involving BigInt
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     op 运算符 / Operator
+ * @param[in]     l 左操作数 / Left operand
+ * @param[in]     r 右操作数 / Right operand
+ *
+ * @return 运算结果 / The result
+ *
+ * @note 两侧必须都是 BigInt；`>>>` 对 BigInt 未定义，按 `TypeError` 处理 / Both sides must be BigInt; `>>>` is undefined for BigInt and raises a `TypeError`
+ */
+static JsValue bigint_arith(HpeJs *js, int op, JsValue l, JsValue r)
+{
+    if (l.t != JS_BIGINT || r.t != JS_BIGINT)
+        bigint_mix_error(js, l, r);
+    switch (op) {
+    case JS_OP_SUB:
+        return js_bigint_add(js, l, r, 1);
+    case JS_OP_MUL:
+        return js_bigint_mul(js, l, r);
+    case JS_OP_DIV:
+        return js_bigint_divmod(js, l, r, 0);
+    case JS_OP_MOD:
+        return js_bigint_divmod(js, l, r, 1);
+    case JS_OP_EXP:
+        return js_bigint_pow(js, l, r);
+    case JS_OP_BAND:
+    case JS_OP_BOR:
+    case JS_OP_BXOR:
+        return js_bigint_bitop(js, op, l, r);
+    case JS_OP_SHL:
+        return js_bigint_shift(js, l, r, 1);
+    case JS_OP_SHR:
+        return js_bigint_shift(js, l, r, 0);
+    default:
+        js_throw_value(js, js_make_error(js, "TypeError", "BigInts have no unsigned right shift, use >> instead"));
+        return js_undef();
+    }
+}
+
+/**
+ * @brief 求值 `+` 运算符 / Evaluate the `+` operator
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     l 左操作数 / Left operand
+ * @param[in]     r 右操作数 / Right operand
+ *
+ * @return 数值和或拼接结果 / The numeric sum or the concatenation
+ *
+ * @note 任一侧为字符串走拼接；两侧都是 BigInt 走大整数加法；BigInt 与其它原始值混用抛 `TypeError` /
+ *       A string on either side concatenates; two BigInts use big-integer addition; mixing BigInt with
+ *       another primitive raises a `TypeError`
+ */
 static JsValue bin_add(HpeJs *js, JsValue l, JsValue r)
 {
     if (l.t == JS_STR || r.t == JS_STR)
         return bin_concat(js, l, r);
+    if (l.t == JS_BIGINT || r.t == JS_BIGINT) {
+        if (l.t != r.t)
+            bigint_mix_error(js, l, r);
+        return js_bigint_add(js, l, r, 0);
+    }
     if ((l.t == JS_OBJ && l.obj) || (r.t == JS_OBJ && r.obj)) {
         JsValue lp = js_primitive_of(js, l);
         JsValue rp = js_primitive_of(js, r);
         if (lp.t == JS_STR || rp.t == JS_STR)
             return bin_concat(js, lp, rp);
-        return js_num(js_to_number(js, lp) + js_to_number(js, rp));
+        return bin_add(js, lp, rp);
     }
     return js_num(js_to_number(js, l) + js_to_number(js, r));
 }
@@ -1731,6 +1924,26 @@ static JsValue bin_add(HpeJs *js, JsValue l, JsValue r)
  *
  * @return 表达式求值结果 / The evaluated expression value
  */
+/**
+ * @brief 分派算术与位运算，必要时改走 BigInt / Dispatch arithmetic and bitwise operators, diverting to BigInt when needed
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     n 运算符节点（提供行号）/ The operator node, supplying the line number
+ * @param[in]     op 运算符 / The operator
+ * @param[in]     l 左操作数 / Left operand
+ * @param[in]     r 右操作数 / Right operand
+ *
+ * @return 运算结果 / The result
+ *
+ * @note 任一操作数为 BigInt 时整条链路走任意精度路径；混用 BigInt 与 Number 会抛 `TypeError` / A BigInt on either side routes the whole operation through the arbitrary-precision path; mixing BigInt with Number raises `TypeError`
+ */
+static JsValue eval_bin_arith(HpeJs *js, JsNode *n, int op, JsValue l, JsValue r)
+{
+    if (l.t == JS_BIGINT || r.t == JS_BIGINT)
+        return bigint_arith(js, op, l, r);
+    return eval_arithmetic(js, n, l, r);
+}
+
 static JsValue eval_bin(HpeJs *js, JsEnv *env, JsNode *n)
 {
     int op = n->op;
@@ -1755,13 +1968,11 @@ static JsValue eval_bin(HpeJs *js, JsEnv *env, JsNode *n)
     case JS_OP_GE:
         return eval_relational(js, n, l, r);
     case JS_OP_EQ:
-        return js_bool(js_values_equal(js, l, r, 0));
     case JS_OP_NEQ:
-        return js_bool(!js_values_equal(js, l, r, 0));
+        return js_bool(js_values_equal(js, l, r, 0) == (op == JS_OP_EQ));
     case JS_OP_SEQ:
-        return js_bool(js_values_equal(js, l, r, 1));
     case JS_OP_SNEQ:
-        return js_bool(!js_values_equal(js, l, r, 1));
+        return js_bool(js_values_equal(js, l, r, 1) == (op == JS_OP_SEQ));
     case JS_OP_IN:
         return eval_in_operator(js, n, l, r);
     case JS_OP_SUB:
@@ -1775,7 +1986,7 @@ static JsValue eval_bin(HpeJs *js, JsEnv *env, JsNode *n)
     case JS_OP_SHL:
     case JS_OP_SHR:
     case JS_OP_USHR:
-        return eval_arithmetic(js, n, l, r);
+        return eval_bin_arith(js, n, op, l, r);
     default:
         js_error(js, n->line, "unsupported binary operator");
         return js_undef();
@@ -1803,7 +2014,7 @@ static JsValue read_target(HpeJs *js, JsEnv *env, JsNode *target)
         JsValue base = eval_expr(js, env, target->kids[0]);
         char *prop = target->op == JS_OP_DOT
                          ? target->str
-                         : js_to_string(js, eval_expr(js, env, target->kids[1]));
+                         : key_of_value(js, eval_expr(js, env, target->kids[1]));
         return member_get(js, env, base, prop, target->line);
     }
     return js_undef();
@@ -1835,7 +2046,7 @@ static void write_target(HpeJs *js, JsEnv *env, JsNode *target, JsValue value)
         JsValue base = eval_expr(js, env, target->kids[0]);
         char *prop = target->op == JS_OP_DOT
                          ? target->str
-                         : js_to_string(js, eval_expr(js, env, target->kids[1]));
+                         : key_of_value(js, eval_expr(js, env, target->kids[1]));
         member_set(js, env, base, prop, value, target->line);
         return;
     }
@@ -2262,10 +2473,33 @@ static JsValue class_eval(HpeJs *js, JsEnv *env, JsNode *n)
  *
  * @return 新建的对象值 / The newly created object value
  */
+/**
+ * @brief 构造 `import.meta` 对象 / Build the `import.meta` object
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ *
+ * @return 带 `url` 属性的新对象 / A new object carrying a `url` property
+ *
+ * @note `url` 取当前模块的路径；入口模块的路径由宿主经 `hpe_js_set_entry_path` 提供 /
+ *       `url` is the current module's path; the entry module's path comes from the host through
+ *       `hpe_js_set_entry_path`
+ */
+static JsValue import_meta_object(HpeJs *js)
+{
+    JsObj *o = js_object_new(js);
+    const char *url = js->current_module && js->current_module->path ? js->current_module->path
+                                                                    : "";
+    js_obj_set(js, o, "url", js_string(js, url));
+    return js_objval(o);
+}
+
 static JsValue object_literal(HpeJs *js, JsEnv *env, JsNode *n)
 {
     JsObj *o = js_object_new(js);
     int i;
+    /* `import.meta`: the parser marks its placeholder node with op==1 */
+    if (n->op == 1)
+        return import_meta_object(js);
     for (i = 0; i < n->kid_count; i++) {
         JsNode *pair = n->kids[i];
         char *key;
@@ -2292,7 +2526,8 @@ static JsValue object_literal(HpeJs *js, JsEnv *env, JsNode *n)
         /* a computed key is stored as a synthetic JS_N_BLOCK child marker:
          * the parser puts the key expression as kids[1] for computed names and
          * leaves kids[0] as the value/method. */
-        key = pair->str ? pair->str : "";
+        key = pair->kid_count > 1 ? key_of_value(js, eval_expr(js, env, pair->kids[1]))
+                                  : (pair->str ? pair->str : "");
         if (pair->op == JS_PROP_GET)
             js_obj_set_accessor(js, o, key, make_method(js, env, pair->kids[0]), js_undef());
         else if (pair->op == JS_PROP_SET)
@@ -2366,7 +2601,14 @@ static JsValue template_eval(HpeJs *js, JsEnv *env, JsNode *n)
 static JsValue eval_member(HpeJs *js, JsEnv *env, JsNode *n)
 {
     JsValue base = eval_expr(js, env, n->kids[0]);
-    char *prop = n->op == JS_OP_DOT ? n->str : js_to_string(js, eval_expr(js, env, n->kids[1]));
+    JsValue keyv = n->op == JS_OP_DOT ? js_undef() : eval_expr(js, env, n->kids[1]);
+    char *prop;
+    if (n->op == JS_OP_DOT)
+        prop = n->str;
+    else if (js_is_symbol(keyv))
+        prop = js_symbol_key(js, keyv);
+    else
+        prop = js_to_string(js, keyv);
     if (n->num != 0 && (base.t == JS_NULL || base.t == JS_UNDEF))
         return js_undef(); /* optional chain */
     return member_get(js, env, base, prop, n->line);
@@ -2480,9 +2722,10 @@ static void args_build(ArgList *al, HpeJs *js, JsEnv *env, JsNode *n, int first)
         JsNode *a = n->kids[i];
         if (a && a->kind == JS_N_SPREAD) {
             JsValue v = eval_expr(js, env, a->kids[0]);
-            int k, len = js_iter_len(js, v);
+            JsObj *sp = iter_expand(js, v);
+            int k, len = array_length(js, sp);
             for (k = 0; k < len; k++)
-                args_push(al, js, js_iter_at(js, v, k));
+                args_push(al, js, array_get_index(js, sp, k));
         } else {
             args_push(al, js, eval_expr(js, env, a));
         }
@@ -2510,7 +2753,7 @@ static int eval_callee(HpeJs *js, JsEnv *env, JsNode *n, JsNode *callee_node, Js
         JsValue base = eval_expr(js, env, callee_node->kids[0]);
         char *prop = callee_node->op == JS_OP_DOT
                          ? callee_node->str
-                         : js_to_string(js, eval_expr(js, env, callee_node->kids[1]));
+                         : key_of_value(js, eval_expr(js, env, callee_node->kids[1]));
         if (n->op == 1 && (base.t == JS_NULL || base.t == JS_UNDEF))
             return 0;
         *callee = member_get(js, env, base, prop, callee_node->line);
@@ -2644,6 +2887,7 @@ static JsValue eval_new(HpeJs *js, JsEnv *env, JsNode *n)
  * @retval "object" `JS_NULL` 或非可调用对象 / `JS_NULL` or a non-callable object
  * @retval "boolean" 布尔值 / A boolean value
  * @retval "number" 数值 / A number
+ * @retval "bigint" 大整数 / A BigInt
  * @retval "string" 字符串 / A string
  * @retval "function" 可调用对象（函数）/ A callable object (function)
  *
@@ -2660,6 +2904,10 @@ static const char *typeof_name(JsValue v)
         return "boolean";
     case JS_NUM:
         return "number";
+    case JS_BIGINT:
+        return "bigint";
+    case JS_SYMBOL:
+        return "symbol";
     case JS_STR:
         return "string";
     case JS_OBJ:
@@ -2689,9 +2937,15 @@ static JsValue eval_delete(HpeJs *js, JsEnv *env, JsNode *target)
         JsValue base = eval_expr(js, env, target->kids[0]);
         char *prop = target->op == JS_OP_DOT
                          ? target->str
-                         : js_to_string(js, eval_expr(js, env, target->kids[1]));
-        if (base.t == JS_OBJ && base.obj)
+                         : key_of_value(js, eval_expr(js, env, target->kids[1]));
+        if (base.t == JS_OBJ && base.obj) {
+            if (proxy_is(base.obj)) {
+                int ok = 1;
+                if (proxy_bool_trap(js, base.obj, "deleteProperty", prop, &ok))
+                    return js_bool(ok);
+            }
             js_obj_delete(js, base.obj, prop);
+        }
         return js_bool(1);
     }
     if (target->kind == JS_N_IDENT) {
@@ -2719,6 +2973,15 @@ static JsValue eval_unary_arithmetic(HpeJs *js, JsNode *n, JsValue v)
         return js_bool(!js_truthy(v));
     if (n->op == JS_OP_VOID)
         return js_undef();
+    if (v.t == JS_BIGINT) {
+        if (n->op == JS_OP_NEG)
+            return js_bigint_neg(js, v);
+        if (n->op == JS_OP_POS)
+            js_throw_value(js, js_make_error(js, "TypeError", "Cannot convert a BigInt value to a number"));
+        if (n->op == JS_OP_BNOT)
+            return js_bigint_not(js, v);
+        return js_num(js_to_number(js, v));
+    }
     if (n->op == JS_OP_NEG)
         return js_num(-js_to_number(js, v));
     if (n->op == JS_OP_POS)
@@ -2753,9 +3016,10 @@ static JsValue eval_array_literal(HpeJs *js, JsEnv *env, JsNode *n)
         }
         if (item->kind == JS_N_SPREAD) {
             JsValue v = eval_expr(js, env, item->kids[0]);
-            int k, len = js_iter_len(js, v);
+            JsObj *sp = iter_expand(js, v);
+            int k, len = array_length(js, sp);
             for (k = 0; k < len; k++)
-                array_push_value(js, arr, js_iter_at(js, v, k));
+                array_push_value(js, arr, array_get_index(js, sp, k));
         } else {
             array_push_value(js, arr, eval_expr(js, env, item));
         }
@@ -2793,17 +3057,56 @@ static JsValue eval_await(HpeJs *js, JsEnv *env, JsNode *n)
 }
 
 /**
+ * @brief 让当前生成器在 `yield` 处挂起 / Park the current generator at a `yield`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     value 本次产出的值 / The value produced this time
+ *
+ * @note 挂起发生在**当前 C 栈**上：`hpe_coro_yield` 切回调用者后，本帧原样留在协程栈里，
+ *       下一次 `next()` 会从这里继续往下走，所以 `yield` 后面的代码与 `yield` 表达式的结果
+ *       都保持不变。没有生成器在跑时本函数只把值记进 `yield_sink`（旧急切路径）。
+ *       The suspension happens on the **current C stack**: after `hpe_coro_yield` switches back,
+ *       this frame is left untouched on the coroutine stack, and the next `next()` continues right
+ *       here, so both the code after the `yield` and the value of the `yield` expression survive.
+ *       With no generator active the value goes to `yield_sink` (the old eager path).
+ */
+void hpe_js_gen_suspend(HpeJs *js, JsValue value)
+{
+    HpeJsGen *g = js->gen_active;
+    JsValue pending;
+    if (!g) {
+        if (js->yield_sink)
+            array_push_value(js, js->yield_sink, value);
+        return;
+    }
+    hpe_js_gen_set_yielded(js, g, value);
+    hpe_coro_yield(hpe_js_gen_coro(js, g));
+    /* Resumed. `throw(v)` parks an exception for us to raise *here*, on the
+     * coroutine stack, so the body's own `try` frames can catch it. */
+    if (hpe_js_gen_take_pending_throw(js, g, &pending))
+        js_throw_value(js, pending);
+    /* `return(v)` also unwinds from here, but as a return completion: raising the
+     * private marker makes `exec_try_finally` run the `finally` blocks and
+     * `exec_try_catch` decline to catch it. */
+    if (hpe_js_gen_take_pending_return(js, g, &pending))
+        js_throw_value(js, pending);
+}
+
+/**
  * @brief 求值 `yield` / `yield*` / Evaluate `yield` / `yield*`
  *
- * @details 先求操作数（无操作数则取 `undefined`）；写入 `js->yield_sink`：委托形式迭代操作数逐项追加，非委托形式追加单个值。
- *          The operand is evaluated (`undefined` when absent); the value is written to `js->yield_sink`: the delegate form iterates the operand and appends each item, the plain form appends the single value.
+ * @details 先求操作数（无操作数则取 `undefined`）；委托形式（`yield*`）逐个迭代操作数并在每个元素处挂起，
+ *          非委托形式直接挂起并产出该值。返回 `next(v)` 送入的值。
+ *          The operand is evaluated (`undefined` when absent); the delegate form (`yield*`) iterates
+ *          the operand and parks at each element, the plain form parks once with that value. Either
+ *          way the expression's result is whatever `next(v)` sent in.
  *
  * @param[in,out] js JS 运行时上下文 / JS runtime context
  * @param[in,out] env 词法环境 / Lexical environment
  * @param[in,out] n 节点 / Node
  * @param[in]     delegate 非 0 表示 `yield*` 委托迭代 / Non-zero for `yield*` delegation
  *
- * @return 恒为 `undefined` / Always `undefined`
+ * @return `next(v)` 送入的值（`yield*` 为被委托迭代器的返回值）/ The value `next(v)` sent in (`yield*` yields the delegate's return value)
  *
  * @see eval_yield_node eval_await
  */
@@ -2811,13 +3114,27 @@ static JsValue eval_yield(HpeJs *js, JsEnv *env, JsNode *n, int delegate)
 {
     JsValue v = n->kids[0] ? eval_expr(js, env, n->kids[0]) : js_undef();
 
-    if (js->yield_sink) {
-        if (delegate) {
-            int k, len = js_iter_len(js, v);
-            for (k = 0; k < len; k++)
-                array_push_value(js, js->yield_sink, js_iter_at(js, v, k));
-        } else {
-            array_push_value(js, js->yield_sink, v);
+    if (!delegate) {
+        hpe_js_gen_suspend(js, v);
+        return hpe_js_gen_get_sent(js, js->gen_active);
+    }
+    /* `yield*` forwards each item of the delegate, so an endless inner generator
+     * keeps the outer one suspended instead of being materialised. */
+    if (iter_is_pullable(v)) {
+        JsValue res = js_undef();
+        while (hpe_js_gen_pull(js, v.obj, &res)) {
+            hpe_js_gen_suspend(js, js_obj_get(js, res.obj, "value"));
+        }
+        /* the pull that reported `done` carries the delegate's return value,
+         * which becomes the value of the whole `yield*` expression */
+        if (res.t == JS_OBJ)
+            return js_obj_get(js, res.obj, "value");
+        return js_undef();
+    }
+    {
+        int k, len = js_iter_len(js, v);
+        for (k = 0; k < len; k++) {
+            hpe_js_gen_suspend(js, js_iter_at(js, v, k));
         }
     }
     return js_undef();
@@ -2963,6 +3280,8 @@ static JsValue eval_literal(HpeJs *js, JsNode *n, const char *s)
         return js_string(js, s ? s : "");
     if (n->kind == JS_N_NUM)
         return js_num(n->num);
+    if (n->kind == JS_N_BIGINT)
+        return js_bigint_from_str(js, s ? s : "0", (int)n->num);
     if (n->kind == JS_N_TRUE)
         return js_bool(1);
     if (n->kind == JS_N_FALSE)
@@ -3130,6 +3449,7 @@ static JsValue eval_expr(HpeJs *js, JsEnv *env, JsNode *n)
     /* literal nodes carry no side effects, so they share one entry point */
     switch (n->kind) {
     case JS_N_NUM:
+    case JS_N_BIGINT:
     case JS_N_STR:
     case JS_N_TRUE:
     case JS_N_FALSE:
@@ -3515,10 +3835,72 @@ static Flow exec_for(HpeJs *js, JsEnv *env, JsNode *n, const char *const *labels
 }
 
 /**
+ * @brief 判断一个值是否需要用拉取式迭代 / Test whether a value needs pull-based iteration
+ *
+ * @param[in] v 待检查的值 / The value to inspect
+ *
+ * @return 是可拉取的生成器返回 1 / 1 for a pullable generator
+ *
+ * @note 生成器（含无限生成器）没有可预知长度，所以索引式协议不适用，必须改用 `next()` 逐个拉取 / A generator — especially an endless one — has no knowable length, so the indexed protocol does not apply and `next()` must be pulled one item at a time
+ */
+static int iter_is_pullable(JsValue v)
+{
+    return v.t == JS_OBJ && v.obj && v.obj->kind == JS_OBJ_GEN;
+}
+
+/**
+ * @brief 按拉取式迭代收集全部项 / Collect every item through pull-based iteration
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     v 可拉取的值 / The pullable value
+ *
+ * @return 装载全部产出项的新数组对象 / A fresh array holding every yielded item
+ *
+ * @note 只对有限生成器安全，因此调用点必须能保证生成器会结束 / Only safe for a finite generator, so the call site must be sure the generator terminates
+ */
+static JsObj *iter_collect(HpeJs *js, JsObj *v)
+{
+    JsObj *arr = js_array_new(js);
+    JsValue res;
+    while (hpe_js_gen_pull(js, v, &res)) {
+        JsValue val = js_obj_get(js, res.obj, "value");
+        array_push_value(js, arr, val);
+    }
+    return arr;
+}
+
+/**
+ * @brief 把一个值按迭代协议展开成数组 / Expand a value into an array through the iteration protocol
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     v 待展开的值 / The value to expand
+ *
+ * @return 展开后的数组对象 / The expanded array object
+ *
+ * @note 生成器走 `next()` 拉取（支持无限生成器配合 `break`，但此处会全量收集），其余走既有的长度+索引协议 / Generators are pulled with `next()`; everything else uses the existing length-plus-index protocol
+ */
+static JsObj *iter_expand(HpeJs *js, JsValue v)
+{
+    JsObj *arr;
+    int k, len;
+    if (iter_is_pullable(v))
+        return iter_collect(js, v.obj);
+    arr = js_array_new(js);
+    len = js_iter_len(js, v);
+    for (k = 0; k < len; k++)
+        array_push_value(js, arr, js_iter_at(js, v, k));
+    return arr;
+}
+
+/**
  * @brief 执行 `for...of` 循环 / Execute a `for...of` loop
  *
  * @details 对第 1 个子节点求值得到可迭代表，取其长度后按“绑定循环变量 + 执行循环体（kid 2）”逐项迭代。
- *          Child 1 is evaluated into an iterable, its length taken, and the loop iterates item by item while binding the loop variable and running the body (child 2).
+ *          生成器改走拉取路径：每轮 `next()` 取一项，因此 `break` 不会再驱动生成器，
+ *          无限生成器也能安全地被提前退出。
+ *          Child 1 is evaluated into an iterable; generators take the pull path, fetching one item per
+ *          round with `next()`, so a `break` stops driving the generator and an endless generator can
+ *          still be exited early.
  *
  * @param[in,out] js JS 运行时上下文 / JS runtime context
  * @param[in,out] env 词法环境 / Lexical environment
@@ -3535,15 +3917,29 @@ static Flow exec_forof(HpeJs *js, JsEnv *env, JsNode *n, const char *const *labe
                        Flow *out)
 {
     JsValue it = eval_expr(js, env, n->kids[1]);
-    int len = js_iter_len(js, it), i;
 
-    for (i = 0; i < len; i++) {
-        int act = loop_body_step(js, env, n->kids[0], js_iter_at(js, it, i), n->kids[2], labels,
-                                 nlabels, out);
-        if (act == 1)
-            return flow_none();
-        if (act == 2)
-            return *out;
+    if (iter_is_pullable(it)) {
+        JsValue res;
+        while (hpe_js_gen_pull(js, it.obj, &res)) {
+            int act = loop_body_step(js, env, n->kids[0], js_obj_get(js, res.obj, "value"),
+                                     n->kids[2], labels, nlabels, out);
+            if (act == 1)
+                return flow_none();
+            if (act == 2)
+                return *out;
+        }
+        return flow_none();
+    }
+    {
+        int len = js_iter_len(js, it), i;
+        for (i = 0; i < len; i++) {
+            int act = loop_body_step(js, env, n->kids[0], js_iter_at(js, it, i), n->kids[2],
+                                     labels, nlabels, out);
+            if (act == 1)
+                return flow_none();
+            if (act == 2)
+                return *out;
+        }
     }
     return flow_none();
 }
@@ -3747,6 +4143,15 @@ static void exec_try_catch(HpeJs *js, JsEnv *env, JsNode *cc, JsValue thrown, Fl
     JsTryFrame f;
 
     *pending = 0;
+    /* A return completion travels as an exception so `finally` runs, but a user
+     * `catch` must not see it: leave it pending and let the outer frames handle
+     * it. `js->gen_ret_sentinel` is the private marker `Generator.prototype.return`
+     * raises. */
+    if (thrown.t == JS_OBJ && thrown.obj == js->gen_ret_sentinel) {
+        *pending = 1;
+        *rethrown = thrown;
+        return;
+    }
     f.prev = js->try_top;
     js->try_top = &f;
     if (setjmp(f.jmp) == 0) {
@@ -4231,6 +4636,7 @@ static JsModule *module_run(HpeJs *js, JsModule *m)
     JsNode *prog;
     JsModule *prev_mod;
     const char *prev_dir;
+    char cur_dir[1024];
     int i;
 
     if (m->evaluated == MOD_DONE || m->evaluated == MOD_RUNNING)
@@ -4248,7 +4654,10 @@ static JsModule *module_run(HpeJs *js, JsModule *m)
     prev_mod = js->current_module;
     prev_dir = js->current_dir;
     js->current_module = m;
-    js->current_dir = m->path;
+    /* relative specifiers inside this module resolve against its own directory,
+     * not its full path -- `from_dir` is joined as `dir + "/" + spec` */
+    hpe_path_dir(m->path, cur_dir, sizeof(cur_dir));
+    js->current_dir = cur_dir;
 
     /* imports run before the body (module hoisting) */
     for (i = 0; i < prog->kid_count; i++)
@@ -4614,64 +5023,6 @@ static void def_method(HpeJs *js, JsObj *target, const char *name, JsNativeFn fn
 static void def_value(HpeJs *js, JsObj *target, const char *name, JsValue v)
 {
     js_obj_set(js, target, name, v);
-}
-
-/**
- * @brief 读取字符串实参，缺失时返回回退值 / Read a string argument, returning a fallback when absent
- *
- * @details 下标越界直接返回 `fallback`，否则以 `js_to_string` 转换该实参。
- *          An out-of-range index returns `fallback` directly; otherwise the argument is converted with `js_to_string`.
- *
- * @param[in,out] js JS 运行时上下文 / JS runtime context
- * @param[in,out] args 实参数组 / Actual argument array
- * @param[in]     argc 实参个数 / Number of actual arguments
- * @param[in]     i 实参下标 / Argument index
- * @param[in]     fallback 缺失时的回退字符串 / The fallback string when absent
- *
- * @return 参数字符串或回退值 / The argument string or the fallback
- */
-static const char *arg_cstr(HpeJs *js, JsValue *args, int argc, int i, const char *fallback)
-{
-    if (i >= argc)
-        return fallback;
-    return js_to_string(js, args[i]);
-}
-
-/**
- * @brief 把值数组打包成 JS 数组 / Pack a value array into a JS array
- *
- * @param[in,out] js JS 运行时上下文 / JS runtime context
- * @param[in,out] v 值数组 / Value array
- * @param[in]     n 元素个数 / Number of elements
- *
- * @return 新建的 JS 数组 / The newly created JS array
- *
- * @see array_of
- */
-static JsValue list_of(HpeJs *js, JsValue *v, int n)
-{
-    return array_of(js, v, n);
-}
-
-/**
- * @brief 取得 `Array.prototype` 方法的接收者（须类数组）/ Get the receiver of an `Array.prototype` method (must be array-like)
- *
- * @details 接收者为对象时返回该对象；为字符串时返回 `NULL`（调用方另行处理）；其余返回 `NULL`。
- *          Returns the object when the receiver is an object, `NULL` when it is a string (handled separately by the caller), and `NULL` otherwise.
- *
- * @param[in,out] js JS 运行时上下文 / JS runtime context
- * @param[in]     thisv 调用时的 this 值 / The `this` value of the call
- *
- * @return 接收对象，或 `NULL` / The receiver object, or `NULL`
- */
-static JsObj *this_like(HpeJs *js, JsValue thisv)
-{
-    if (thisv.t == JS_OBJ && thisv.obj)
-        return thisv.obj;
-    if (thisv.t == JS_STR)
-        return NULL;
-    HPE_UNUSED(js);
-    return NULL;
 }
 
 /**
@@ -5274,6 +5625,155 @@ static JsValue native_decode_uri_component(HpeJs *js, JsValue thisv, JsValue *ar
     return js_string_len(js, out, o);
 }
 
+/* ---------------- legacy escape / unescape ---------------- */
+
+/**
+ * @brief `escape` 的免转义字符集 / The unescaped character set used by `escape`
+ *
+ * @note 与 ES 规范 B.2.1 一致：字母数字加 `@*_+-./` / Matches ES spec B.2.1: alphanumerics plus `@*_+-./`
+ */
+static const char *escape_unreserved = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@*_+-./";
+
+/**
+ * @brief 把 UTF-16 码元追加为 `%XX` 或 `%uXXXX` / Append a UTF-16 code unit as `%XX` or `%uXXXX`
+ *
+ * @param[out]    out 输出缓冲 / Output buffer
+ * @param[in,out] o 已写入长度，函数返回时推进 / Written length, advanced on return
+ * @param[in]     unit 单个 UTF-16 码元 / One UTF-16 code unit
+ *
+ * @note 码元小于 256 用两位十六进制，否则用 `%u` 加四位十六进制 / Two hex digits below 256, otherwise `%u` plus four hex digits
+ */
+static void escape_unit(char *out, size_t *o, uint32_t unit)
+{
+    if (unit < 256)
+        *o += (size_t)snprintf(out + *o, 8, "%%%02X", unit);
+    else
+        *o += (size_t)snprintf(out + *o, 8, "%%u%04X", unit);
+}
+
+/**
+ * @brief 实现老式全局函数 `escape` / Implement the legacy global `escape`
+ *
+ * @details 逐码点处理：免转义字符原样输出，其余按 UTF-16 码元转义；BMP 之外的码点先拆成代理对，
+ *          因而与浏览器输出逐字节一致。Clipping: characters in the unreserved set pass through and the
+ *          rest are escaped per UTF-16 code unit; code points beyond the BMP are split into a surrogate
+ *          pair first, so the output matches browsers byte for byte.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 忽略 / Ignored
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 转义后的字符串 / The escaped string
+ */
+static JsValue native_escape(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *ud)
+{
+    char *s = js_to_string(js, arg_at(args, argc, 0));
+    const char *p = s ? s : "";
+    size_t cap = strlen(p) * 6 + 1;
+    char *out = (char *)hpe_js_alloc(js, cap);
+    size_t o = 0;
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(ud);
+    for (; *p;) {
+        uint32_t cp;
+        int n = hpe_utf8_next(p, &cp);
+        p += n > 0 ? n : 1;
+        if (cp < 128 && strchr(escape_unreserved, (int)cp)) {
+            out[o++] = (char)cp;
+        } else if (cp <= 0xFFFF) {
+            escape_unit(out, &o, cp);
+        } else {
+            uint32_t v = cp - 0x10000u;
+            escape_unit(out, &o, 0xD800u + (v >> 10));
+            escape_unit(out, &o, 0xDC00u + (v & 0x3FFu));
+        }
+    }
+    out[o] = '\0';
+    return js_string_len(js, out, o);
+}
+
+/**
+ * @brief 读取 `%XX` 或 `%uXXXX` 并推进指针 / Read a `%XX` or `%uXXXX` escape and advance the cursor
+ *
+ * @param[in,out] p 扫描游标指针的地址 / Address of the scan cursor
+ *
+ * @return 解码出的 UTF-16 码元；不是合法转义时返回 -1 且不推进 / The decoded code unit, or -1 without advancing when the escape is malformed
+ */
+static int unescape_at(const char **p)
+{
+    const char *s = *p;
+    int l;
+    uint32_t v = 0;
+    if (s[0] != '%' || s[1] == '\0')
+        return -1;
+    if (s[1] == 'u') {
+        int i;
+        for (i = 0; i < 4; i++) {
+            int d = s[2 + i] ? uri_hex((unsigned char)s[2 + i]) : -1;
+            if (d < 0)
+                return -1;
+            v = (v << 4) | (uint32_t)d;
+        }
+        *p = s + 6;
+        return (int)v;
+    }
+    l = s[2] ? uri_hex((unsigned char)s[2]) : -1;
+    if (uri_hex((unsigned char)s[1]) < 0 || l < 0)
+        return -1;
+    *p = s + 3;
+    return uri_hex((unsigned char)s[1]) * 16 + l;
+}
+
+/**
+ * @brief 实现老式全局函数 `unescape` / Implement the legacy global `unescape`
+ *
+ * @details 识别 `%uXXXX` 与 `%XX`；相邻的代理对会被合并回单一码点再编码为 UTF-8。
+ *          Recognises `%uXXXX` and `%XX`; a neighbouring surrogate pair is merged back into one code point
+ *          and encoded as UTF-8.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 忽略 / Ignored
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 解码后的字符串 / The decoded string
+ */
+static JsValue native_unescape(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *ud)
+{
+    char *s = js_to_string(js, arg_at(args, argc, 0));
+    const char *p = s ? s : "";
+    size_t cap = strlen(p) + 1; /* a decode never grows the text */
+    char *out = (char *)hpe_js_alloc(js, cap);
+    size_t o = 0;
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(ud);
+    while (*p) {
+        const char *save = p;
+        int u = unescape_at(&p);
+        uint32_t cp;
+        if (u < 0) {
+            out[o++] = *save;
+            p = save + 1;
+            continue;
+        }
+        cp = (uint32_t)u;
+        if (u >= 0xD800 && u <= 0xDBFF && p[0] == '%' && p[1] == 'u') {
+            const char *next = p;
+            int lo = unescape_at(&next);
+            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                cp = 0x10000u + (((uint32_t)u - 0xD800u) << 10) + ((uint32_t)lo - 0xDC00u);
+                p = next;
+            }
+        }
+        o += (size_t)hpe_utf8_encode(cp, out + o);
+    }
+    out[o] = '\0';
+    return js_string_len(js, out, o);
+}
+
 /**
  * @brief 把 `thisv` 当作可读写的普通对象取出 / Take `thisv` as a plain mutable object
  *
@@ -5282,15 +5782,6 @@ static JsValue native_decode_uri_component(HpeJs *js, JsValue thisv, JsValue *ar
  *
  * @return 普通对象指针；类型不是带实体的普通对象时返回 `NULL` / The plain object pointer, or `NULL` when it is not a plain object with storage
  */
-
-static JsObj *str_this(HpeJs *js, JsValue thisv)
-{
-    HPE_UNUSED(js);
-    if (thisv.t == JS_OBJ && thisv.obj && thisv.obj->kind == JS_OBJ_PLAIN && thisv.obj->items)
-        return thisv.obj;
-    HPE_UNUSED(thisv);
-    return NULL;
-}
 
 /**
  * @brief 把参数强制转换为字符串 / Coerce an argument to a string
@@ -5384,8 +5875,8 @@ static JsValue string_charCodeAt(HpeJs *js, JsValue thisv, JsValue *a, int argc,
  */
 static JsValue string_indexOf(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    char *s = str_arg(js, thisv);
-    char *needle = str_arg(js, arg_at(a, argc, 0));
+    const char *s = str_arg(js, thisv);
+    const char *needle = str_arg(js, arg_at(a, argc, 0));
     char *hit;
     HPE_UNUSED(ud);
     if (argc > 1) {
@@ -5427,8 +5918,8 @@ static JsValue string_indexOf(HpeJs *js, JsValue thisv, JsValue *a, int argc, vo
  */
 static JsValue string_lastIndexOf(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    char *s = str_arg(js, thisv);
-    char *needle = str_arg(js, arg_at(a, argc, 0));
+    const char *s = str_arg(js, thisv);
+    const char *needle = str_arg(js, arg_at(a, argc, 0));
     size_t nl = strlen(needle), sl = strlen(s), i;
     HPE_UNUSED(ud);
     HPE_UNUSED(argc);
@@ -5476,7 +5967,7 @@ static size_t utf8_offset(const char *s, int i)
  */
 static JsValue string_slice(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    char *s = str_arg(js, thisv);
+    const char *s = str_arg(js, thisv);
     int len = utf8_len(s);
     int start = argc > 0 ? (int)js_to_number(js, a[0]) : 0;
     int end = argc > 1 && a[1].t != JS_UNDEF ? (int)js_to_number(js, a[1]) : len;
@@ -5510,7 +6001,7 @@ static JsValue string_slice(HpeJs *js, JsValue thisv, JsValue *a, int argc, void
  */
 static JsValue string_substring(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    char *s = str_arg(js, thisv);
+    const char *s = str_arg(js, thisv);
     int len = utf8_len(s);
     int start = argc > 0 ? (int)js_to_number(js, a[0]) : 0;
     int end = argc > 1 && a[1].t != JS_UNDEF ? (int)js_to_number(js, a[1]) : len;
@@ -5547,7 +6038,7 @@ static JsValue string_substring(HpeJs *js, JsValue thisv, JsValue *a, int argc, 
  */
 static JsValue string_substr(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    char *s = str_arg(js, thisv);
+    const char *s = str_arg(js, thisv);
     int len = utf8_len(s);
     int start = argc > 0 ? (int)js_to_number(js, a[0]) : 0;
     int count = argc > 1 && a[1].t != JS_UNDEF ? (int)js_to_number(js, a[1]) : len;
@@ -5579,7 +6070,7 @@ static JsValue string_substr(HpeJs *js, JsValue thisv, JsValue *a, int argc, voi
  */
 static JsValue string_toUpperCase(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    char *s = str_arg(js, thisv);
+    const char *s = str_arg(js, thisv);
     char *out = hpe_js_strdup(js, s);
     size_t i;
     HPE_UNUSED(a);
@@ -5604,7 +6095,7 @@ static JsValue string_toUpperCase(HpeJs *js, JsValue thisv, JsValue *a, int argc
  */
 static JsValue string_toLowerCase(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    char *s = str_arg(js, thisv);
+    const char *s = str_arg(js, thisv);
     char *out = hpe_js_strdup(js, s);
     size_t i;
     HPE_UNUSED(a);
@@ -5629,7 +6120,7 @@ static JsValue string_toLowerCase(HpeJs *js, JsValue thisv, JsValue *a, int argc
  */
 static JsValue string_trim(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    char *s = str_arg(js, thisv);
+    const char *s = str_arg(js, thisv);
     const char *b = s, *e = s + strlen(s);
     HPE_UNUSED(a);
     HPE_UNUSED(argc);
@@ -5658,7 +6149,7 @@ static JsValue string_trim(HpeJs *js, JsValue thisv, JsValue *a, int argc, void 
  */
 static JsValue string_pad(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    char *s = str_arg(js, thisv);
+    const char *s = str_arg(js, thisv);
     int target = argc > 0 ? (int)js_to_number(js, a[0]) : 0;
     char *pad = argc > 1 ? js_to_string(js, a[1]) : " ";
     int cur = utf8_len(s);
@@ -5699,7 +6190,7 @@ static JsValue string_pad(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *
  */
 static JsValue string_repeat(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    char *s = str_arg(js, thisv);
+    const char *s = str_arg(js, thisv);
     int n = argc > 0 ? (int)js_to_number(js, a[0]) : 0;
     size_t sl = strlen(s);
     char *out;
@@ -5727,7 +6218,7 @@ static JsValue string_repeat(HpeJs *js, JsValue thisv, JsValue *a, int argc, voi
  */
 static JsValue string_trim_side(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    char *s = str_arg(js, thisv);
+    const char *s = str_arg(js, thisv);
     HPE_UNUSED(a);
     HPE_UNUSED(argc);
     if (ud) {
@@ -5986,7 +6477,7 @@ static JsValue string_matchAll(HpeJs *js, JsValue thisv, JsValue *a, int argc, v
                 break;
             if (caps[1] < 0)
                 caps[1] = m;
-            array_push_value(js, out, regex_make_result(js, s, caps, total));
+            array_push_value(js, out, regex_make_result(js, re, s, caps, total, hpe_regex_flags(re)));
             off = caps[1] > caps[0] ? caps[1] : caps[0] + 1;
             if ((size_t)off > strlen(s))
                 break;
@@ -6938,11 +7429,13 @@ static JsValue array_sort(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *
             int c;
             if (has_cmp) {
                 JsValue args[2];
+                double d;
                 args[0] = x;
                 args[1] = y;
-                c = (int)js_to_number(js, call_value(js, NULL, cmp, js_undef(), args, 2, 0));
-                if (c != c)
-                    c = 0;
+                /* the comparator may legitimately return NaN; test before the
+                 * narrowing cast, since (int)NaN is undefined behaviour */
+                d = js_to_number(js, call_value(js, NULL, cmp, js_undef(), args, 2, 0));
+                c = (d != d) ? 0 : (int)d;
             } else {
                 int undef = 0;
                 c = default_cmp(js, x, y, &undef);
@@ -7175,9 +7668,14 @@ static JsValue native_array_from(HpeJs *js, JsValue thisv, JsValue *a, int argc,
     JsObj *out = js_array_new(js);
     JsValue src = arg_at(a, argc, 0);
     JsValue fn = arg_at(a, argc, 1);
+    JsObj *expanded;
     int i, n;
     HPE_UNUSED(thisv);
     HPE_UNUSED(ud);
+    /* a generator has no length up front, so materialise it first; otherwise the
+     * indexed protocol below walks the source directly */
+    expanded = iter_expand(js, src);
+    src = js_objval(expanded);
     n = js_iter_len(js, src);
     for (i = 0; i < n; i++) {
         JsValue v = js_iter_at(js, src, i);
@@ -7257,27 +7755,9 @@ void js_array_install_methods(HpeJs *js, JsObj *arr)
 static JsValue object_keys(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     JsValue v = arg_at(a, argc, 0);
-    JsObj *out = js_array_new(js);
     HPE_UNUSED(thisv);
     HPE_UNUSED(ud);
-    if (v.t == JS_OBJ && v.obj) {
-        if (v.obj->kind == JS_OBJ_ARRAY) {
-            int len = array_length(js, v.obj), i;
-            for (i = 0; i < len; i++) {
-                char buf[24];
-                snprintf(buf, sizeof(buf), "%d", i);
-                array_push_value(js, out, js_string(js, buf));
-            }
-        } else {
-            char **keys;
-            int nk, i;
-            js_obj_own_keys(v.obj, &keys, &nk);
-            for (i = 0; i < nk; i++)
-                array_push_value(js, out, js_string(js, keys[i]));
-            free(keys);
-        }
-    }
-    return js_objval(out);
+    return fund_own_keys(js, v);
 }
 
 /**
@@ -7534,13 +8014,9 @@ static JsValue object_has_own(HpeJs *js, JsValue thisv, JsValue *a, int argc, vo
  */
 static JsValue object_get_prototype_of(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    JsValue v = arg_at(a, argc, 0);
-    HPE_UNUSED(js);
     HPE_UNUSED(thisv);
     HPE_UNUSED(ud);
-    if (v.t == JS_OBJ && v.obj && v.obj->proto)
-        return js_objval(v.obj->proto);
-    return js_null();
+    return reflect_get_proto(js, js_undef(), a, argc, NULL);
 }
 
 /**
@@ -8026,8 +8502,6 @@ static JsValue number_is_safe_integer(HpeJs *js, JsValue thisv, JsValue *a, int 
     return js_bool(v.t == JS_NUM && floor(v.num) == v.num && fabs(v.num) <= 9007199254740991.0);
 }
 
-static JsValue number_this_toString_radix(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud);
-
 /**
  * @brief Boolean.prototype.valueOf：取布尔接收者的原始布尔值 / Boolean.prototype.valueOf: return the primitive boolean of the receiver
  *
@@ -8074,29 +8548,6 @@ static JsValue bool_this_toString(HpeJs *js, JsValue thisv, JsValue *a, int argc
     HPE_UNUSED(argc);
     HPE_UNUSED(ud);
     return js_string(js, js_truthy(thisv) ? "true" : "false");
-}
-
-/**
- * @brief Number.prototype.toString 的基数版本（占位实现）/ Radix-aware Number.prototype.toString (placeholder implementation)
- *
- * @param[in,out] js JS 运行时上下文 / JS runtime context
- * @param[in]     thisv 忽略 / Ignored
- * @param[in,out] a 实参数组，忽略 / Argument array; ignored
- * @param[in]     argc 实参个数，忽略 / Argument count; ignored
- * @param[in,out] ud 未使用 / Unused
- *
- * @return 目前固定返回 `undefined` / Currently always returns `undefined`
- *
- * @note 该版本尚未实现，所有入参均被忽略 / This version is not implemented yet and ignores all arguments
- */
-static JsValue number_this_toString_radix(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
-{
-    HPE_UNUSED(js);
-    HPE_UNUSED(thisv);
-    HPE_UNUSED(a);
-    HPE_UNUSED(argc);
-    HPE_UNUSED(ud);
-    return js_undef();
 }
 
 /* ---------------- JSON ---------------- */
@@ -8322,6 +8773,26 @@ static int json_write_date(HpeJs *js, JSBuf *b, JsValue v, int depth)
  * @retval     0 递归过深，判定为循环结构 / Recursion too deep, treated as a circular structure
  * @retval     1 已写出 / Written
  */
+/**
+ * @brief 写出 JSON 数字 / Write a JSON number
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] b JSON 输出缓冲 / JSON output buffer
+ * @param[in]     v 数字值 / The numeric value
+ *
+ * @note NaN 与 ±Infinity 不是合法 JSON，一律写 `null` / NaN and ±Infinity are not valid JSON and are written as `null`
+ */
+static void json_write_num(HpeJs *js, JSBuf *b, JsValue v)
+{
+    char *s;
+    if (v.num != v.num || isinf(v.num)) {
+        jsbuf_add(b, "null", 4);
+        return;
+    }
+    s = js_num_to_string(js, v.num);
+    jsbuf_add(b, s, strlen(s));
+}
+
 static int json_write(HpeJs *js, JSBuf *b, JsValue v, int depth)
 {
     if (depth > 64)
@@ -8337,18 +8808,14 @@ static int json_write(HpeJs *js, JSBuf *b, JsValue v, int depth)
         return 1;
     }
     case JS_NUM:
-        if (v.num != v.num || isinf(v.num)) {
-            jsbuf_add(b, "null", 4); /* NaN and Infinity are not valid JSON */
-            return 1;
-        }
-        {
-            char *s = js_num_to_string(js, v.num);
-            jsbuf_add(b, s, strlen(s));
-        }
+        json_write_num(js, b, v);
         return 1;
     case JS_STR:
         json_quote(b, v.str);
         return 1;
+    case JS_BIGINT:
+        js_throw_value(js, js_make_error(js, "TypeError", "Do not know how to serialize a BigInt"));
+        return 0;
     case JS_OBJ: {
         JsObj *o = v.obj;
 
@@ -8719,6 +9186,30 @@ static int regex_is_global(JsValue thisv){
 }
 
 /**
+ * @brief 判断正则在 `lastIndex` 处锚定匹配（`g` 或 `y`）/ Test whether the regex anchors at `lastIndex` (`g` or `y`)
+ *
+ * @param[in] thisv 正则对象 / The regex object
+ *
+ * @return 带 `g` 或 `y` 标志返回 1 / 1 when the `g` or `y` flag is present
+ *
+ * @note sticky（`y`）正则即使不带 `g` 也从 `lastIndex` 起并维护它 / A sticky (`y`) regex uses and updates `lastIndex` even without `g`
+ */
+static int regex_uses_last_index(JsValue thisv)
+{
+    JsValue fl;
+    const char *s;
+    if (thisv.t != JS_OBJ || !thisv.obj)
+        return 0;
+    fl = js_get_prop(NULL, NULL, thisv, "flags", 0);
+    if (fl.t != JS_STR || !fl.str)
+        return 0;
+    for (s = fl.str; *s; s++)
+        if (*s == 'g' || *s == 'y')
+            return 1;
+    return 0;
+}
+
+/**
  * @brief 读取正则对象的 lastIndex / Read a regex object's lastIndex
  *
  * @param[in]     thisv 正则对象 / The regex object
@@ -8765,11 +9256,15 @@ static void regex_set_last_index(HpeJs *js, JsValue thisv, int v)
  *
  * @note `caps[0]` 被钳制到 ≥0，`caps[1]` 被钳制到字符串长度 / `caps[0]` is clamped to ≥0 and `caps[1]` to the string length
  */
-static JsValue regex_make_result(HpeJs *js, const char *s, int *caps, int total)
+static JsValue regex_make_result(HpeJs *js, HpeRegex *re, const char *s, int *caps, int total,
+                                 int flags)
 {
     JsObj *out = js_array_new(js);
     size_t sl = strlen(s);
     int g;
+    /* a named-group object is built first; `groups` stays undefined when the
+     * pattern has no `(?<name>...)` groups (spec behaviour) */
+    JsValue groups = js_undef();
     if (caps[0] < 0)
         caps[0] = 0;
     if (caps[1] < 0 || caps[1] > (int)sl)
@@ -8785,8 +9280,104 @@ static JsValue regex_make_result(HpeJs *js, const char *s, int *caps, int total)
     }
     js_obj_set(js, out, "index", js_num((double)caps[0]));
     js_obj_set(js, out, "input", js_string(js, s));
-    js_obj_set(js, out, "groups", js_undef());
+    groups = regex_make_groups(js, re, s, caps, total);
+    js_obj_set(js, out, "groups", groups);
+    if (flags & 32)
+        js_obj_set(js, out, "indices", regex_make_indices(js, re, caps, total));
     return js_objval(out);
+}
+
+/**
+ * @brief 构造一个 `[start, end]` 下标对 / Build a `[start, end]` index pair
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     start 起始字节偏移 / Start byte offset
+ * @param[in]     end 结束字节偏移 / End byte offset
+ *
+ * @return 两个元素的数组 / A two-element array
+ */
+static JsValue regex_index_pair(HpeJs *js, int start, int end)
+{
+    JsObj *pair = js_array_new(js);
+    array_push_value(js, pair, js_num((double)start));
+    array_push_value(js, pair, js_num((double)end));
+    return js_objval(pair);
+}
+
+/**
+ * @brief 构造带 `d` 标志的 `indices` 数组 / Build the `indices` array for the `d` flag
+ *
+ * @details 首元素为整体匹配的 `[start, end]`，其后依次为各捕获组；未参与的组为 `undefined`。
+ *          具名组同时挂在 `indices.groups` 上。
+ *          The first element is the whole match's `[start, end]`, followed by each capture group
+ *          (`undefined` when it did not participate). Named groups also appear on
+ *          `indices.groups`.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     re 已编译的正则（提供名字表）/ The compiled regex, which supplies the name table
+ * @param[in]     caps 捕获下标数组 / The capture index array
+ * @param[in]     total 捕获组个数 / Number of capture groups
+ *
+ * @return `indices` 数组 / The `indices` array
+ */
+static JsValue regex_make_indices(HpeJs *js, HpeRegex *re, int *caps, int total)
+{
+    JsObj *arr = js_array_new(js);
+    JsObj *groups = NULL;
+    int g;
+    array_push_value(js, arr, regex_index_pair(js, caps[0], caps[1]));
+    for (g = 1; g <= total; g++) {
+        int bi = 2 + (g - 1) * 2, ei = bi + 1;
+        const char *name = hpe_regex_group_name(re, g);
+        JsValue pair;
+        if (bi >= RE_CAPS || caps[bi] < 0 || caps[ei] < caps[bi])
+            pair = js_undef();
+        else
+            pair = regex_index_pair(js, caps[bi], caps[ei]);
+        array_push_value(js, arr, pair);
+        if (name) {
+            if (!groups)
+                groups = js_object_new(js);
+            js_obj_set(js, groups, name, pair);
+        }
+    }
+    js_obj_set(js, arr, "groups", groups ? js_objval(groups) : js_undef());
+    return js_objval(arr);
+}
+
+/**
+ * @brief 构造具名捕获组的 `groups` 对象 / Build the `groups` object for named capture groups
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     re 已编译的正则（提供名字表）/ The compiled regex, which supplies the name table
+ * @param[in]     s 输入字符串 / The input string
+ * @param[in,out] caps 捕获下标数组 / The capture index array
+ * @param[in]     total 捕获组个数 / Number of capture groups
+ *
+ * @return 含各具名组的对象，无具名组时返回 `undefined` / An object of the named groups, or `undefined` when there are none
+ */
+static JsValue regex_make_groups(HpeJs *js, HpeRegex *re, const char *s, int *caps, int total)
+{
+    JsObj *groups = NULL;
+    int g;
+    if (!re)
+        return js_undef();
+    for (g = 1; g <= total; g++) {
+        const char *name = hpe_regex_group_name(re, g);
+        int bi, ei;
+        if (!name)
+            continue;
+        if (!groups)
+            groups = js_object_new(js);
+        bi = 2 + (g - 1) * 2;
+        ei = bi + 1;
+        if (bi < RE_CAPS && caps[bi] >= 0 && caps[ei] >= caps[bi])
+            js_obj_set(js, groups, name,
+                       js_string_len(js, s + caps[bi], (size_t)(caps[ei] - caps[bi])));
+        else
+            js_obj_set(js, groups, name, js_undef());
+    }
+    return groups ? js_objval(groups) : js_undef();
 }
 
 /**
@@ -8843,7 +9434,7 @@ static JsValue regex_exec(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *
     char *s = js_to_string(js, arg_at(a, argc, 0));
     int caps[RE_CAPS];
     int start, m;
-    int global = regex_is_global(thisv);
+    int global = regex_uses_last_index(thisv);
     HPE_UNUSED(ud);
     if (!re)
         return js_null();
@@ -8856,7 +9447,7 @@ static JsValue regex_exec(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *
     }
     if (global)
         regex_set_last_index(js, thisv, m);
-    return regex_make_result(js, s, caps, hpe_regex_group_count(re));
+    return regex_make_result(js, re, s, caps, hpe_regex_group_count(re), hpe_regex_flags(re));
 }
 
 /**
@@ -9206,7 +9797,7 @@ static JsValue match_regex_once(HpeJs *js, HpeRegex *re, const char *s, int tota
         return js_null();
     if (caps[1] < 0)
         caps[1] = m;
-    return regex_make_result(js, s, caps, total);
+    return regex_make_result(js, re, s, caps, total, hpe_regex_flags(re));
 }
 
 /**
@@ -9295,62 +9886,6 @@ static JsValue string_search(HpeJs *js, JsValue thisv, JsValue *a, int argc, voi
         char *hit = strstr(s, n);
         return js_num(hit ? (double)(hit - s) : -1.0);
     }
-}
-
-/* ---------------- Symbol (minimal) ---------------- */
-
-static int symbol_counter = 0;
-
-static JsValue symbol_toString(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud);
-
-/**
- * @brief Symbol(...)：创建一个最小可用的 Symbol 对象 / Symbol(...): create a minimal Symbol object
- *
- * @param[in,out] js JS 运行时上下文 / JS runtime context
- * @param[in]     thisv 忽略 / Ignored
- * @param[in,out] a 实参数组，`a[0]` 为描述文本 / Argument array; `a[0]` is the description
- * @param[in]     argc 实参个数 / Argument count
- * @param[in,out] ud 未使用 / Unused
- *
- * @return 新的 Symbol 对象 / The new Symbol object
- *
- * @note 对象带 `description`（形如 `Symbol(desc)`）、`toString`，并以自增计数器作为内部标识 / The object carries `description` (of the form `Symbol(desc)`), `toString`, and an auto-incrementing counter as its internal identity
- */
-static JsValue native_symbol(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
-{
-    JsObj *o = js_object_raw(js);
-    char buf[48];
-    HPE_UNUSED(thisv);
-    HPE_UNUSED(ud);
-    o->kind = JS_OBJ_PLAIN;
-    o->class_name = "Symbol";
-    o->proto = js->object_proto;
-    snprintf(buf, sizeof(buf), "Symbol(%s)",
-             argc > 0 && a[0].t != JS_UNDEF ? js_to_string(js, a[0]) : "");
-    js_obj_set(js, o, "description", js_string(js, buf));
-    js_obj_set(js, o, "toString", mk_native(js, symbol_toString, NULL));
-    o->payload = (void *)(intptr_t)(++symbol_counter);
-    return js_objval(o);
-}
-
-/**
- * @brief Symbol.prototype.toString：返回 symbol 的描述 / Symbol.prototype.toString: return the symbol's description
- *
- * @param[in,out] js JS 运行时上下文 / JS runtime context
- * @param[in]     thisv Symbol 对象接收者 / The Symbol receiver
- * @param[in,out] a 实参数组，忽略 / Argument array; ignored
- * @param[in]     argc 实参个数，忽略 / Argument count; ignored
- * @param[in,out] ud 未使用 / Unused
- *
- * @return `description` 字符串；缺失时返回 `Symbol()` / The `description` string, or `Symbol()` when absent
- */
-static JsValue symbol_toString(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
-{
-    JsValue d = member_get(js, NULL, thisv, "description", 0);
-    HPE_UNUSED(a);
-    HPE_UNUSED(argc);
-    HPE_UNUSED(ud);
-    return d.t == JS_STR ? d : js_string(js, "Symbol()");
 }
 
 static JsValue map_set_impl(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud);
@@ -9581,31 +10116,6 @@ static JsValue map_clear(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *u
         o->items = NULL;
     }
     return js_undef();
-}
-
-/**
- * @brief Map.prototype.size 取值器：返回元素个数 / Map.prototype.size getter: return the entry count
- *
- * @param[in,out] js JS 运行时上下文 / JS runtime context
- * @param[in]     thisv Map 对象接收者 / The Map receiver
- * @param[in,out] a 实参数组，忽略 / Argument array; ignored
- * @param[in]     argc 实参个数，忽略 / Argument count; ignored
- * @param[in,out] ud 未使用 / Unused
- *
- * @return 键数组的长度；非 Map 时为 0 / The length of the key array, or 0 for a non-Map
- *
- * @note 作为属性访问器调用，非 Map 接收者返回 0 / Invoked as a property accessor; a non-Map receiver yields 0
- */
-static JsValue map_size_get(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
-{
-    JsObj *keys;
-    HPE_UNUSED(a);
-    HPE_UNUSED(argc);
-    HPE_UNUSED(ud);
-    if (thisv.t != JS_OBJ || thisv.obj->kind != JS_OBJ_MAP)
-        return js_num(0);
-    keys = thisv.obj->payload_obj;
-    return js_num(keys ? (double)array_length(js, keys) : 0.0);
 }
 
 /**
@@ -10243,11 +10753,22 @@ static JsValue function_ctor(HpeJs *js, JsValue thisv, JsValue *a, int argc, voi
 
 static JsValue native_string_ctor(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
+    JsValue v;
     HPE_UNUSED(thisv);
     HPE_UNUSED(ud);
     if (argc == 0)
         return js_string(js, "");
-    return js_string(js, js_to_string(js, a[0]));
+    v = a[0];
+    /* `String(sym)` is the one explicit coercion the spec allows on a symbol,
+     * so it must bypass js_to_string, which rejects symbols. */
+    if (js_is_symbol(v))
+        return js_string(js, js_symbol_text(js, v));
+    if (v.t == JS_OBJ && v.obj) {
+        JsValue p = js_primitive_of(js, v);
+        if (js_is_symbol(p))
+            return js_string(js, js_symbol_text(js, p));
+    }
+    return js_string(js, js_to_string(js, v));
 }
 
 /**
@@ -10409,29 +10930,6 @@ static JsValue native_array_ctor(HpeJs *js, JsValue thisv, JsValue *a, int argc,
 }
 
 /**
- * @brief Symbol.iterator 的取值函数：返回一个空对象 / The Symbol.iterator accessor: return an empty object
- *
- * @param[in,out] js JS 运行时上下文 / JS runtime context
- * @param[in]     thisv 忽略 / Ignored
- * @param[in,out] a 实参数组，忽略 / Argument array; ignored
- * @param[in]     argc 实参个数，忽略 / Argument count; ignored
- * @param[in,out] ud 未使用 / Unused
- *
- * @return 新建的空对象 / A freshly created empty object
- *
- * @note 仅用于让 `obj[Symbol.iterator]` 的取值/存在性检查成立，不产生真实迭代器 / Only serves to make a `obj[Symbol.iterator]` read or existence check succeed; no real iterator is produced
- */
-
-static JsValue native_iter_symbol(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
-{
-    HPE_UNUSED(thisv);
-    HPE_UNUSED(a);
-    HPE_UNUSED(argc);
-    HPE_UNUSED(ud);
-    return js_objval(js_object_new(js));
-}
-
-/**
  * @brief 统计字节区间内的 UTF-8 码点数 / Count the UTF-8 code points within a byte range
  *
  * @param[in]     s 以 NUL 结尾的字符串 / NUL-terminated string
@@ -10573,7 +11071,7 @@ static void string_split_plain(HpeJs *js, JsObj *out, const char *s, JsValue sep
  */
 static JsValue string_split(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    char *s = str_arg(js, thisv);
+    const char *s = str_arg(js, thisv);
     JsObj *out = js_array_new(js);
     JsValue sep = arg_at(a, argc, 0);
     int limit = argc > 1 && a[1].t != JS_UNDEF ? (int)js_to_number(js, a[1]) : -1;
@@ -10608,7 +11106,7 @@ static JsValue string_split(HpeJs *js, JsValue thisv, JsValue *a, int argc, void
  */
 static JsValue string_concat(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    char *s = str_arg(js, thisv);
+    const char *s = str_arg(js, thisv);
     size_t len = strlen(s);
     size_t cap = len + 16;
     char *out = (char *)hpe_js_alloc(js, cap);
@@ -10617,7 +11115,7 @@ static JsValue string_concat(HpeJs *js, JsValue thisv, JsValue *a, int argc, voi
     memcpy(out, s, len);
     out[len] = '\0';
     for (i = 0; i < argc; i++) {
-        char *piece = str_arg(js, a[i]);
+        const char *piece = str_arg(js, a[i]);
         size_t pl = strlen(piece);
         if (len + pl + 1 > cap) {
             size_t ncap = (len + pl + 1) * 2;
@@ -10648,8 +11146,8 @@ static JsValue string_concat(HpeJs *js, JsValue thisv, JsValue *a, int argc, voi
  */
 static JsValue string_includes(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    char *s = str_arg(js, thisv);
-    char *needle = str_arg(js, arg_at(a, argc, 0));
+    const char *s = str_arg(js, thisv);
+    const char *needle = str_arg(js, arg_at(a, argc, 0));
     int pos = argc > 1 ? (int)js_to_number(js, a[1]) : 0;
     int total = utf8_len(s);
     HPE_UNUSED(ud);
@@ -10675,8 +11173,8 @@ static JsValue string_includes(HpeJs *js, JsValue thisv, JsValue *a, int argc, v
  */
 static JsValue string_starts_with(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    char *s = str_arg(js, thisv);
-    char *needle = str_arg(js, arg_at(a, argc, 0));
+    const char *s = str_arg(js, thisv);
+    const char *needle = str_arg(js, arg_at(a, argc, 0));
     int pos = argc > 1 ? (int)js_to_number(js, a[1]) : 0;
     size_t nl = strlen(needle);
     HPE_UNUSED(ud);
@@ -10700,8 +11198,8 @@ static JsValue string_starts_with(HpeJs *js, JsValue thisv, JsValue *a, int argc
  */
 static JsValue string_ends_with(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    char *s = str_arg(js, thisv);
-    char *needle = str_arg(js, arg_at(a, argc, 0));
+    const char *s = str_arg(js, thisv);
+    const char *needle = str_arg(js, arg_at(a, argc, 0));
     int total = utf8_len(s);
     int end = argc > 1 && a[1].t != JS_UNDEF ? (int)js_to_number(js, a[1]) : total;
     size_t nl = strlen(needle);
@@ -10732,7 +11230,7 @@ static JsValue string_ends_with(HpeJs *js, JsValue thisv, JsValue *a, int argc, 
  */
 static JsValue string_at(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    char *s = str_arg(js, thisv);
+    const char *s = str_arg(js, thisv);
     int total = utf8_len(s);
     int i = (int)js_to_number(js, arg_at(a, argc, 0));
     HPE_UNUSED(ud);
@@ -10977,20 +11475,10 @@ static JsValue set_clear(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *u
  */
 static JsValue set_values(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    JsObj *o = (thisv.t == JS_OBJ) ? thisv.obj : NULL;
-    JsObj *items = js_array_new(js);
     HPE_UNUSED(a);
     HPE_UNUSED(argc);
     HPE_UNUSED(ud);
-    if (o && o->payload_obj) {
-        char **keys;
-        int nk, i;
-        js_obj_own_keys(o->payload_obj, &keys, &nk);
-        for (i = 0; i < nk; i++)
-            array_push_value(js, items, js_obj_get(js, o->payload_obj, keys[i]));
-        free(keys);
-    }
-    return make_iterable(js, items);
+    return make_collection_iter(js, thisv, 2);
 }
 
 static JsValue set_foreach(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
@@ -11055,15 +11543,6 @@ static JsValue map_size_fn(HpeJs *js, JsValue thisv, JsValue *a, int argc, void 
  * @return 是 Map/Set 返回 1、否则 0 / 1 when it is a `Map`/`Set`, otherwise 0
  */
 
-static int map_kind(JsValue thisv, JsObj **out)
-{
-    JsObj *o = (thisv.t == JS_OBJ) ? thisv.obj : NULL;
-    if (!o || o->kind != JS_OBJ_MAP)
-        return 0;
-    *out = o;
-    return 1;
-}
-
 /**
  * @brief Map.prototype.keys：返回键的可迭代对象 / `Map.prototype.keys`: return an iterable over the keys
  *
@@ -11079,18 +11558,10 @@ static int map_kind(JsValue thisv, JsObj **out)
  */
 static JsValue map_keys(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    JsObj *o;
-    JsObj *items = js_array_new(js);
-    int i, n;
     HPE_UNUSED(a);
     HPE_UNUSED(argc);
     HPE_UNUSED(ud);
-    if (!map_kind(thisv, &o))
-        return make_iterable(js, items);
-    n = array_length(js, o->payload_obj);
-    for (i = 0; i < n; i++)
-        array_push_value(js, items, array_get_index(js, o->payload_obj, i));
-    return make_iterable(js, items);
+    return make_collection_iter(js, thisv, 1);
 }
 
 /**
@@ -11108,21 +11579,10 @@ static JsValue map_keys(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud
  */
 static JsValue map_values(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    JsObj *o;
-    JsObj *items = js_array_new(js);
-    int i, n;
     HPE_UNUSED(a);
     HPE_UNUSED(argc);
     HPE_UNUSED(ud);
-    if (!map_kind(thisv, &o))
-        return make_iterable(js, items);
-    n = array_length(js, o->payload_obj);
-    for (i = 0; i < n; i++) {
-        char buf[24];
-        snprintf(buf, sizeof(buf), "v%d", i);
-        array_push_value(js, items, member_get(js, NULL, thisv, buf, 0));
-    }
-    return make_iterable(js, items);
+    return make_collection_iter(js, thisv, 2);
 }
 
 /**
@@ -11140,24 +11600,10 @@ static JsValue map_values(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *
  */
 static JsValue map_entries(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    JsObj *o;
-    JsObj *items = js_array_new(js);
-    int i, n;
     HPE_UNUSED(a);
     HPE_UNUSED(argc);
     HPE_UNUSED(ud);
-    if (!map_kind(thisv, &o))
-        return make_iterable(js, items);
-    n = array_length(js, o->payload_obj);
-    for (i = 0; i < n; i++) {
-        char buf[24];
-        JsValue pair[2];
-        pair[0] = array_get_index(js, o->payload_obj, i);
-        snprintf(buf, sizeof(buf), "v%d", i);
-        pair[1] = member_get(js, NULL, thisv, buf, 0);
-        array_push_value(js, items, array_of(js, pair, 2));
-    }
-    return make_iterable(js, items);
+    return make_collection_iter(js, thisv, 3);
 }
 
 /**
@@ -11175,23 +11621,10 @@ static JsValue map_entries(HpeJs *js, JsValue thisv, JsValue *a, int argc, void 
  */
 static JsValue set_entries(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    JsObj *o = (thisv.t == JS_OBJ) ? thisv.obj : NULL;
-    JsObj *items = js_array_new(js);
-    int i, n;
     HPE_UNUSED(a);
     HPE_UNUSED(argc);
     HPE_UNUSED(ud);
-    if (!o || o->kind != JS_OBJ_MAP)
-        return make_iterable(js, items);
-    n = js_iter_len(js, thisv);
-    for (i = 0; i < n; i++) {
-        JsValue pair[2];
-        JsValue v = js_iter_at(js, thisv, i);
-        pair[0] = v;
-        pair[1] = v;
-        array_push_value(js, items, array_of(js, pair, 2));
-    }
-    return make_iterable(js, items);
+    return make_collection_iter(js, thisv, 4);
 }
 
 /**
@@ -11209,22 +11642,17 @@ static JsValue set_entries(HpeJs *js, JsValue thisv, JsValue *a, int argc, void 
  */
 static JsValue map_set_iter_self(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    HPE_UNUSED(js);
+    JsObj *o = (thisv.t == JS_OBJ) ? thisv.obj : NULL;
+    int is_set;
     HPE_UNUSED(a);
     HPE_UNUSED(argc);
     HPE_UNUSED(ud);
-    return thisv;
+    if (!o)
+        return make_collection_iter(js, thisv, 3);
+    is_set = o->class_name && !strcmp(o->class_name, "Set");
+    return make_collection_iter(js, thisv, is_set ? 2 : 3);
 }
 
-static JsValue symbol_brand(HpeJs *js, const char *desc){
-    JsObj *o = js_object_raw(js);
-    o->kind = JS_OBJ_PLAIN;
-    o->class_name = "Symbol";
-    o->proto = js->symbol_proto;
-    js_obj_set(js, o, "description", js_string(js, desc));
-    js_obj_set(js, o, "toString", mk_native(js, symbol_toString, NULL));
-    return js_objval(o);
-}
 
 /**
  * @brief 字符串的 `[Symbol.iterator]`：按码点遍历 / `[Symbol.iterator]` on a string: iterate by code point
@@ -11302,6 +11730,12 @@ static JsValue make_ctor(HpeJs *js, const char *name, JsNativeFn fn, void *ud, J
 static void init_prototypes(HpeJs *js)
 {
     js->object_proto = fresh_proto(js, "Object", NULL);
+    /* a private marker object; `exec_try_catch` passes it through so a
+     * `Generator.prototype.return` unwinds `finally` without being catchable */
+    js->gen_ret_sentinel = js_object_raw(js);
+    js->gen_ret_sentinel->kind = JS_OBJ_HOST;
+    js->gen_ret_sentinel->class_name = "GeneratorReturnCompletion";
+    js->gen_ret_sentinel->proto = js->object_proto;
     js->func_proto = fresh_proto(js, "Function", js->object_proto);
     js->array_proto = fresh_proto(js, "Array", js->object_proto);
     js->string_proto = fresh_proto(js, "String", js->object_proto);
@@ -11316,8 +11750,11 @@ static void init_prototypes(HpeJs *js)
     js->ref_error_proto = fresh_proto(js, "ReferenceError", js->error_proto);
     js->map_proto = fresh_proto(js, "Map", js->object_proto);
     js->set_proto = fresh_proto(js, "Set", js->object_proto);
-    js->symbol_proto = fresh_proto(js, "Symbol", js->object_proto);
     js->date_proto = fresh_proto(js, "Date", js->object_proto);
+    js->weakmap_proto = fresh_proto(js, "WeakMap", js->object_proto);
+    js->weakset_proto = fresh_proto(js, "WeakSet", js->object_proto);
+    js->weakref_proto = fresh_proto(js, "WeakRef", js->object_proto);
+    js->finreg_proto = fresh_proto(js, "FinalizationRegistry", js->object_proto);
 }
 
 /**
@@ -11650,6 +12087,185 @@ static void install_string_ctor(HpeJs *js)
  *
  * @note 含 `isInteger`/`isFinite`/`isNaN`/`isSafeInteger`、`parseInt`/`parseFloat` 及 `MAX_SAFE_INTEGER`/`NaN` 等常量 / Includes `isInteger`/`isFinite`/`isNaN`/`isSafeInteger`, `parseInt`/`parseFloat` and constants such as `MAX_SAFE_INTEGER`/`NaN`
  */
+/**
+ * @brief 校验整数串是否全是合法数字 / Validate that an integer string holds digits only
+ *
+ * @param[in] s 数字部分（符号与进制前缀已剥离）/ The digit part, with sign and radix prefix removed
+ * @param[in] radix 进制 / The radix
+ *
+ * @return 合法返回 1 / 1 when well formed
+ */
+static int bigint_str_ok(const char *s, int radix)
+{
+    if (!s || !*s)
+        return 0;
+    for (; *s; s++) {
+        int d = (*s >= '0' && *s <= '9')   ? *s - '0'
+                : (*s >= 'a' && *s <= 'z') ? *s - 'a' + 10
+                : (*s >= 'A' && *s <= 'Z') ? *s - 'A' + 10 : -1;
+        if (d < 0 || d >= radix)
+            return 0;
+    }
+    return 1;
+}
+
+/**
+ * @brief `BigInt(value)` 构造与转换 / The `BigInt(value)` constructor and conversion
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 忽略 / Ignored
+ * @param[in,out] a 实参数组，`a[0]` 为被转换的值 / Argument array; `a[0]` is the value to convert
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 新的 BigInt 原语 / The new BigInt primitive
+ *
+ * @note 数值必须是整数值（且有限），字符串必须是整数串，BigInt 原样返回；其余类型抛 `TypeError` /
+ *       A number must be a finite integer, a string must be an integer literal, a BigInt passes
+ *       through and every other type raises a `TypeError`
+ */
+static JsValue native_bigint_ctor(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    char buf[64];
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(ud);
+    if (argc == 0)
+        js_throw_value(js, js_make_error(js, "TypeError", "Cannot convert undefined to a BigInt"));
+    if (a[0].t == JS_BIGINT)
+        return a[0];
+    if (a[0].t == JS_NUM) {
+        double d = a[0].num;
+        if (d != d || isinf(d) || floor(d) != d)
+            js_throw_value(js, js_make_error(js, "RangeError", "The number cannot be converted to a BigInt because it is not an integer"));
+        snprintf(buf, sizeof(buf), "%.0f", d);
+        return js_bigint_from_str(js, buf, 10);
+    }
+    if (a[0].t == JS_STR) {
+        const char *s = a[0].str ? a[0].str : "";
+        const char *p = s;
+        int radix = 10;
+        if (*p == '+' || *p == '-')
+            p++;
+        if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+            radix = 16;
+            p += 2;
+        }
+        if (!bigint_str_ok(p, radix))
+            js_throw_value(js, js_make_error(js, "SyntaxError", "Cannot convert the string to a BigInt"));
+        return js_bigint_from_str(js, p, radix);
+    }
+    if (a[0].t == JS_BOOL)
+        return js_bigint_from_i64(js, a[0].num != 0.0 ? 1 : 0);
+    if (a[0].t == JS_OBJ) {
+        JsValue n = js_primitive_of(js, a[0]);
+        return native_bigint_ctor(js, thisv, &n, 1, NULL);
+    }
+    js_throw_value(js, js_make_error(js, "TypeError", "Cannot convert the value to a BigInt"));
+    return js_undef();
+}
+
+/**
+ * @brief `BigInt.prototype.toString(radix)` / `BigInt.prototype.toString(radix)`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 接收者 / The receiver
+ * @param[in,out] a 实参数组，`a[0]` 为进制 / Argument array; `a[0]` is the radix
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 字符串形式 / The string form
+ */
+static JsValue bigint_to_string_m(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    int radix = argc > 0 && a[0].t != JS_UNDEF ? (int)js_to_number(js, a[0]) : 10;
+    HPE_UNUSED(ud);
+    return js_string(js, js_bigint_to_radix(js, thisv, radix));
+}
+
+/**
+ * @brief `BigInt.prototype.valueOf()` / `BigInt.prototype.valueOf()`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 接收者 / The receiver
+ * @param[in,out] a 未使用 / Unused
+ * @param[in]     argc 未使用 / Unused
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return `this` 本身 / `this` itself
+ */
+static JsValue bigint_value_of(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    HPE_UNUSED(js);
+    HPE_UNUSED(a);
+    HPE_UNUSED(argc);
+    HPE_UNUSED(ud);
+    return thisv;
+}
+
+/**
+ * @brief `BigInt.asIntN(bits, v)` / `BigInt.asIntN(bits, v)`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 忽略 / Ignored
+ * @param[in,out] a 实参数组 / Argument array
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 按有符号定宽截断后的 BigInt / The BigInt after a signed fixed-width truncation
+ */
+static JsValue bigint_as_int_n(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(ud);
+    return js_bigint_asn(js, js_to_number(js, arg_at(a, argc, 0)), arg_at(a, argc, 1), 1);
+}
+
+/**
+ * @brief `BigInt.asUintN(bits, v)` / `BigInt.asUintN(bits, v)`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 忽略 / Ignored
+ * @param[in,out] a 实参数组 / Argument array
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 按无符号定宽截断后的 BigInt / The BigInt after an unsigned fixed-width truncation
+ */
+static JsValue bigint_as_uint_n(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(ud);
+    return js_bigint_asn(js, js_to_number(js, arg_at(a, argc, 0)), arg_at(a, argc, 1), 0);
+}
+
+/**
+ * @brief 安装 `BigInt` 构造器与静态方法 / Install the `BigInt` constructor and its static methods
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ *
+ * @note `BigInt` 不可用 `new` 调用，因此只按普通函数挂到全局，不挂 `prototype` 供实例使用 /
+ *       `BigInt` is not constructible with `new`, so it is attached as a plain function; the prototype
+ *       exists only to carry `toString` / `valueOf` for the primitives
+ */
+static void install_bigint_ctor(HpeJs *js)
+{
+    JsObj *proto = fresh_proto(js, "BigInt", js->object_proto);
+    JsObj *ctor;
+
+    ctor = js_native_new(js, native_bigint_ctor, NULL);
+    ctor->name = hpe_js_strdup(js, "BigInt");
+    js_obj_set(js, ctor, "name", js_string(js, "BigInt"));
+    js_obj_set(js, ctor, "length", js_num(1));
+    js_obj_set(js, ctor, "prototype", js_objval(proto));
+    def_method(js, proto, "toString", bigint_to_string_m, NULL);
+    def_method(js, proto, "valueOf", bigint_value_of, NULL);
+    def_method(js, proto, "toLocaleString", bigint_to_string_m, NULL);
+    def_method(js, ctor, "asIntN", bigint_as_int_n, NULL);
+    def_method(js, ctor, "asUintN", bigint_as_uint_n, NULL);
+    js_obj_set(js, js->global_obj, "BigInt", js_objval(ctor));
+    js->bigint_proto = proto;
+}
+
 static void install_number_ctor(HpeJs *js)
 {
     JsObj *nc;
@@ -11742,26 +12358,6 @@ static void install_map_set_ctors(HpeJs *js)
     make_ctor(js, "Map", native_map_ctor, NULL, js->map_proto);
     make_ctor(js, "Set", native_set_ctor, NULL, js->set_proto);
     install_set_statics(js);
-}
-
-/**
- * @brief 安装 `Symbol` 构造器、内置符号与方法 / Install the `Symbol` constructor, well-known symbols and methods
- *
- * @param[in,out] js JS 运行时上下文 / JS runtime context
- *
- * @note 注册 `iterator`/`toStringTag`/`asyncIterator` 内置符号，并把 `for` 与原型 `toString` 接上 / Registers the `iterator`/`toStringTag`/`asyncIterator` symbols and wires up `for` and the prototype `toString`
- */
-static void install_symbol_ctor(HpeJs *js)
-{
-    JsObj *sc;
-
-    make_ctor(js, "Symbol", native_symbol, NULL, js->symbol_proto);
-    sc = ctor_of(js, "Symbol");
-    def_value(js, sc, "iterator", symbol_brand(js, "Symbol.iterator"));
-    def_value(js, sc, "toStringTag", symbol_brand(js, "Symbol.toStringTag"));
-    def_value(js, sc, "asyncIterator", symbol_brand(js, "Symbol.asyncIterator"));
-    def_method(js, sc, "for", native_symbol, NULL);
-    def_method(js, js->symbol_proto, "toString", symbol_toString, NULL);
 }
 
 /* one row per `Math` function whose signature is `(x)` or `(x,y)`; the last
@@ -11883,9 +12479,231 @@ static void install_global_functions(HpeJs *js)
     /* `encodeURI` reuses the component codec with the "keep reserved chars" flag */
     def_value(js, g, "encodeURI", mk_native(js, native_encode_uri_component, (void *)1));
     def_value(js, g, "decodeURI", mk_native(js, native_decode_uri_component, NULL));
+    def_value(js, g, "escape", mk_native(js, native_escape, NULL));
+    def_value(js, g, "unescape", mk_native(js, native_unescape, NULL));
     def_value(js, g, "NaN", js_num(NAN));
     def_value(js, g, "Infinity", js_num(INFINITY));
     def_value(js, g, "undefined", js_undef());
+}
+
+/* `console.time`/`timeEnd` labels and `console.count` tallies. Both are tiny
+ * fixed tables: a debugging aid does not need a hash map, and a bounded table
+ * keeps the runtime allocation-free here. */
+#define HPE_CONSOLE_SLOTS 16
+static struct {
+    char label[32];
+    double start;
+    int count;
+} g_console_timers[HPE_CONSOLE_SLOTS];
+
+/**
+ * @brief 查找一个 console 记时槽 / Find a console timing slot
+ *
+ * @param[in] label 标签 / Label
+ * @param[in] create 未命中时新建为 1 / 1 to allocate a slot on miss
+ *
+ * @return 槽下标，未命中且 `create` 为 0 时返回 -1 / The slot index, or -1 on a miss with `create` == 0
+ */
+static int console_slot(const char *label, int create)
+{
+    int i, free_slot = -1;
+    for (i = 0; i < HPE_CONSOLE_SLOTS; i++) {
+        if (g_console_timers[i].label[0] && !strcmp(g_console_timers[i].label, label))
+            return i;
+        if (free_slot < 0 && !g_console_timers[i].label[0])
+            free_slot = i;
+    }
+    if (!create || free_slot < 0)
+        return free_slot;
+    snprintf(g_console_timers[free_slot].label, sizeof(g_console_timers[free_slot].label), "%s",
+             label);
+    return free_slot;
+}
+
+/**
+ * @brief 记录 `console.time(label)` 的起始时刻 / Record the start of `console.time(label)`
+ *
+ * @param[in] label 标签 / Label
+ * @param[in] now 当前秒数 / Current seconds
+ */
+static void console_timer_set(const char *label, double now)
+{
+    int i = console_slot(label, 1);
+    if (i >= 0)
+        g_console_timers[i].start = now;
+}
+
+/**
+ * @brief 取 `console.time(label)` 的起始时刻 / Read the start of `console.time(label)`
+ *
+ * @param[in] label 标签 / Label
+ *
+ * @return 起始秒数；无该标签返回 0 / The start time, or 0 when the label is unknown
+ */
+static double console_timer_get(const char *label)
+{
+    int i = console_slot(label, 0);
+    return i >= 0 ? g_console_timers[i].start : 0.0;
+}
+
+/**
+ * @brief 实现 `console.count` / Implement `console.count`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 调用时的 this 值（未使用）/ The `this` value (unused)
+ * @param[in,out] args 实参数组，`args[0]` 为标签 / Argument array, `args[0]` being the label
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 恒为 `undefined` / Always `undefined`
+ */
+static JsValue native_console_count(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *ud)
+{
+    const char *label = (argc > 0 ? js_to_string(js, args[0]) : NULL);
+    int i;
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(ud);
+    if (!label || !*label)
+        label = "default";
+    i = console_slot(label, 1);
+    if (i < 0)
+        return js_undef();
+    g_console_timers[i].count++;
+    printf("%s: %d\n", label, g_console_timers[i].count);
+    return js_undef();
+}
+
+/**
+ * @brief 实现 `performance.now()` / Implement `performance.now()`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 调用时的 this 值（未使用）/ The `this` value (unused)
+ * @param[in,out] args 实参数组（未使用）/ Argument array (unused)
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 自页面加载以来的毫秒数 / Milliseconds elapsed since the page started loading
+ *
+ * @note 基于单调时钟的进程起点，因此不会受系统时间调整影响 / Based on the monotonic clock's process origin, so it is immune to wall-clock adjustments
+ */
+static JsValue native_performance_now(HpeJs *js, JsValue thisv, JsValue *args, int argc,
+                                      void *ud)
+{
+    HPE_UNUSED(js);
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(args);
+    HPE_UNUSED(argc);
+    HPE_UNUSED(ud);
+    return js_num(hpe_time_seconds() * 1000.0);
+}
+
+/**
+ * @brief 创建并注册全局 `performance` 对象 / Create and register the global `performance` object
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ */
+static void install_performance(HpeJs *js)
+{
+    JsObj *perf = js_object_new(js);
+    perf->class_name = "Performance";
+    def_method(js, perf, "now", native_performance_now, NULL);
+    js_obj_set(js, js->global_obj, "performance", js_objval(perf));
+}
+
+/**
+ * @brief 实现 `console.table` / Implement `console.table`
+ *
+ * @details 数组按「下标 | 值」、对象按「键 | 值」逐行打印，便于无头运行核对数据结构；
+ *          无参数时输出一行空表头。
+ *          Arrays print as `index | value` rows and objects as `key | value`; with no argument a bare header row is printed, which keeps headless runs readable.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 调用时的 this 值（未使用）/ The `this` value (unused)
+ * @param[in,out] args 实参数组，`args[0]` 为待打印的值 / Argument array, `args[0]` being the value to print
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 非 `NULL` 写 stderr / Non-`NULL` writes to stderr
+ *
+ * @return 恒为 `undefined` / Always `undefined`
+ *
+ * @see native_console
+ */
+static JsValue native_console_table(HpeJs *js, JsValue thisv, JsValue *args, int argc,
+                                   void *ud)
+{
+    FILE *out = ud ? stderr : stdout;
+    JsValue v = argc > 0 ? args[0] : js_undef();
+    HPE_UNUSED(thisv);
+    fprintf(out, "index | value\n");
+    if (v.t != JS_OBJ || !v.obj)
+        return js_undef();
+    if (v.obj->kind == JS_OBJ_ARRAY) {
+        int len = array_length(js, v.obj);
+        int i;
+        for (i = 0; i < len; i++) {
+            char *s = js_to_string(js, array_get_index(js, v.obj, i));
+            fprintf(out, "%d | %s\n", i, s ? s : "");
+        }
+    } else {
+        char **keys = NULL;
+        int n = 0, i;
+        js_obj_own_keys(v.obj, &keys, &n);
+        for (i = 0; i < n; i++) {
+            char *s = js_to_string(js, js_obj_get(js, v.obj, keys[i]));
+            fprintf(out, "%s | %s\n", keys[i], s ? s : "");
+        }
+    }
+    return js_undef();
+}
+
+/**
+ * @brief 实现 `console.time` / Implement `console.time`
+ *
+ * @details 把当前单调时钟读入一个固定容量的定时器表（按标签查找）。
+ *          Stores the current monotonic reading into a small fixed-size table keyed by label.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 调用时的 this 值（未使用）/ The `this` value (unused)
+ * @param[in,out] args 实参数组，`args[0]` 为标签 / Argument array, `args[0]` being the label
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 恒为 `undefined` / Always `undefined`
+ */
+static JsValue native_console_time(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *ud)
+{
+    const char *label = argc > 0 ? js_to_string(js, args[0]) : "default";
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(ud);
+    console_timer_set(label ? label : "default", hpe_time_seconds());
+    return js_undef();
+}
+
+/**
+ * @brief 实现 `console.timeEnd` / Implement `console.timeEnd`
+ *
+ * @details 打印「标签: 毫秒 ms」，未找到标签时打印 0。
+ *          Prints `label: ms ms`, or 0 when the label was never started.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 调用时的 this 值（未使用）/ The `this` value (unused)
+ * @param[in,out] args 实参数组，`args[0]` 为标签 / Argument array, `args[0]` being the label
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 恒为 `undefined` / Always `undefined`
+ *
+ * @see native_console_time
+ */
+static JsValue native_console_time_end(HpeJs *js, JsValue thisv, JsValue *args, int argc,
+                                       void *ud)
+{
+    const char *label = argc > 0 ? js_to_string(js, args[0]) : "default";
+    double start = console_timer_get(label ? label : "default");
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(ud);
+    printf("%s: %.3f ms\n", label ? label : "default",
+           start > 0.0 ? (hpe_time_seconds() - start) * 1000.0 : 0.0);
+    return js_undef();
 }
 
 /**
@@ -11893,7 +12711,7 @@ static void install_global_functions(HpeJs *js)
  *
  * @param[in,out] js JS 运行时上下文 / JS runtime context
  *
- * @note 各方法共用 `native_console`，`ud` 非空表示写到 stderr / All methods share `native_console`; a non-NULL `ud` selects stderr
+ * @note 各方法共用 `native_console`，`ud` 非空表示写到 stderr；`table`/`time`/`timeEnd`/`count` 用各自的实现 / Most methods share `native_console` (a non-NULL `ud` selects stderr); `table`, `time`, `timeEnd` and `count` have their own
  */
 static void install_console(HpeJs *js)
 {
@@ -11902,7 +12720,10 @@ static void install_console(HpeJs *js)
         { "debug", native_console, NULL },  { "warn", native_console, (void *)1 },
         { "error", native_console, (void *)1 },
         { "assert", native_console, NULL }, { "trace", native_console, (void *)1 },
-        { "dir", native_console, NULL },
+        { "dir", native_console, NULL },    { "table", native_console_table, NULL },
+        { "time", native_console_time, NULL },
+        { "timeEnd", native_console_time_end, NULL },
+        { "count", native_console_count, NULL },
     };
     JsObj *console = js_object_new(js);
     size_t i;
@@ -11911,6 +12732,1091 @@ static void install_console(HpeJs *js)
     for (i = 0; i < sizeof(methods) / sizeof(methods[0]); i++)
         def_method(js, console, methods[i].name, methods[i].fn, methods[i].ud);
     js_obj_set(js, js->global_obj, "console", js_objval(console));
+    install_performance(js);
+}
+
+/* ---------------- Proxy / Reflect ---------------- */
+
+/**
+ * @brief 读取代理处理器的某个捕获器 / Read one trap from a proxy's handler
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] proxy 代理对象 / The proxy object
+ * @param[in]     name 捕获器名（如 `get`）/ Trap name, e.g. `get`
+ *
+ * @return 捕获器函数值；未定义该捕获器时返回 `undefined` / The trap function value, or `undefined` when absent
+ *
+ * @note 处理器上的取值走完整属性读取，因此可以用 getter 提供捕获器 / The handler is read through the full property path, so a getter may supply a trap
+ */
+static JsValue proxy_trap(HpeJs *js, JsObj *proxy, const char *name)
+{
+    return member_get(js, NULL, js_objval(proxy->proxy_handler), name, 0);
+}
+
+/**
+ * @brief 判断某个值是否为可用的捕获器 / Test whether a value is a usable trap
+ *
+ * @param[in]     t 候选值 / Candidate value
+ *
+ * @return 已定义且可调用时返回 1 / 1 when defined and callable
+ */
+static int trap_ready(JsValue t)
+{
+    return t.t != JS_UNDEF && js_is_callable(t);
+}
+
+/**
+ * @brief 判断对象是否为代理 / Test whether an object is a proxy
+ *
+ * @param[in,out] o 候选对象，可为 `NULL` / Candidate object, may be `NULL`
+ *
+ * @return 是代理返回 1 / 1 when the object is a proxy
+ */
+static int proxy_is(JsObj *o)
+{
+    return o && o->kind == JS_OBJ_PROXY && o->proxy_target != NULL;
+}
+
+/**
+ * @brief 分派 `get` 捕获器 / Dispatch the `get` trap
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] proxy 代理对象 / The proxy object
+ * @param[in]     receiver 作为接收者的值 / The receiver value
+ * @param[in]     prop 属性名 / Property name
+ * @param[out]    out 接收属性值 / Receives the property value
+ *
+ * @return 捕获器存在并已运行返回 1 / 1 when a trap existed and ran
+ */
+static int proxy_get(HpeJs *js, JsObj *proxy, JsValue receiver, const char *prop, JsValue *out)
+{
+    JsValue t = proxy_trap(js, proxy, "get");
+    JsValue args[3];
+    if (!trap_ready(t))
+        return 0;
+    args[0] = js_objval(proxy->proxy_target);
+    args[1] = js_string(js, prop);
+    args[2] = receiver.t == JS_UNDEF ? js_objval(proxy) : receiver;
+    *out = call_value(js, NULL, t, js_objval(proxy->proxy_handler), args, 3, 0);
+    return 1;
+}
+
+/**
+ * @brief 分派 `set` 捕获器 / Dispatch the `set` trap
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] proxy 代理对象 / The proxy object
+ * @param[in]     receiver 作为接收者的值 / The receiver value
+ * @param[in]     prop 属性名 / Property name
+ * @param[in]     value 写入的值 / Value to store
+ *
+ * @return 捕获器存在并已运行返回 1 / 1 when a trap existed and ran
+ */
+static int proxy_set(HpeJs *js, JsObj *proxy, JsValue receiver, const char *prop, JsValue value)
+{
+    JsValue t = proxy_trap(js, proxy, "set");
+    JsValue args[4];
+    if (!trap_ready(t))
+        return 0;
+    args[0] = js_objval(proxy->proxy_target);
+    args[1] = js_string(js, prop);
+    args[2] = value;
+    args[3] = receiver.t == JS_UNDEF ? js_objval(proxy) : receiver;
+    call_value(js, NULL, t, js_objval(proxy->proxy_handler), args, 4, 0);
+    return 1;
+}
+
+/**
+ * @brief 分派 `has` / `deleteProperty` 捕获器 / Dispatch the `has` / `deleteProperty` traps
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] proxy 代理对象 / The proxy object
+ * @param[in]     name 捕获器名 / Trap name
+ * @param[in]     prop 属性名 / Property name
+ * @param[out]    out 接收布尔结果 / Receives the boolean result
+ *
+ * @return 捕获器存在并已运行返回 1 / 1 when a trap existed and ran
+ *
+ * @note 两个捕获器形参一致，合并处理 / Both traps share a signature, so they share one body
+ */
+static int proxy_bool_trap(HpeJs *js, JsObj *proxy, const char *name, const char *prop, int *out)
+{
+    JsValue t = proxy_trap(js, proxy, name);
+    JsValue args[2];
+    if (!trap_ready(t))
+        return 0;
+    args[0] = js_objval(proxy->proxy_target);
+    args[1] = js_string(js, prop);
+    *out = js_truthy(call_value(js, NULL, t, js_objval(proxy->proxy_handler), args, 2, 0));
+    return 1;
+}
+
+/**
+ * @brief 以函数调用语义穿过代理 / Call through a proxy with function-call semantics
+ *
+ * @details 有 `apply` 捕获器时按其签名传入目标、`this` 与实参数组；否则把调用转交给被代理目标。
+ *          With an `apply` trap the target, `this` and an argument array are passed to it; otherwise
+ *          the call is forwarded to the wrapped target.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] proxy 代理对象 / The proxy object
+ * @param[in]     thisv 调用时的 this 值 / The `this` value of the call
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in]     line 出错时报告的行号 / Line number reported on error
+ *
+ * @return 调用结果 / The call result
+ */
+static JsValue proxy_apply_call(HpeJs *js, JsObj *proxy, JsValue thisv, JsValue *args, int argc,
+                                int line)
+{
+    JsValue t = proxy_trap(js, proxy, "apply");
+    JsValue fwd[3];
+    JsObj *bag;
+    int i;
+    if (!trap_ready(t)) {
+        if (!js_is_callable(js_objval(proxy->proxy_target)))
+            js_error(js, line, "value is not a function");
+        return call_value(js, NULL, js_objval(proxy->proxy_target), thisv, args, argc, line);
+    }
+    bag = js_array_new(js);
+    for (i = 0; i < argc; i++)
+        array_push_value(js, bag, args[i]);
+    fwd[0] = js_objval(proxy->proxy_target);
+    fwd[1] = thisv;
+    fwd[2] = js_objval(bag);
+    return call_value(js, NULL, t, js_objval(proxy->proxy_handler), fwd, 3, line);
+}
+
+/**
+ * @brief 以 `new` 语义穿过代理 / Construct through a proxy with `new` semantics
+ *
+ * @details 有 `construct` 捕获器时按其签名传入目标与实参数组；否则把构造转交给被代理目标。
+ *          With a `construct` trap the target and an argument array are passed to it; otherwise the
+ *          construction is forwarded to the wrapped target.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] proxy 代理对象 / The proxy object
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in]     line 出错时报告的行号 / Line number reported on error
+ *
+ * @return 构造出的对象 / The constructed object
+ */
+static JsValue proxy_new_call(HpeJs *js, JsObj *proxy, JsValue *args, int argc, int line)
+{
+    JsValue t = proxy_trap(js, proxy, "construct");
+    JsValue fwd[2];
+    JsObj *bag;
+    int i;
+    if (!trap_ready(t))
+        return js_construct(js, js_objval(proxy->proxy_target), args, argc, line);
+    bag = js_array_new(js);
+    for (i = 0; i < argc; i++)
+        array_push_value(js, bag, args[i]);
+    fwd[0] = js_objval(proxy->proxy_target);
+    fwd[1] = js_objval(bag);
+    return call_value(js, NULL, t, js_objval(proxy->proxy_handler), fwd, 2, line);
+}
+
+/* ---------------- fundamental operations (traps and Reflect share these) ------ */
+
+/**
+ * @brief [[Get]]：读取目标对象的属性 / [[Get]]: read a property from a target
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     target 目标值 / Target value
+ * @param[in]     key 属性键 / Property key
+ * @param[in]     receiver 作为接收者的值 / The receiver value
+ *
+ * @return 属性值 / The property value
+ *
+ * @note 目标为代理时继续解包，从而支持代理套代理 / A proxy target is unwrapped further, so proxies nest
+ */
+static JsValue fund_get(HpeJs *js, JsValue target, const char *key, JsValue receiver)
+{
+    if (target.t == JS_OBJ && proxy_is(target.obj)) {
+        JsValue out;
+        if (proxy_get(js, target.obj, receiver, key, &out))
+            return out;
+        target = js_objval(target.obj->proxy_target);
+    }
+    return member_get(js, NULL, target, key, 0);
+}
+
+/**
+ * @brief [[Set]]：写入目标对象的属性 / [[Set]]: write a property on a target
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     target 目标值 / Target value
+ * @param[in]     key 属性键 / Property key
+ * @param[in]     value 写入的值 / Value to store
+ * @param[in]     receiver 作为接收者的值 / The receiver value
+ *
+ * @return 恒为 1 / Always 1
+ */
+static int fund_set(HpeJs *js, JsValue target, const char *key, JsValue value, JsValue receiver)
+{
+    if (target.t == JS_OBJ && proxy_is(target.obj)) {
+        if (proxy_set(js, target.obj, receiver, key, value))
+            return 1;
+        target = js_objval(target.obj->proxy_target);
+    }
+    member_set(js, NULL, target, key, value, 0);
+    return 1;
+}
+
+/**
+ * @brief [[HasProperty]]：判断目标是否有某属性 / [[HasProperty]]: test a target for a property
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     target 目标值 / Target value
+ * @param[in]     key 属性键 / Property key
+ *
+ * @return 存在返回 1 / 1 when the property exists
+ */
+static int fund_has(HpeJs *js, JsValue target, const char *key)
+{
+    if (target.t == JS_OBJ && proxy_is(target.obj)) {
+        int out = 1;
+        if (proxy_bool_trap(js, target.obj, "has", key, &out))
+            return out;
+        target = js_objval(target.obj->proxy_target);
+    }
+    if (target.t != JS_OBJ || !target.obj)
+        js_error(js, 0, "cannot use 'in' operator on a non-object");
+    return js_obj_has(target.obj, key);
+}
+
+/**
+ * @brief [[OwnPropertyKeys]]：收集目标的键 / [[OwnPropertyKeys]]: collect a target's keys
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     target 目标值 / Target value
+ *
+ * @return 键名数组值 / An array value holding the key strings
+ */
+static JsValue fund_own_keys(HpeJs *js, JsValue target)
+{
+    JsObj *arr = js_array_new(js);
+    char **keys = NULL;
+    int nk = 0, i;
+    if (target.t != JS_OBJ || !target.obj)
+        return js_objval(arr);
+    if (proxy_is(target.obj)) {
+        JsValue t = proxy_trap(js, target.obj, "ownKeys");
+        JsValue args[1];
+        if (trap_ready(t)) {
+            args[0] = js_objval(target.obj->proxy_target);
+            return call_value(js, NULL, t, js_objval(target.obj->proxy_handler), args, 1, 0);
+        }
+        target = js_objval(target.obj->proxy_target);
+    }
+    if (target.obj->kind == JS_OBJ_ARRAY) {
+        int len = array_length(js, target.obj);
+        for (i = 0; i < len; i++) {
+            char buf[24];
+            snprintf(buf, sizeof(buf), "%d", i);
+            array_push_value(js, arr, js_string(js, buf));
+        }
+        return js_objval(arr);
+    }
+    js_obj_own_keys(target.obj, &keys, &nk);
+    for (i = 0; i < nk; i++)
+        array_push_value(js, arr, js_string(js, keys[i]));
+    free(keys);
+    return js_objval(arr);
+}
+
+/**
+ * @brief `new Proxy(target, handler)` / `new Proxy(target, handler)`
+ *
+ * @details 目标必须是对象（含可调用值），处理器必须是非 `null` 的对象。代理继承目标的原型，
+ *          使 `instanceof` 与 `Object.getPrototypeOf` 的表现与目标一致。The target must be an object
+ *          (callables included) and the handler a non-null object; the proxy copies the target's
+ *          prototype so `instanceof` and `Object.getPrototypeOf` behave as if it were the target.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 忽略 / Ignored
+ * @param[in,out] a 第一个实参为被代理目标、第二个为处理器 / Argument 0 is the target, argument 1 the handler
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 新建的代理对象 / The freshly built proxy object
+ */
+static JsValue native_proxy_ctor(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    JsValue target = arg_at(a, argc, 0);
+    JsValue handler = arg_at(a, argc, 1);
+    JsObj *p;
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(ud);
+    if (target.t != JS_OBJ || !target.obj)
+        js_throw_value(js, js_make_error(js, "TypeError", "Proxy: target is not an object"));
+    if (handler.t != JS_OBJ || !handler.obj)
+        js_throw_value(js, js_make_error(js, "TypeError", "Proxy: handler is not an object"));
+    p = js_object_raw(js);
+    p->kind = JS_OBJ_PROXY;
+    p->class_name = target.obj->class_name;
+    p->proxy_target = target.obj;
+    p->proxy_handler = handler.obj;
+    p->proto = target.obj->proto;
+    return js_objval(p);
+}
+
+/**
+ * @brief `Reflect.get(target, key[, receiver])` / `Reflect.get(target, key[, receiver])`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 忽略 / Ignored
+ * @param[in,out] a 实参数组 / Argument array
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 目标上该键的值 / The value of the key on the target
+ */
+static JsValue reflect_get(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    JsValue target = arg_at(a, argc, 0);
+    char *key = js_to_string(js, arg_at(a, argc, 1));
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(ud);
+    if (target.t != JS_OBJ || !target.obj)
+        js_throw_value(js, js_make_error(js, "TypeError", "Reflect.get: target is not an object"));
+    return fund_get(js, target, key, arg_at(a, argc, 2));
+}
+
+/**
+ * @brief `Reflect.set(target, key, value[, receiver])` / `Reflect.set(target, key, value[, receiver])`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 忽略 / Ignored
+ * @param[in,out] a 实参数组 / Argument array
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 恒为 `true` / Always `true`
+ */
+static JsValue reflect_set(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    JsValue target = arg_at(a, argc, 0);
+    char *key = js_to_string(js, arg_at(a, argc, 1));
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(ud);
+    if (target.t != JS_OBJ || !target.obj)
+        js_throw_value(js, js_make_error(js, "TypeError", "Reflect.set: target is not an object"));
+    fund_set(js, target, key, arg_at(a, argc, 2), arg_at(a, argc, 3));
+    return js_bool(1);
+}
+
+/**
+ * @brief `Reflect.has(target, key)` / `Reflect.has(target, key)`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 忽略 / Ignored
+ * @param[in,out] a 实参数组 / Argument array
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 存在该属性返回 `true` / `true` when the property exists
+ */
+static JsValue reflect_has(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(ud);
+    return js_bool(fund_has(js, arg_at(a, argc, 0), js_to_string(js, arg_at(a, argc, 1))));
+}
+
+/**
+ * @brief `Reflect.deleteProperty(target, key)` / `Reflect.deleteProperty(target, key)`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 忽略 / Ignored
+ * @param[in,out] a 实参数组 / Argument array
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 删除成功返回 `true` / `true` on success
+ */
+static JsValue reflect_delete(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    JsValue target = arg_at(a, argc, 0);
+    char *key = js_to_string(js, arg_at(a, argc, 1));
+    int out = 1;
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(ud);
+    if (target.t == JS_OBJ && proxy_is(target.obj)) {
+        if (proxy_bool_trap(js, target.obj, "deleteProperty", key, &out))
+            return js_bool(out);
+        target = js_objval(target.obj->proxy_target);
+    }
+    if (target.t == JS_OBJ && target.obj)
+        out = js_obj_delete(js, target.obj, key);
+    return js_bool(out);
+}
+
+/**
+ * @brief `Reflect.ownKeys(target)` / `Reflect.ownKeys(target)`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 忽略 / Ignored
+ * @param[in,out] a 实参数组 / Argument array
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 键名数组 / The array of key names
+ */
+static JsValue reflect_own_keys(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(ud);
+    return fund_own_keys(js, arg_at(a, argc, 0));
+}
+
+/**
+ * @brief `Reflect.getPrototypeOf(target)` / `Reflect.getPrototypeOf(target)`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 忽略 / Ignored
+ * @param[in,out] a 实参数组 / Argument array
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 目标的原型对象，或 `null` / The prototype object, or `null`
+ */
+static JsValue reflect_get_proto(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    JsValue v = arg_at(a, argc, 0);
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(ud);
+    if (v.t != JS_OBJ || !v.obj)
+        js_throw_value(
+            js, js_make_error(js, "TypeError", "Reflect.getPrototypeOf: target is not an object"));
+    if (proxy_is(v.obj)) {
+        JsValue t = proxy_trap(js, v.obj, "getPrototypeOf");
+        JsValue args[1];
+        if (trap_ready(t)) {
+            args[0] = js_objval(v.obj->proxy_target);
+            return call_value(js, NULL, t, js_objval(v.obj->proxy_handler), args, 1, 0);
+        }
+        v = js_objval(v.obj->proxy_target);
+    }
+    return v.obj->proto ? js_objval(v.obj->proto) : js_null();
+}
+
+/**
+ * @brief `Reflect.setPrototypeOf(target, proto)` / `Reflect.setPrototypeOf(target, proto)`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 忽略 / Ignored
+ * @param[in,out] a 实参数组 / Argument array
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 成功返回 `true` / `true` on success
+ */
+static JsValue reflect_set_proto(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    JsValue v = arg_at(a, argc, 0);
+    JsValue p = arg_at(a, argc, 1);
+    HPE_UNUSED(js);
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(ud);
+    if (v.t == JS_OBJ && v.obj) {
+        if (proxy_is(v.obj))
+            v.obj->proxy_target->proto = (p.t == JS_OBJ) ? p.obj : NULL;
+        v.obj->proto = (p.t == JS_OBJ) ? p.obj : NULL;
+    }
+    return js_bool(1);
+}
+
+/**
+ * @brief `Reflect.apply(target, thisArg, argsList)` / `Reflect.apply(target, thisArg, argsList)`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 忽略 / Ignored
+ * @param[in,out] a 实参数组 / Argument array
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 调用结果 / The call result
+ *
+ * @note 第三个实参按可迭代/类数组展开 / The third argument is spread as an iterable or array-like
+ */
+static JsValue reflect_apply(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    JsValue fn = arg_at(a, argc, 0);
+    JsValue list = arg_at(a, argc, 2);
+    int n = js_iter_len(js, list);
+    JsValue *args;
+    int i;
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(ud);
+    if (!js_is_callable(fn))
+        js_throw_value(js, js_make_error(js, "TypeError", "Reflect.apply: target is not callable"));
+    args = (JsValue *)hpe_js_alloc(js, (size_t)(n + 1) * sizeof(JsValue));
+    for (i = 0; i < n; i++)
+        args[i] = js_iter_at(js, list, i);
+    return call_value(js, NULL, fn, arg_at(a, argc, 1), args, n, 0);
+}
+
+/**
+ * @brief `Reflect.construct(target, argsList[, newTarget])` / `Reflect.construct(target, argsList[, newTarget])`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 忽略 / Ignored
+ * @param[in,out] a 实参数组 / Argument array
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 新建的对象 / The constructed object
+ */
+static JsValue reflect_construct(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    JsValue list = arg_at(a, argc, 1);
+    int n = js_iter_len(js, list);
+    JsValue *args;
+    int i;
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(ud);
+    args = (JsValue *)hpe_js_alloc(js, (size_t)(n + 1) * sizeof(JsValue));
+    for (i = 0; i < n; i++)
+        args[i] = js_iter_at(js, list, i);
+    return js_construct(js, arg_at(a, argc, 0), args, n, 0);
+}
+
+/**
+ * @brief `Reflect.defineProperty(target, key, desc)` / `Reflect.defineProperty(target, key, desc)`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 忽略 / Ignored
+ * @param[in,out] a 实参数组 / Argument array
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 恒为 `true` / Always `true`
+ *
+ * @note 描述符带 `get`/`set` 时安装访问器，否则写入 `value` / A `get`/`set` pair installs an accessor, otherwise `value` is written
+ */
+static JsValue reflect_define(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    JsValue target = arg_at(a, argc, 0);
+    JsValue desc = arg_at(a, argc, 2);
+    char *key = js_to_string(js, arg_at(a, argc, 1));
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(ud);
+    if (target.t != JS_OBJ || !target.obj)
+        return js_bool(0);
+    if (desc.t == JS_OBJ && desc.obj) {
+        JsValue g = member_get(js, NULL, desc, "get", 0);
+        JsValue s = member_get(js, NULL, desc, "set", 0);
+        if (g.t != JS_UNDEF || s.t != JS_UNDEF)
+            js_obj_set_accessor(js, target.obj, key, g, s);
+        else
+            member_set(js, NULL, target, key, member_get(js, NULL, desc, "value", 0), 0);
+        return js_bool(1);
+    }
+    member_set(js, NULL, target, key, js_undef(), 0);
+    return js_bool(1);
+}
+
+/**
+ * @brief `Reflect.getOwnPropertyDescriptor(target, key)` / `Reflect.getOwnPropertyDescriptor(target, key)`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 忽略 / Ignored
+ * @param[in,out] a 实参数组 / Argument array
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 描述符对象；属性不存在时为 `undefined` / The descriptor object, or `undefined` when absent
+ */
+static JsValue reflect_get_descriptor(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    JsValue target = arg_at(a, argc, 0);
+    char *key = js_to_string(js, arg_at(a, argc, 1));
+    JsProp *p;
+    JsObj *d;
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(ud);
+    if (target.t != JS_OBJ || !target.obj)
+        return js_undef();
+    p = js_obj_own_prop(proxy_is(target.obj) ? target.obj->proxy_target : target.obj, key);
+    if (!p)
+        return js_undef();
+    d = js_object_new(js);
+    if (p->getter.t != JS_UNDEF || p->setter.t != JS_UNDEF) {
+        js_obj_set(js, d, "get", p->getter);
+        js_obj_set(js, d, "set", p->setter);
+    } else {
+        js_obj_set(js, d, "value", p->val);
+        js_obj_set(js, d, "writable", js_bool(1));
+    }
+    js_obj_set(js, d, "enumerable", js_bool(p->enumerable));
+    js_obj_set(js, d, "configurable", js_bool(1));
+    return js_objval(d);
+}
+
+/**
+ * @brief `Reflect.isExtensible` / `Reflect.preventExtensions` 的共用实现 / Shared body of `Reflect.isExtensible` and `Reflect.preventExtensions`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 忽略 / Ignored
+ * @param[in,out] a 实参数组 / Argument array
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 恒为 `true` / Always `true`
+ *
+ * @note 解释器不做可扩展性建模，两个方法都返回 `true` / The interpreter models no extensibility, so both return `true`
+ */
+static JsValue reflect_always_true(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    HPE_UNUSED(js);
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(a);
+    HPE_UNUSED(argc);
+    HPE_UNUSED(ud);
+    return js_bool(1);
+}
+
+/**
+ * @brief 安装 `Proxy` 与 `Reflect` 到全局对象 / Install `Proxy` and `Reflect` on the global object
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ *
+ * @note 解释器不建模 `[[Writable]]`/`[[Configurable]]` 不变量，因此规范的「捕获器执行后校验不变量」
+ *       这一步不做，捕获器结果直接生效 / The interpreter does not model the
+ *       `[[Writable]]`/`[[Configurable]]` invariants, so the spec's post-trap invariant check is
+ *       skipped and the trap result is used as-is
+ */
+static void install_proxy_reflect(HpeJs *js)
+{
+    static const MathFn fns[] = {
+        { "get", reflect_get, NULL },          { "set", reflect_set, NULL },
+        { "has", reflect_has, NULL },          { "deleteProperty", reflect_delete, NULL },
+        { "ownKeys", reflect_own_keys, NULL }, { "getPrototypeOf", reflect_get_proto, NULL },
+        { "setPrototypeOf", reflect_set_proto, NULL },
+        { "apply", reflect_apply, NULL },      { "construct", reflect_construct, NULL },
+        { "defineProperty", reflect_define, NULL },
+        { "getOwnPropertyDescriptor", reflect_get_descriptor, NULL },
+        { "isExtensible", reflect_always_true, NULL },
+        { "preventExtensions", reflect_always_true, NULL },
+    };
+    JsObj *r = js_object_new(js);
+    size_t i;
+
+    r->class_name = "Reflect";
+    for (i = 0; i < sizeof(fns) / sizeof(fns[0]); i++)
+        def_method(js, r, fns[i].name, fns[i].fn, fns[i].ud);
+    js_obj_set(js, js->global_obj, "Reflect", js_objval(r));
+    make_ctor(js, "Proxy", native_proxy_ctor, NULL, js->object_proto);
+}
+
+/* ---------------- WeakMap / WeakSet / WeakRef / FinalizationRegistry ---------------- */
+
+/**
+ * @brief WeakMap / WeakSet 的内部存储：一张以对象身份为键的旁表 / Backing store for WeakMap / WeakSet: a side table keyed by object identity
+ *
+ * @details 引擎没有垃圾回收器，因此弱引用语义只能做到「API 兼容」：条目存放在一张普通表里，
+ *          以 `o:<指针>` 形式的字符串为键，遍历与 `size` 均不暴露（与规范的不可枚举特性一致）。
+ *          真正的弱可达回收需要 GC，本实现不承诺。The engine has no garbage collector, so weak
+ *          semantics are API-compatible only: entries live in a plain table keyed by an `o:<pointer>`
+ *          string, and neither iteration nor `size` is exposed, matching the spec's non-enumerable
+ *          surface. Genuine weak reachability would need a GC and is not promised here.
+ *
+ * @param[in]     v 待转为内部键的值 / Value to turn into an internal key
+ *
+ * @return 以对象身份构造的键字符串 / The key string built from the object identity
+ *
+ * @note 非对象值返回 `NULL`，调用方据此抛出 `TypeError` / Returns `NULL` for non-objects so the caller can raise a `TypeError`
+ */
+static const char *weak_key(HpeJs *js, JsValue v)
+{
+    char buf[64];
+    if (v.t != JS_OBJ || !v.obj)
+        return NULL;
+    snprintf(buf, sizeof(buf), "o:%p", (void *)v.obj);
+    return hpe_js_strdup(js, buf);
+}
+
+/**
+ * @brief 取回 WeakMap / WeakSet 的后备存储 / Fetch the backing store of a WeakMap / WeakSet
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 接收者 / The receiver
+ * @param[in]     cls 期望的类名，用于错误信息 / Expected class name, used in the error message
+ * @param[in]     line 出错时报告的行号 / Line number reported on error
+ *
+ * @return 后备对象；接收者类型不符时为 `NULL` / The backing object, or `NULL` when the receiver is wrong
+ */
+static JsObj *weak_store(HpeJs *js, JsValue thisv, const char *cls, int line)
+{
+    if (thisv.t != JS_OBJ || !thisv.obj || thisv.obj->kind != JS_OBJ_WEAKMAP) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Method %s called on incompatible receiver", cls);
+        js_error(js, line, "%s", msg);
+        return NULL;
+    }
+    return thisv.obj;
+}
+
+/**
+ * @brief `new WeakMap([iterable])` / `new WeakMap([iterable])`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 忽略 / Ignored
+ * @param[in,out] a 实参数组，`a[0]` 可为键值对可迭代对象 / Argument array; `a[0]` may be an iterable of key/value pairs
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 新建的 WeakMap / The new WeakMap
+ */
+static JsValue native_weakmap_ctor(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    JsObj *o = js_object_raw(js);
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(ud);
+    o->kind = JS_OBJ_WEAKMAP;
+    o->class_name = "WeakMap";
+    o->proto = js->weakmap_proto;
+    o->payload_obj = js_object_raw(js);
+    o->payload_obj->proto = js->object_proto;
+    if (argc > 0 && js_iter_len(js, a[0]) > 0) {
+        int n = js_iter_len(js, a[0]), i;
+        for (i = 0; i < n; i++) {
+            JsValue pair = js_iter_at(js, a[0], i);
+            JsValue kv[2];
+            kv[0] = js_iter_at(js, pair, 0);
+            kv[1] = js_iter_at(js, pair, 1);
+            {
+                const char *k = weak_key(js, kv[0]);
+                if (!k)
+                    js_throw_value(js, js_make_error(js, "TypeError",
+                                                     "Invalid value used as weak map key"));
+                js_obj_set(js, o->payload_obj, k, kv[1]);
+            }
+        }
+    }
+    return js_objval(o);
+}
+
+/**
+ * @brief `WeakMap.prototype.set(key, value)` / `WeakMap.prototype.set(key, value)`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv WeakMap 接收者 / The WeakMap receiver
+ * @param[in,out] a 实参数组：键、值 / Argument array: key and value
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return WeakMap 本身，便于链式调用 / The WeakMap itself, for chaining
+ */
+static JsValue weakmap_set(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    JsObj *o = weak_store(js, thisv, "WeakMap.prototype.set", 0);
+    const char *k = weak_key(js, arg_at(a, argc, 0));
+    HPE_UNUSED(ud);
+    if (!k)
+        js_throw_value(js, js_make_error(js, "TypeError", "Invalid value used as weak map key"));
+    if (o)
+        js_obj_set(js, o->payload_obj, k, arg_at(a, argc, 1));
+    return thisv;
+}
+
+/**
+ * @brief `WeakMap.prototype.get(key)` / `WeakMap.prototype.get(key)`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv WeakMap 接收者 / The WeakMap receiver
+ * @param[in,out] a 实参数组，`a[0]` 为键 / Argument array; `a[0]` is the key
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 键对应的值；非对象键或缺席时为 `undefined` / The value for the key, or `undefined` for a non-object key or a miss
+ */
+static JsValue weakmap_get(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    JsObj *o = weak_store(js, thisv, "WeakMap.prototype.get", 0);
+    const char *k = weak_key(js, arg_at(a, argc, 0));
+    HPE_UNUSED(ud);
+    if (!k || !o)
+        return js_undef();
+    return js_obj_own_has(o->payload_obj, k) ? js_obj_get(js, o->payload_obj, k) : js_undef();
+}
+
+/**
+ * @brief `WeakMap.prototype.has(key)` / `WeakMap.prototype.has(key)`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv WeakMap 接收者 / The WeakMap receiver
+ * @param[in,out] a 实参数组，`a[0]` 为键 / Argument array; `a[0]` is the key
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 存在该键返回 `true` / `true` when the key is present
+ */
+static JsValue weakmap_has(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    JsObj *o = weak_store(js, thisv, "WeakMap.prototype.has", 0);
+    const char *k = weak_key(js, arg_at(a, argc, 0));
+    HPE_UNUSED(ud);
+    if (!k || !o)
+        return js_bool(0);
+    return js_bool(js_obj_own_has(o->payload_obj, k));
+}
+
+/**
+ * @brief `WeakMap.prototype.delete(key)` / `WeakMap.prototype.delete(key)`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv WeakMap 接收者 / The WeakMap receiver
+ * @param[in,out] a 实参数组，`a[0]` 为键 / Argument array; `a[0]` is the key
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 删除到条目返回 `true` / `true` when an entry was removed
+ */
+static JsValue weakmap_delete(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    JsObj *o = weak_store(js, thisv, "WeakMap.prototype.delete", 0);
+    const char *k = weak_key(js, arg_at(a, argc, 0));
+    HPE_UNUSED(ud);
+    if (!k || !o || !js_obj_own_has(o->payload_obj, k))
+        return js_bool(0);
+    js_obj_delete(js, o->payload_obj, k);
+    return js_bool(1);
+}
+
+/**
+ * @brief `new WeakSet([iterable])` / `new WeakSet([iterable])`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 忽略 / Ignored
+ * @param[in,out] a 实参数组，`a[0]` 可为可迭代对象 / Argument array; `a[0]` may be an iterable
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 新建的 WeakSet / The new WeakSet
+ */
+static JsValue native_weakset_ctor(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    JsObj *o = js_object_raw(js);
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(ud);
+    o->kind = JS_OBJ_WEAKMAP; /* same backing shape as WeakMap */
+    o->class_name = "WeakSet";
+    o->proto = js->weakset_proto;
+    o->payload_obj = js_object_raw(js);
+    o->payload_obj->proto = js->object_proto;
+    if (argc > 0 && js_iter_len(js, a[0]) > 0) {
+        int n = js_iter_len(js, a[0]), i;
+        for (i = 0; i < n; i++) {
+            const char *k = weak_key(js, js_iter_at(js, a[0], i));
+            if (!k)
+                js_throw_value(js,
+                               js_make_error(js, "TypeError", "Invalid value used in weak set"));
+            js_obj_set(js, o->payload_obj, k, js_bool(1));
+        }
+    }
+    return js_objval(o);
+}
+
+/**
+ * @brief WeakSet 的 `add` / `has` / `delete` / `WeakSet.prototype.add`, `has` and `delete`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv WeakSet 接收者 / The WeakSet receiver
+ * @param[in,out] a 实参数组，`a[0]` 为成员 / Argument array; `a[0]` is the member
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 选择动作：0 `add`、1 `has`、2 `delete` / Action selector: 0 `add`, 1 `has`, 2 `delete`
+ *
+ * @return `add` 返回接收者，`has` 返回布尔，`delete` 返回是否删除成功 / `add` returns the receiver, `has` a boolean and `delete` whether a member was removed
+ */
+static JsValue weakset_op(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    JsObj *o = weak_store(js, thisv, "WeakSet.prototype", 0);
+    const char *k = weak_key(js, arg_at(a, argc, 0));
+    int action = (int)(intptr_t)ud;
+    if (!k)
+        js_throw_value(js, js_make_error(js, "TypeError", "Invalid value used in weak set"));
+    if (!o)
+        return action == 0 ? thisv : js_bool(0);
+    if (action == 0) {
+        js_obj_set(js, o->payload_obj, k, js_bool(1));
+        return thisv;
+    }
+    if (action == 1)
+        return js_bool(js_obj_own_has(o->payload_obj, k));
+    if (!js_obj_own_has(o->payload_obj, k))
+        return js_bool(0);
+    js_obj_delete(js, o->payload_obj, k);
+    return js_bool(1);
+}
+
+/**
+ * @brief `new WeakRef(target)` / `new WeakRef(target)`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 忽略 / Ignored
+ * @param[in,out] a 实参数组，`a[0]` 为被引用对象 / Argument array; `a[0]` is the referenced target
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 新建的 WeakRef / The new WeakRef
+ *
+ * @note 引擎没有 GC，`deref()` 因此始终返回原对象 / With no GC in the engine, `deref()` always yields the original object
+ */
+static JsValue native_weakref_ctor(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    JsValue target = arg_at(a, argc, 0);
+    JsObj *o;
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(ud);
+    if (target.t != JS_OBJ || !target.obj)
+        js_throw_value(js, js_make_error(js, "TypeError", "WeakRef: target must be an object"));
+    o = js_object_raw(js);
+    o->kind = JS_OBJ_PLAIN;
+    o->class_name = "WeakRef";
+    o->proto = js->weakref_proto;
+    o->payload_obj = target.obj;
+    return js_objval(o);
+}
+
+/**
+ * @brief `WeakRef.prototype.deref()` / `WeakRef.prototype.deref()`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv WeakRef 接收者 / The WeakRef receiver
+ * @param[in,out] a 未使用 / Unused
+ * @param[in]     argc 未使用 / Unused
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 被引用的对象 / The referenced object
+ */
+static JsValue weakref_deref(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    HPE_UNUSED(a);
+    HPE_UNUSED(argc);
+    HPE_UNUSED(ud);
+    if (thisv.t != JS_OBJ || !thisv.obj || thisv.obj->payload_obj == NULL)
+        return js_undef();
+    if (strcmp(thisv.obj->class_name ? thisv.obj->class_name : "", "WeakRef") != 0)
+        js_error(js, 0, "WeakRef.prototype.deref called on incompatible receiver");
+    return js_objval(thisv.obj->payload_obj);
+}
+
+/**
+ * @brief `new FinalizationRegistry(cleanup)` / `new FinalizationRegistry(cleanup)`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 忽略 / Ignored
+ * @param[in,out] a 实参数组，`a[0]` 为清理回调 / Argument array; `a[0]` is the cleanup callback
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 新建的 FinalizationRegistry / The new FinalizationRegistry
+ *
+ * @note 引擎没有 GC，因此注册的清理回调不会被自动调用；API 保持可用以便移植代码无需改动 /
+ *       With no GC the registered cleanup callback is never invoked automatically; the API is kept
+ *       working so ported code needs no changes
+ */
+static JsValue native_finreg_ctor(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    JsObj *o;
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(ud);
+    if (!js_is_callable(arg_at(a, argc, 0)))
+        js_throw_value(
+            js, js_make_error(js, "TypeError", "FinalizationRegistry: callback is not callable"));
+    o = js_object_raw(js);
+    o->kind = JS_OBJ_PLAIN;
+    o->class_name = "FinalizationRegistry";
+    o->proto = js->finreg_proto;
+    js_obj_set(js, o, "_cb", a[0]);
+    o->payload_obj = js_object_raw(js);
+    o->payload_obj->proto = js->object_proto;
+    return js_objval(o);
+}
+
+/**
+ * @brief FinalizationRegistry 的 `register` / `unregister`（只记录，不触发）/ `register` and `unregister` (recorded only, never fired)
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv FinalizationRegistry 接收者 / The FinalizationRegistry receiver
+ * @param[in,out] a 实参数组 / Argument array
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return `register` 返回 `undefined`，`unregister` 返回是否移除了登记 / `register` returns `undefined`; `unregister` reports whether a registration was removed
+ */
+static JsValue finreg_register(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    char buf[64];
+    HPE_UNUSED(ud);
+    if (thisv.t != JS_OBJ || !thisv.obj || !thisv.obj->payload_obj)
+        return js_undef();
+    if (arg_at(a, argc, 0).t != JS_OBJ) {
+        js_throw_value(js, js_make_error(js, "TypeError", "register: target must be an object"));
+    }
+    snprintf(buf, sizeof(buf), "r:%p", (void *)arg_at(a, argc, 0).obj);
+    js_obj_set(js, thisv.obj->payload_obj,
+               hpe_js_strdup(js, buf), arg_at(a, argc, 1));
+    return js_undef();
+}
+
+/**
+ * @brief `FinalizationRegistry.prototype.unregister(token)` / `FinalizationRegistry.prototype.unregister(token)`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv FinalizationRegistry 接收者 / The FinalizationRegistry receiver
+ * @param[in,out] a 实参数组，`a[0]` 为登记令牌 / Argument array; `a[0]` is the registration token
+ * @param[in]     argc 实参个数 / Argument count
+ * @param[in,out] ud 未使用 / Unused
+ *
+ * @return 移除到登记返回 `true` / `true` when a registration was removed
+ */
+static JsValue finreg_unregister(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    char buf[64];
+    HPE_UNUSED(ud);
+    if (thisv.t != JS_OBJ || !thisv.obj || !thisv.obj->payload_obj)
+        return js_bool(0);
+    if (arg_at(a, argc, 0).t != JS_OBJ)
+        return js_bool(0);
+    snprintf(buf, sizeof(buf), "t:%p", (void *)arg_at(a, argc, 0).obj);
+    if (!js_obj_own_has(thisv.obj->payload_obj, buf))
+        return js_bool(0);
+    js_obj_delete(js, thisv.obj->payload_obj, buf);
+    return js_bool(1);
+}
+
+/**
+ * @brief 把 WeakMap / WeakSet / WeakRef / FinalizationRegistry 装到全局 / Install the weak-collection family on the global object
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ *
+ * @note 与规范一致，WeakMap/WeakSet 不提供 `size`、迭代与 `forEach`；`WeakRef.deref()` 与
+ *       `FinalizationRegistry` 的清理回调在无 GC 的引擎里不会自动触发 / As per spec, WeakMap and
+ *       WeakSet expose no `size`, iteration or `forEach`; without a GC, `WeakRef.deref()` never
+ *       returns `undefined` and the registry callback never fires
+ */
+static void install_weak_family(HpeJs *js)
+{
+    make_ctor(js, "WeakMap", native_weakmap_ctor, NULL, js->weakmap_proto);
+    make_ctor(js, "WeakSet", native_weakset_ctor, NULL, js->weakset_proto);
+    make_ctor(js, "WeakRef", native_weakref_ctor, NULL, js->weakref_proto);
+    make_ctor(js, "FinalizationRegistry", native_finreg_ctor, NULL, js->finreg_proto);
+    def_method(js, js->weakmap_proto, "set", weakmap_set, NULL);
+    def_method(js, js->weakmap_proto, "get", weakmap_get, NULL);
+    def_method(js, js->weakmap_proto, "has", weakmap_has, NULL);
+    def_method(js, js->weakmap_proto, "delete", weakmap_delete, NULL);
+    def_method(js, js->weakset_proto, "add", weakset_op, (void *)0);
+    def_method(js, js->weakset_proto, "has", weakset_op, (void *)1);
+    def_method(js, js->weakset_proto, "delete", weakset_op, (void *)2);
+    def_method(js, js->weakref_proto, "deref", weakref_deref, NULL);
+    def_method(js, js->finreg_proto, "register", finreg_register, NULL);
+    def_method(js, js->finreg_proto, "unregister", finreg_unregister, NULL);
 }
 
 /**
@@ -11929,15 +13835,20 @@ static void install_global_object(HpeJs *js)
     install_array_ctor(js);
     install_string_ctor(js);
     install_number_ctor(js);
+    install_bigint_ctor(js);
     make_ctor(js, "Boolean", native_boolean_ctor, NULL, js->bool_proto);
     install_error_ctors(js);
     install_promise_ctor(js);
     make_ctor(js, "RegExp", native_regexp_ctor, NULL, js->regex_proto);
     install_map_set_ctors(js);
-    install_symbol_ctor(js);
+    install_weak_family(js);
+    hpe_js_symbol_install(js);
+    install_proxy_reflect(js);
     install_math(js);
     install_json(js);
     hpe_js_date_install(js);
+    hpe_js_intl_install(js);
+    hpe_js_buffer_install(js);
     install_global_functions(js);
     install_console(js);
     def_value(js, js->global_obj, "alert", mk_native(js, native_alert, NULL));
@@ -12087,7 +13998,9 @@ static int eval_common(HpeJs *js, const char *source, int module, char *errbuf, 
         if (module) {
             JsModule *m = (JsModule *)malloc(sizeof(JsModule));
             memset(m, 0, sizeof(*m));
-            m->path = hpe_js_strdup(js, "<eval>");
+            m->path = hpe_js_strdup(js, (js->entry_path && *js->entry_path)
+                                            ? js->entry_path
+                                            : "<eval>");
             m->env = env;
             m->ns = js_module_ns_new(js, m);
             m->ns->proto = NULL;
@@ -12230,6 +14143,23 @@ void hpe_js_set_current_dir(HpeJs *js, const char *dir)
 {
     if (js)
         js->current_dir = dir;
+}
+
+/**
+ * @brief 设置入口模块路径 / Set the entry module path
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     path 入口模块的文件路径 / Path of the entry module
+ *
+ * @note 供 `import.meta.url` 使用；入口模块不经过 `module_run`，路径只能由宿主提供 /
+ *       Used by `import.meta.url`; the entry module skips `module_run`, so the host must supply the path
+ *
+ * @see hpe_js_set_current_dir
+ */
+void hpe_js_set_entry_path(HpeJs *js, const char *path)
+{
+    if (js)
+        js->entry_path = path;
 }
 
 /**

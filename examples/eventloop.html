@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Hope Engine - Event Loop</title>
+  <style>
+    body { margin: 0; background-color: #f5f6f8; color: #202124; font-size: 15px;
+           line-height: 1.55; font-family: sans-serif; }
+    .page { width: 760px; margin: 24px auto; }
+    h1 { font-size: 26px; margin: 0 0 6px 0; color: #14213d; }
+    .subtitle { color: #5f6368; font-size: 13px; margin: 0 0 18px 0; }
+    .card { background-color: #ffffff; border: 1px solid #dcdfe4;
+            padding: 12px 18px; margin: 0 0 14px 0; }
+    .card h2 { font-size: 16px; margin: 0 0 8px 0; color: #1a73e8; }
+    .row { font-family: monospace; font-size: 13px; white-space: pre; }
+    .fail { color: #d93025; font-weight: bold; }
+    .ok { color: #188038; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <h1>Event Loop</h1>
+    <p class="subtitle">task/microtask order &middot; 4 ms nesting clamp &middot; rAF re-arm &middot; same-instant FIFO</p>
+    <div class="card"><h2>Results</h2><div id="out"></div></div>
+  </div>
+<script>
+  var lines = [];
+  function check(label, got, want) {
+    var pass = String(got) === String(want);
+    lines.push((pass ? "  ok   " : "  FAIL ") + label + " = " + got + (pass ? "" : "   (want " + want + ")"));
+    return pass;
+  }
+  var passCount = 0, total = 0;
+  function ok(label, cond) { total++; if (check(label, !!cond, "true")) passCount++; }
+
+  var order = [];       // 1. macro/micro interleaving
+  var sameInstant = []; // 2. timers sharing one deadline
+  var rafRuns = 0;      // 3. a re-arming rAF must not loop inside one frame
+  var spinTimes = [];   // 4. per-run timestamps of the zero-delay self-recursion
+
+  // (1) macro/micro interleaving. The HTML order is "task, then its microtask
+  // checkpoint": both microtasks must land between macro1 and macro2.
+  setTimeout(function () {
+    order.push("macro1");
+    Promise.resolve().then(function () { order.push("micro1"); });
+    Promise.resolve().then(function () { order.push("micro2"); });
+  }, 0);
+  setTimeout(function () { order.push("macro2"); }, 0);
+
+  // (2) three timers with the identical 30 ms deadline keep creation order.
+  setTimeout(function () { sameInstant.push("a"); }, 30);
+  setTimeout(function () { sameInstant.push("b"); }, 30);
+  setTimeout(function () { sameInstant.push("c"); }, 30);
+
+  // (3) rAF that re-arms itself: each pump must run it at most once, otherwise a
+  // single frame would run the loop thousands of times.
+  function rafLoop() {
+    rafRuns++;
+    if (rafRuns < 5)
+      requestAnimationFrame(rafLoop);
+  }
+  requestAnimationFrame(rafLoop);
+
+  // (4) zero-delay self-rescheduling timer. Past nesting level 5 the HTML spec
+  // applies a 4 ms floor; without it this loop would run as fast as the pump
+  // allows. Each timestamp tells us how the pacing actually behaves.
+  function spin() {
+    spinTimes.push(performance.now());
+    setTimeout(spin, 0);
+  }
+  spin();
+
+  // (5) cancellation must win over a pending fire.
+  var realCancel = false;
+  var t1id = setTimeout(function () { realCancel = true; }, 10);
+  var t2id = setTimeout(function () { realCancel = false; }, 10);
+  clearTimeout(t2id);
+
+  // (6) re-arming a long-delay timer, then cancelling it, leaves no callback.
+  var lateRan = false;
+  var t3id = setTimeout(function () { lateRan = true; }, 400);
+  clearTimeout(t3id);
+
+  // ---- final report, deferred so all of the async work above has run ----
+  setTimeout(function () {
+    // 1
+    total++; if (check("macro1 first", order[0], "macro1")) passCount++;
+    total++; if (check("microtask 1 right after macro1", order[1], "micro1")) passCount++;
+    total++; if (check("microtask 2 right after macro1", order[2], "micro2")) passCount++;
+    total++; if (check("next macro after the checkpoint", order[3], "macro2")) passCount++;
+    total++; if (check("exactly four records", order.length, 4)) passCount++;
+
+    // 2
+    total++; if (check("same-instant FIFO a", sameInstant[0], "a")) passCount++;
+    total++; if (check("same-instant FIFO b", sameInstant[1], "b")) passCount++;
+    total++; if (check("same-instant FIFO c", sameInstant[2], "c")) passCount++;
+    total++; if (check("exactly three same-instant", sameInstant.length, 3)) passCount++;
+
+    // 3
+    ok("rAF ran at least once", rafRuns >= 1);
+    ok("re-armed rAF not run hot in one frame", rafRuns < 100);
+
+    // 4 -- the clamp: nesting levels 1..5 run back to back inside one pump, then
+    // the 4 ms floor paces every later run. Counting the paced gaps avoids
+    // depending on exactly where the burst ends.
+    var n = spinTimes.length, i, paced = 0;
+    for (i = 1; i < n; i++) {
+      if (spinTimes[i] - spinTimes[i - 1] >= 3.5)
+        paced++;
+    }
+    ok("spin loop is paced (not a hot loop)", n < 500);
+    ok("spin loop advanced past the burst", n > 6);
+    ok("clamp paces later runs (>= 5 x ~4ms)", paced >= 5);
+
+    // 5 / 6
+    ok("cleared timer never fires", realCancel);
+    ok("cleared long timer never fires", !lateRan);
+    ok("clearTimeout returns undefined", String(clearTimeout(t1id)) === "undefined");
+
+    lines.unshift((passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total + " checks");
+    var cls = passCount === total ? "ok" : "fail";
+    var el = document.getElementById("out");
+    for (var li = 0; li < lines.length; li++) {
+      var row = document.createElement("div");
+      row.className = "row " + (li === 0 ? cls : "");
+      row.textContent = lines[li];
+      el.appendChild(row);
+    }
+    document.title = (passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total;
+  }, 600);
+</script>
+</body>
+</html>

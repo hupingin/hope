@@ -5,6 +5,7 @@
 #include "render/hpe_pixmap.h"
 
 typedef struct HpeEngine HpeEngine;
+typedef struct HpeDomNode HpeDomNode;
 
 /**
  * @brief 创建引擎实例并初始化像素缓冲 / Create an engine instance and initialise its pixel buffer
@@ -95,6 +96,76 @@ void hpe_engine_resize(HpeEngine *engine, int width, int height);
  * @see hpe_engine_scroll_offset hpe_engine_render
  */
 void hpe_engine_scroll_by(HpeEngine *engine, float lines);
+
+/**
+ * @brief 把滚轮事件投递给指针处的滚动容器 / Deliver a wheel event to the scroll container under the pointer
+ *
+ * @details 指针落在可滚动元素（`overflow:scroll`/`auto` 且内容溢出）上时滚动该元素，
+ *          未被消费的行数继续冒泡给整页，模拟浏览器的滚动链。
+ *          When the pointer is over a scrollable element (`overflow:scroll`/`auto` with
+ *          overflowing content) that element scrolls and the remaining lines bubble to the
+ *          page, mirroring browser scroll chaining.
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     x 视口 x（窗口坐标，含浏览器外框）/ Viewport x in window coordinates
+ * @param[in]     y 视口 y（窗口坐标，含浏览器外框）/ Viewport y in window coordinates
+ * @param[in]     lines 滚动的行数，正为下滚 / Lines to scroll, positive scrolls down
+ *
+ * @return 有元素消费该事件返回 1，否则返回 0 / 1 when an element consumed the wheel, 0 otherwise
+ *
+ * @see hpe_engine_scroll_by
+ */
+int hpe_engine_wheel_scroll(HpeEngine *engine, int x, int y, float lines);
+
+/**
+ * @brief 向页面派发滚轮事件 / Dispatch a wheel event into the page
+ *
+ * @param[in,out] engine 引擎实例，无 JS 上下文时返回 0 / Engine instance; 0 without a JS context
+ * @param[in]     x X 坐标（窗口坐标）/ X coordinate in window space
+ * @param[in]     y Y 坐标（窗口坐标）/ Y coordinate in window space
+ * @param[in]     delta_x 水平滚动量（像素）/ Horizontal scroll amount in pixels
+ * @param[in]     lines 垂直滚动行数，正为下滚（按 `HPE_SCROLL_LINE_PX` 换算成 `deltaY`）/ Vertical scroll in lines, positive scrolls down (converted to `deltaY` via `HPE_SCROLL_LINE_PX`)
+ * @param[in]     mods `HPE_MOD_*` 修饰键掩码 / The `HPE_MOD_*` modifier mask
+ *
+ * @return 有监听器触发返回 1，否则 0 / 1 when any listener ran, otherwise 0
+ *
+ * @note 打到指针下的元素上并向上冒泡；事件对象带 `deltaX`/`deltaY`/`deltaMode`
+ *       Targets the element under the pointer and bubbles; the event object carries `deltaX`/`deltaY`/`deltaMode`
+ *
+ * @see hpe_engine_wheel_scroll
+ */
+int hpe_engine_wheel_event(HpeEngine *engine, int x, int y, int delta_x, float lines, int mods);
+
+/**
+ * @brief 向页面派发键盘事件 / Dispatch a keyboard event into the page
+ *
+ * @param[in,out] engine 引擎实例，无 JS 上下文时返回 0 / Engine instance; 0 without a JS context
+ * @param[in]     vk 虚拟键码（非可打印键）/ Virtual key code for keys that are not printable
+ * @param[in]     printable 可打印字符（0 表示不是可打印键）/ The printable character, or 0 when the key is not printable
+ * @param[in]     mods `HPE_MOD_*` 修饰键掩码 / The `HPE_MOD_*` modifier mask
+ * @param[in]     phase 0 = `keydown`，1 = `keyup`，2 = `keypress` / 0 = `keydown`, 1 = `keyup`, 2 = `keypress`
+ * @param[in]     repeat 按住重复为 1 / 1 while the key is held down
+ *
+ * @return 有监听器触发返回 1，否则 0 / 1 when any listener ran, otherwise 0
+ *
+ * @note 目标是当前获得 `:focus` 的元素，无焦点时退回 `document.body`；事件对象带
+ *       `key`/`code`/`keyCode`/`repeat` 与四个修饰键
+ *       The target is the element owning `:focus`, falling back to `document.body`; the event object carries `key`/`code`/`keyCode`/`repeat` and the four modifiers
+ */
+int hpe_engine_key_event(HpeEngine *engine, int vk, int printable, int mods, int phase,
+                         int repeat);
+
+/**
+ * @brief 向页面派发一次 `scroll` 事件 / Dispatch a `scroll` event into the page
+ *
+ * @param[in,out] engine 引擎实例，无 JS 上下文时返回 0 / Engine instance; 0 without a JS context
+ * @param[in,out] target 滚动发生的元素；传 `NULL` 表示文档 / The element that scrolled, or `NULL` for the document
+ *
+ * @return 有监听器触发返回 1，否则 0 / 1 when any listener ran, otherwise 0
+ *
+ * @note `scroll` 不冒泡，因此只在目标元素上触发 / `scroll` does not bubble, so it fires on the target only
+ */
+int hpe_engine_scroll_event(HpeEngine *engine, HpeDomNode *target);
 
 /**
  * @brief 派发一次鼠标按下 / 抬起 / Deliver a mouse press/release
@@ -322,6 +393,43 @@ const char *hpe_engine_status(HpeEngine *engine);
  * @see hpe_engine_scroll_by
  */
 float hpe_engine_scroll_offset(HpeEngine *engine);
+
+/* ---------------- dynamic element state (state pseudo-classes) ---------------- */
+
+/**
+ * @brief 设置拥有焦点的 DOM 节点 / Set the DOM node that owns the focus
+ *
+ * @param[in,out] engine 引擎实例，NULL 时直接返回 / Engine instance, returns immediately when NULL
+ * @param[in,out] node 新的焦点元素，传 NULL 清除焦点 / New focus element, NULL clears the focus
+ *
+ * @note `:focus` 是选择器，因此焦点变化会触发一次重排并刷新状态行；`node` 与当前焦点相同时不做任何事 / `:focus` is a selector, so a change triggers a relayout and refreshes the status line; nothing happens when `node` already owns the focus
+ *
+ * @see hpe_engine_focused_node hpe_engine_set_target
+ */
+void hpe_engine_set_focus(HpeEngine *engine, HpeDomNode *node);
+
+/**
+ * @brief 取当前拥有焦点的 DOM 节点 / Get the DOM node that currently owns the focus
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @return 焦点元素，无焦点或 `engine` 为 NULL 时返回 `NULL` / The focused element, or `NULL` when nothing is focused or `engine` is `NULL`
+ *
+ * @see hpe_engine_set_focus
+ */
+HpeDomNode *hpe_engine_focused_node(HpeEngine *engine);
+
+/**
+ * @brief 设置 URL 片段目标元素 / Set the URL-fragment target element
+ *
+ * @param[in,out] engine 引擎实例，NULL 时直接返回 / Engine instance, returns immediately when NULL
+ * @param[in,out] node 新的片段目标元素，传 NULL 表示无目标 / New fragment target, NULL clears it
+ *
+ * @note `:target` 是选择器，因此变化会触发一次重排 / `:target` is a selector, so a change triggers a relayout
+ *
+ * @see hpe_engine_set_focus
+ */
+void hpe_engine_set_target(HpeEngine *engine, HpeDomNode *node);
 
 /* ---------------- document metadata ---------------- */
 

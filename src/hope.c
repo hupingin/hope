@@ -17,6 +17,7 @@
 #include "layout/hpe_layout.h"
 #include "paint/hpe_paint.h"
 #include "platform/hpe_platform.h"
+#include "render/hpe_image.h"
 
 #define HPE_MAX_SCRIPTS 64
 
@@ -37,6 +38,12 @@ static const char BLANK_PAGE[] =
 
 static int click_element_by_id(HpeEngine *engine, const char *id);
 static void print_text_by_id(HpeEngine *engine, const char *id);
+static void clear_target_flags(HpeDomNode *node);
+static void hope_focus_hook(void *ud, HpeDomNode *node);
+static void hope_layout_hook(void *ud);
+static void hope_viewport_hook(void *ud, float *w, float *h, float *sx, float *sy);
+static void key_names_of(int vk, int printable, char *key, char *code, size_t n);
+static HpeDomNode *node_from_hit(HpeEngine *engine, int x, int y);
 
 /* ---------------- stylesheets ---------------- */
 
@@ -849,6 +856,18 @@ static void run_one_script(HpeEngine *engine, HpeDomNode *node, const char *dir)
     if (!code)
         return;
     errbuf[0] = '\0';
+    /* an external module's `import.meta.url` is its own file; an inline one
+     * reports the document it came from */
+    if (is_module) {
+        const char *src = hpe_dom_attr(node, "src");
+        char full[1024];
+        if (src && *src) {
+            hpe_path_join(full, sizeof(full), dir, src);
+            hpe_js_set_entry_path(engine->js, full);
+        } else {
+            hpe_js_set_entry_path(engine->js, engine->path);
+        }
+    }
     rc = is_module ? hpe_js_eval_module(engine->js, code, dir, errbuf, sizeof(errbuf))
                    : hpe_js_eval(engine->js, code, errbuf, sizeof(errbuf));
     if (rc != 0)
@@ -883,6 +902,13 @@ static void run_scripts(HpeEngine *engine)
 
     engine->js = hpe_js_create();
     hpe_js_dom_install(engine->js, engine->doc);
+    /* `el.focus()` / `el.blur()` from script route back into the engine so the
+     * `:focus` selector and the relayout stay in sync with the script view */
+    hpe_js_dom_set_focus_hook(engine->js, hope_focus_hook, engine);
+    /* geometry getters (offsetWidth & friends) force a layout, like browsers */
+    hpe_js_dom_set_layout_hook(engine->js, hope_layout_hook, engine);
+    /* `getBoundingClientRect` needs the viewport size and scroll offsets */
+    hpe_js_dom_set_viewport_hook(engine->js, hope_viewport_hook, engine);
 
     hpe_path_dir(engine->path ? engine->path : ".", dir, sizeof(dir));
     hpe_js_set_current_dir(engine->js, dir);
@@ -989,6 +1015,7 @@ void hpe_engine_destroy(HpeEngine *engine)
     }
     if (engine->path)
         hpe_free(engine->path);
+    hpe_image_shutdown();
     hpe_font_shutdown();
     hpe_free(engine);
 }
@@ -1062,6 +1089,11 @@ static void parse_document(HpeEngine *engine, char *src, size_t size, const char
         else
             hpe_path_join(engine->base_href, sizeof(engine->base_href), dir, base);
     }
+    /* the image module resolves `src` / `url()` against this directory; a
+     * `<base href>` rebases relative references exactly like `resolve_url` */
+    if (engine->base_href[0])
+        hpe_path_dir(engine->base_href, dir, sizeof(dir));
+    hpe_image_set_base_dir(dir);
 }
 
 /**
@@ -1343,6 +1375,257 @@ void hpe_engine_scroll_by(HpeEngine *engine, float lines)
 }
 
 /**
+ * @brief 在给定视口坐标处找最深的可滚动元素 / Find the deepest scrollable element at a viewport coordinate
+ *
+ * @details 沿盒树下行，保留「滚动范围大于 0 且指针落在其边框盒内」的最深元素；
+ *          子元素的坐标已含祖先容器的滚动偏移，因此沿途把 `elem_scroll` 累加进去再比较。
+ *          Walks the box tree keeping the deepest element with a positive scroll range that contains the point; because a descendant's coordinates already include its ancestors' scroll offsets, `elem_scroll` accumulates as the walk descends.
+ *
+ * @param[in]     box 当前盒 / Current box
+ * @param[in]     x 视口 x / Viewport x
+ * @param[in]     y_vp 视口 y（不含页面滚动）/ Viewport y without the page scroll
+ * @param[in]     page_scroll 页面滚动偏移 / Page scroll offset
+ * @param[in]     elem_scroll 祖先容器的累计滚动偏移 / Accumulated element scroll of the ancestors
+ * @param[in,out] best 目前找到的最深滚动容器 / Deepest scroll container found so far
+ *
+ * @return 更新后的最深滚动容器 / The updated deepest scroll container
+ *
+ * @see hpe_engine_wheel_scroll
+ */
+static HpeBox *find_scroll_container(HpeBox *box, float x, float y_vp, float page_scroll,
+                                     float elem_scroll, HpeBox *best)
+{
+    HpeBox *child;
+    float ytest;
+    if (!box)
+        return best;
+    ytest = box->style.position == HPE_POS_FIXED ? y_vp + elem_scroll : y_vp + page_scroll;
+    if (x < box->border_box.x || ytest < box->border_box.y ||
+        x > box->border_box.x + box->border_box.w ||
+        ytest > box->border_box.y + box->border_box.h)
+        return best;
+    if (box->is_scroll_container && box->scroll_max > 0.0f)
+        best = box;
+    for (child = box->first_child; child; child = child->next)
+        best = find_scroll_container(child, x, y_vp, page_scroll, elem_scroll + box->scroll_y,
+                                     best);
+    return best;
+}
+
+/**
+ * @brief 把滚轮事件投递给指针处的滚动容器 / Deliver a wheel event to the scroll container under the pointer
+ *
+ * @details 指针落在可滚动元素（`overflow:scroll`/`auto` 且内容溢出）上时滚动该元素，
+ *          未被消费的行数继续冒泡给整页，模拟浏览器的滚动链。元素滚动发生在被裁剪的
+ *          子树内部，损伤矩形路径只能整体平移页面，无法表示它，所以一旦元素偏移发生
+ *          实际变化就强制一次全量重绘。
+ *          When the pointer is over a scrollable element the element scrolls and the
+ *          remaining lines bubble to the page, mirroring browser scroll chaining. An element
+ *          scroll happens inside a clipped subtree, which the damage-rect path (a whole-page
+ *          shift) cannot represent, so a full repaint is forced whenever the offset moved.
+ *
+ * @param[in,out] engine 引擎实例，NULL 或无盒树时返回 0 / Engine instance; 0 when NULL or without a box tree
+ * @param[in]     x 视口 x（窗口坐标，含浏览器外框）/ Viewport x in window coordinates, chrome included
+ * @param[in]     y 视口 y（窗口坐标，含浏览器外框）/ Viewport y in window coordinates, chrome included
+ * @param[in]     lines 滚动的行数，正为下滚 / Lines to scroll, positive scrolls down
+ *
+ * @return 有元素消费该事件返回 1，否则返回 0 / 1 when an element consumed the wheel, 0 otherwise
+ *
+ * @see find_scroll_container hpe_engine_scroll_by
+ */
+int hpe_engine_wheel_scroll(HpeEngine *engine, int x, int y, float lines)
+{
+    HpeBox *target;
+    float cy, delta, want_line = lines * HPE_SCROLL_LINE_PX;
+    if (!engine || !engine->root)
+        return 0;
+    /* window coords: the page viewport starts below the browser chrome */
+    cy = (float)(y - engine->chrome_h);
+    target = find_scroll_container(engine->root, (float)x, cy, engine->scroll_y, 0.0f, NULL);
+    if (!target)
+        return 0;
+    delta = want_line;
+    {
+        float before = target->scroll_y;
+        float want = before + delta;
+        if (want < 0.0f)
+            want = 0.0f;
+        if (want > target->scroll_max)
+            want = target->scroll_max;
+        want = floorf(want + 0.5f);
+        target->scroll_y = want;
+        /* whatever the element could not consume bubbles up to the page, which
+         * is what makes a nested scroller chain into the document */
+        delta -= want - before;
+    }
+    if (target->scroll_y != 0.0f || delta != want_line)
+        engine->dirty = HPE_DIRTY_FULL;
+    if (delta != 0.0f)
+        hpe_engine_scroll_by(engine, delta / HPE_SCROLL_LINE_PX);
+    hpe_engine_refresh_status(engine);
+    return 1;
+}
+
+/**
+ * @brief 向页面派发滚轮事件 / Dispatch a wheel event into the page
+ *
+ * @param[in,out] engine 引擎实例，无 JS 上下文时返回 0 / Engine instance; 0 without a JS context
+ * @param[in]     x X 坐标（窗口坐标）/ X coordinate in window space
+ * @param[in]     y Y 坐标（窗口坐标）/ Y coordinate in window space
+ * @param[in]     delta_x 水平滚动量（像素）/ Horizontal scroll amount in pixels
+ * @param[in]     lines 垂直滚动行数，正为下滚 / Vertical scroll in lines, positive scrolls down
+ * @param[in]     mods `HPE_MOD_*` 修饰键掩码 / The `HPE_MOD_*` modifier mask
+ *
+ * @return 有监听器触发返回 1，否则 0 / 1 when any listener ran, otherwise 0
+ *
+ * @note 打到指针下的元素上并向上冒泡；事件对象带 `deltaX`/`deltaY`/`deltaMode`
+ *       Targets the element under the pointer and bubbles; the event object carries `deltaX`/`deltaY`/`deltaMode`
+ *
+ * @see hpe_engine_wheel_scroll
+ */
+int hpe_engine_wheel_event(HpeEngine *engine, int x, int y, int delta_x, float lines, int mods)
+{
+    HpeDomNode *node;
+    HpeJsEventInit init;
+    if (!engine || !engine->js)
+        return 0;
+    node = node_from_hit(engine, x, y);
+    if (!node)
+        return 0;
+    memset(&init, 0, sizeof(init));
+    init.client_x = x;
+    init.client_y = y - engine->chrome_h;
+    init.delta_x = delta_x;
+    init.delta_y = (int)(lines * HPE_SCROLL_LINE_PX);
+    init.ctrl = (mods & HPE_MOD_CTRL) != 0;
+    init.shift = (mods & HPE_MOD_SHIFT) != 0;
+    init.alt = (mods & HPE_MOD_ALT) != 0;
+    return hpe_js_dom_dispatch_ex(engine->js, node, "wheel", &init);
+}
+
+/**
+ * @brief 把虚拟键码翻译成 `key`/`code` 名字 / Translate a virtual key code into `key`/`code` names
+ *
+ * @param[in]     vk 虚拟键码 / Virtual key code
+ * @param[in]     printable 可打印字符（0 表示不是可打印键）/ The printable character, or 0 when the key is not printable
+ * @param[out]    key 接收 `KeyboardEvent.key` / Receives `KeyboardEvent.key`
+ * @param[out]    code 接收 `KeyboardEvent.code` / Receives `KeyboardEvent.code`
+ * @param[in]     n 两个缓冲的容量 / Capacity of both buffers
+ *
+ * @note 只覆盖外壳会转发的编辑键与字母数字键；其余给空串 / Covers only the editing keys and alphanumerics the shell forwards; everything else yields an empty string
+ */
+static void key_names_of(int vk, int printable, char *key, char *code, size_t n)
+{
+    static const struct {
+        int vk;
+        const char *key;
+        const char *code;
+    } table[] = {
+        {0x08, "Backspace", "Backspace"}, {0x0D, "Enter", "Enter"},
+        {0x09, "Tab", "Tab"},             {0x1B, "Escape", "Escape"},
+        {0x2E, "Delete", "Delete"},       {0x25, "ArrowLeft", "ArrowLeft"},
+        {0x26, "ArrowUp", "ArrowUp"},     {0x27, "ArrowRight", "ArrowRight"},
+        {0x28, "ArrowDown", "ArrowDown"}, {0x24, "Home", "Home"},
+        {0x23, "End", "End"},             {0x21, "PageUp", "PageUp"},
+        {0x22, "PageDown", "PageDown"},   {0x20, " ", "Space"},
+        {0, NULL, NULL},
+    };
+    size_t i;
+    int c = printable;
+    key[0] = '\0';
+    code[0] = '\0';
+    /* A `keydown` carries no printable character, but the shell's virtual key
+     * code is still an ASCII letter or digit for those keys, so recover it. */
+    if (c == 0 && ((vk >= 0x30 && vk <= 0x39) || (vk >= 0x41 && vk <= 0x5A)))
+        c = vk;
+    if (c > 0 && c < 0x80) {
+        snprintf(key, n, "%c", (char)(c >= 'A' && c <= 'Z' ? c - 'A' + 'a' : c));
+        if (c >= 'a' && c <= 'z')
+            snprintf(code, n, "Key%c", (char)(c - 'a' + 'A'));
+        else if (c >= 'A' && c <= 'Z')
+            snprintf(code, n, "Key%c", (char)c);
+        else if (c >= '0' && c <= '9')
+            snprintf(code, n, "Digit%c", (char)c);
+        return;
+    }
+    for (i = 0; table[i].key; i++) {
+        if (table[i].vk == vk) {
+            snprintf(key, n, "%s", table[i].key);
+            snprintf(code, n, "%s", table[i].code);
+            return;
+        }
+    }
+}
+
+/**
+ * @brief 向页面派发键盘事件 / Dispatch a keyboard event into the page
+ *
+ * @param[in,out] engine 引擎实例，无 JS 上下文时返回 0 / Engine instance; 0 without a JS context
+ * @param[in]     vk 虚拟键码（非可打印键）/ Virtual key code for keys that are not printable
+ * @param[in]     printable 可打印字符（0 表示不是可打印键）/ The printable character, or 0 when the key is not printable
+ * @param[in]     mods `HPE_MOD_*` 修饰键掩码 / The `HPE_MOD_*` modifier mask
+ * @param[in]     phase 0 = `keydown`，1 = `keyup`，2 = `keypress` / 0 = `keydown`, 1 = `keyup`, 2 = `keypress`
+ * @param[in]     repeat 按住重复为 1 / 1 while the key is held down
+ *
+ * @return 有监听器触发返回 1，否则 0 / 1 when any listener ran, otherwise 0
+ *
+ * @note 目标是当前获得 `:focus` 的元素，无焦点时退回 `document.body` / The target is the element owning `:focus`, falling back to `document.body`
+ */
+int hpe_engine_key_event(HpeEngine *engine, int vk, int printable, int mods, int phase,
+                         int repeat)
+{
+    static const char *names[] = {"keydown", "keyup", "keypress"};
+    HpeDomNode *node;
+    HpeJsEventInit init;
+    char key[32], code[32];
+    if (!engine || !engine->js || phase < 0 || phase > 2)
+        return 0;
+    node = engine->focus_node;
+    if (!node) {
+        node = engine->doc; /* fall back to the document element */
+        while (node && node->type != HPE_NODE_ELEMENT)
+            node = node->first_child;
+    }
+    if (!node)
+        return 0;
+    key_names_of(vk, printable, key, code, sizeof(key));
+    memset(&init, 0, sizeof(init));
+    init.key_code = printable > 0 ? printable : vk;
+    init.ctrl = (mods & HPE_MOD_CTRL) != 0;
+    init.shift = (mods & HPE_MOD_SHIFT) != 0;
+    init.alt = (mods & HPE_MOD_ALT) != 0;
+    init.key = key;
+    init.code = code;
+    init.repeat = repeat;
+    return hpe_js_dom_dispatch_ex(engine->js, node, names[phase], &init);
+}
+
+/**
+ * @brief 向页面派发一次 `scroll` 事件 / Dispatch a `scroll` event into the page
+ *
+ * @param[in,out] engine 引擎实例，无 JS 上下文时返回 0 / Engine instance; 0 without a JS context
+ * @param[in,out] target 滚动发生的元素；传 `NULL` 表示文档 / The element that scrolled, or `NULL` for the document
+ *
+ * @return 有监听器触发返回 1，否则 0 / 1 when any listener ran, otherwise 0
+ *
+ * @note `scroll` 不冒泡，因此只在目标元素上触发 / `scroll` does not bubble, so it fires on the target only
+ */
+int hpe_engine_scroll_event(HpeEngine *engine, HpeDomNode *target)
+{
+    HpeDomNode *node = target;
+    if (!engine || !engine->js)
+        return 0;
+    if (!node) {
+        node = engine->doc;
+        while (node && node->type != HPE_NODE_ELEMENT)
+            node = node->first_child;
+    }
+    if (!node)
+        return 0;
+    return hpe_js_dom_dispatch_self(engine->js, node, "scroll", NULL);
+}
+
+/**
  * @brief 查询是否禁用损伤矩形滚动（`HPE_NO_DIRTY`）/ Test whether damage-rect scrolling is disabled (`HPE_NO_DIRTY`)
  *
  * @return 禁用为 1，否则 0 / 1 when disabled, otherwise 0
@@ -1379,6 +1662,156 @@ static void collect_fixed_boxes(HpeBox *box, HpeBox **out, int max, int *count)
     }
 }
 
+static void page_scrollbar_seek(HpeEngine *engine, float pointer_y);
+
+/**
+ * @brief 绘制页面级滚动条（仅启用外壳时）/ Paint the page-level scrollbar (only when chrome is enabled)
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @note 无溢出或未启用外壳（`chrome_h == 0`）时不绘；作为 chrome 层压在页面之上，
+ *       因此每次整帧或滚动重绘后都要再叠一次 / Skipped when there is no overflow or the
+ *       browser chrome is off (`chrome_h == 0`); drawn as a chrome layer on top of the
+ *       page, so it has to be re-laid after every full or scrolled repaint
+ *
+ * @see hpe_paint_page_scrollbar hpe_engine_render render_scrolled
+ */
+static void paint_page_scrollbar(HpeEngine *engine)
+{
+    float view_h;
+    if (!engine || engine->chrome_h <= 0)
+        return;
+    view_h = (float)hpe_engine_view_height(engine);
+    hpe_paint_page_scrollbar(&engine->pm, (float)engine->chrome_h, view_h, engine->scroll_y,
+                             engine->content_height, HPE_PAGE_SCROLLBAR_W);
+}
+
+/**
+ * @brief 取页面滚动条滑块的高度与位置 / Compute the page-scrollbar thumb's height and position
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[out]    out_thumb_h 接收滑块高度 / Receives the thumb height
+ * @param[out]    out_thumb_y 接收滑块顶边的设备 y / Receives the thumb's top edge in device y
+ *
+ * @return 有可拖动的滚动条返回 1，否则 0 / 1 when there is a draggable scrollbar, otherwise 0
+ *
+ * @note 几何与 `hpe_paint_page_scrollbar` 必须完全一致，否则拖动会与视觉错位 / The geometry must match `hpe_paint_page_scrollbar` exactly or dragging would drift from what is drawn
+ *
+ * @see hpe_paint_page_scrollbar hpe_page_scrollbar_mouse
+ */
+static int page_scrollbar_thumb(HpeEngine *engine, float *out_thumb_h, float *out_thumb_y)
+{
+    float view_h = (float)hpe_engine_view_height(engine);
+    float max_scroll, thumb_h, pos;
+    if (!engine || engine->chrome_h <= 0 || !(view_h > 0.0f))
+        return 0;
+    if (!(engine->content_height > view_h))
+        return 0;
+    max_scroll = engine->content_height - view_h;
+    thumb_h = view_h * (view_h / engine->content_height);
+    if (thumb_h < 20.0f)
+        thumb_h = 20.0f;
+    if (thumb_h > view_h)
+        thumb_h = view_h;
+    if (engine->scroll_y > max_scroll)
+        pos = view_h - thumb_h;
+    else
+        pos = (engine->scroll_y / max_scroll) * (view_h - thumb_h);
+    *out_thumb_h = thumb_h;
+    *out_thumb_y = (float)engine->chrome_h + pos;
+    return 1;
+}
+
+/**
+ * @brief 处理页面滚动条上的指针事件 / Handle a pointer event on the page scrollbar
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     x X 坐标（窗口坐标）/ X coordinate in window space
+ * @param[in]     y Y 坐标（窗口坐标）/ Y coordinate in window space
+ * @param[in]     down 按下为 1、抬起为 0 / 1 when pressed, 0 when released
+ *
+ * @return 事件被滚动条消费返回 1，否则 0 / 1 when the scrollbar consumed the event, otherwise 0
+ *
+ * @note 指针落在右缘条带内（或正在拖动）时：拖动滑块按抓握偏移跟随，点击轨道则把滑块中心
+ *       对齐到点击处（翻页），松开结束拖动。`y` 在条带内即返回 1，使页面点击不被误触发
+ *       / When the pointer is in the right-edge gutter (or a drag is in flight): dragging the
+ *       thumb follows the grab offset, clicking the track centres the thumb on the click, and
+ *       releasing ends the drag. Returning 1 for any hit inside the gutter keeps the page from
+ *       seeing the click
+ *
+ * @see page_scrollbar_thumb hpe_engine_mouse_event_mods
+ */
+static int page_scrollbar_mouse(HpeEngine *engine, int x, int y, int down)
+{
+    float thumb_h, thumb_y;
+    int in_gutter;
+
+    if (!engine || engine->chrome_h <= 0)
+        return 0;
+    if (!page_scrollbar_thumb(engine, &thumb_h, &thumb_y))
+        return 0;
+    in_gutter = (float)x >= (float)engine->width - HPE_PAGE_SCROLLBAR_W && y >= engine->chrome_h;
+
+    if (down) {
+        if (!in_gutter)
+            return 0;
+        if ((float)y >= thumb_y && (float)y < thumb_y + thumb_h) {
+            engine->page_sb_grab = (float)y - thumb_y; /* grab the thumb */
+        } else {
+            engine->page_sb_grab = thumb_h * 0.5f; /* click the track: centre the thumb */
+            page_scrollbar_seek(engine, (float)y);
+        }
+        engine->page_sb_drag = 1;
+        return 1;
+    }
+
+    /* release */
+    if (engine->page_sb_drag) {
+        engine->page_sb_drag = 0;
+        return 1;
+    }
+    return 0;
+}
+
+/**
+ * @brief 把滑块顶边拖到指定设备 y / Drag the thumb's top edge to a device y
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     pointer_y 指针设备 y / Pointer device y
+ *
+ * @note 反解 `hpe_paint_page_scrollbar` 的线性投影得到滚动偏移，夹紧后吸附到整像素 /
+ *       Inverts the linear projection of `hpe_paint_page_scrollbar` to get the scroll offset,
+ *       clamped and snapped to whole pixels
+ *
+ * @see page_scrollbar_mouse hpe_engine_scroll_by
+ */
+static void page_scrollbar_seek(HpeEngine *engine, float pointer_y)
+{
+    float view_h = (float)hpe_engine_view_height(engine);
+    float max_scroll = engine->content_height - view_h;
+    float thumb_h, thumb_y, want;
+
+    if (!page_scrollbar_thumb(engine, &thumb_h, &thumb_y))
+        return;
+    (void)thumb_y; /* only the thumb height affects the mapping */
+    want = pointer_y - (float)engine->chrome_h - engine->page_sb_grab;
+    if (want < 0.0f)
+        want = 0.0f;
+    if (want > view_h - thumb_h)
+        want = view_h - thumb_h;
+    want = (view_h - thumb_h) > 0.0f ? (want / (view_h - thumb_h)) * max_scroll : 0.0f;
+    want = floorf(want + 0.5f);
+    if (want < 0.0f)
+        want = 0.0f;
+    if (want > max_scroll)
+        want = max_scroll;
+    if (want != engine->scroll_y) {
+        engine->scroll_y = want;
+        if (engine->dirty == HPE_DIRTY_NONE)
+            engine->dirty = HPE_DIRTY_SCROLL;
+    }
+}
+
 /**
  * @brief 仅滚动的局部重绘 / Scroll-only repaint
  *
@@ -1403,6 +1836,7 @@ static void render_scrolled(HpeEngine *engine)
     if (dyi >= view_h || dyi <= -view_h) {
         hpe_paint_document(&engine->pm, engine->root, engine->scroll_y, bg, (float)origin_y);
         hpe_chrome_paint(engine);
+        paint_page_scrollbar(engine);
         engine->painted_scroll = engine->scroll_y;
         return;
     }
@@ -1435,6 +1869,9 @@ static void render_scrolled(HpeEngine *engine)
         hpe_paint_region(&engine->pm, engine->root, engine->painted_scroll, bg, clip,
                          (float)origin_y);
     }
+
+    /* the scrollbar is chrome: it must sit on top of the shifted content */
+    paint_page_scrollbar(engine);
 }
 
 /**
@@ -1466,6 +1903,7 @@ void hpe_engine_render(HpeEngine *engine)
     else {
         hpe_paint_document(&engine->pm, engine->root, engine->scroll_y, hpe_rgb(255, 255, 255),
                            (float)engine->chrome_h);
+        paint_page_scrollbar(engine);
         hpe_chrome_paint(engine);
         engine->painted_scroll = engine->scroll_y;
         engine->painted = 1;
@@ -1513,6 +1951,129 @@ const char *hpe_engine_status(HpeEngine *engine)
 float hpe_engine_scroll_offset(HpeEngine *engine)
 {
     return engine ? engine->scroll_y : 0.0f;
+}
+
+/**
+ * @brief 脚本 `focus()`/`blur()` 到引擎焦点的回调 / Callback bridging script `focus()`/`blur()` into the engine focus
+ *
+ * @param[in,out] ud 引擎实例 / Engine instance
+ * @param[in,out] node 目标元素，NULL 表示失焦 / Target element, NULL to blur
+ *
+ * @note 直接转给 `hpe_engine_set_focus`，由它负责 `:focus` 标记与重排 / Forwards straight to `hpe_engine_set_focus`, which owns the `:focus` flag and the relayout
+ *
+ * @see hpe_engine_set_focus hpe_js_dom_set_focus_hook
+ */
+static void hope_focus_hook(void *ud, HpeDomNode *node)
+{
+    hpe_engine_set_focus((HpeEngine *)ud, node);
+}
+
+/**
+ * @brief 脚本读几何属性前触发排版的回调 / Callback forcing a layout before script geometry reads
+ *
+ * @param[in,out] ud 引擎实例 / Engine instance
+ *
+ * @note 浏览器在 `offsetWidth`/`clientWidth` 这类读取上强制布局；这里做同样的事，使脚本刚建的元素也能量到尺寸 / Browsers force a layout on reads such as `offsetWidth`/`clientWidth`; doing the same here lets elements a script just built be measured
+ *
+ * @see hpe_engine_relayout hpe_js_dom_set_layout_hook
+ */
+static void hope_layout_hook(void *ud)
+{
+    HpeEngine *engine = (HpeEngine *)ud;
+    if (engine && engine->doc)
+        hpe_engine_relayout(engine);
+}
+
+/**
+ * @brief 交给脚本的视口尺寸与滚动偏移 / Viewport size and scroll offsets handed to script
+ *
+ * @param[in,out] ud 引擎实例 / Engine instance
+ * @param[out]    w 视口宽 / Viewport width
+ * @param[out]    h 视口高 / Viewport height
+ * @param[out]    sx 水平滚动偏移（本引擎恒为 0）/ Horizontal scroll offset (always 0 here)
+ * @param[out]    sy 垂直滚动偏移 / Vertical scroll offset
+ *
+ * @note `getBoundingClientRect` 用它把文档坐标换算成视口坐标 / `getBoundingClientRect` uses it to map document coordinates onto the viewport
+ *
+ * @see hpe_js_dom_set_viewport_hook
+ */
+static void hope_viewport_hook(void *ud, float *w, float *h, float *sx, float *sy)
+{
+    HpeEngine *engine = (HpeEngine *)ud;
+    if (!engine)
+        return;
+    *w = (float)engine->width;
+    *h = (float)hpe_engine_view_height(engine);
+    *sx = 0.0f;
+    *sy = engine->scroll_y;
+}
+
+/**
+ * @brief 设置焦点元素并同步 `:focus` 状态 / Set the focus element and sync the `:focus` state
+ *
+ * @details 清除旧焦点元素的 `:focus` 标记并置位新元素；`:focus` 是选择器，因此焦点变化会触发一次重排并刷新状态行。
+ *          The previous focus element's `:focus` flag is cleared and the new one is set; because `:focus` is a selector the change triggers a relayout and refreshes the status line.
+ *
+ * @param[in,out] engine 引擎实例，NULL 时直接返回 / Engine instance, returns immediately when NULL
+ * @param[in,out] node 新的焦点元素，传 NULL 表示清除焦点 / New focus element, NULL clears the focus
+ *
+ * @note 若 `node` 与当前焦点相同则不做任何事 / Does nothing when `node` already owns the focus
+ *
+ * @see hpe_engine_focused_node
+ */
+void hpe_engine_set_focus(HpeEngine *engine, HpeDomNode *node)
+{
+    if (!engine)
+        return;
+    if (engine->focus_node == node) {
+        if (node)
+            node->focused = 1;
+        return;
+    }
+    if (engine->focus_node)
+        engine->focus_node->focused = 0;
+    engine->focus_node = node;
+    if (node)
+        node->focused = 1;
+    hpe_engine_relayout(engine);
+    hpe_engine_refresh_status(engine);
+}
+
+/**
+ * @brief 取当前拥有焦点的 DOM 节点 / Get the DOM node that currently owns the focus
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @return 焦点元素，无焦点或 `engine` 为 NULL 时返回 `NULL` / The focused element, or `NULL` when nothing is focused or `engine` is `NULL`
+ *
+ * @see hpe_engine_set_focus
+ */
+HpeDomNode *hpe_engine_focused_node(HpeEngine *engine)
+{
+    return engine ? engine->focus_node : NULL;
+}
+
+/**
+ * @brief 设置 URL 片段目标元素 / Set the URL-fragment target element
+ *
+ * @details 清除旧目标的 `:target` 标记并置位新元素；`:target` 是选择器，因此变化会触发一次重排。
+ *          The previous target's `:target` flag is cleared and the new one is set; because `:target` is a selector the change triggers a relayout.
+ *
+ * @param[in,out] engine 引擎实例，NULL 时直接返回 / Engine instance, returns immediately when NULL
+ * @param[in,out] node 新的片段目标元素，传 NULL 表示无目标 / New fragment target, NULL clears it
+ *
+ * @see hpe_engine_focused_node
+ */
+void hpe_engine_set_target(HpeEngine *engine, HpeDomNode *node)
+{
+    if (!engine)
+        return;
+    if (engine->doc)
+        clear_target_flags(engine->doc);
+    if (node)
+        node->targeted = 1;
+    hpe_engine_relayout(engine);
+    hpe_engine_refresh_status(engine);
 }
 
 /**
@@ -1684,6 +2245,24 @@ static void clear_hover_flags(HpeDomNode *node)
 }
 
 /**
+ * @brief 清除子树的 `:target` 标记 / Clear the `:target` flags of a subtree
+ *
+ * @param[in,out] node 起始 DOM 节点 / Starting DOM node
+ *
+ * @note 递归自身及其所有兄弟子树 / Recurses over the node and all its siblings
+ *
+ * @see hpe_engine_set_target
+ */
+static void clear_target_flags(HpeDomNode *node)
+{
+    for (; node; node = node->next_sibling) {
+        node->targeted = 0;
+        if (node->first_child)
+            clear_target_flags(node->first_child);
+    }
+}
+
+/**
  * @brief 处理指针移动：更新 `:hover` 并派发 `mousemove` / Handle a pointer move: update `:hover` and fire `mousemove`
  *
  * @param[in,out] engine 引擎实例，NULL 或无盒树时返回 0 / Engine instance, returns 0 when NULL or without a box tree
@@ -1703,6 +2282,12 @@ int hpe_engine_mouse_move(HpeEngine *engine, int x, int y)
 
     if (!engine || !engine->root)
         return 0;
+    /* a live page-scrollbar drag keeps tracking the pointer, even off the gutter */
+    if (engine->page_sb_drag) {
+        page_scrollbar_seek(engine, (float)y);
+        hpe_engine_refresh_status(engine);
+        return 1;
+    }
     /* a drag that started inside the address bar keeps receiving the moves, even
      * once the pointer leaves the strip */
     if (hpe_chrome_mouse_move(engine, x, y))
@@ -1714,6 +2299,18 @@ int hpe_engine_mouse_move(HpeEngine *engine, int x, int y)
         clear_hover_flags(engine->doc);
         if (node)
             node->hovered = 1;
+        if (engine->js) {
+            HpeJsEventInit init;
+            memset(&init, 0, sizeof(init));
+            init.client_x = x;
+            init.client_y = y - engine->chrome_h;
+            init.related = engine->hover_node; /* where the pointer came from */
+            if (engine->hover_node)
+                hpe_js_dom_dispatch_self(engine->js, engine->hover_node, "mouseleave",
+                                         &init);
+            if (node)
+                hpe_js_dom_dispatch_self(engine->js, node, "mouseenter", &init);
+        }
         engine->hover_node = node;
     }
 
@@ -1793,16 +2390,55 @@ int hpe_engine_mouse_event(HpeEngine *engine, int x, int y, int button, int down
  *
  * @see hpe_engine_mouse_event
  */
+/* `:active` tracks the element under the pointer while a button is held.
+ * Returns 1 when the active element changed (so the caller recascades). */
+static int mouse_track_active(HpeEngine *engine, HpeDomNode *node, int down)
+{
+    if (down) {
+        if (node == engine->active_node)
+            return 0;
+        if (engine->active_node)
+            engine->active_node->active = 0;
+        engine->active_node = node;
+        node->active = 1;
+        return 1;
+    }
+    if (engine->active_node) {
+        engine->active_node->active = 0;
+        engine->active_node = NULL;
+        return 1;
+    }
+    return 0;
+}
+
+/* Press dispatches `mousedown`; release dispatches `mouseup` then `click`. */
+static int mouse_dispatch_events(HpeEngine *engine, HpeDomNode *node, int x, int py, int down)
+{
+    int fired = 0;
+    if (down)
+        return hpe_js_dom_dispatch(engine->js, node, "mousedown", x, py);
+    if (hpe_js_dom_dispatch(engine->js, node, "mouseup", x, py))
+        fired = 1;
+    if (hpe_js_dom_dispatch(engine->js, node, "click", x, py))
+        fired = 1;
+    return fired;
+}
+
 int hpe_engine_mouse_event_mods(HpeEngine *engine, int x, int y, int button, int down, int mods)
 {
     HpeDomNode *node;
     int fired = 0;
     int blurred = 0;
+    int active_changed = 0;
     int py;
 
     HPE_UNUSED(button);
     if (!engine || !engine->root)
         return 0;
+
+    /* the page scrollbar is chrome: it takes precedence over the page */
+    if (page_scrollbar_mouse(engine, x, y, down))
+        return 1;
 
     /* clicks inside the chrome strip focus the address bar instead of the page */
     if (engine->chrome_h > 0 && (y < engine->chrome_h || engine->addr_drag))
@@ -1820,23 +2456,18 @@ int hpe_engine_mouse_event_mods(HpeEngine *engine, int x, int y, int button, int
     if (!node)
         return blurred;
     py = y - engine->chrome_h;
+    active_changed = mouse_track_active(engine, node, down);
+    fired = mouse_dispatch_events(engine, node, x, py, down);
 
-    if (down)
-        fired = hpe_js_dom_dispatch(engine->js, node, "mousedown", x, py);
-    else {
-        if (hpe_js_dom_dispatch(engine->js, node, "mouseup", x, py))
-            fired = 1;
-        if (hpe_js_dom_dispatch(engine->js, node, "click", x, py))
-            fired = 1;
-    }
-
-    if (fired) {
+    if (active_changed)
+        hpe_engine_relayout(engine); /* :active is a selector, recascade */
+    if (fired || active_changed) {
         /* the handlers may have changed the DOM; only do the work their
          * mutations call for (a click that toggles a colour skips layout) */
         hpe_engine_flush(engine, 0);
         hpe_engine_refresh_status(engine);
     }
-    return fired || blurred;
+    return fired || blurred || active_changed;
 }
 
 /**

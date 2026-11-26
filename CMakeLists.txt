@@ -9,6 +9,7 @@ set(HOPE_CORE_SOURCES
     src/base/hpe_util.c
     src/render/hpe_pixmap.c
     src/render/hpe_raster.c
+    src/render/hpe_image.c
     src/render/hpe_font.c
     src/dom/hpe_dom.c
     src/html/hpe_html.c
@@ -25,6 +26,11 @@ set(HOPE_CORE_SOURCES
     src/js/hpe_js_timers.c
     src/js/hpe_js_regex.c
     src/js/hpe_js_date.c
+    src/js/hpe_js_intl.c
+    src/js/hpe_js_bigint.c
+    src/js/hpe_js_buffer.c
+    src/js/hpe_js_symbol.c
+    src/js/hpe_js_gen.c
     src/hope.c
     src/hope_chrome.c
 )

@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Hope Engine - Browser Globals</title>
+  <style>
+    body {
+      margin: 0;
+      background-color: #f5f6f8;
+      color: #202124;
+      font-size: 15px;
+      line-height: 1.55;
+      font-family: sans-serif;
+    }
+    .page { width: 720px; margin: 24px auto; }
+    h1 { font-size: 26px; margin: 0 0 6px 0; color: #14213d; }
+    .subtitle { color: #5f6368; font-size: 13px; margin: 0 0 18px 0; }
+    .card {
+      background-color: #ffffff;
+      border: 1px solid #dcdfe4;
+      padding: 12px 18px;
+      margin: 0 0 14px 0;
+    }
+    .card h2 { font-size: 16px; margin: 0 0 8px 0; color: #1a73e8; }
+    .row { font-family: monospace; font-size: 13px; white-space: pre; }
+    .fail { color: #d93025; font-weight: bold; }
+    .ok { color: #188038; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <h1>Browser Globals</h1>
+    <p class="subtitle">performance &middot; history &middot; localStorage &middot; sessionStorage &middot; console.time/count/table</p>
+    <div class="card"><h2>Results</h2><div id="out"></div></div>
+  </div>
+<script>
+  var lines = [];
+  function check(label, got, want) {
+    var pass = String(got) === String(want);
+    lines.push((pass ? "  ok   " : "  FAIL ") + label + " = " + got + (pass ? "" : "   (want " + want + ")"));
+    return pass;
+  }
+  var passCount = 0, total = 0;
+
+  // ---- 1. performance.now() ----
+  total++; if (check("performance is object", typeof performance, "object")) passCount++;
+  total++; if (check("performance.now is fn", typeof performance.now, "function")) passCount++;
+  var p0 = performance.now();
+  total++; if (check("performance.now is number", typeof p0, "number")) passCount++;
+  total++; if (check("performance.now non-negative", p0 >= 0, "true")) passCount++;
+  total++; if (check("performance.now monotonic", performance.now() >= p0, "true")) passCount++;
+
+  // ---- 2. history ----
+  total++; if (check("history.pushState is fn", typeof history.pushState, "function")) passCount++;
+  total++; if (check("history.replaceState is fn", typeof history.replaceState, "function")) passCount++;
+  total++; if (check("history.back is fn", typeof history.back, "function")) passCount++;
+  total++; if (check("history.forward is fn", typeof history.forward, "function")) passCount++;
+  total++; if (check("history.go is fn", typeof history.go, "function")) passCount++;
+  total++; if (check("history.length starts at 1", history.length, "1")) passCount++;
+  history.pushState({ page: 1 }, "one", "/one");
+  total++; if (check("history.length after push", history.length, "2")) passCount++;
+  total++; if (check("history.state mirrors push", history.state.page, "1")) passCount++;
+  history.pushState({ page: 2 }, "two", "/two");
+  total++; if (check("history.length after 2 pushes", history.length, "3")) passCount++;
+  history.replaceState({ page: 9 }, "nine", "/nine");
+  total++; if (check("replaceState keeps length", history.length, "3")) passCount++;
+  total++; if (check("replaceState swaps state", history.state.page, "9")) passCount++;
+  total++; if (check("history.back returns undefined", String(history.back()), "undefined")) passCount++;
+  total++; if (check("history.go returns undefined", String(history.go(-1)), "undefined")) passCount++;
+  total++; if (check("scrollRestoration default", history.scrollRestoration, "auto")) passCount++;
+
+  // ---- 3. localStorage: methods ----
+  total++; if (check("localStorage is object", typeof localStorage, "object")) passCount++;
+  total++; if (check("setItem is fn", typeof localStorage.setItem, "function")) passCount++;
+  total++; if (check("getItem is fn", typeof localStorage.getItem, "function")) passCount++;
+  total++; if (check("removeItem is fn", typeof localStorage.removeItem, "function")) passCount++;
+  total++; if (check("clear is fn", typeof localStorage.clear, "function")) passCount++;
+  total++; if (check("key is fn", typeof localStorage.key, "function")) passCount++;
+  localStorage.clear();
+  total++; if (check("empty length", localStorage.length, "0")) passCount++;
+
+  // ---- 4. localStorage: round trip ----
+  localStorage.setItem("alpha", "a1");
+  total++; if (check("getItem after set", localStorage.getItem("alpha"), "a1")) passCount++;
+  total++; if (check("length after one set", localStorage.length, "1")) passCount++;
+  total++; if (check("key(0)", localStorage.key(0), "alpha")) passCount++;
+  total++; if (check("key(1) is null", localStorage.key(1), "null")) passCount++;
+  total++; if (check("missing key is null", localStorage.getItem("nope"), "null")) passCount++;
+
+  // ---- 5. localStorage: property access mirrors getItem/setItem ----
+  total++; if (check("property read", localStorage.alpha, "a1")) passCount++;
+  localStorage.alpha = "a2";
+  total++; if (check("property write visible via getItem", localStorage.getItem("alpha"), "a2")) passCount++;
+  localStorage.setItem("beta", "b1");
+  total++; if (check("setItem visible via property", localStorage.beta, "b1")) passCount++;
+  total++; if (check("two keys", localStorage.length, "2")) passCount++;
+
+  // ---- 6. localStorage: numeric value coercion ----
+  localStorage.setItem("num", 42);
+  total++; if (check("number coerced to string", localStorage.getItem("num"), "42")) passCount++;
+
+  // ---- 7. localStorage: removeItem / clear ----
+  localStorage.removeItem("alpha");
+  total++; if (check("removeItem drops key", localStorage.getItem("alpha"), "null")) passCount++;
+  total++; if (check("length after remove", localStorage.length, "2")) passCount++;
+  localStorage.clear();
+  total++; if (check("clear empties area", localStorage.length, "0")) passCount++;
+
+  // ---- 8. sessionStorage is a separate area ----
+  total++; if (check("sessionStorage is object", typeof sessionStorage, "object")) passCount++;
+  sessionStorage.clear();
+  sessionStorage.setItem("token", "s1");
+  total++; if (check("session round trip", sessionStorage.getItem("token"), "s1")) passCount++;
+  total++; if (check("session length", sessionStorage.length, "1")) passCount++;
+  total++; if (check("areas are isolated", localStorage.getItem("token"), "null")) passCount++;
+  localStorage.setItem("token", "l1");
+  total++; if (check("same key, other area", localStorage.getItem("token"), "l1")) passCount++;
+  total++; if (check("session key untouched", sessionStorage.getItem("token"), "s1")) passCount++;
+  sessionStorage.removeItem("token");
+  total++; if (check("session removeItem", sessionStorage.getItem("token"), "null")) passCount++;
+  localStorage.clear();
+  sessionStorage.clear();
+
+  // ---- 9. console extensions exist ----
+  total++; if (check("console.table is fn", typeof console.table, "function")) passCount++;
+  total++; if (check("console.time is fn", typeof console.time, "function")) passCount++;
+  total++; if (check("console.timeEnd is fn", typeof console.timeEnd, "function")) passCount++;
+  total++; if (check("console.count is fn", typeof console.count, "function")) passCount++;
+  console.time("boot");
+  console.timeEnd("boot");
+  console.count("hits");
+  console.count("hits");
+  console.table([{ id: 1, name: "one" }, { id: 2, name: "two" }]);
+  console.table({ a: 1, b: 2, c: 3 });
+  total++; if (check("console methods ran", "ok", "ok")) passCount++;
+
+  // ---- 10. window exposes the new globals ----
+  total++; if (check("window.history", window.history === history, "true")) passCount++;
+  total++; if (check("window.localStorage", window.localStorage === localStorage, "true")) passCount++;
+  total++; if (check("window.sessionStorage", window.sessionStorage === sessionStorage, "true")) passCount++;
+  total++; if (check("window.performance", window.performance === performance, "true")) passCount++;
+  total++; if (check("window.console", typeof window.console, "object")) passCount++;
+
+  // ---- summary ----
+  lines.unshift((passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total + " checks");
+  var cls = passCount === total ? "ok" : "fail";
+  var el = document.getElementById("out");
+  for (var li = 0; li < lines.length; li++) {
+    var row = document.createElement("div");
+    row.className = "row " + (li === 0 ? cls : "");
+    row.textContent = lines[li];
+    el.appendChild(row);
+  }
+  document.title = (passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total;
+</script>
+</body>
+</html>

@@ -7,6 +7,7 @@
 
 #include "paint/hpe_svg.h"
 #include "base/hpe_util.h"
+#include "render/hpe_image.h"
 #include "render/hpe_raster.h"
 
 /**
@@ -30,6 +31,9 @@ static float snap_y(float y)
  * a scratch pixmap anchored at the box's top-left) and later by transforms. */
 typedef struct PaintCtx {
     float dev_x, dev_y;
+    /* accumulated scroll offset of every enclosing scroll container, added to
+     * the page offset: descendants of a scrolled element move with it */
+    float elem_scroll;
     int group_depth; /* opacity/transform-group nesting, to cap pathological recursion */
 } PaintCtx;
 
@@ -48,7 +52,7 @@ typedef struct PaintCtx {
  */
 static float ctx_dev_y(PaintCtx *ctx, float doc_y, float scroll)
 {
-    return doc_y - scroll + ctx->dev_y;
+    return doc_y - scroll - ctx->elem_scroll + ctx->dev_y;
 }
 
 /**
@@ -64,7 +68,7 @@ static HpeRect box_device_rect(PaintCtx *ctx, HpeBox *box, float scroll)
 {
     HpeRect r = box->border_box;
     r.x += ctx->dev_x;
-    r.y = snap_y(r.y - scroll + ctx->dev_y);
+    r.y = snap_y(r.y - scroll - ctx->elem_scroll + ctx->dev_y);
     return r;
 }
 
@@ -331,9 +335,560 @@ static void paint_text_shadow(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float s
     }
 }
 
+/**
+ * @brief 把索引夹到 `[0, n-1]` / Clamp an index to `[0, n-1]`
+ *
+ * @param[in]     i 待夹取的索引 / Index to clamp
+ * @param[in]     n 有效元素个数 / Number of valid elements
+ *
+ * @return 夹取后的索引 / The clamped index
+ *
+ * @note 供双线性采样处理越界样本；`n <= 0` 时返回 0 / Used by bilinear sampling for out-of-range taps; returns 0 when `n <= 0`
+ *
+ * @see blit_image
+ */
+static int clamp_idx(int i, int n)
+{
+    if (n <= 0)
+        return 0;
+    if (i < 0)
+        return 0;
+    if (i > n - 1)
+        return n - 1;
+    return i;
+}
+
+/**
+ * @brief 把目标矩形夹到像素缓冲的裁剪矩形 / Clamp a destination rect to the pixmap's clip
+ *
+ * @param[in]     pm 目标像素缓冲 / Target pixel buffer
+ * @param[in,out] x0 目标左边界，就地夹取 / Destination left edge, clamped in place
+ * @param[in,out] y0 目标上边界，就地夹取 / Destination top edge, clamped in place
+ * @param[in,out] w 目标宽度，就地夹取 / Destination width, clamped in place
+ * @param[in,out] h 目标高度，就地夹取 / Destination height, clamped in place
+ *
+ * @return 夹取后仍有面积返回 1，否则 0 / 1 when the clamped rect still has area, otherwise 0
+ *
+ * @note 与 `hpe_fill_rect_i` 的夹取方式一致 / The clamping matches `hpe_fill_rect_i`
+ *
+ * @see blit_image
+ */
+static int clamp_dest_to_clip(HpePixmap *pm, int *x0, int *y0, int *w, int *h)
+{
+    if (*x0 < pm->clip_x0) {
+        *w -= pm->clip_x0 - *x0;
+        *x0 = pm->clip_x0;
+    }
+    if (*y0 < pm->clip_y0) {
+        *h -= pm->clip_y0 - *y0;
+        *y0 = pm->clip_y0;
+    }
+    if (*x0 + *w > pm->clip_x1)
+        *w = pm->clip_x1 - *x0;
+    if (*y0 + *h > pm->clip_y1)
+        *h = pm->clip_y1 - *y0;
+    return *w > 0 && *h > 0;
+}
+
+/**
+ * @brief 2×2 双线性采样（按样本 alpha 加权）/ 2×2 bilinear sample, weighted by each sample's alpha
+ *
+ * @param[in]     row0 上行像素 / Upper row of pixels
+ * @param[in]     row1 下行像素 / Lower row of pixels
+ * @param[in]     ix0 左列索引（已夹取）/ Left column index, already clamped
+ * @param[in]     ix1 右列索引（已夹取）/ Right column index, already clamped
+ * @param[in]     fx 水平小数 / Horizontal fraction
+ * @param[in]     fy 垂直小数 / Vertical fraction
+ * @param[out]    out_r 加权 R 累加 / Alpha-weighted R sum
+ * @param[out]    out_g 加权 G 累加 / Alpha-weighted G sum
+ * @param[out]    out_b 加权 B 累加 / Alpha-weighted B sum
+ * @param[out]    out_w 权重和（即输出 alpha，0..255）/ Weight sum, which is the output alpha in 0..255
+ *
+ * @note 每个样本的权重乘以其自身 alpha，透明边缘不会被拖向黑色 / Each sample's weight is scaled by its own alpha so transparent edges are not dragged towards black
+ *
+ * @see blit_image
+ */
+static void sample_bilinear(const uint32_t *row0, const uint32_t *row1, int ix0, int ix1, float fx,
+                            float fy, float *out_r, float *out_g, float *out_b, float *out_w)
+{
+    uint32_t p00 = row0[ix0], p10 = row0[ix1], p01 = row1[ix0], p11 = row1[ix1];
+    float w00 = (1.0f - fx) * (1.0f - fy) * (float)((p00 >> 24) & 0xFFu);
+    float w10 = fx * (1.0f - fy) * (float)((p10 >> 24) & 0xFFu);
+    float w01 = (1.0f - fx) * fy * (float)((p01 >> 24) & 0xFFu);
+    float w11 = fx * fy * (float)((p11 >> 24) & 0xFFu);
+
+    *out_r = (float)((p00 >> 16) & 0xFFu) * w00 + (float)((p10 >> 16) & 0xFFu) * w10 +
+             (float)((p01 >> 16) & 0xFFu) * w01 + (float)((p11 >> 16) & 0xFFu) * w11;
+    *out_g = (float)((p00 >> 8) & 0xFFu) * w00 + (float)((p10 >> 8) & 0xFFu) * w10 +
+             (float)((p01 >> 8) & 0xFFu) * w01 + (float)((p11 >> 8) & 0xFFu) * w11;
+    *out_b = (float)(p00 & 0xFFu) * w00 + (float)(p10 & 0xFFu) * w10 + (float)(p01 & 0xFFu) * w01 +
+             (float)(p11 & 0xFFu) * w11;
+    *out_w = w00 + w10 + w01 + w11;
+}
+
+/**
+ * @brief 把一个反预乘样本混合到目标像素 / Blend an un-premultiplied sample onto a destination pixel
+ *
+ * @param[in,out] dst 目标像素 / Destination pixel
+ * @param[in]     r 加权 R 累加 / Alpha-weighted R sum
+ * @param[in]     g 加权 G 累加 / Alpha-weighted G sum
+ * @param[in]     b 加权 B 累加 / Alpha-weighted B sum
+ * @param[in]     wsum 权重和 / Weight sum
+ *
+ * @note 双线性权重和为 1，故 `wsum` 恰为 0..255 的输出 alpha；颜色先按它反预乘再合成，全不透明时直接覆盖 / The bilinear weights sum to 1, so `wsum` is exactly the output alpha in 0..255; the colour is un-premultiplied by it before compositing, and an opaque result overwrites directly
+ *
+ * @see sample_bilinear blit_image
+ */
+static void blend_pixel(uint32_t *dst, float r, float g, float b, float wsum)
+{
+    uint32_t sa;
+    float inv, dr, dg, db;
+
+    if (wsum <= 0.0f)
+        return;
+    sa = (uint32_t)(wsum + 0.5f);
+    if (sa == 0)
+        return;
+    if (sa > 255u)
+        sa = 255u;
+    r = r / wsum;
+    g = g / wsum;
+    b = b / wsum;
+    if (sa >= 255u) {
+        *dst = 0xFF000000u | ((uint32_t)(r + 0.5f) << 16) | ((uint32_t)(g + 0.5f) << 8) |
+               (uint32_t)(b + 0.5f);
+        return;
+    }
+    dr = (float)((*dst >> 16) & 0xFFu);
+    dg = (float)((*dst >> 8) & 0xFFu);
+    db = (float)(*dst & 0xFFu);
+    inv = 255.0f - (float)sa;
+    *dst = 0xFF000000u |
+           ((uint32_t)((r * (float)sa + dr * inv) / 255.0f + 0.5f) << 16) |
+           ((uint32_t)((g * (float)sa + dg * inv) / 255.0f + 0.5f) << 8) |
+           (uint32_t)((b * (float)sa + db * inv) / 255.0f + 0.5f);
+}
+
+/**
+ * @brief 把一个解码图像按目标矩形双线性重采样混合到像素缓冲 / Composite a decoded image onto the pixel buffer with bilinear resampling
+ *
+ * @details 源图像按源矩形 `sx0..sx1 × sy0..sy1` 双线性采样到目标矩形
+ *          `dx..dx+dw × dy..dy+dh`，逐像素按源 alpha 混合，并裁剪到 `pm` 的裁剪矩形。
+ *          采样权重各自乘上样本自身的 alpha，因此透明边缘不会被拖向黑色。
+ *          The source is bilinearly sampled from `sx0..sx1 × sy0..sy1` into the destination rect
+ *          `dx..dx+dw × dy..dy+dh`, blended per pixel by source alpha and clipped to `pm`'s clip
+ *          rectangle. Each sample's weight is multiplied by its own alpha, so transparent edges
+ *          are not dragged towards black.
+ *
+ * @param[in,out] pm 目标像素缓冲 / Destination pixel buffer
+ * @param[in]     img 源图像（32bpp 0xAARRGGBB，自上而下）/ Source image (32bpp 0xAARRGGBB, top-down)
+ * @param[in]     dx 目标矩形左边界（设备坐标）/ Destination left edge in device coordinates
+ * @param[in]     dy 目标矩形上边界（设备坐标）/ Destination top edge in device coordinates
+ * @param[in]     dw 目标矩形宽度 / Destination width
+ * @param[in]     dh 目标矩形高度 / Destination height
+ * @param[in]     sx0 源矩形左边界（像素）/ Source left edge in pixels
+ * @param[in]     sy0 源矩形上边界（像素）/ Source top edge in pixels
+ * @param[in]     sx1 源矩形右边界（像素，不含）/ Source right edge in pixels, exclusive
+ * @param[in]     sy1 源矩形下边界（像素，不含）/ Source bottom edge in pixels, exclusive
+ *
+ * @note 目标或源矩形为空、图像无像素时直接返回 / Returns immediately for an empty destination or source rect or an image with no pixels
+ *
+ * @see sample_bilinear blend_pixel paint_image_box paint_background_image
+ */
+static void blit_image(HpePixmap *pm, const HpeImage *img, float dx, float dy, float dw, float dh,
+                       float sx0, float sy0, float sx1, float sy1)
+{
+    int x0, y0, w, h, px, py;
+    float sw = sx1 - sx0, sh = sy1 - sy0;
+
+    if (!pm || !pm->pixels || !img || !img->pixels || dw <= 0.0f || dh <= 0.0f)
+        return;
+    if (sw <= 0.0f || sh <= 0.0f)
+        return;
+
+    x0 = (int)floorf(dx);
+    y0 = (int)floorf(dy);
+    w = (int)ceilf(dw);
+    h = (int)ceilf(dh);
+    if (!clamp_dest_to_clip(pm, &x0, &y0, &w, &h))
+        return;
+
+    for (py = 0; py < h; py++) {
+        /* sample at pixel centres: the destination pixel's centre maps to the
+         * source coordinate `sy0 + (y + 0.5) / dh * sh - 0.5` in image pixels */
+        float sy = sy0 + (((float)(y0 + py) - dy) + 0.5f) / dh * sh - 0.5f;
+        int iy = (int)floorf(sy);
+        float fy = sy - (float)iy;
+        uint32_t *dst_row = pm->pixels + (size_t)(y0 + py) * (size_t)pm->width + (size_t)x0;
+        const uint32_t *row0 = img->pixels + (size_t)clamp_idx(iy, img->height) * (size_t)img->width;
+        const uint32_t *row1 =
+            img->pixels + (size_t)clamp_idx(iy + 1, img->height) * (size_t)img->width;
+
+        for (px = 0; px < w; px++) {
+            float sx = sx0 + (((float)(x0 + px) - dx) + 0.5f) / dw * sw - 0.5f;
+            int ix = (int)floorf(sx);
+            float fx = sx - (float)ix;
+            float r, g, b, wsum;
+
+            sample_bilinear(row0, row1, clamp_idx(ix, img->width), clamp_idx(ix + 1, img->width),
+                            fx, fy, &r, &g, &b, &wsum);
+            blend_pixel(&dst_row[px], r, g, b, wsum);
+        }
+    }
+}
+
+static float clamp01(float v)
+{
+    if (v < 0.0f)
+        return 0.0f;
+    if (v > 1.0f)
+        return 1.0f;
+    return v;
+}
+
+/**
+ * @brief 按 `object-fit` 求图像的目标尺寸 / Solve the image's destination size under `object-fit`
+ *
+ * @param[in]     fit 生效的 `object-fit` / The effective `object-fit`
+ * @param[in]     iw 图像固有宽 / Intrinsic image width
+ * @param[in]     ih 图像固有高 / Intrinsic image height
+ * @param[in]     cw 内容盒宽 / Content-box width
+ * @param[in]     ch 内容盒高 / Content-box height
+ * @param[out]    out_w 目标宽 / Destination width
+ * @param[out]    out_h 目标高 / Destination height
+ *
+ * @note `fill` 拉伸铺满，`none` 保持固有尺寸，`cover`/`contain` 等比缩放，`scale-down` 取较小者 / `fill` stretches, `none` keeps the intrinsic size, `cover`/`contain` scale proportionally, `scale-down` takes the smaller
+ *
+ * @see object_fit_rects
+ */
+static void object_fit_size(HpeObjectFit fit, int iw, int ih, float cw, float ch, float *out_w,
+                            float *out_h)
+{
+    float scale;
+    if (fit == HPE_OBJECT_FIT_FILL) {
+        *out_w = cw;
+        *out_h = ch;
+        return;
+    }
+    {
+        float sx = cw / (float)iw, sy = ch / (float)ih;
+        if (fit == HPE_OBJECT_FIT_NONE)
+            scale = 1.0f;
+        else if (fit == HPE_OBJECT_FIT_COVER)
+            scale = sx > sy ? sx : sy;
+        else /* contain, and the smaller branch of scale-down */
+            scale = sx < sy ? sx : sy;
+        if (fit == HPE_OBJECT_FIT_SCALE_DOWN && scale > 1.0f)
+            scale = 1.0f;
+    }
+    *out_w = (float)iw * scale;
+    *out_h = (float)ih * scale;
+}
+
+/**
+ * @brief 按 `object-fit` 求图像在内容盒内的目标矩形与源矩形 / Compute the destination and source rects of an image under `object-fit`
+ *
+ * @details 按 `object-fit` 与 `object-position` 计算：`fill` 拉伸铺满，`contain` 等比缩放并完整放入，
+ *          `cover` 等比缩放并铺满（裁掉溢出），`none` 保持固有尺寸，`scale-down` 取 `none` 与 `contain` 中较小者。
+ *          Computed from `object-fit` and `object-position`: `fill` stretches, `contain` scales
+ *          down to fit entirely, `cover` scales to cover (clipping the overflow), `none` keeps
+ *          the intrinsic size and `scale-down` takes the smaller of `none` and `contain`.
+ *
+ * @param[in]     fit 生效的 `object-fit` / The effective `object-fit`
+ * @param[in]     pos 生效的 `object-position`（可能未声明）/ The effective `object-position`, possibly undeclared
+ * @param[in]     iw 图像固有宽 / Intrinsic image width
+ * @param[in]     ih 图像固有高 / Intrinsic image height
+ * @param[in]     cw 内容盒宽 / Content-box width
+ * @param[in]     ch 内容盒高 / Content-box height
+ * @param[out]    out_x 目标矩形左边界（相对内容盒）/ Destination left edge, relative to the content box
+ * @param[out]    out_y 目标矩形上边界（相对内容盒）/ Destination top edge, relative to the content box
+ * @param[out]    out_w 目标矩形宽 / Destination width
+ * @param[out]    out_h 目标矩形高 / Destination height
+ * @param[out]    sx0 源矩形左边界（像素）/ Source left edge in pixels
+ * @param[out]    sy0 源矩形上边界（像素）/ Source top edge in pixels
+ * @param[out]    sx1 源矩形右边界（像素，不含）/ Source right edge in pixels, exclusive
+ * @param[out]    sy1 源矩形下边界（像素，不含）/ Source bottom edge in pixels, exclusive
+ *
+ * @note `contain`/`cover` 保持图像宽高比，因此目标矩形可能小于或大于内容盒 / `contain` and `cover` preserve the aspect ratio, so the destination rect may be smaller or larger than the content box
+ *
+ * @see blit_image paint_image_box
+ */
+static void object_fit_rects(HpeObjectFit fit, const HpeBgPos *pos, int iw, int ih, float cw,
+                             float ch, float *out_x, float *out_y, float *out_w, float *out_h,
+                             float *sx0, float *sy0, float *sx1, float *sy1)
+{
+    float dw, dh, ox = 0.5f, oy = 0.5f;
+
+    *sx0 = 0.0f;
+    *sy0 = 0.0f;
+    *sx1 = (float)iw;
+    *sy1 = (float)ih;
+
+    if (iw <= 0 || ih <= 0 || cw <= 0.0f || ch <= 0.0f) {
+        *out_x = 0.0f;
+        *out_y = 0.0f;
+        *out_w = cw > 0.0f ? cw : 0.0f;
+        *out_h = ch > 0.0f ? ch : 0.0f;
+        return;
+    }
+
+    object_fit_size(fit, iw, ih, cw, ch, &dw, &dh);
+
+    /* `object-position` defaults to 50% 50% (centred) */
+    if (pos && pos->present) {
+        ox = pos->x_pct ? pos->x * 0.01f : (cw != dw ? pos->x / (cw - dw) : 0.0f);
+        oy = pos->y_pct ? pos->y * 0.01f : (ch != dh ? pos->y / (ch - dh) : 0.0f);
+        ox = clamp01(ox);
+        oy = clamp01(oy);
+    }
+    *out_x = (cw - dw) * ox;
+    *out_y = (ch - dh) * oy;
+    *out_w = dw;
+    *out_h = dh;
+}
+
+/**
+ * @brief 把 `<img>` 的解码内容绘制进内容盒 / Paint a decoded `<img>` into its content box
+ *
+ * @param[in]     ctx 绘制上下文 / Paint context
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     box 已排版的 `<img>` 盒 / The laid-out `<img>` box
+ * @param[in]     scroll 纵向滚动偏移 / Vertical scroll offset
+ *
+ * @note 内容盒为空、`src` 缺失或解码失败时静默跳过 / Silently skipped when the content box is empty, `src` is missing or the decode failed
+ *
+ * @see blit_image object_fit_rects
+ */
+static void paint_image_box(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float scroll)
+{
+    HpeStyle *bs = &box->style;
+    const char *src = box->node ? hpe_dom_attr(box->node, "src") : NULL;
+    const HpeImage *img;
+    char path[1024];
+    float x, y, w, h, sx0, sy0, sx1, sy1;
+
+    if (!src || !src[0])
+        return;
+    if (box->content_box.w <= 0.0f || box->content_box.h <= 0.0f)
+        return;
+    if (!hpe_image_resolve_url(src, path, sizeof(path)))
+        return;
+    img = hpe_image_cache_get(hpe_image_shared_cache(), path, HPE_IMG_UNKNOWN, -1, -1);
+    if (!img || !img->pixels)
+        return;
+
+    object_fit_rects(bs->object_fit, &bs->object_pos, img->width, img->height, box->content_box.w,
+                     box->content_box.h, &x, &y, &w, &h, &sx0, &sy0, &sx1, &sy1);
+    {
+        /* `object-fit: cover` / `none` may overflow the content box, which the
+         * replaced element clips: narrow the clip for the duration of the blit
+         * and restore it afterwards (a `set` would drop an outer clip). */
+        int saved[4];
+        HpeRect clip;
+        saved[0] = pm->clip_x0;
+        saved[1] = pm->clip_y0;
+        saved[2] = pm->clip_x1;
+        saved[3] = pm->clip_y1;
+        clip = box->content_box;
+        clip.x += ctx->dev_x;
+        clip.y = ctx_dev_y(ctx, box->content_box.y, scroll);
+        hpe_pixmap_intersect_clip(pm, clip);
+        blit_image(pm, img, box->content_box.x + ctx->dev_x + x,
+                   ctx_dev_y(ctx, box->content_box.y, scroll) + y, w, h, sx0, sy0, sx1, sy1);
+        pm->clip_x0 = saved[0];
+        pm->clip_y0 = saved[1];
+        pm->clip_x1 = saved[2];
+        pm->clip_y1 = saved[3];
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* background / borders                                                */
 /* ------------------------------------------------------------------ */
+
+/**
+ * @brief 求 `background-size` 展开后的图像尺寸 / Resolve a background layer's used pixel size
+ *
+ * @details `auto` 保持固有尺寸；`cover`/`contain` 按与 `object-fit` 相同的等比规则铺满或放入；
+ *          单值只给宽时高按固有比例推出。
+ *          `auto` keeps the intrinsic size, `cover`/`contain` use the same aspect-preserving
+ *          rules as `object-fit`, and a single-value form derives the height from the ratio.
+ *
+ * @param[in]     bg 背景放置参数（`background-position` / `background-size`）/ Background placement parameters
+ * @param[in]     iw 图像固有宽 / Intrinsic image width
+ * @param[in]     ih 图像固有高 / Intrinsic image height
+ * @param[in]     bw 定位区宽 / Positioning-area width
+ * @param[in]     bh 定位区高 / Positioning-area height
+ * @param[out]    out_w 计算后的图像宽 / The resulting image width
+ * @param[out]    out_h 计算后的图像高 / The resulting image height
+ *
+ * @see paint_background_image
+ */
+static void bg_layer_size(const HpeBgPos *bg, int iw, int ih, float bw, float bh, float *out_w,
+                          float *out_h)
+{
+    float w = (float)iw, h = (float)ih;
+
+    if (iw <= 0 || ih <= 0 || bw <= 0.0f || bh <= 0.0f) {
+        *out_w = bw > 0.0f ? bw : 0.0f;
+        *out_h = bh > 0.0f ? bh : 0.0f;
+        return;
+    }
+    if (bg->present && bg->size_cover) {
+        float s = (bw / (float)iw) > (bh / (float)ih) ? (bw / (float)iw) : (bh / (float)ih);
+        w = (float)iw * s;
+        h = (float)ih * s;
+    } else if (bg->present && bg->size_contain) {
+        float s = (bw / (float)iw) < (bh / (float)ih) ? (bw / (float)iw) : (bh / (float)ih);
+        w = (float)iw * s;
+        h = (float)ih * s;
+    } else if (bg->present && !bg->size_auto) {
+        int have_x = bg->size_x != 0.0f || bg->sx_pct;
+        int have_y = bg->size_y != 0.0f || bg->sy_pct;
+        if (have_x)
+            w = bg->sx_pct ? bw * bg->size_x * 0.01f : bg->size_x;
+        if (have_y)
+            h = bg->sy_pct ? bh * bg->size_y * 0.01f : bg->size_y;
+        /* a single value keeps the intrinsic ratio */
+        if (have_x && !have_y && bg->size_x != 0.0f)
+            h = (float)ih * (w / (float)iw);
+        else if (have_y && !have_x && bg->size_y != 0.0f)
+            w = (float)iw * (h / (float)ih);
+    }
+    *out_w = w;
+    *out_h = h;
+}
+
+/**
+ * @brief 求 `background-repeat` 在两个方向上的平铺次数 / Compute the tile counts for both axes under `background-repeat`
+ *
+ * @param[in]     repeat 生效的 `background-repeat` / The effective `background-repeat`
+ * @param[in]     area_w 定位区宽 / Positioning-area width
+ * @param[in]     area_h 定位区高 / Positioning-area height
+ * @param[in]     ox 图层左上角 x / Layer top-left x
+ * @param[in]     oy 图层左上角 y / Layer top-left y
+ * @param[in]     w 图层宽 / Layer width
+ * @param[in]     h 图层高 / Layer height
+ * @param[out]    out_nx 横向平铺次数 / Horizontal tile count
+ * @param[out]    out_ny 纵向平铺次数 / Vertical tile count
+ *
+ * @note 平铺次数上限 4096，避免小图铺满大盒时爆炸 / The tile count is capped at 4096 so a tiny image over a huge box cannot explode
+ *
+ * @see paint_background_image
+ */
+static void bg_tile_counts(HpeBgRepeat repeat, float area_w, float area_h, float ox, float oy,
+                           float w, float h, int *out_nx, int *out_ny)
+{
+    int nx = 1, ny = 1;
+    if (repeat == HPE_BG_REPEAT_REPEAT || repeat == HPE_BG_REPEAT_X) {
+        nx = (int)ceilf((area_w - ox) / w) + 1;
+        if (nx < 1)
+            nx = 1;
+    }
+    if (repeat == HPE_BG_REPEAT_REPEAT || repeat == HPE_BG_REPEAT_Y) {
+        ny = (int)ceilf((area_h - oy) / h) + 1;
+        if (ny < 1)
+            ny = 1;
+    }
+    if (nx > 4096)
+        nx = 4096;
+    if (ny > 4096)
+        ny = 4096;
+    *out_nx = nx;
+    *out_ny = ny;
+}
+
+/**
+ * @brief 平铺绘制一个背景图层 / Tile one background layer across the positioning area
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     img 源图像 / Source image
+ * @param[in]     bb 定位区（边框盒）设备矩形 / Positioning area (border box) in device coordinates
+ * @param[in]     w 图层宽 / Layer width
+ * @param[in]     h 图层高 / Layer height
+ * @param[in]     ox 图层左上角 x / Layer top-left x
+ * @param[in]     oy 图层左上角 y / Layer top-left y
+ * @param[in]     nx 横向平铺次数 / Horizontal tile count
+ * @param[in]     ny 纵向平铺次数 / Vertical tile count
+ *
+ * @note `background-clip` 默认边框盒，因此整体裁剪在定位区之内 / `background-clip` defaults to the border box, so the whole layer is clipped to the positioning area
+ *
+ * @see blit_image bg_tile_counts
+ */
+static void bg_blit_tiles(HpePixmap *pm, const HpeImage *img, HpeRect bb, float w, float h, float ox,
+                          float oy, int nx, int ny)
+{
+    int saved[4];
+    int tile_x, tile_y;
+
+    saved[0] = pm->clip_x0;
+    saved[1] = pm->clip_y0;
+    saved[2] = pm->clip_x1;
+    saved[3] = pm->clip_y1;
+    hpe_pixmap_intersect_clip(pm, bb);
+    for (tile_y = 0; tile_y < ny; tile_y++) {
+        for (tile_x = 0; tile_x < nx; tile_x++) {
+            float dx = bb.x + ox + (float)tile_x * w;
+            float dy = bb.y + oy + (float)tile_y * h;
+            if (dx > bb.x + bb.w || dy > bb.y + bb.h)
+                continue;
+            blit_image(pm, img, dx, dy, w, h, 0.0f, 0.0f, (float)img->width, (float)img->height);
+        }
+    }
+    pm->clip_x0 = saved[0];
+    pm->clip_y0 = saved[1];
+    pm->clip_x1 = saved[2];
+    pm->clip_y1 = saved[3];
+}
+
+/**
+ * @brief 绘制 `background-image: url(...)` 图层 / Paint a `background-image: url(...)` layer
+ *
+ * @details 按 `background-position` 求图层左上角，按 `background-repeat` 平铺，逐块调用 `blit_image`。
+ *          The layer's top-left comes from `background-position` and tiling follows
+ *          `background-repeat`, with every tile drawn by `blit_image`.
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     bs 计算样式 / Computed style
+ * @param[in]     bb 盒的设备矩形（定位区）/ Device rect of the box, the positioning area
+ *
+ * @note 解码失败或尺寸退化时静默跳过 / Silently skipped when the decode fails or the layer size degenerates
+ *
+ * @see bg_layer_size bg_tile_counts bg_blit_tiles paint_background
+ */
+static void paint_background_image(HpePixmap *pm, HpeStyle *bs, HpeRect bb)
+{
+    const HpeImage *img;
+    char path[1024];
+    float w, h, ox, oy;
+    int nx, ny;
+
+    if (!bs->background_image.url[0])
+        return;
+    if (!hpe_image_resolve_url(bs->background_image.url, path, sizeof(path)))
+        return;
+    img = hpe_image_cache_get(hpe_image_shared_cache(), path, HPE_IMG_UNKNOWN, -1, -1);
+    if (!img || !img->pixels)
+        return;
+    if (bb.w <= 0.0f || bb.h <= 0.0f)
+        return;
+
+    bg_layer_size(&bs->bg_pos, img->width, img->height, bb.w, bb.h, &w, &h);
+    if (w <= 0.0f || h <= 0.0f)
+        return;
+
+    /* `background-position` defaults to 0% 0% (top-left) */
+    if (bs->bg_pos.present) {
+        ox = bs->bg_pos.x_pct ? (bb.w - w) * bs->bg_pos.x * 0.01f : bs->bg_pos.x;
+        oy = bs->bg_pos.y_pct ? (bb.h - h) * bs->bg_pos.y * 0.01f : bs->bg_pos.y;
+    } else {
+        ox = 0.0f;
+        oy = 0.0f;
+    }
+
+    bg_tile_counts(bs->bg_repeat, bb.w, bb.h, ox, oy, w, h, &nx, &ny);
+    bg_blit_tiles(pm, img, bb, w, h, ox, oy, nx, ny);
+}
 
 /**
  * @brief 绘制盒背景 / Paint a box's background
@@ -343,10 +898,18 @@ static void paint_text_shadow(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float s
  * @param[in]     bb 盒的设备矩形 / Device rect of the box
  * @param[in]     radius 圆角半径 / Corner radius
  *
- * @note 线性渐变背景优先；否则纯色填充，radius > 0.5 时走圆角填充 / A linear-gradient background wins; otherwise a solid fill, using the rounded-rect path when `radius > 0.5`
+ * @note 背景色先铺底，再叠渐变或外链图像图层；radius > 0.5 时纯色走圆角填充 / The background colour is laid down first, then a gradient or external-image layer on top; a solid fill uses the rounded-rect path when `radius > 0.5`
  */
 static void paint_background(HpeStyle *bs, HpePixmap *pm, HpeRect bb, float radius)
 {
+    /* the colour is the bottom layer; an image / gradient sits above it */
+    if (bs->background.a > 0) {
+        if (radius > 0.5f)
+            hpe_fill_round_rect(pm, bb, radius, bs->background);
+        else
+            hpe_fill_rect(pm, bb, bs->background);
+    }
+
     if (bs->background_image.kind == HPE_BG_LINEAR_GRADIENT) {
         HpeRasterStop stops[HPE_MAX_GRADIENT_STOPS];
         int i;
@@ -358,12 +921,8 @@ static void paint_background(HpeStyle *bs, HpePixmap *pm, HpeRect bb, float radi
                                      bs->background_image.stop_count);
         return;
     }
-    if (bs->background.a > 0) {
-        if (radius > 0.5f)
-            hpe_fill_round_rect(pm, bb, radius, bs->background);
-        else
-            hpe_fill_rect(pm, bb, bs->background);
-    }
+    if (bs->background_image.kind == HPE_BG_URL)
+        paint_background_image(pm, bs, bb);
 }
 
 /**
@@ -578,6 +1137,7 @@ static void paint_group(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float scroll,
     /* shift the device origin so the box's top-left lands at the scratch origin */
     sub.dev_x = ctx->dev_x - (float)x0;
     sub.dev_y = ctx->dev_y - (float)y0;
+    sub.elem_scroll = ctx->elem_scroll;
     sub.group_depth = ctx->group_depth + 1;
     paint_box_inner(&sub, &scratch, box, scroll);
 
@@ -676,28 +1236,22 @@ static void paint_box(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float scroll)
  *
  * @note 依次绘制阴影、背景、边框、列表标记、文本阴影、文本 run 与装饰；原子行内 run 由子盒递归绘制 / Paints the shadow, background, borders, list marker, text shadow, text runs and decorations; atomic inline runs are painted via child recursion
  */
-static void paint_box_own_content(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float own_scroll,
-                                  HpeRect bb, float radius)
+/* Trace a box's paint call when HOPE_TRACE_PAINT is set. */
+static void paint_trace_box(HpeBox *box, HpeStyle *bs, HpeRect bb)
 {
-    HpeStyle *bs = &box->style;
+    if (!getenv("HOPE_TRACE_PAINT"))
+        return;
+    fprintf(stderr, "paint %s<%s> bb=(%.2f,%.2f %.2fx%.2f) bg=%02x%02x%02x%02x runs=%d\n",
+            box->kind == HPE_BOX_TEXT ? "T" : (box->kind == HPE_BOX_INLINE ? "I" : "B"),
+            box->node && box->node->tag ? box->node->tag : "?", bb.x, bb.y, bb.w, bb.h,
+            bs->background.a, bs->background.r, bs->background.g, bs->background.b,
+            box->line_count);
+}
+
+/* Blit the glyph runs of every line whose band intersects the clip. */
+static void paint_box_line_runs(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float own_scroll)
+{
     int i, r;
-
-    if (bs->box_shadow.valid)
-        paint_box_shadow(pm, box, bb, radius);
-    paint_background(bs, pm, bb, radius);
-    paint_borders(bs, pm, bb, radius);
-
-    if (getenv("HOPE_TRACE_PAINT"))
-        fprintf(stderr, "paint %s<%s> bb=(%.2f,%.2f %.2fx%.2f) bg=%02x%02x%02x%02x runs=%d\n",
-                box->kind == HPE_BOX_TEXT ? "T" : (box->kind == HPE_BOX_INLINE ? "I" : "B"),
-                box->node && box->node->tag ? box->node->tag : "?", bb.x, bb.y, bb.w, bb.h,
-                bs->background.a, bs->background.r, bs->background.g, bs->background.b,
-                box->line_count);
-
-    paint_list_marker(ctx, pm, box, own_scroll);
-    if (bs->text_shadow.valid)
-        paint_text_shadow(ctx, pm, box, own_scroll);
-
     for (i = 0; i < box->line_count; i++) {
         HpeLine *line = &box->lines[i];
         float baseline = snap_y(ctx_dev_y(ctx, line->y + line->baseline, own_scroll));
@@ -724,6 +1278,29 @@ static void paint_box_own_content(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, flo
             hpe_draw_text_mask(pm, x, y, mask, run->color);
         }
     }
+}
+
+static void paint_box_own_content(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float own_scroll,
+                                  HpeRect bb, float radius)
+{
+    HpeStyle *bs = &box->style;
+
+    if (bs->box_shadow.valid)
+        paint_box_shadow(pm, box, bb, radius);
+    paint_background(bs, pm, bb, radius);
+    paint_borders(bs, pm, bb, radius);
+    /* a replaced element paints its decoded content inside the content box,
+     * above the background and borders but below any generated text */
+    if (box->is_replaced)
+        paint_image_box(ctx, pm, box, own_scroll);
+
+    paint_trace_box(box, bs, bb);
+
+    paint_list_marker(ctx, pm, box, own_scroll);
+    if (bs->text_shadow.valid)
+        paint_text_shadow(ctx, pm, box, own_scroll);
+
+    paint_box_line_runs(ctx, pm, box, own_scroll);
     if (bs->text_decoration != HPE_TD_NONE)
         paint_text_decorations(ctx, pm, box, own_scroll, bs->text_decoration);
 }
@@ -784,6 +1361,55 @@ static void paint_box_children(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float 
 }
 
 /**
+ * @brief 绘制元素级纵向滚动条 / Paint an element's vertical scrollbar
+ *
+ * @details 轨道覆盖元素 padding box 的右侧 `scrollbar-width` 宽条带，滑块高度按
+ *           「可见高 / 内容高」的比例算出，位置按当前滚动偏移线性投影。
+ *          The track covers a `scrollbar-width` strip down the padding box's right edge; the thumb's height is the visible/content ratio and its position is the scroll offset projected linearly.
+ *
+ * @param[in]     ctx 绘制上下文 / Paint context
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     box 滚动容器盒 / Scroll-container box
+ * @param[in]     own_scroll 本盒所在层的滚动偏移 / The enclosing layer's scroll offset
+ *
+ * @note 宽度取 `scrollbar-width`（初始值 `auto` = 12px，`none` = 0 即不绘），保证最小滑块长度 20px / The width comes from `scrollbar-width` (initial `auto` = 12px, `none` = 0 so nothing is drawn) and the thumb is at least 20px long
+ */
+static void paint_box_scrollbar(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float own_scroll)
+{
+    float sw = box->style.scrollbar_width;
+    float port_h = box->scroll_port_h;
+    float content_h = port_h + box->scroll_max;
+    HpeRect track, thumb;
+    float thumb_h, pos;
+
+    if (!(sw > 0.0f) || !(port_h > 0.0f) || !(content_h > 0.0f))
+        return;
+    track = box->pad_box;
+    track.x += ctx->dev_x;
+    track.y = snap_y(ctx_dev_y(ctx, box->pad_box.y, own_scroll));
+    track.x = track.x + track.w - sw;
+    track.w = sw;
+
+    thumb_h = port_h * (port_h / content_h);
+    if (thumb_h < 20.0f)
+        thumb_h = 20.0f;
+    if (thumb_h > port_h)
+        thumb_h = port_h;
+    pos = box->scroll_max > 0.0f ? (box->scroll_y / box->scroll_max) * (port_h - thumb_h) : 0.0f;
+
+    /* the track is a light gutter, the thumb a darker slab inset by one pixel */
+    hpe_fill_rect(pm, track, hpe_rgba(240, 240, 240, 255));
+    thumb = track;
+    thumb.y += pos;
+    thumb.h = thumb_h;
+    thumb.x += 1.0f;
+    thumb.w -= 2.0f;
+    if (thumb.h > 2.0f)
+        thumb.h -= 2.0f;
+    hpe_fill_rect(pm, thumb, hpe_rgba(170, 170, 170, 255));
+}
+
+/**
  * @brief 按 overflow 裁剪后绘制子盒 / Paint the children clipped per `overflow`
  *
  * @param[in]     ctx 绘制上下文 / Paint context
@@ -792,7 +1418,9 @@ static void paint_box_children(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float 
  * @param[in]     scroll 纵向滚动偏移 / Vertical scroll offset
  * @param[in]     own_scroll 本盒的滚动偏移 / The box's own scroll offset
  *
- * @note hidden/scroll/auto 会为子树建立裁剪矩形；元素级滚动尚未实现，scroll/auto 对超出内容表现为 hidden / `hidden`/`scroll`/`auto` establish a clip rect; element-level scrolling is not modelled, so `scroll`/`auto` behave like `hidden` for overflow
+ * @note hidden/scroll/auto 会为子树建立裁剪矩形；`scroll`/`auto` 且内容溢出时，子树
+ *       按本盒的 `scroll_y` 整体上移，并在裁剪解除后于右缘补绘滚动条
+ *       / `hidden`/`scroll`/`auto` establish a clip rect; when `scroll`/`auto` content overflows, the subtree shifts by the box's `scroll_y` and a scrollbar is drawn at the right edge after the clip is lifted
  */
 static void paint_box_clipped_children(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float scroll,
                                        float own_scroll)
@@ -812,7 +1440,10 @@ static void paint_box_clipped_children(PaintCtx *ctx, HpePixmap *pm, HpeBox *box
         had_clip = 1;
     }
 
+    /* descendants of a scrolled element shift up by its own offset */
+    ctx->elem_scroll += box->scroll_y;
     paint_box_children(ctx, pm, box, scroll);
+    ctx->elem_scroll -= box->scroll_y;
 
     if (had_clip) {
         pm->clip_x0 = saved[0];
@@ -820,6 +1451,10 @@ static void paint_box_clipped_children(PaintCtx *ctx, HpePixmap *pm, HpeBox *box
         pm->clip_x1 = saved[2];
         pm->clip_y1 = saved[3];
     }
+    /* the scrollbar is chrome: drawn after the clip is lifted, on top of the
+     * content, only when the container actually overflows */
+    if (box->is_scroll_container && box->scroll_max > 0.0f)
+        paint_box_scrollbar(ctx, pm, box, own_scroll);
 }
 
 /**
@@ -888,6 +1523,7 @@ void hpe_paint_document(HpePixmap *pm, HpeBox *root, float scroll_y, HpeColor pa
     if (root) {
         ctx.dev_x = 0.0f;
         ctx.dev_y = origin_y;
+        ctx.elem_scroll = 0.0f;
         ctx.group_depth = 0;
         /* keep page content below the browser chrome */
         hpe_pixmap_set_clip(pm, hpe_rect(0.0f, origin_y, (float)pm->width,
@@ -932,4 +1568,58 @@ void hpe_paint_region(HpePixmap *pm, HpeBox *root, float scroll_y, HpeColor page
         paint_box(&ctx, pm, root, scroll_y);
     }
     hpe_pixmap_reset_clip(pm);
+}
+
+/**
+ * @brief 绘制页面级纵向滚动条 / Paint the page-level vertical scrollbar
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     view_top 视口顶边的设备 y / Device y of the viewport's top edge
+ * @param[in]     view_h 视口高度（像素）/ Viewport height in pixels
+ * @param[in]     scroll_y 当前滚动偏移 / Current scroll offset
+ * @param[in]     content_h 内容总高 / Total content height
+ * @param[in]     width 滚动条宽度（像素），不大于 0 时不绘 / Scrollbar width in pixels; nothing is drawn when not positive
+ *
+ * @note 纯 chrome：在右缘覆盖绘制，须在内容绘制并解除裁剪后调用 / Pure chrome: drawn over the right edge, called after the content is painted and the clip is lifted
+ */
+void hpe_paint_page_scrollbar(HpePixmap *pm, float view_top, float view_h, float scroll_y,
+                              float content_h, float width)
+{
+    HpeRect track, thumb;
+    float max_scroll, thumb_h, pos;
+
+    if (!pm || !pm->pixels || !(width > 0.0f) || !(view_h > 0.0f))
+        return;
+    /* no overflow: no scrollbar at all (matching a browser's overlay behaviour) */
+    if (!(content_h > view_h))
+        return;
+
+    max_scroll = content_h - view_h;
+    track = hpe_rect((float)pm->width - width, view_top, width, view_h);
+
+    thumb_h = view_h * (view_h / content_h);
+    if (thumb_h < 20.0f)
+        thumb_h = 20.0f;
+    if (thumb_h > view_h)
+        thumb_h = view_h;
+    if (scroll_y < 0.0f)
+        scroll_y = 0.0f;
+    if (scroll_y > max_scroll)
+        scroll_y = max_scroll;
+    pos = max_scroll > 0.0f ? (scroll_y / max_scroll) * (view_h - thumb_h) : 0.0f;
+
+    /* the track is a light gutter, the thumb a darker slab inset by one pixel,
+     * both painted with the 1/64 device grid so scrolled repaints stay exact */
+    track.y = snap_y(track.y);
+    hpe_fill_rect(pm, track, hpe_rgba(240, 240, 240, 255));
+    thumb = track;
+    thumb.y += pos;
+    thumb.h = thumb_h;
+    thumb.x += 1.0f;
+    thumb.w -= 2.0f;
+    if (thumb.h > 2.0f)
+        thumb.h -= 2.0f;
+    if (thumb.w < 1.0f)
+        thumb.w = 1.0f;
+    hpe_fill_rect(pm, thumb, hpe_rgba(170, 170, 170, 255));
 }

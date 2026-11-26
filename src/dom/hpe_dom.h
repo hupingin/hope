@@ -36,7 +36,13 @@ typedef struct HpeDomNode {
     struct HpeDomNode *content;
     void *listeners; /* DOM bridge: per-node event listener list (opaque) */
     void *box;       /* layout: box generated for this element (opaque) */
-    int hovered;     /* dynamic state: pointer is over this element (:hover) */
+    /* dynamic state driving the state pseudo-classes; all are maintained by the
+     * engine/host layer and read by the CSS matcher. */
+    int hovered;  /* :hover — pointer is over this element */
+    int focused;  /* :focus — this element owns the focus */
+    int active;   /* :active — pointer is pressed on this element */
+    int visited;  /* :visited — element was activated before */
+    int targeted; /* :target — element is the fragment target of the URL */
 } HpeDomNode;
 
 /**
@@ -74,12 +80,23 @@ HpeDomNode *hpe_dom_element(const char *tag);
 HpeDomNode *hpe_dom_text(const char *text);
 
 /**
+ * @brief 设置文本节点的内容 / Set the content of a text node
+ *
+ * @param[in,out] node 文本节点（其他类型直接返回）/ Text node; other node types return immediately
+ * @param[in]     text 新内容（`NULL` 视为空串）/ New content, `NULL` falls back to the empty string
+ *
+ * @note 以 `HPE_MUT_TEXT` 报告一次变更，使 `characterData` 观察者与引擎脏标记都能看到 / Reports one `HPE_MUT_TEXT` change so `characterData` observers and the engine's dirty tracker both see it
+ *
+ * @see hpe_dom_text
+ */
+void hpe_dom_set_text(HpeDomNode *node, const char *text);
+
+/**
  * @brief 创建一个文档节点 / Create a document node
  *
  * @return 新的文档节点 / The new document node
  */
 HpeDomNode *hpe_dom_document(void);
-
 /**
  * @brief 创建一个文档片段节点 / Create a document-fragment node
  *

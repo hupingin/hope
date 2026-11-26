@@ -11,7 +11,13 @@ typedef enum HpeDisplay {
     HPE_DISPLAY_BLOCK,
     HPE_DISPLAY_NONE,
     HPE_DISPLAY_INLINE_BLOCK,
-    HPE_DISPLAY_FLEX
+    HPE_DISPLAY_FLEX,
+    HPE_DISPLAY_GRID,            /* grid container */
+    HPE_DISPLAY_TABLE,           /* the table wrapper/root */
+    HPE_DISPLAY_TABLE_ROW,       /* <tr> */
+    HPE_DISPLAY_TABLE_CELL,      /* <td> / <th> */
+    HPE_DISPLAY_TABLE_ROW_GROUP, /* <thead> / <tbody> / <tfoot> */
+    HPE_DISPLAY_TABLE_CAPTION
 } HpeDisplay;
 
 /* flex container axes; only `row` is reverse-free, `*-reverse` is unsupported */
@@ -128,16 +134,39 @@ typedef struct HpeGradientStop {
 
 typedef enum HpeBackgroundKind {
     HPE_BG_NONE = 0,
-    HPE_BG_LINEAR_GRADIENT
+    HPE_BG_LINEAR_GRADIENT,
+    HPE_BG_URL /* an external image referenced by `background-image: url(...)` */
 } HpeBackgroundKind;
 
-/* parsed `background-image`: a linear gradient plus its stored stops */
+/* how a replaced element's content is fitted into its content box */
+typedef enum HpeObjectFit {
+    HPE_OBJECT_FIT_FILL = 0,
+    HPE_OBJECT_FIT_CONTAIN,
+    HPE_OBJECT_FIT_COVER,
+    HPE_OBJECT_FIT_NONE,
+    HPE_OBJECT_FIT_SCALE_DOWN
+} HpeObjectFit;
+
+/* how a background image layer tiles inside its positioning area */
+typedef enum HpeBgRepeat {
+    HPE_BG_REPEAT_REPEAT = 0,
+    HPE_BG_REPEAT_X,
+    HPE_BG_REPEAT_Y,
+    HPE_BG_REPEAT_NO_REPEAT
+} HpeBgRepeat;
+
+/* longest storable `url()` reference in `background-image` */
+#define HPE_BG_URL_MAX 512
+
+/* parsed `background-image`: a linear gradient plus its stored stops, or an
+ * external image referenced by `url(...)` */
 #define HPE_MAX_GRADIENT_STOPS 8
 typedef struct HpeBackground {
     HpeBackgroundKind kind;
     float angle_deg; /* 0 = to top, 90 = to right (css `to` direction mapped to degrees) */
     HpeGradientStop stops[HPE_MAX_GRADIENT_STOPS];
     int stop_count;
+    char url[HPE_BG_URL_MAX]; /* `kind == HPE_BG_URL`: the raw `url()` argument */
 } HpeBackground;
 
 /* a box-shadow / text-shadow (one layer) */
@@ -169,6 +198,33 @@ typedef enum HpeCursor {
     HPE_CURSOR_EW_RESIZE,
     HPE_CURSOR_NS_RESIZE
 } HpeCursor;
+
+/* flattening limits shared by the style struct and the cascade */
+#define HPE_CONTENT_MAX 256
+#define HPE_GRID_MAX_TRACKS 12
+
+/* a `background-position` / `background-size` pair (px or %; `auto` = negative sentinel) */
+typedef struct HpeBgPos {
+    float x, y;      /* position: px, or a percentage when `x_pct`/`y_pct` */
+    int x_pct, y_pct;
+    float size_x, size_y; /* size: px, or a percentage when `sx_pct`/`sy_pct` */
+    int sx_pct, sy_pct;
+    int size_auto;        /* 1 = `background-size: auto` (use the intrinsic size) */
+    int size_cover, size_contain;
+    int present;
+} HpeBgPos;
+
+/* one `grid-template-*` track: a length or a fraction (`fr`) */
+typedef struct HpeGridTrack {
+    int kind; /* 0 = px, 1 = fr, 2 = auto, 3 = % */
+    float value;
+} HpeGridTrack;
+
+typedef struct HpeGridSpec {
+    HpeGridTrack tracks[HPE_GRID_MAX_TRACKS];
+    int count;
+    int present;
+} HpeGridSpec;
 
 /* relationship of a compound to the compound on its left inside a selector */
 typedef enum HpeCombinator {
@@ -250,7 +306,38 @@ typedef enum HpeCombinator {
 #define HPE_PROP2_TRANSFORM           (1ull << 23)
 #define HPE_PROP2_TRANSITION          (1ull << 24)
 #define HPE_PROP2_ANIMATION           (1ull << 25)
+#define HPE_PROP2_CONTENT             (1ull << 26)
+#define HPE_PROP2_FLEX_WRAP           (1ull << 27)
+#define HPE_PROP2_ORDER               (1ull << 28)
+#define HPE_PROP2_FLEX_BASIS          (1ull << 29)
+#define HPE_PROP2_FLEX_SHRINK         (1ull << 30)
+#define HPE_PROP2_BACKGROUND_POSITION (1ull << 31)
+#define HPE_PROP2_BACKGROUND_SIZE     (1ull << 32)
+#define HPE_PROP2_RADIAL_GRADIENT     (1ull << 33)
+#define HPE_PROP2_GRID_TEMPLATE_COLUMNS (1ull << 34)
+#define HPE_PROP2_GRID_TEMPLATE_ROWS  (1ull << 35)
+#define HPE_PROP2_GRID_GAP            (1ull << 36)
+#define HPE_PROP2_DIRECTION           (1ull << 37)
+#define HPE_PROP2_SCROLLBAR_WIDTH     (1ull << 38)
+#define HPE_PROP2_TABLE_LAYOUT        (1ull << 39)
+#define HPE_PROP2_BORDER_SPACING      (1ull << 40)
+#define HPE_PROP2_ROW_REVERSE         (1ull << 41)
+#define HPE_PROP2_GRID_COLUMN         (1ull << 42)
+#define HPE_PROP2_GRID_ROW            (1ull << 43)
+#define HPE_PROP2_JUSTIFY_ITEMS       (1ull << 44)
+#define HPE_PROP2_ALIGN_CONTENT       (1ull << 45)
+#define HPE_PROP2_GRID_AUTO_FLOW      (1ull << 46)
+/* geometric properties of an external image layer: `background-repeat` plus the
+ * replaced-element `object-fit` / `object-position` pair */
+#define HPE_PROP2_BACKGROUND_REPEAT   (1ull << 47)
+#define HPE_PROP2_OBJECT_FIT          (1ull << 48)
+#define HPE_PROP2_OBJECT_POSITION     (1ull << 49)
 /* per-side border color uses one bit plus the shared HpeStyle.border_colors[4] */
+
+/* `scrollbar-width` initial value is `auto`, i.e. a classic 12px scrollbar. The
+ * resolved width is stored as plain pixels, and 0 (`scrollbar-width: none`) is a
+ * legal value, so the default cannot double as a "not set" sentinel. */
+#define HPE_SCROLLBAR_WIDTH_AUTO 12.0f
 
 /* A fully resolved (or partially, via `set`) inline style.
  * `line_height` <= 0 means "auto", a negative value -n means the n-multiple of font-size.
@@ -314,6 +401,41 @@ typedef struct HpeStyle {
     HpeTransform transform;
     int has_transition; /* parsed presence only; no interpolation clock yet */
     int has_animation;
+    /* generated content, resolved to text for ::before / ::after */
+    char content[HPE_CONTENT_MAX];
+    char attr_content[96]; /* `attr(name)` argument of `content`, resolved at box build */
+    int has_content;
+    /* flex item longhands */
+    int flex_wrap;         /* 0 = nowrap, 1 = wrap, 2 = wrap-reverse */
+    int order;
+    HpeLength flex_basis;
+    float flex_shrink;
+    int row_reverse;       /* flex-direction: *-reverse */
+    /* background placement (background-position / background-size) */
+    HpeBgPos bg_pos;
+    /* radial gradient parameters (kind stays HPE_BG_LINEAR_GRADIENT for linear) */
+    int bg_radial;         /* 1 when `background-image` was a radial-gradient */
+    int bg_radial_circle;  /* 1 for `circle`, 0 for `ellipse` */
+    float bg_radial_cx, bg_radial_cy, bg_radial_rx, bg_radial_ry; /* 0..1 relative */
+    /* grid container specs */
+    HpeGridSpec grid_cols;
+    HpeGridSpec grid_rows;
+    float grid_gap;
+    /* grid item placement (`grid-column` / `grid-row`, 1-based; 0 = auto,
+     * a negative value -n means `span n`) */
+    int grid_col_start, grid_col_end;
+    int grid_row_start, grid_row_end;
+    int justify_items;   /* HpeAlignItems values, applied to grid items */
+    int align_content;   /* HpeJustify values, applied to the whole grid */
+    int grid_auto_flow;  /* 0 = row, 1 = column */
+    int table_layout_fixed;
+    float border_spacing_h, border_spacing_v;
+    int direction_rtl;
+    float scrollbar_width;
+    /* replaced-element content fitting and external background-image tiling */
+    HpeObjectFit object_fit;
+    HpeBgPos object_pos; /* `object-position`, shares HpeBgPos' px / % form */
+    HpeBgRepeat bg_repeat;
 } HpeStyle;
 
 typedef struct HpeAttrSel {
@@ -362,6 +484,44 @@ typedef struct HpeMediaQuery {
     HpeMediaAlt alts[HPE_MEDIA_MAX_ALT];
 } HpeMediaQuery;
 
+/* pseudo-elements the engine materialises as anonymous boxes */
+typedef enum HpePseudoElement {
+    HPE_PE_NONE = 0,
+    HPE_PE_BEFORE,
+    HPE_PE_AFTER
+} HpePseudoElement;
+
+/* state / structural pseudo-class bits; a compound selector may carry several
+ * (`a:hover.foo:first-child`). Parametric forms (`:nth-child(an+b)`, `:not()`,
+ * `:is()`, `:where()`) have dedicated fields below instead. */
+#define HPE_PS_HOVER        (1u << 0)
+#define HPE_PS_FOCUS        (1u << 1)
+#define HPE_PS_ACTIVE       (1u << 2)
+#define HPE_PS_VISITED      (1u << 3)
+#define HPE_PS_FIRST_CHILD  (1u << 4)
+#define HPE_PS_LAST_CHILD   (1u << 5)
+#define HPE_PS_ONLY_CHILD   (1u << 6)
+#define HPE_PS_FIRST_OF_TYPE (1u << 7)
+#define HPE_PS_LAST_OF_TYPE  (1u << 8)
+#define HPE_PS_ONLY_OF_TYPE  (1u << 9)
+#define HPE_PS_EMPTY         (1u << 10)
+#define HPE_PS_CHECKED       (1u << 11)
+#define HPE_PS_DISABLED      (1u << 12)
+#define HPE_PS_ENABLED       (1u << 13)
+#define HPE_PS_LINK          (1u << 14)
+#define HPE_PS_TARGET        (1u << 15)
+
+/* one `an+b` formula as used by :nth-child() and friends; matches index i when
+ * a != 0 and (i - b) is a non-negative multiple of a (or, for a < 0, when i
+ * steps down from b and stays >= 1). `present` marks the pseudo being used. */
+typedef struct HpeNth {
+    int a; /* step; `odd` = 2, `even` = 2 with b = 0/1 */
+    int b; /* offset */
+    int present;
+} HpeNth;
+
+typedef struct HpeSelector HpeSelector;
+
 typedef struct HpeCompound {
     char *tag; /* NULL or "*" means any element */
     char *id;
@@ -371,16 +531,27 @@ typedef struct HpeCompound {
     HpeAttrSel *attrs;
     int attr_count;
     size_t attr_cap;
-    int pseudo_hover; /* :hover — matches only the hovered element */
+    unsigned pseudo; /* HPE_PS_* bits */
+    HpeNth nth_child;      /* :nth-child(an+b) */
+    HpeNth nth_last_child; /* :nth-last-child(an+b) */
+    HpeNth nth_of_type;    /* :nth-of-type(an+b) */
+    HpeNth nth_last_of_type; /* :nth-last-of-type(an+b) */
+    HpeSelector *not_list;   /* :not(...) argument (any match fails) */
+    int not_count;
+    HpeSelector *is_list;    /* :is(...) / :where(...) argument */
+    int is_count;
+    int is_where;            /* 1 for `:where()`, which contributes no specificity */
+    int pseudo_element;      /* HpePseudoElement */
     int comb; /* HpeCombinator for this part (relative to the previous part) */
 } HpeCompound;
 
-typedef struct HpeSelector {
+struct HpeSelector {
     HpeCompound *parts; /* left to right, the last part is the subject */
     int count;
     size_t cap;
     int specificity;
-} HpeSelector;
+};
+
 
 typedef struct HpeRule {
     HpeSelector *selectors;
@@ -524,6 +695,25 @@ void hpe_css_parse_declarations(const char *text, size_t length, HpeStyle *decl)
  */
 void hpe_css_compute(HpeStylesheet *sheet, const HpeDomNode *node, const HpeStyle *parent,
                      HpeStyle *out);
+
+/**
+ * @brief 计算 `::before` / `::after` 伪元素的计算样式 / Compute a `::before` / `::after` pseudo-element's style
+ *
+ * @details 从宿主元素的计算样式出发，套用所有选择器命中（末段带同向伪元素）的规则，并叠加宿主元素内联 `style` 的可继承部分；结果保留「已声明」位。
+ *          Starting from the host element's computed style, every rule whose selectors end in the matching pseudo-element is applied, and the inheritable part of the host's inline `style` is overlaid; the "declared" bits are kept.
+ *
+ * @param[in,out] sheet 样式表；为 `NULL` 时只用宿主样式 / Stylesheet; when `NULL` only the host style is used
+ * @param[in]     node 宿主元素 / Host element
+ * @param[in]     host_style 宿主元素的计算样式 / The host element's computed style
+ * @param[in]     which `HPE_PE_BEFORE` 或 `HPE_PE_AFTER` / `HPE_PE_BEFORE` or `HPE_PE_AFTER`
+ * @param[out]    out 接收计算后的样式 / Receives the computed style
+ *
+ * @note 只有末段复合选择器带有同向伪元素的选择器才参与匹配 / Only selectors whose final compound carries the matching pseudo-element take part
+ *
+ * @see hpe_css_compute
+ */
+void hpe_css_compute_pseudo(HpeStylesheet *sheet, const HpeDomNode *node, const HpeStyle *host_style,
+                            int which, HpeStyle *out);
 
 /**
  * @brief 返回内置的用户代理默认样式表文本 / Return the built-in user-agent stylesheet text

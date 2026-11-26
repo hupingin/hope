@@ -9,8 +9,10 @@
  * deterministic and headless-testable; tests pin values through the
  * constructor and the UTC setters instead of "now".
  *
- * Local time == UTC here: the engine has no timezone database, so getHours()
- * and getUTCHours() agree. This is called out in the design doc.
+ * Local time is resolved per instant through hpe_time_utc_offset_minutes,
+ * which reports the offset the system's timezone rules had in force at that
+ * moment. This is what makes `getHours()` follow DST transitions and the
+ * historical rule changes of the configured zone instead of assuming UTC.
  */
 #include "js/hpe_js_internal.h"
 
@@ -26,6 +28,7 @@
 #define MS_PER_SEC 1000.0
 
 static JsValue d_arg(JsValue *a, int argc, int i);
+static double local_to_utc(double local_ms);
 
 /**
  * @brief 把纪元天数转换为公历年月日 / Convert a day count since the epoch to a civil date
@@ -384,7 +387,8 @@ static JsValue native_date_ctor(HpeJs *js, JsValue thisv, JsValue *a, int argc, 
         t += (dv - 1.0) * MS_PER_DAY;
         t += hv * MS_PER_HOUR + miv * MS_PER_MIN + sv * MS_PER_SEC + msv;
         t = floor(t + (t >= 0 ? 0.5 : -0.5));
-        return js_objval(date_alloc(js, t));
+        /* the field form is local time, so shift it onto the UTC timeline */
+        return js_objval(date_alloc(js, local_to_utc(t)));
     }
 }
 
@@ -405,16 +409,9 @@ typedef struct {
  *
  * @note 负数毫秒的取整做了收尾处理，字段值全部非负 / Negative milliseconds are normalised so every field ends up non-negative
  */
-static int split_time(HpeJs *js, JsValue thisv, DateParts *p)
+static void split_ms_fields(double ms, DateParts *p)
 {
-    double ms;
     long long days, rem;
-    if (!date_value(js, thisv, &ms))
-        return 0;
-    if (ms != ms) {
-        memset(p, 0, sizeof(*p));
-        return 0;
-    }
     days = (long long)floor(ms / MS_PER_DAY);
     rem = (long long)ms - days * (long long)MS_PER_DAY;
     if (rem < 0) {
@@ -427,6 +424,145 @@ static int split_time(HpeJs *js, JsValue thisv, DateParts *p)
     p->mi = (int)((rem / 60000) % 60);
     p->se = (int)((rem / 1000) % 60);
     p->ms = (int)(rem % 1000);
+}
+
+/**
+ * @brief 某个时刻生效的时区信息 / The timezone in force at one instant
+ *
+ * @note `offset_min` 以「东为正」的分钟数表示，与 `getTimezoneOffset()` 的符号相反 / `offset_min` is minutes positive east, the opposite sign of `getTimezoneOffset()`
+ */
+typedef struct {
+    int offset_min;
+    int is_dst;
+    char name[64];
+} TzInfo;
+
+/**
+ * @brief 求某个 UTC 时刻生效的时区 / Resolve the timezone in force at a UTC instant
+ *
+ * @param[in]     ms 自 Unix 纪元起的毫秒 / Milliseconds since the Unix epoch
+ * @param[out]    tzi 接收时区信息 / Receives the timezone information
+ *
+ * @note 偏移按**该时刻**的历史规则求解，因此夏令时切换前后会不同 / The offset follows the rules **in force at that instant**, so it differs across a DST transition
+ */
+static void tz_at(double ms, TzInfo *tzi)
+{
+    tzi->name[0] = '\0';
+    tzi->is_dst = 0;
+    tzi->offset_min = hpe_time_utc_offset_minutes(ms, tzi->name, sizeof(tzi->name), &tzi->is_dst);
+}
+
+/**
+ * @brief 把本地墙钟毫秒换算成 UTC 毫秒 / Convert local wall-clock milliseconds to UTC milliseconds
+ *
+ * @param[in]     local_ms 按本地时间解释的墙钟毫秒 / Wall-clock milliseconds interpreted as local time
+ *
+ * @return 对应的 UTC 毫秒 / The matching UTC milliseconds
+ *
+ * @note 先按一次猜测求偏移，再用该偏移回算；跨越夏令时切换时二次求解收敛到正确一侧 / The offset is resolved from a first guess and then re-applied; around a DST transition the second resolution settles on the correct side
+ */
+static double local_to_utc(double local_ms)
+{
+    TzInfo t;
+    tz_at(local_ms, &t);
+    tz_at(local_ms - (double)t.offset_min * MS_PER_MIN, &t);
+    return local_ms - (double)t.offset_min * MS_PER_MIN;
+}
+
+/**
+ * @brief 把 Date 实例按**本地时间**拆成日历字段 / Split a Date instance into **local-time** calendar fields
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[out]    p 接收拆解后的字段结构 / Receives the split field structure
+ *
+ * @return 成功返回 1；`this` 非 Date 或时间值无效返回 0 / 1 on success; 0 when `this` is not a Date or the time value is invalid
+ *
+ * @note 先把 UTC 毫秒加上**该时刻生效**的时区偏移再拆字段 / The offset **in force at that instant** is added to the UTC milliseconds before the fields are split
+ */
+static int split_time(HpeJs *js, JsValue thisv, DateParts *p)
+{
+    double ms;
+    TzInfo t;
+    if (!date_value(js, thisv, &ms))
+        return 0;
+    if (ms != ms) {
+        memset(p, 0, sizeof(*p));
+        return 0;
+    }
+    tz_at(ms, &t);
+    split_ms_fields(ms + (double)t.offset_min * MS_PER_MIN, p);
+    return 1;
+}
+
+/**
+ * @brief 把 Date 实例拆成 UTC 日历字段 / Split a Date instance into UTC calendar fields
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[out]    p 接收拆解后的字段结构 / Receives the split field structure
+ *
+ * @return 成功返回 1；`this` 非 Date 或时间值无效返回 0 / 1 on success; 0 when `this` is not a Date or the time value is invalid
+ *
+ * @note `getUTC*` 走本函数，与本地时间的 `split_time` 相对 / Backs `getUTC*`, the counterpart of the local-time `split_time`
+ */
+static int split_time_utc(HpeJs *js, JsValue thisv, DateParts *p)
+{
+    double ms;
+    if (!date_value(js, thisv, &ms))
+        return 0;
+    if (ms != ms) {
+        memset(p, 0, sizeof(*p));
+        return 0;
+    }
+    split_ms_fields(ms, p);
+    return 1;
+}
+
+/**
+ * @brief 按 `ud` 选择本地或 UTC 拆分 / Split in local or UTC terms based on `ud`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 方法调用的 `this` / The `this` of the call
+ * @param[out]    p 接收拆解后的字段结构 / Receives the split field structure
+ * @param[in]     ud 非 `NULL` 表示 UTC 版本 / Non-`NULL` selects the UTC variant
+ *
+ * @return 成功返回 1 / 1 on success
+ *
+ * @note 同一份实现同时供给 `getHours` 与 `getUTCHours`，避免两份逐字段拷贝 / One implementation serves both `getHours` and `getUTCHours`, avoiding a second field-by-field copy
+ */
+static int split_like(HpeJs *js, JsValue thisv, DateParts *p, void *ud)
+{
+    return ud ? split_time_utc(js, thisv, p) : split_time(js, thisv, p);
+}
+
+/**
+ * @brief 把 Date 实例拆成 UTC 日历字段 / Split a Date instance into UTC calendar fields
+ *
+ * @param[in]     datev Date 值 / The Date value
+ * @param[out]    out 接收拆解后的字段 / Receives the split fields
+ *
+ * @return 成功返回 1，非 Date 或无效日期返回 0 / 1 on success, 0 for a non-Date or an invalid date
+ *
+ * @note 供 `Intl.DateTimeFormat` 复用，避免历法算法出现第二份副本 / Shared with `Intl.DateTimeFormat` so the civil
+ *       algorithm has a single copy
+ */
+int hpe_js_date_fields(JsValue datev, HpeDateFields *out)
+{
+    DateParts p;
+    if (datev.t != JS_OBJ || !datev.obj || datev.obj->kind != JS_OBJ_DATE)
+        return 0;
+    if (datev.obj->num_val != datev.obj->num_val)
+        return 0;
+    split_ms_fields(datev.obj->num_val, &p);
+    out->year = p.y;
+    out->month = p.mo;
+    out->day = p.d;
+    out->weekday = p.wd;
+    out->hour = p.h;
+    out->minute = p.mi;
+    out->second = p.se;
+    out->ms = p.ms;
     return 1;
 }
 
@@ -446,8 +582,7 @@ static JsValue date_get_full_year(HpeJs *js, JsValue thisv, JsValue *a, int argc
     DateParts p;
     HPE_UNUSED(a);
     HPE_UNUSED(argc);
-    HPE_UNUSED(ud);
-    if (!split_time(js, thisv, &p))
+    if (!split_like(js, thisv, &p, ud))
         return js_num(NAN);
     return js_num((double)p.y);
 }
@@ -468,8 +603,7 @@ static JsValue date_get_month(HpeJs *js, JsValue thisv, JsValue *a, int argc, vo
     DateParts p;
     HPE_UNUSED(a);
     HPE_UNUSED(argc);
-    HPE_UNUSED(ud);
-    if (!split_time(js, thisv, &p))
+    if (!split_like(js, thisv, &p, ud))
         return js_num(NAN);
     return js_num((double)(p.mo - 1));
 }
@@ -490,8 +624,7 @@ static JsValue date_get_date(HpeJs *js, JsValue thisv, JsValue *a, int argc, voi
     DateParts p;
     HPE_UNUSED(a);
     HPE_UNUSED(argc);
-    HPE_UNUSED(ud);
-    if (!split_time(js, thisv, &p))
+    if (!split_like(js, thisv, &p, ud))
         return js_num(NAN);
     return js_num((double)p.d);
 }
@@ -512,8 +645,7 @@ static JsValue date_get_day(HpeJs *js, JsValue thisv, JsValue *a, int argc, void
     DateParts p;
     HPE_UNUSED(a);
     HPE_UNUSED(argc);
-    HPE_UNUSED(ud);
-    if (!split_time(js, thisv, &p))
+    if (!split_like(js, thisv, &p, ud))
         return js_num(NAN);
     return js_num((double)p.wd);
 }
@@ -534,8 +666,7 @@ static JsValue date_get_hours(HpeJs *js, JsValue thisv, JsValue *a, int argc, vo
     DateParts p;
     HPE_UNUSED(a);
     HPE_UNUSED(argc);
-    HPE_UNUSED(ud);
-    if (!split_time(js, thisv, &p))
+    if (!split_like(js, thisv, &p, ud))
         return js_num(NAN);
     return js_num((double)p.h);
 }
@@ -556,8 +687,7 @@ static JsValue date_get_minutes(HpeJs *js, JsValue thisv, JsValue *a, int argc, 
     DateParts p;
     HPE_UNUSED(a);
     HPE_UNUSED(argc);
-    HPE_UNUSED(ud);
-    if (!split_time(js, thisv, &p))
+    if (!split_like(js, thisv, &p, ud))
         return js_num(NAN);
     return js_num((double)p.mi);
 }
@@ -578,8 +708,7 @@ static JsValue date_get_seconds(HpeJs *js, JsValue thisv, JsValue *a, int argc, 
     DateParts p;
     HPE_UNUSED(a);
     HPE_UNUSED(argc);
-    HPE_UNUSED(ud);
-    if (!split_time(js, thisv, &p))
+    if (!split_like(js, thisv, &p, ud))
         return js_num(NAN);
     return js_num((double)p.se);
 }
@@ -600,8 +729,7 @@ static JsValue date_get_ms(HpeJs *js, JsValue thisv, JsValue *a, int argc, void 
     DateParts p;
     HPE_UNUSED(a);
     HPE_UNUSED(argc);
-    HPE_UNUSED(ud);
-    if (!split_time(js, thisv, &p))
+    if (!split_like(js, thisv, &p, ud))
         return js_num(NAN);
     return js_num((double)p.ms);
 }
@@ -637,18 +765,21 @@ static JsValue date_get_time(HpeJs *js, JsValue thisv, JsValue *a, int argc, voi
  * @param[in]     argc 参数个数（未使用）/ Argument count (unused)
  * @param[in,out] ud 用户数据（未使用）/ User data (unused)
  *
- * @return 恒为 0 / Always 0
+ * @return 本地时间相对 UTC 的分钟数，西半球为正（与 `hpe_time_utc_offset_minutes` 反号）；无效日期返回 NaN / Minutes of local time behind UTC, positive west (the opposite sign of `hpe_time_utc_offset_minutes`); NaN for an invalid date
  *
- * @note 引擎没有时区数据库，本地时间即 UTC / The engine has no timezone database, so local time equals UTC
+ * @note 偏移按**该 Date 时刻**生效的历史时区规则求解，因此同一脚本里 1 月与 7 月的日期可能给出不同结果 / The offset follows the historical rules **in force at that instant**, so January and July dates may differ within one script
  */
 static JsValue date_get_tz_offset(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    HPE_UNUSED(js);
-    HPE_UNUSED(thisv);
+    double ms;
+    TzInfo t;
     HPE_UNUSED(a);
     HPE_UNUSED(argc);
     HPE_UNUSED(ud);
-    return js_num(0); /* no timezone database: local time is UTC */
+    if (!date_value(js, thisv, &ms) || ms != ms)
+        return js_num(NAN);
+    tz_at(ms, &t);
+    return js_num(-(double)t.offset_min);
 }
 
 /**
@@ -689,6 +820,7 @@ static JsValue date_set_time(HpeJs *js, JsValue thisv, JsValue *a, int argc, voi
  * @param[in,out] a 实参数组 / Actual argument array
  * @param[in]     argc 参数个数 / Argument count
  * @param[in]     first_field 首个实参写入的字段下标（0=年 … 6=毫秒）/ Field index the first argument writes to (0 = year … 6 = millisecond)
+ * @param[in]     utc 非 0 时墙钟字段按 UTC 解释，否则按本地时间 / Non-zero takes the wall-clock fields as UTC, otherwise as local time
  *
  * @return 写入后的时间值 / The stored time value
  *
@@ -696,7 +828,7 @@ static JsValue date_set_time(HpeJs *js, JsValue thisv, JsValue *a, int argc, voi
  *
  * @see date_set_full_year date_set_month date_set_date date_set_hours date_set_minutes date_set_seconds date_set_ms
  */
-static JsValue set_fields(HpeJs *js, JsValue thisv, JsValue *a, int argc, int first_field)
+static JsValue set_fields(HpeJs *js, JsValue thisv, JsValue *a, int argc, int first_field, int utc)
 {
     DateParts p;
     double f[7];
@@ -707,7 +839,7 @@ static JsValue set_fields(HpeJs *js, JsValue thisv, JsValue *a, int argc, int fi
         js_error(js, 0, "Date.prototype setter called on a non-Date");
         return js_num(NAN);
     }
-    if (!split_time(js, thisv, &p))
+    if (utc ? !split_time_utc(js, thisv, &p) : !split_time(js, thisv, &p))
         return js_num(NAN);
 
     f[0] = (double)p.y;
@@ -737,8 +869,8 @@ static JsValue set_fields(HpeJs *js, JsValue thisv, JsValue *a, int argc, int fi
     t += (f[2] - 1.0) * MS_PER_DAY;
     t += f[3] * MS_PER_HOUR + f[4] * MS_PER_MIN + f[5] * MS_PER_SEC + f[6];
     t = floor(t + (t >= 0 ? 0.5 : -0.5));
-    thisv.obj->num_val = t;
-    return js_num(t);
+    thisv.obj->num_val = utc ? t : local_to_utc(t);
+    return js_num(thisv.obj->num_val);
 }
 
 /**
@@ -748,7 +880,7 @@ static JsValue set_fields(HpeJs *js, JsValue thisv, JsValue *a, int argc, int fi
  * @param[in]     thisv 方法调用的 `this` / The `this` of the call
  * @param[in,out] a 实参数组 / Actual argument array
  * @param[in]     argc 参数个数 / Argument count
- * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ * @param[in,out] ud 非 `NULL` 表示 UTC 变体 / Non-`NULL` selects the UTC variant
  *
  * @return 写入后的时间值 / The stored time value
  *
@@ -756,8 +888,7 @@ static JsValue set_fields(HpeJs *js, JsValue thisv, JsValue *a, int argc, int fi
  */
 static JsValue date_set_full_year(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    HPE_UNUSED(ud);
-    return set_fields(js, thisv, a, argc, 0);
+    return set_fields(js, thisv, a, argc, 0, ud != NULL);
 }
 
 /**
@@ -767,7 +898,7 @@ static JsValue date_set_full_year(HpeJs *js, JsValue thisv, JsValue *a, int argc
  * @param[in]     thisv 方法调用的 `this` / The `this` of the call
  * @param[in,out] a 实参数组 / Actual argument array
  * @param[in]     argc 参数个数 / Argument count
- * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ * @param[in,out] ud 非 `NULL` 表示 UTC 变体 / Non-`NULL` selects the UTC variant
  *
  * @return 写入后的时间值 / The stored time value
  *
@@ -775,8 +906,7 @@ static JsValue date_set_full_year(HpeJs *js, JsValue thisv, JsValue *a, int argc
  */
 static JsValue date_set_month(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    HPE_UNUSED(ud);
-    return set_fields(js, thisv, a, argc, 1);
+    return set_fields(js, thisv, a, argc, 1, ud != NULL);
 }
 
 /**
@@ -786,7 +916,7 @@ static JsValue date_set_month(HpeJs *js, JsValue thisv, JsValue *a, int argc, vo
  * @param[in]     thisv 方法调用的 `this` / The `this` of the call
  * @param[in,out] a 实参数组 / Actual argument array
  * @param[in]     argc 参数个数 / Argument count
- * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ * @param[in,out] ud 非 `NULL` 表示 UTC 变体 / Non-`NULL` selects the UTC variant
  *
  * @return 写入后的时间值 / The stored time value
  *
@@ -794,8 +924,7 @@ static JsValue date_set_month(HpeJs *js, JsValue thisv, JsValue *a, int argc, vo
  */
 static JsValue date_set_date(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    HPE_UNUSED(ud);
-    return set_fields(js, thisv, a, argc, 2);
+    return set_fields(js, thisv, a, argc, 2, ud != NULL);
 }
 
 /**
@@ -805,7 +934,7 @@ static JsValue date_set_date(HpeJs *js, JsValue thisv, JsValue *a, int argc, voi
  * @param[in]     thisv 方法调用的 `this` / The `this` of the call
  * @param[in,out] a 实参数组 / Actual argument array
  * @param[in]     argc 参数个数 / Argument count
- * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ * @param[in,out] ud 非 `NULL` 表示 UTC 变体 / Non-`NULL` selects the UTC variant
  *
  * @return 写入后的时间值 / The stored time value
  *
@@ -813,8 +942,7 @@ static JsValue date_set_date(HpeJs *js, JsValue thisv, JsValue *a, int argc, voi
  */
 static JsValue date_set_hours(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    HPE_UNUSED(ud);
-    return set_fields(js, thisv, a, argc, 3);
+    return set_fields(js, thisv, a, argc, 3, ud != NULL);
 }
 
 /**
@@ -824,7 +952,7 @@ static JsValue date_set_hours(HpeJs *js, JsValue thisv, JsValue *a, int argc, vo
  * @param[in]     thisv 方法调用的 `this` / The `this` of the call
  * @param[in,out] a 实参数组 / Actual argument array
  * @param[in]     argc 参数个数 / Argument count
- * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ * @param[in,out] ud 非 `NULL` 表示 UTC 变体 / Non-`NULL` selects the UTC variant
  *
  * @return 写入后的时间值 / The stored time value
  *
@@ -832,8 +960,7 @@ static JsValue date_set_hours(HpeJs *js, JsValue thisv, JsValue *a, int argc, vo
  */
 static JsValue date_set_minutes(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    HPE_UNUSED(ud);
-    return set_fields(js, thisv, a, argc, 4);
+    return set_fields(js, thisv, a, argc, 4, ud != NULL);
 }
 
 /**
@@ -843,7 +970,7 @@ static JsValue date_set_minutes(HpeJs *js, JsValue thisv, JsValue *a, int argc, 
  * @param[in]     thisv 方法调用的 `this` / The `this` of the call
  * @param[in,out] a 实参数组 / Actual argument array
  * @param[in]     argc 参数个数 / Argument count
- * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ * @param[in,out] ud 非 `NULL` 表示 UTC 变体 / Non-`NULL` selects the UTC variant
  *
  * @return 写入后的时间值 / The stored time value
  *
@@ -851,8 +978,7 @@ static JsValue date_set_minutes(HpeJs *js, JsValue thisv, JsValue *a, int argc, 
  */
 static JsValue date_set_seconds(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    HPE_UNUSED(ud);
-    return set_fields(js, thisv, a, argc, 5);
+    return set_fields(js, thisv, a, argc, 5, ud != NULL);
 }
 
 /**
@@ -862,7 +988,7 @@ static JsValue date_set_seconds(HpeJs *js, JsValue thisv, JsValue *a, int argc, 
  * @param[in]     thisv 方法调用的 `this` / The `this` of the call
  * @param[in,out] a 实参数组 / Actual argument array
  * @param[in]     argc 参数个数 / Argument count
- * @param[in,out] ud 用户数据（未使用）/ User data (unused)
+ * @param[in,out] ud 非 `NULL` 表示 UTC 变体 / Non-`NULL` selects the UTC variant
  *
  * @return 写入后的时间值 / The stored time value
  *
@@ -870,8 +996,7 @@ static JsValue date_set_seconds(HpeJs *js, JsValue thisv, JsValue *a, int argc, 
  */
 static JsValue date_set_ms(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
-    HPE_UNUSED(ud);
-    return set_fields(js, thisv, a, argc, 6);
+    return set_fields(js, thisv, a, argc, 6, ud != NULL);
 }
 
 /* ---------------- formatting ---------------- */
@@ -900,7 +1025,8 @@ static JsValue date_to_iso(HpeJs *js, JsValue thisv, JsValue *a, int argc, void 
     HPE_UNUSED(a);
     HPE_UNUSED(argc);
     HPE_UNUSED(ud);
-    if (!split_time(js, thisv, &p))
+    memset(&p, 0, sizeof(p));
+    if (!split_time_utc(js, thisv, &p))
         js_throw_value(js, js_make_error(js, "RangeError", "Invalid time value"));
     if (p.y >= 0 && p.y <= 9999)
         snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ", p.y, p.mo, p.d, p.h,
@@ -936,6 +1062,21 @@ static JsValue date_to_json(HpeJs *js, JsValue thisv, JsValue *a, int argc, void
 }
 
 /**
+ * @brief 把偏移分钟格式化成 `GMT+HHMM` / Format an offset in minutes as `GMT+HHMM`
+ *
+ * @param[out]    buf 接收格式化结果的缓冲 / Buffer receiving the formatted text
+ * @param[in]     cap 缓冲容量（字节）/ Buffer capacity in bytes
+ * @param[in]     offset_min 本地时间相对 UTC 的偏移分钟（东为正）/ Offset in minutes, positive east
+ *
+ * @note 分钟部分用绝对值，负偏移不会写成 `-01-30` / The minute part uses the absolute value so a negative offset never renders as `-01-30`
+ */
+static void fmt_gmt_offset(char *buf, size_t cap, int offset_min)
+{
+    int a = offset_min < 0 ? -offset_min : offset_min;
+    snprintf(buf, cap, "GMT%c%02d%02d", offset_min < 0 ? '-' : '+', a / 60, a % 60);
+}
+
+/**
  * @brief `Date.prototype.toString`：输出人类可读日期 / `Date.prototype.toString`: render a human-readable date
  *
  * @param[in,out] js JS 运行时上下文 / JS runtime context
@@ -944,19 +1085,30 @@ static JsValue date_to_json(HpeJs *js, JsValue thisv, JsValue *a, int argc, void
  * @param[in]     argc 参数个数（未使用）/ Argument count (unused)
  * @param[in,out] ud 用户数据（未使用）/ User data (unused)
  *
- * @return 形如 `Tue Jan 02 2024 03:04:05 GMT+0000 (Coordinated Universal Time)` 的字符串；无效日期返回 `Invalid Date` / A string like `Tue Jan 02 2024 03:04:05 GMT+0000 (Coordinated Universal Time)`, or `Invalid Date`
+ * @return 形如 `Tue Jan 02 2024 11:04:05 GMT+0800 (China Standard Time)` 的字符串；无效日期返回 `Invalid Date` / A string like `Tue Jan 02 2024 11:04:05 GMT+0800 (China Standard Time)`, or `Invalid Date`
+ *
+ * @note 偏移与时区名取自该时刻生效的规则，无名称时省略括号部分 / The offset and name come from the rules in force at that instant; the parenthesised name is omitted when the platform reports none
  */
 static JsValue date_to_string(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     DateParts p;
-    char buf[80];
+    TzInfo t;
+    char buf[160], gmt[16];
+    double ms = 0;
     HPE_UNUSED(a);
     HPE_UNUSED(argc);
     HPE_UNUSED(ud);
-    if (!split_time(js, thisv, &p))
+    if (!split_like(js, thisv, &p, NULL))
         return js_string(js, "Invalid Date");
-    snprintf(buf, sizeof(buf), "%s %s %02d %04d %02d:%02d:%02d GMT+0000 (Coordinated Universal Time)",
-             day_names[p.wd], month_names[p.mo - 1], p.d, p.y, p.h, p.mi, p.se);
+    date_value(js, thisv, &ms);
+    tz_at(ms, &t);
+    fmt_gmt_offset(gmt, sizeof(gmt), t.offset_min);
+    if (t.name[0])
+        snprintf(buf, sizeof(buf), "%s %s %02d %04d %02d:%02d:%02d %s (%s)", day_names[p.wd],
+                 month_names[p.mo - 1], p.d, p.y, p.h, p.mi, p.se, gmt, t.name);
+    else
+        snprintf(buf, sizeof(buf), "%s %s %02d %04d %02d:%02d:%02d %s", day_names[p.wd],
+                 month_names[p.mo - 1], p.d, p.y, p.h, p.mi, p.se, gmt);
     return js_string(js, buf);
 }
 
@@ -977,8 +1129,7 @@ static JsValue date_to_date_string(HpeJs *js, JsValue thisv, JsValue *a, int arg
     char buf[64];
     HPE_UNUSED(a);
     HPE_UNUSED(argc);
-    HPE_UNUSED(ud);
-    if (!split_time(js, thisv, &p))
+    if (!split_like(js, thisv, &p, ud))
         return js_string(js, "Invalid Date");
     snprintf(buf, sizeof(buf), "%s %s %02d %04d", day_names[p.wd], month_names[p.mo - 1], p.d, p.y);
     return js_string(js, buf);
@@ -993,18 +1144,23 @@ static JsValue date_to_date_string(HpeJs *js, JsValue thisv, JsValue *a, int arg
  * @param[in]     argc 参数个数（未使用）/ Argument count (unused)
  * @param[in,out] ud 用户数据（未使用）/ User data (unused)
  *
- * @return 形如 `03:04:05 GMT+0000` 的字符串；无效日期返回 `Invalid Date` / A string like `03:04:05 GMT+0000`, or `Invalid Date`
+ * @return 形如 `11:04:05 GMT+0800` 的字符串；无效日期返回 `Invalid Date` / A string like `11:04:05 GMT+0800`, or `Invalid Date`
  */
 static JsValue date_to_time_string(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
 {
     DateParts p;
-    char buf[32];
+    TzInfo t;
+    char buf[48], gmt[16];
+    double ms = 0;
     HPE_UNUSED(a);
     HPE_UNUSED(argc);
     HPE_UNUSED(ud);
-    if (!split_time(js, thisv, &p))
+    if (!split_like(js, thisv, &p, NULL))
         return js_string(js, "Invalid Date");
-    snprintf(buf, sizeof(buf), "%02d:%02d:%02d GMT+0000", p.h, p.mi, p.se);
+    date_value(js, thisv, &ms);
+    tz_at(ms, &t);
+    fmt_gmt_offset(gmt, sizeof(gmt), t.offset_min);
+    snprintf(buf, sizeof(buf), "%02d:%02d:%02d %s", p.h, p.mi, p.se, gmt);
     return js_string(js, buf);
 }
 
@@ -1049,8 +1205,7 @@ static JsValue date_to_locale_date(HpeJs *js, JsValue thisv, JsValue *a, int arg
     char buf[48];
     HPE_UNUSED(a);
     HPE_UNUSED(argc);
-    HPE_UNUSED(ud);
-    if (!split_time(js, thisv, &p))
+    if (!split_like(js, thisv, &p, ud))
         return js_string(js, "Invalid Date");
     snprintf(buf, sizeof(buf), "%d/%d/%d", p.mo, p.d, p.y);
     return js_string(js, buf);
@@ -1073,8 +1228,7 @@ static JsValue date_to_locale_time(HpeJs *js, JsValue thisv, JsValue *a, int arg
     char buf[32];
     HPE_UNUSED(a);
     HPE_UNUSED(argc);
-    HPE_UNUSED(ud);
-    if (!split_time(js, thisv, &p))
+    if (!split_like(js, thisv, &p, ud))
         return js_string(js, "Invalid Date");
     snprintf(buf, sizeof(buf), "%02d:%02d:%02d", p.h, p.mi, p.se);
     return js_string(js, buf);
@@ -1207,19 +1361,24 @@ static void d_def(HpeJs *js, JsObj *target, const char *name, JsNativeFn fn)
 }
 
 /**
- * @brief 把一个已有属性值复制到另一个键名 / Copy an existing property value under another key
+ * @brief 安装一个别名属性，可携带新的用户数据 / Install an alias property, optionally with fresh user data
  *
  * @param[in,out] js JS 运行时上下文 / JS runtime context
  * @param[in,out] p 目标原型对象 / Target prototype object
  * @param[in]     name 新键名 / The new key
  * @param[in]     src_name 被复制的原键名 / The source key to copy from
+ * @param[in,out] ud 传给别名函数的用户数据；`NULL` 时与原函数完全共用 / User data for the alias; `NULL` shares the very same function object
  *
- * @note 用于让 `getUTC*`/`setUTC*` 与本地时间版本共用同一函数对象 / Lets `getUTC*`/`setUTC*` share the very same function objects
+ * @note 原函数是原生函数且 `ud` 非 `NULL` 时新建一个函数对象，使 `getUTC*`/`setUTC*` 能走 UTC 分支；否则直接共享函数对象 / When the source is a native function and `ud` is non-`NULL` a fresh function object is made so `getUTC*`/`setUTC*` can take the UTC branch; otherwise the function object is shared as-is
  */
-static void def_alias(HpeJs *js, JsObj *p, const char *name, const char *src_name)
+static void def_alias(HpeJs *js, JsObj *p, const char *name, const char *src_name, void *ud)
 {
     JsProp *prop = js_obj_own_prop(p, src_name);
-    if (prop)
+    if (!prop)
+        return;
+    if (ud && prop->val.t == JS_OBJ && prop->val.obj && prop->val.obj->kind == JS_OBJ_NATIVE)
+        js_obj_set(js, p, name, js_objval(js_native_new(js, prop->val.obj->native, ud)));
+    else
         js_obj_set(js, p, name, prop->val);
 }
 
@@ -1251,13 +1410,16 @@ static void date_def_methods(HpeJs *js, JsObj *p, const DateMethodDef *defs)
  * @param[in,out] p 目标原型对象 / Target prototype object
  * @param[in]     n 别名对数 / Number of alias pairs
  *
- * @note 别名对表形如 `{ 新名, 原名 }`，经 `def_alias` 逐个建立 / The table entries are `{ new_name, source_name }` pairs fed to `def_alias`
+ * @note 表项形如 `{ 新名, 原名 }`；名字以 `UTC` 开头的按 UTC 变体安装，其余与原函数共享 / Entries are `{ new_name, source_name }`; a name starting with `UTC` is installed as the UTC variant and the rest share the source function
  */
 static void date_def_aliases(HpeJs *js, JsObj *p, const char (*aliases)[2][24], int n)
 {
     int i;
-    for (i = 0; i < n; i++)
-        def_alias(js, p, aliases[i][0], aliases[i][1]);
+    for (i = 0; i < n; i++) {
+        const char *name = aliases[i][0];
+        void *ud = strstr(name, "UTC") ? (void *)1 : NULL;
+        def_alias(js, p, name, aliases[i][1], ud);
+    }
 }
 
 /* prototype methods; the getUTC* / setUTC* names alias these via alias_pairs */

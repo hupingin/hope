@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>image</title>
+<style>
+  html { background: #f4f6f8; }
+  body { margin: 12px; font-family: sans-serif; font-size: 13px; color: #22262b; }
+  h2 { font-size: 14px; margin: 14px 0 6px 0; color: #3a4048; }
+  .row { margin: 0 0 10px 0; }
+  .row img { vertical-align: middle; margin-right: 6px; border: 1px solid #c8ced6; }
+
+  /* intrinsic size, scaled by attribute, then by CSS */
+  .a { }
+  .b { width: 96px; }
+  .c { width: 120px; height: 40px; }
+
+  /* object-fit on a fixed box */
+  .fit { width: 90px; height: 60px; background: #dfe4ea; border: 1px solid #b6bdc6;
+         vertical-align: top; margin-right: 6px; }
+  .fit.fill    { object-fit: fill; }
+  .fit.contain { object-fit: contain; }
+  .fit.cover   { object-fit: cover; }
+  .fit.none    { object-fit: none; }
+  .fit.scale   { object-fit: scale-down; }
+
+  /* background-image layers */
+  .bg { width: 150px; height: 56px; border: 1px solid #b6bdc6; display: inline-block;
+        vertical-align: top; margin-right: 8px; }
+  .bg-one   { background-image: url(assets/logo.png); background-repeat: no-repeat; }
+  .bg-tile  { background-image: url(assets/tile.png); background-repeat: repeat; }
+  .bg-x     { background-image: url(assets/tile.png); background-repeat: repeat-x;
+              background-position: left top; }
+  .bg-cover { background-image: url(assets/photo.jpg); background-repeat: no-repeat;
+              background-size: cover; }
+  .bg-cont  { background-image: url(assets/photo.jpg); background-repeat: no-repeat;
+              background-size: contain; background-position: center; }
+  .bg-center{ background-image: url(assets/logo.png); background-repeat: no-repeat;
+              background-position: center; background-color: #eef3ff; }
+</style>
+</head>
+<body>
+  <h2>PNG / JPEG / GIF / BMP intrinsic size</h2>
+  <div class="row">
+    <img class="a" src="assets/logo.png" alt="logo">
+    <img class="a" src="assets/photo.jpg" alt="photo">
+    <img class="a" src="assets/anim.gif" alt="gif">
+    <img class="a" src="assets/stamp.bmp" alt="bmp">
+  </div>
+
+  <h2>author size: attribute, then CSS</h2>
+  <div class="row">
+    <img class="b" src="assets/logo.png" alt="attr" width="48">
+    <img class="c" src="assets/logo.png" alt="css">
+    <img src="assets/alpha.png" alt="alpha" width="96">
+  </div>
+
+  <h2>object-fit</h2>
+  <div class="row">
+    <img class="fit fill"    src="assets/photo.jpg" alt="fill">
+    <img class="fit contain" src="assets/photo.jpg" alt="contain">
+    <img class="fit cover"   src="assets/photo.jpg" alt="cover">
+    <img class="fit none"    src="assets/logo.png" alt="none">
+    <img class="fit scale"   src="assets/logo.png" alt="scale-down">
+  </div>
+
+  <h2>background-image: url()</h2>
+  <div class="row">
+    <span class="bg bg-one"></span>
+    <span class="bg bg-tile"></span>
+    <span class="bg bg-x"></span>
+    <span class="bg bg-cover"></span>
+    <span class="bg bg-cont"></span>
+    <span class="bg bg-center"></span>
+  </div>
+</body>
+</html>

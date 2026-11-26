@@ -53,6 +53,16 @@ python tools/doxy_apply.py --dry         # 全树校验：应为 0 blocks（幂�
 ## 一定要
 - 写代码的同时补齐设计文档
 
+## 规范参考：Chromium 源码（OpenGrok）
+- OpenGrok 实例当前索引 **`chromium-120.0.6099.298`**，可查 Blink 的布局/样式/解析/绘制实现，
+  用于**对齐 W3C/CSS/HTML 规范行为**、核对边界情形与命名。
+- **仅作参考**：本项目是纯 C 自研引擎，不照抄其 C++ 代码与架构，查清规范行为后用纯 C 自己实现。
+- 关键路径：`src/third_party/blink/renderer/core/{layout,css,paint,html}/`、`core/layout/{grid,ng,svg}/`。
+- 查法：`opengrok_list_projects` → `opengrok_search`
+  （`projects=chromium-120.0.6099.298`，`kind`=full/def/symbol/path/hist）
+  → `opengrok_get_file(path, start, end)`，path 如
+  `/chromium-120.0.6099.298/src/third_party/blink/renderer/core/layout/grid/layout_grid.h`。
+
 ## 渲染对齐基准
 - 参考页面 `copyResource/aim.html` 曾用作「真页面」验收样本（页头 flex 横排、SVG 思维导图
   （viewBox 缩放、三次曲线边、圆角节点）、JS 生成 DOM、点击折叠、`border-bottom` 分隔线）。

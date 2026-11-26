@@ -17,7 +17,7 @@
 
 /* ---------------- tokens ---------------- */
 
-enum { T_EOF, T_NUM, T_STR, T_IDENT, T_PUNCT, T_REGEX, T_TEMPLATE };
+enum { T_EOF, T_NUM, T_STR, T_IDENT, T_PUNCT, T_REGEX, T_TEMPLATE, T_BIGINT };
 
 typedef struct {
     int type;
@@ -383,18 +383,72 @@ static double lex_decimal_number(Lexer *lx, char *buf, size_t cap, size_t *n)
 }
 
 /**
+ * @brief 把 BigInt 字面量的源码片段登记为一个词法单元 / Record a BigInt literal's source span as one token
+ *
+ * @param[in,out] lx 词法分析器 / Lexer
+ * @param[in]     start 字面量起始下标（含前缀）/ Start index of the literal, prefix included
+ * @param[in]     end 字面量结束下标（不含 `n` 后缀）/ End index of the literal, `n` suffix excluded
+ * @param[in]     line 所在行号 / Source line
+ *
+ * @note 剥离 `0x`/`0b`/`0o` 前缀与 `_` 分隔符后把数字串存进 `text`；进制编码进 `num` 字段 /
+ *       The `0x`/`0b`/`0o` prefix and `_` separators are stripped from the digits stored in `text`;
+ *       the radix rides along in the `num` field
+ *
+ * @see lex_number
+ */
+static void lex_bigint_literal(Lexer *lx, size_t start, size_t end, int line)
+{
+    char buf[160];
+    size_t i = start, n = 0;
+    int radix = 10;
+
+    if (i + 1 < end && lx->src[i] == '0' &&
+        (lx->src[i + 1] == 'x' || lx->src[i + 1] == 'X')) {
+        radix = 16;
+        i += 2;
+    } else if (i + 1 < end && lx->src[i] == '0' &&
+               (lx->src[i + 1] == 'b' || lx->src[i + 1] == 'B')) {
+        radix = 2;
+        i += 2;
+    } else if (i + 1 < end && lx->src[i] == '0' &&
+               (lx->src[i + 1] == 'o' || lx->src[i + 1] == 'O')) {
+        radix = 8;
+        i += 2;
+    }
+    for (; i < end && n < sizeof(buf) - 1; i++) {
+        char c = lx->src[i];
+        int d;
+        if (c == '_')
+            continue;
+        d = (c >= '0' && c <= '9') ? c - '0'
+            : (c >= 'a' && c <= 'z') ? c - 'a' + 10
+            : (c >= 'A' && c <= 'Z') ? c - 'A' + 10 : -1;
+        /* BigInt literals are integers only: a fraction or exponent is a syntax error */
+        if (d < 0 || d >= radix)
+            js_error(lx->js, line, "invalid BigInt literal");
+        buf[n++] = c;
+    }
+    if (n == 0)
+        buf[n++] = '0';
+    lex_add(lx, T_BIGINT, (double)radix, buf, n, line);
+}
+
+/**
  * @brief 读取任意形式的数字字面量 / Scan a numeric literal of any form
  *
  * @param[in,out] lx 词法分析器 / Lexer
  *
- * @note 按 `0x`/`0b`/`0o` 前缀分派；容忍 BigInt 后缀 `n`（仍按 double 存储）/ Dispatches on the `0x`/`0b`/`0o` prefix; tolerates a trailing BigInt `n` (still stored as a double)
+ * @note 按 `0x`/`0b`/`0o` 前缀分派；带 `n` 后缀的字面量产出 `T_BIGINT`，其 `text` 为剥离前缀与下划线后的数字串 /
+ *       Dispatches on the `0x`/`0b`/`0o` prefix; a literal carrying the `n` suffix yields `T_BIGINT`
+ *       whose `text` holds the digits with prefix and underscores stripped
  *
  * @see lex_hex_number, lex_radix_number, lex_decimal_number
  */
 static void lex_number(Lexer *lx)
 {
-    char buf[80];
+    char buf[160];
     size_t n = 0;
+    size_t start = lx->pos;
     int start_line = lx->line;
     double v;
     char c0 = lx->src[lx->pos];
@@ -410,8 +464,11 @@ static void lex_number(Lexer *lx)
         v = lex_radix_number(lx, 8);
     else
         v = lex_decimal_number(lx, buf, sizeof(buf), &n);
-    if (lx->pos < lx->len && lx->src[lx->pos] == 'n')
-        lx->pos++; /* BigInt suffix: values are doubles here */
+    if (lx->pos < lx->len && lx->src[lx->pos] == 'n') {
+        lx->pos++;
+        lex_bigint_literal(lx, start, lx->pos - 1, start_line);
+        return;
+    }
     lex_add(lx, T_NUM, v, NULL, 0, start_line);
 }
 
@@ -442,8 +499,8 @@ static int lex_regex_allowed(Lexer *lx)
     if (lx->ntok == 0)
         return 1;
     t = &lx->toks[lx->ntok - 1];
-    if (t->type == T_NUM || t->type == T_STR || t->type == T_REGEX || t->type == T_TEMPLATE ||
-        t->type == T_EOF)
+    if (t->type == T_NUM || t->type == T_BIGINT || t->type == T_STR || t->type == T_REGEX ||
+        t->type == T_TEMPLATE || t->type == T_EOF)
         return 0;
     if (t->type == T_IDENT) {
         static const char *kw[] = {"return", "typeof",  "case",   "in",   "of",   "new",
@@ -1688,7 +1745,6 @@ static JsNode *p_arrow_params(P *p)
 static JsNode *p_unary(P *p);
 static JsNode *p_postfix(P *p);
 static JsNode *p_primary(P *p);
-static JsNode *p_assign_target(P *p);
 
 /**
  * @brief 解析类私有名 `#name` / Parse a private class name `#name`
@@ -2479,9 +2535,11 @@ static JsNode *p_async_expr(P *p)
  *
  * @param[in,out] p 解析器状态 / Parser state
  *
- * @return 一个 `JS_N_OBJECT` 节点（占位对象）/ A `JS_N_OBJECT` node (a placeholder object)
+ * @return 一个 `JS_N_OBJECT` 节点，`op` 置 1 标记为 `import.meta`（占位对象）/
+ *         A `JS_N_OBJECT` node with `op` set to 1 to mark it as `import.meta` (a placeholder object)
  *
- * @note 动态 `import()` 不受支持 / Dynamic `import()` is not supported
+ * @note 动态 `import()` 不受支持；`op = 1` 由 `object_literal` 识别并填充 `url` /
+ *       Dynamic `import()` is not supported; `op = 1` is recognised by `object_literal`, which fills in `url`
  */
 static JsNode *p_import_meta(P *p)
 {
@@ -2490,6 +2548,7 @@ static JsNode *p_import_meta(P *p)
     p_advance(p);
     if (p_cur(p)->type == T_IDENT)
         p_advance(p);
+    n->op = 1; /* marker: import.meta, not a real object literal */
     return n;
 }
 
@@ -2633,30 +2692,47 @@ static JsNode *p_paren_expr(P *p)
  *
  * @see p_ident_primary, p_paren_expr, p_array_literal
  */
+/**
+ * @brief 解析数字、大整数、字符串、正则与模板字面量 / Parse numeric, BigInt, string, regex and template literals
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ * @param[in]     t 当前 token / The current token
+ *
+ * @return 字面量节点；当前 token 不是字面量时返回 `NULL` / The literal node, or `NULL` when the token is not a literal
+ *
+ * @note 大整数与正则都把词法阶段拼好的文本随节点带走，求值期无需再次扫描源码 / BigInt and regex both carry the text assembled by the lexer, so evaluation never rescans the source
+ */
+static JsNode *p_literal(P *p, Tok *t)
+{
+    JsNode *n;
+    if (t->type == T_NUM) {
+        n = p_node(p, JS_N_NUM);
+        n->num = t->num;
+    } else if (t->type == T_BIGINT) {
+        n = p_node(p, JS_N_BIGINT);
+        n->num = t->num; /* radix */
+        n->str = t->text;
+    } else if (t->type == T_STR) {
+        n = p_node(p, JS_N_STR);
+        n->str = t->text;
+    } else if (t->type == T_REGEX) {
+        n = p_node(p, JS_N_REGEX);
+        n->str = t->text; /* "pattern\0flags" */
+    } else if (t->type == T_TEMPLATE) {
+        return p_template(p);
+    } else {
+        return NULL;
+    }
+    p_advance(p);
+    return n;
+}
+
 static JsNode *p_primary(P *p)
 {
     Tok *t = p_cur(p);
-
-    if (t->type == T_NUM) {
-        JsNode *n = p_node(p, JS_N_NUM);
-        n->num = t->num;
-        p_advance(p);
-        return n;
-    }
-    if (t->type == T_STR) {
-        JsNode *n = p_node(p, JS_N_STR);
-        n->str = t->text;
-        p_advance(p);
-        return n;
-    }
-    if (t->type == T_REGEX) {
-        JsNode *n = p_node(p, JS_N_REGEX);
-        n->str = t->text; /* "pattern\0flags" */
-        p_advance(p);
-        return n;
-    }
-    if (t->type == T_TEMPLATE)
-        return p_template(p);
+    JsNode *lit = p_literal(p, t);
+    if (lit)
+        return lit;
     if (t->type == T_IDENT) {
         JsNode *kw = p_ident_primary(p);
         if (kw)
@@ -3188,22 +3264,6 @@ static JsNode *p_expr(P *p)
     return first;
 }
 
-/**
- * @brief 解析 for 头部的赋值目标 / Parse the target of a `for` head
- *
- * @param[in,out] p 解析器状态 / Parser state
- *
- * @return 表达式节点 / The expression node
- *
- * @note 当前等同于 `p_expr`，形参与解构在 `p_binding_target` 处理 / Currently equivalent to `p_expr`; destructuring is handled by `p_binding_target`
- *
- * @see p_expr
- */
-static JsNode *p_assign_target(P *p)
-{
-    HPE_UNUSED(p);
-    return p_expr(p);
-}
 /* ---------------- statements ---------------- */
 
 /**
@@ -3257,23 +3317,6 @@ static JsNode *p_block(P *p)
         js_node_add(p->js, blk, p_statement(p));
     }
     p_expect(p, "}");
-    return blk;
-}
-
-/**
- * @brief 解析函数体 / Parse a function body
- *
- * @param[in,out] p 解析器状态 / Parser state
- *
- * @return 函数体块节点 / The body block node
- *
- * @note 等同于 `p_block` / Equivalent to `p_block`
- *
- * @see p_block
- */
-static JsNode *p_function_body(P *p)
-{
-    JsNode *blk = p_block(p);
     return blk;
 }
 

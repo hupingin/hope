@@ -15,16 +15,22 @@ typedef enum JsType {
     JS_BOOL,
     JS_NUM,
     JS_STR,
-    JS_OBJ
+    JS_OBJ,
+    JS_BIGINT,
+    JS_SYMBOL
 } JsType;
 
 typedef struct JsObj JsObj;
+typedef struct HpeBigInt HpeBigInt;
+typedef struct HpeSymbol HpeSymbol;
 
 typedef struct JsValue {
     JsType t;
     double num;
     char *str; /* JS_STR: heap-owned immutable string */
     JsObj *obj;
+    HpeBigInt *big; /* JS_BIGINT: arena-owned arbitrary-precision integer */
+    HpeSymbol *sym; /* JS_SYMBOL: arena-owned symbol identity */
 } JsValue;
 
 typedef struct HpeJs HpeJs;
@@ -162,5 +168,17 @@ void hpe_js_set_module_loader(HpeJs *js, const HpeJsModuleLoader *loader);
  * @note 相对 `import` 说明符以此目录为起点解析 / Relative `import` specifiers are resolved from this directory
  */
 void hpe_js_set_current_dir(HpeJs *js, const char *dir);
+
+/**
+ * @brief 设置入口模块路径（供 `import.meta.url` 使用）/ Set the entry module path (used by `import.meta.url`)
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     path 入口模块的文件路径；`NULL` 或空串表示未知 / Path of the entry module; `NULL` or empty when unknown
+ *
+ * @note 入口模块不经 `module_run`，因此它的路径需要宿主显式提供；未设置时 `import.meta.url`
+ *       回退为 `<eval>` / The entry module does not go through `module_run`, so its path must be supplied
+ *       by the host; `import.meta.url` falls back to `<eval>` when unset
+ */
+void hpe_js_set_entry_path(HpeJs *js, const char *path);
 
 #endif /* HPE_JS_H */

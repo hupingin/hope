@@ -1,0 +1,60 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>table layout</title>
+<style>
+  body { margin: 8px; font-family: sans-serif; font-size: 12px; }
+  .t { border-collapse: separate; border-spacing: 0; margin-bottom: 16px; }
+  .t td, .t th { border: 1px solid #444; padding: 2px 6px; }
+
+  /* 1. automatic column sizing follows the widest cell */
+  .auto  { width: 260px; }
+  .auto td.wide { width: 140px; }
+
+  /* 2. border-spacing separates the cells */
+  .spaced { width: 260px; border-spacing: 6px; }
+
+  /* 3. colspan / rowspan */
+  .span { width: 220px; }
+  .span .acc1 { background: #f6d5d5; }
+  .span .acc2 { background: #d5e8f6; }
+  .span .acc3 { background: #d9f2d9; }
+  .span .acc4 { background: #f6f2d5; }
+
+  /* 4. row groups + caption + th centring */
+  .grp { width: 260px; }
+  .grp th { background: #eee; }
+  .grp caption { font-weight: bold; }
+</style>
+</head>
+<body>
+
+<table class="t auto">
+  <tr><td class="wide">wide column</td><td>x</td></tr>
+  <tr><td>short</td><td>yyyyyyyy</td></tr>
+</table>
+
+<table class="t spaced">
+  <tr><td>a1</td><td>a2</td></tr>
+  <tr><td>b1</td><td>b2</td></tr>
+</table>
+
+<table class="t span">
+  <tr><td class="acc1" colspan="2">colspan=2 header</td></tr>
+  <tr><td class="acc2" rowspan="2">row<br>span<br>=2</td><td class="acc3">top right</td></tr>
+  <tr><td class="acc4">bottom right</td></tr>
+</table>
+
+<table class="t grp">
+  <caption>row groups</caption>
+  <thead><tr><th>H1</th><th>H2</th></tr></thead>
+  <tbody>
+    <tr><td>r1c1</td><td>r1c2</td></tr>
+    <tr><td>r2c1</td><td>r2c2</td></tr>
+  </tbody>
+  <tfoot><tr><td>f1</td><td>f2</td></tr></tfoot>
+</table>
+
+</body>
+</html>

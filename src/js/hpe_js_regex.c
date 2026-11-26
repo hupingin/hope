@@ -68,6 +68,8 @@ struct HpeRegex {
     ReNode *root;
     int ngroups;
     int flags;
+    /* named capture groups: index 1..ngroups, "" when unnamed */
+    char *names[RE_MAX_GROUPS + 1];
 };
 
 typedef struct {
@@ -75,6 +77,7 @@ typedef struct {
     const char *p;
     size_t i, len;
     int ngroups;
+    char *names[RE_MAX_GROUPS + 1]; /* name per capture index; "" when unnamed */
 } ReParser;
 
 /**
@@ -211,6 +214,80 @@ static uint32_t re_hex(ReParser *rp, int digits)
 }
 
 /**
+ * @brief 一条 Unicode 属性类到码点区间的映射 / One mapping from a Unicode property class to code-point ranges
+ *
+ * @note 只收录不含庞大的逐码点表的常用大类与若干常用属性 / Only the common general categories and a
+ *       few well-known properties are covered, since a full per-code-point table is out of scope
+ */
+typedef struct {
+    const char *name; /* property name after `\p{` */
+    uint32_t lo;
+    uint32_t hi;
+} ReUniSpan;
+
+/* Latin-1 .. BMP core ranges. These are coarse but accurate enough for the
+ * general categories that actually show up in text processing. */
+static const ReUniSpan re_uni_spans[] = {
+    {"Lu", 'A', 'Z'},          {"Lu", 0x00C0, 0x00D6}, {"Lu", 0x00D8, 0x00DE},
+    {"Lu", 0x0100, 0x0100},    {"Lu", 0x0391, 0x03A9}, {"Ll", 'a', 'z'},
+    {"Ll", 0x00DF, 0x00F6},    {"Ll", 0x00F8, 0x00FF}, {"Ll", 0x03B1, 0x03C9},
+    {"L", 'A', 'Z'},           {"L", 'a', 'z'},        {"L", 0x00C0, 0x024F},
+    {"L", 0x0391, 0x03C9},     {"L", 0x0400, 0x04FF},  {"L", 0x4E00, 0x9FFF},
+    {"L", 0x3040, 0x30FF},     {"L", 0xAC00, 0xD7AF},  {"Letter", 'A', 'Z'},
+    {"Letter", 'a', 'z'},      {"Letter", 0x00C0, 0x024F},
+    {"Letter", 0x0391, 0x03C9}, {"Letter", 0x4E00, 0x9FFF},
+    {"Number", '0', '9'},      {"N", '0', '9'},         {"Nd", '0', '9'},
+    {"Nd", 0x0660, 0x0669},    {"Nd", 0x06F0, 0x06F9},
+    {"P", 0x0021, 0x002F},     {"P", 0x003A, 0x0040},   {"P", 0x005B, 0x0060},
+    {"P", 0x007B, 0x007E},     {"Punctuation", 0x0021, 0x002F},
+    {"S", 0x0024, 0x0024},     {"S", 0x002B, 0x002B},   {"S", 0x003C, 0x003E},
+    {"S", 0x005E, 0x005E},     {"S", 0x0060, 0x0060},   {"S", 0x007C, 0x007C},
+    {"S", 0x007E, 0x007E},     {"Symbol", 0x002B, 0x002B},
+    {"Z", ' ', ' '},           {"Zs", ' ', ' '},        {"Z", 0x00A0, 0x00A0},
+    {"White_Space", ' ', ' '}, {"White_Space", '\t', '\r'}, {"White_Space", 0x00A0, 0x00A0},
+    {"Space", ' ', ' '},       {"ASCII", 0x0000, 0x007F},
+};
+
+/**
+ * @brief 把 `\p{Name}` / `\P{Name}` 展开为码点区间 / Expand `\p{Name}` or `\P{Name}` into code-point ranges
+ *
+ * @param[in,out] rp 正则解析器（游标位于 `{`）/ Regex parser with the cursor at `{`
+ * @param[in,out] cls 接收区间的字符类节点 / Character-class node receiving the ranges
+ * @param[in]     negate 非零表示 `\P`（补集）/ Non-zero means `\P`, which takes the complement
+ *
+ * @return 属性名被识别返回 1，否则 0（游标已越过 `{}`）/ 1 when the property was recognised, otherwise 0 (the cursor has skipped the braces either way)
+ *
+ * @note 未知属性名不报错、只当作空集，以免影响既有页面 / An unknown property silently yields the empty set rather than raising, so existing pages keep working
+ */
+static int re_add_unicode_class(ReParser *rp, ReNode *cls, int negate)
+{
+    size_t start, n, k;
+    int hit = 0;
+
+    if (rp->i >= rp->len || rp->p[rp->i] != '{')
+        return 0;
+    rp->i++;
+    start = rp->i;
+    while (rp->i < rp->len && rp->p[rp->i] != '}')
+        rp->i++;
+    n = rp->i - start;
+    if (rp->i < rp->len)
+        rp->i++;
+    for (k = 0; k < sizeof(re_uni_spans) / sizeof(re_uni_spans[0]); k++) {
+        const ReUniSpan *sp = &re_uni_spans[k];
+        if (strlen(sp->name) != n || strncmp(sp->name, rp->p + start, n) != 0)
+            continue;
+        re_add_range(cls, sp->lo, sp->hi);
+        hit = 1;
+    }
+    if (negate && hit) {
+        /* complement: the class node flips its own match test */
+        cls->negate = !cls->negate;
+    }
+    return 1;
+}
+
+/**
  * @brief 展开 `\d \D \w \W \s \S` 简写类为码点区间 / Expand a `\d \D \w \W \s \S` shorthand class into code-point ranges
  *
  * @param[in,out] cls 接收展开区间的字符类节点 / Character-class node receiving the ranges
@@ -299,6 +376,8 @@ static int re_escape(ReParser *rp, ReNode *cls, uint32_t *lit)
 {
     char e = rp->i < rp->len ? rp->p[rp->i++] : '\\';
 
+    if (e == 'p' || e == 'P')
+        return re_add_unicode_class(rp, cls, e == 'P');
     if (re_add_class_escapes(cls, e))
         return 1;
     if (e == 'u') {
@@ -429,6 +508,8 @@ typedef struct {
     int look;
     int behind;
     int negative;
+    const char *name; /* named group's name (arena), NULL when unnamed */
+    size_t name_len;
 } ReGroupHdr;
 
 /**
@@ -437,7 +518,9 @@ typedef struct {
  * @param[in,out] rp 正则解析器（游标前进）/ Regex parser, whose cursor advances
  * @param[out]    h 接收分组头信息（捕获/环视/后顾/否定）/ Receives the header info: capturing, look-around, look-behind and negation
  *
- * @note 识别 `(?:`、`(?=`、`(?!`、`(?<=`、`(?<!` 与 `(?<name>`；具名组的名字不保留 / Recognises `(?:`, `(?=`, `(?!`, `(?<=`, `(?<!` and `(?<name>`; the name itself is discarded
+ * @note 识别 `(?:`、`(?=`、`(?!`、`(?<=`、`(?<!` 与 `(?<name>`；具名组的名字记入 `h->name` /
+ *       Recognises `(?:`, `(?=`, `(?!`, `(?<=`, `(?<!` and `(?<name>`; a named group's name is
+ *       recorded in `h->name`
  */
 static void re_parse_group_header(ReParser *rp, ReGroupHdr *h)
 {
@@ -465,12 +548,42 @@ static void re_parse_group_header(ReParser *rp, ReGroupHdr *h)
         h->negative = rp->p[rp->i + 2] == '!';
         rp->i += 3;
     } else if (d == '<') {
-        rp->i += 2; /* (?<name>…) — the name is not retained */
+        size_t start;
+        rp->i += 2; /* (?<name>…) */
+        start = rp->i;
         while (rp->i < rp->len && rp->p[rp->i] != '>')
             rp->i++;
+        h->name = rp->p + start;
+        h->name_len = rp->i - start;
         if (rp->i < rp->len)
             rp->i++;
     }
+}
+
+/**
+ * @brief 记录一个捕获组的名字 / Record a capture group's name
+ *
+ * @param[in,out] rp 正则解析器 / Regex parser
+ * @param[in]     h 分组头信息 / Group-header information
+ *
+ * @return arena 中的名字串，无名组返回空串 / The name in the arena, or an empty string for an unnamed group
+ *
+ * @note 重名时经 `js_error` 报错（不返回）/ Raises through `js_error` on a duplicate name (does not return)
+ */
+static char *re_group_name(ReParser *rp, const ReGroupHdr *h)
+{
+    int i;
+    char *name;
+    if (!h->name || h->name_len == 0)
+        return "";
+    for (i = 1; i <= rp->ngroups - 1; i++)
+        if (rp->names[i] && strlen(rp->names[i]) == h->name_len &&
+            !strncmp(rp->names[i], h->name, h->name_len))
+            js_error(rp->js, 0, "duplicate capture group name");
+    name = (char *)hpe_js_alloc(rp->js, h->name_len + 1);
+    memcpy(name, h->name, h->name_len);
+    name[h->name_len] = '\0';
+    return name;
 }
 
 /**
@@ -484,10 +597,12 @@ static void re_parse_group_header(ReParser *rp, ReGroupHdr *h)
  * @return 分组/环视/后顾节点 / The group, look-around or look-behind node
  *
  * @note 捕获组数量超过 `RE_MAX_GROUPS` 后不再编号但仍会解析 / Beyond `RE_MAX_GROUPS` groups are still parsed but no longer numbered
+ *
+ * @see re_group_name
  */
 static ReNode *re_parse_group(ReParser *rp)
 {
-    ReGroupHdr h = {1, 0, 0, 0};
+    ReGroupHdr h = {1, 0, 0, 0, NULL, 0};
     ReNode *g;
 
     rp->i++; /* ( */
@@ -501,6 +616,7 @@ static ReNode *re_parse_group(ReParser *rp)
             if (rp->ngroups < RE_MAX_GROUPS)
                 rp->ngroups++;
             g->group = rp->ngroups;
+            rp->names[g->group] = re_group_name(rp, &h);
         }
     }
     g->child = re_parse_alt(rp);
@@ -1444,12 +1560,46 @@ int hpe_regex_group_count(HpeRegex *re)
 }
 
 /**
+ * @brief 取指定捕获组的名字 / Get a capture group's name
+ *
+ * @param[in] re 已编译的正则对象，可为 `NULL` / A compiled regex object, may be `NULL`
+ * @param[in] index 捕获组序号（1 起）/ Capture index, 1-based
+ *
+ * @return 组名字符串，无名或越界时返回 `NULL` / The group name, or `NULL` when unnamed or out of range
+ *
+ * @note 返回的指针归正则对象所有 / The returned pointer is owned by the regex object
+ */
+const char *hpe_regex_group_name(HpeRegex *re, int index)
+{
+    if (!re || index < 1 || index > re->ngroups || index > RE_MAX_GROUPS)
+        return NULL;
+    if (!re->names[index] || !re->names[index][0])
+        return NULL;
+    return re->names[index];
+}
+
+/**
+ * @brief 取正则对象的标志位掩码 / Get a regex object's flag bit mask
+ *
+ * @param[in] re 已编译的正则对象，可为 `NULL` / A compiled regex object, may be `NULL`
+ *
+ * @return 标志位掩码（`i`=1、`m`=2、`s`=4、`u`=8、`y`=16、`d`=32），`re` 为 `NULL` 时返回 0 /
+ *         The flag bit mask (`i`=1, `m`=2, `s`=4, `u`=8, `y`=16, `d`=32), or 0 when `re` is `NULL`
+ */
+int hpe_regex_flags(HpeRegex *re)
+{
+    return re ? re->flags : 0;
+}
+
+/**
  * @brief 从标志串解析 `/i /m /s` 开关 / Parse the `/i /m /s` switches from a flag string
  *
  * @param[in,out] re 目标正则对象，可为 `NULL` / Target regex object, may be `NULL`
  * @param[in]     flags 标志串，可为 `NULL` / Flag string, may be `NULL`
  *
- * @note 先清零再逐字符置位（`i`=1、`m`=2、`s`=4）；`g` 由调用方处理 / The bit mask is cleared first, then `i`=1, `m`=2 and `s`=4 are set per character; `g` is handled by the caller
+ * @note 先清零再逐字符置位（`i`=1、`m`=2、`s`=4、`u`=8、`y`=16、`d`=32）；`g` 由调用方处理 /
+ *       The bit mask is cleared first, then `i`=1, `m`=2, `s`=4, `u`=8, `y`=16 and `d`=32 are
+ *       set per character; `g` is handled by the caller
  */
 void hpe_regex_set_flags(HpeRegex *re, const char *flags)
 {
@@ -1466,6 +1616,12 @@ void hpe_regex_set_flags(HpeRegex *re, const char *flags)
             re->flags |= 2;
         else if (*p == 's')
             re->flags |= 4;
+        else if (*p == 'u')
+            re->flags |= 8;
+        else if (*p == 'y')
+            re->flags |= 16;
+        else if (*p == 'd')
+            re->flags |= 32;
     }
 }
 
@@ -1495,6 +1651,11 @@ HpeRegex *hpe_regex_compile(HpeJs *js, const char *pattern)
     rp.len = strlen(rp.p);
     re->root = re_parse_alt(&rp);
     re->ngroups = rp.ngroups;
+    {
+        int i;
+        for (i = 1; i <= rp.ngroups && i <= RE_MAX_GROUPS; i++)
+            re->names[i] = rp.names[i] ? rp.names[i] : "";
+    }
     return re;
 }
 
@@ -1512,14 +1673,57 @@ HpeRegex *hpe_regex_compile(HpeJs *js, const char *pattern)
  *
  * @return 匹配则返回匹配结束后的字节偏移，否则返回 -1 / The byte offset just past the match, or -1 when nothing matches
  *
- * @note 非多行模式下顶层 `^` 只可能在偏移 0 匹配，越过后提前退出 / A top-level `^` can only match at offset 0 outside multi-line mode, so the loop stops once past it
+ * @note 非多行模式下顶层 `^` 只可能在偏移 0 匹配，越过后提前退出；`y`（sticky）标志
+ *       使匹配只锚定在 `start` 处，不再向后滑动
+ *       A top-level `^` can only match at offset 0 outside multi-line mode, so the loop stops
+ *       once past it; the `y` (sticky) flag anchors the match at `start` instead of sliding on
  */
+/**
+ * @brief 在指定偏移处尝试一次匹配 / Attempt one match at a given offset
+ *
+ * @param[in,out] re 已编译的正则对象 / A compiled regex object
+ * @param[in,out] c 匹配上下文（`s`/`len`/`caps`/`ncaps`/`flags` 已就绪）/ Match context with `s`, `len`, `caps`, `ncaps` and `flags` already set up
+ * @param[in]     pos 起始字节偏移 / Starting byte offset
+ *
+ * @return 匹配结束的字节偏移，未匹配返回 -1 / The byte offset just past the match, or -1 when nothing matches
+ *
+ * @note 每次尝试前把 `caps` 全部复位为 -1；成功时写入 `caps[0]`/`caps[1]` /
+ *       `caps` is reset to -1 before every attempt, and `caps[0]`/`caps[1]` are filled in on success
+ */
+static int re_try_at(HpeRegex *re, ReCtx *c, size_t pos)
+{
+    ReK end;
+    int i;
+
+    c->depth = 0;
+    c->match_end = -1;
+    for (i = 0; i < c->ncaps; i++)
+        c->caps[i] = -1;
+    end.kind = K_END;
+    end.seq = NULL;
+    end.idx = 0;
+    end.rep = NULL;
+    end.count = 0;
+    end.at = 0;
+    end.group = 0;
+    end.gstart = 0;
+    end.target = -1;
+    end.next = NULL;
+    if (!re_node(re->root, &end, c, pos) || c->match_end < 0)
+        return -1;
+    /* caps[0]/caps[1] describe the whole match (byte offsets) */
+    if (c->ncaps > 1) {
+        c->caps[0] = (int)pos;
+        c->caps[1] = c->match_end;
+    }
+    return c->match_end;
+}
+
 int hpe_regex_search(HpeRegex *re, const char *subject, int start, int *captures, int ncaps)
 {
     ReCtx c;
     size_t pos;
     const char *s = subject ? subject : "";
-    int i;
 
     if (!re || !re->root)
         return -1;
@@ -1534,29 +1738,12 @@ int hpe_regex_search(HpeRegex *re, const char *subject, int start, int *captures
     if ((size_t)start > c.len)
         return -1;
     for (pos = (size_t)start; pos <= c.len; pos++) {
-        ReK end;
-        c.depth = 0;
-        c.match_end = -1;
-        for (i = 0; i < ncaps; i++)
-            captures[i] = -1;
-        end.kind = K_END;
-        end.seq = NULL;
-        end.idx = 0;
-        end.rep = NULL;
-        end.count = 0;
-        end.at = 0;
-        end.group = 0;
-        end.gstart = 0;
-        end.target = -1;
-        end.next = NULL;
-        if (re_node(re->root, &end, &c, pos) && c.match_end >= 0) {
-            /* caps[0]/caps[1] describe the whole match (byte offsets) */
-            if (ncaps > 1) {
-                captures[0] = (int)pos;
-                captures[1] = c.match_end;
-            }
-            return c.match_end;
-        }
+        int m = re_try_at(re, &c, pos);
+        if (m >= 0)
+            return m;
+        /* sticky: only the offset given by `start` is ever tried */
+        if (re->flags & 16)
+            break;
         /* a top-level ^ can only ever match at offset 0 (or after a newline) */
         if (!(re->flags & 2) && re->root->type == RE_SEQ && re->root->n > 0 &&
             re->root->kids[0]->type == RE_BOL && pos > 0)

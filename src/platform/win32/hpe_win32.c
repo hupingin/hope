@@ -396,6 +396,10 @@ static LRESULT hope_wnd_dispatch(HpeWindow *win, HWND hwnd, UINT msg, WPARAM wpa
         if (win->cb.on_key)
             win->cb.on_key(win->user, (int)wparam, hope_mods());
         return 0;
+    case WM_KEYUP:
+        if (win->cb.on_key_up)
+            win->cb.on_key_up(win->user, (int)wparam, hope_mods());
+        return 0;
     case WM_CHAR:
         return hope_on_char(win, wparam);
     case WM_LBUTTONDOWN:
@@ -526,6 +530,206 @@ double hpe_time_epoch_ms(void)
     u.LowPart = ft.dwLowDateTime;
     u.HighPart = ft.dwHighDateTime;
     return (double)u.QuadPart / 10000.0 - 11644473600000.0;
+}
+
+/**
+ * @brief 把 UTF-16 时区名转成 UTF-8 / Convert a UTF-16 timezone name to UTF-8
+ *
+ * @param[in]     w UTF-16 源文本 / Source UTF-16 text
+ * @param[out]    out 接收 UTF-8 的缓冲 / Receives the UTF-8 text
+ * @param[in]     cap 缓冲容量（字节）/ Buffer capacity in bytes
+ *
+ * @note 转换失败时写入空串 / Writes an empty string when the conversion fails
+ */
+static void tz_name_utf8(const WCHAR *w, char *out, int cap)
+{
+    if (!out || cap <= 0)
+        return;
+    out[0] = '\0';
+    if (w && w[0])
+        WideCharToMultiByte(CP_UTF8, 0, w, -1, out, cap, NULL, NULL);
+}
+
+/**
+ * @brief 求某组时区规则下 UTC 时刻的偏移分钟 / Offset in minutes for a UTC instant under one rule set
+ *
+ * @param[in]     tzi 时区规则 / The timezone rules
+ * @param[in]     utc 待换算的 UTC 时刻 / The UTC instant to convert
+ * @param[out]    out_dst 接收夏令时标志，可为 `NULL` / Receives the daylight flag, may be `NULL`
+ *
+ * @return 本地时间相对 UTC 的偏移分钟；换算失败返回 0 / Offset in minutes, or 0 when the conversion fails
+ *
+ * @note 由 `SystemTimeToTzSpecificLocalTime` 换算后回推差值，因此自动包含该年的夏令时规则 / The difference is derived after `SystemTimeToTzSpecificLocalTime`, so that year's daylight rule is accounted for automatically
+ */
+static int tz_offset_for(const TIME_ZONE_INFORMATION *tzi, const SYSTEMTIME *utc, int *out_dst)
+{
+    SYSTEMTIME loc;
+    FILETIME fa, fb;
+    ULARGE_INTEGER ua, ub;
+    double diff;
+    if (!SystemTimeToTzSpecificLocalTime(tzi, utc, &loc))
+        return 0;
+    SystemTimeToFileTime(utc, &fa);
+    SystemTimeToFileTime(&loc, &fb);
+    ua.LowPart = fa.dwLowDateTime;
+    ua.HighPart = fa.dwHighDateTime;
+    ub.LowPart = fb.dwLowDateTime;
+    ub.HighPart = fb.dwHighDateTime;
+    diff = ((double)ub.QuadPart - (double)ua.QuadPart) / 600000000.0;
+    if (out_dst)
+        *out_dst = tzi->DaylightDate.wMonth != 0 && loc.wHour != utc->wHour;
+    return (int)(diff >= 0 ? diff + 0.5 : diff - 0.5);
+}
+
+/**
+ * @brief 求某个 UTC 时刻的系统时区偏移 / Resolve the system timezone offset at a UTC instant
+ *
+ * @param[in]     epoch_ms 自 Unix 纪元起的 UTC 毫秒 / UTC milliseconds since the Unix epoch
+ * @param[out]    out_name 接收时区名的缓冲，可为 `NULL` / Receives the timezone name, may be `NULL`
+ * @param[in]     cap `out_name` 的容量（字节，UTF-8）/ Capacity of `out_name` in bytes, UTF-8
+ * @param[out]    out_dst 接收是否为夏令时的标志，可为 `NULL` / Receives the daylight-saving flag, may be `NULL`
+ *
+ * @return 本地时间相对 UTC 的偏移分钟数（东为正）/ Offset in minutes, positive east
+ *
+ * @note 用 `GetTimeZoneInformationForYear` 取**该年份生效**的规则，因此夏令时起止日期随年份变化；该 API 不可用时退回当前规则 / `GetTimeZoneInformationForYear` supplies the rules **in force for that year**, so DST boundaries track the year; the current rules are used when that call is unavailable
+ */
+int hpe_time_utc_offset_minutes(double epoch_ms, char *out_name, size_t cap, int *out_dst)
+{
+    DYNAMIC_TIME_ZONE_INFORMATION dyn;
+    TIME_ZONE_INFORMATION tzi;
+    ULARGE_INTEGER u;
+    SYSTEMTIME utc;
+    int ok;
+
+    ZeroMemory(&dyn, sizeof(dyn));
+    GetDynamicTimeZoneInformation(&dyn);
+    u.QuadPart = (unsigned long long)(epoch_ms + 11644473600000.0) * 10000ULL;
+    ZeroMemory(&utc, sizeof(utc));
+    ok = FileTimeToSystemTime((FILETIME *)&u, &utc) != 0;
+    ZeroMemory(&tzi, sizeof(tzi));
+    if (!ok)
+        GetTimeZoneInformation(&tzi);
+    else if (!GetTimeZoneInformationForYear(utc.wYear, &dyn, &tzi))
+        GetTimeZoneInformation(&tzi);
+    if (out_name)
+        tz_name_utf8(out_dst ? tzi.DaylightName : tzi.StandardName, out_name, (int)cap);
+    if (out_dst)
+        *out_dst = 0;
+    return tz_offset_for(&tzi, &utc, out_dst);
+}
+
+/* ---------------- coroutines ---------------- */
+
+/**
+ * @brief 协程句柄 / Coroutine handle
+ *
+ * @note Win32 用 Fiber 实现：入口跑在自己的栈上，`SwitchToFiber` 即挂起/恢复，
+ *       因此 `yield` 处冻结的 C 调用栈可以原样续跑。
+ *       Backed by a Win32 Fiber: the entry runs on its own stack and `SwitchToFiber` does the
+ *       suspend/resume, so the C call stack frozen at a `yield` resumes exactly where it stopped.
+ */
+struct HpeCoro {
+    void *fiber;      /* the coroutine's own fiber / 协程自身的 fiber */
+    void *caller;     /* fiber to switch back to on yield / yield 时切回的 fiber */
+    void (*entry)(void *);
+    void *user;
+    int finished;
+    int started;
+};
+
+/**
+ * @brief Fiber 入口：先调用用户入口，再把 finished 置位并交还控制权 / Fiber entry: run the user entry, mark it finished, hand control back
+ *
+ * @param[in,out] ud 指向 `HpeCoro` / Points at the `HpeCoro`
+ *
+ * @note 用户入口返回后不再切回协程体，所以**末尾那次** `SwitchToFiber` 是必要的，否则 `resume` 会永远等下去 / After the user entry returns the fiber must still switch back once, or `resume` would wait forever
+ */
+static void CALLBACK coro_trampoline(void *ud)
+{
+    HpeCoro *c = (HpeCoro *)ud;
+    c->entry(c->user);
+    c->finished = 1;
+    SwitchToFiber(c->caller);
+}
+
+/**
+ * @brief 在当前线程上创建一个协程 / Create a coroutine on the current thread
+ *
+ * @param[in]     entry 协程入口函数 / Coroutine entry point
+ * @param[in,out] user 透传给入口函数的指针 / Pointer forwarded to the entry function
+ * @param[in]     stack_size 栈字节数，0 表示默认 / Stack size in bytes, 0 for the default
+ *
+ * @return 新协程；失败返回 `NULL` / The new coroutine, or `NULL` on failure
+ *
+ * @note 线程首次调用时会先 `ConvertThreadToFiber`，使其自身也能作为 `caller` / The thread is converted to a fiber on first use so it can act as the `caller` side
+ */
+HpeCoro *hpe_coro_create(void (*entry)(void *), void *user, size_t stack_size)
+{
+    HpeCoro *c = (HpeCoro *)calloc(1, sizeof(*c));
+    if (!c)
+        return NULL;
+    if (!IsThreadAFiber() && !ConvertThreadToFiber(NULL)) {
+        free(c);
+        return NULL;
+    }
+    c->entry = entry;
+    c->user = user;
+    c->fiber = CreateFiber(stack_size ? stack_size : 0, coro_trampoline, c);
+    if (!c->fiber) {
+        free(c);
+        return NULL;
+    }
+    return c;
+}
+
+/**
+ * @brief 把控制权交给协程，直到它 `yield` 或结束 / Hand control to a coroutine until it yields or finishes
+ *
+ * @param[in,out] coro 目标协程 / Target coroutine
+ *
+ * @return 协程仍在运行返回 1；已结束返回 0 / 1 when still live, 0 when finished
+ *
+ * @note `caller` 每次进入前重设，因此嵌套协程（生成器里再开生成器）也能回到正确的调用者 / `caller` is re-read on entry so nested coroutines return to the right frame
+ */
+int hpe_coro_resume(HpeCoro *coro)
+{
+    if (!coro || coro->finished)
+        return 0;
+    coro->caller = GetCurrentFiber();
+    coro->started = 1;
+    SwitchToFiber(coro->fiber);
+    return !coro->finished;
+}
+
+/**
+ * @brief 从协程内部把控制权交还调用者 / Yield control back to the resumer from inside a coroutine
+ *
+ * @param[in,out] coro 当前协程 / The current coroutine
+ */
+void hpe_coro_yield(HpeCoro *coro)
+{
+    if (coro && coro->caller)
+        SwitchToFiber(coro->caller);
+}
+
+/**
+ * @brief 销毁协程并释放其栈 / Destroy a coroutine and release its stack
+ *
+ * @param[in,out] coro 目标协程；`NULL` 时无操作 / Target coroutine; a `NULL` argument is a no-op
+ *
+ * @note `DeleteFiber` 会直接丢弃协程栈而不展开任何 C 帧，这与 JS 里「未跑完的生成器被回收」
+ *       的语义一致；它只能从**别的** fiber 上对挂起的协程调用，调用方须保证这一点。
+ *       `DeleteFiber` discards the coroutine stack without unwinding any C frame, which matches
+ *       how JS reclaims an unfinished generator; it must only be called from a different fiber,
+ *       which the caller is responsible for.
+ */
+void hpe_coro_destroy(HpeCoro *coro)
+{
+    if (!coro)
+        return;
+    if (coro->fiber && coro->fiber != GetCurrentFiber())
+        DeleteFiber(coro->fiber);
+    free(coro);
 }
 
 /**

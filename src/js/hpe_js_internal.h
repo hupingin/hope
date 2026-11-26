@@ -25,8 +25,30 @@ typedef enum {
     JS_OBJ_ERROR,
     JS_OBJ_MAP,
     JS_OBJ_ARGUMENTS,
-    JS_OBJ_DATE
+    JS_OBJ_DATE,
+    JS_OBJ_PROXY,
+    JS_OBJ_WEAKMAP,
+    JS_OBJ_ITER,
+    JS_OBJ_GEN
 } JsObjKind;
+
+/* typed-array element kinds. The order is the installation order and indexes
+ * HpeJs.ta_proto, so it must stay in sync with the name table in
+ * hpe_js_buffer.c. */
+typedef enum {
+    TA_INT8 = 0,
+    TA_UINT8,
+    TA_UINT8C,
+    TA_INT16,
+    TA_UINT16,
+    TA_INT32,
+    TA_UINT32,
+    TA_FLOAT32,
+    TA_FLOAT64,
+    TA_BIGINT64,
+    TA_BIGUINT64,
+    k_ta_count
+} TaKind;
 
 /* function flags: mirrored in JsObj.fn_flags and, for AST function nodes, in
  * JsNode.op (the parser and interpreter share the bit layout) */
@@ -123,6 +145,12 @@ struct JsObj {
     JsReaction *reactions_tail;
     /* module namespace */
     struct JsModule *module;
+    /* JS_OBJ_PROXY: the wrapped target lives in `payload_obj` and the trap table
+     * (a plain object built from the handler argument) in `payload`. The target
+     * keeps the proxy's prototype so `instanceof` and `Object.getPrototypeOf`
+     * behave as if the proxy were the target itself. */
+    struct JsObj *proxy_target;
+    struct JsObj *proxy_handler;
 };
 
 struct JsReaction {
@@ -435,6 +463,17 @@ int js_obj_delete(HpeJs *js, JsObj *obj, const char *key);
  * @note 键名数组用 `malloc` 分配，调用方需 `free` / The array is `malloc`ed and must be freed by the caller
  */
 int js_obj_own_keys(JsObj *obj, char ***out, int *count);
+
+/**
+ * @brief 取对象自身的符号键标识 / Read an object's own symbol-key identities
+ *
+ * @param[in,out] obj 目标对象 / Target object
+ * @param[out]    out 接收符号标识数组（`malloc`，调用方 `free`）/ Receives the symbol ids (`malloc`ed, freed by the caller)
+ * @param[out]    count 接收个数 / Receives the count
+ *
+ * @return 符号个数 / The number of symbol keys
+ */
+int js_obj_own_symbols(JsObj *obj, long long **out, int *count);
 
 /**
  * @brief 返回对象自身属性个数 / Return the number of own properties
@@ -774,6 +813,7 @@ enum {
     JS_N_CALL, JS_N_MEMBER, JS_N_UPDATE, JS_N_REGEX, JS_N_NEW, JS_N_SPREAD,
     JS_N_THIS, JS_N_SUPER_CALL, JS_N_SUPER_MEMBER, JS_N_YIELD, JS_N_AWAIT,
     JS_N_SEQ, JS_N_FUNC_EXPR, JS_N_ARROW, JS_N_TEMPLATE, JS_N_TAGGED,
+    JS_N_BIGINT /* `num` holds the radix, `str` the digits */,
     /* patterns (destructuring) */
     JS_N_PAT_ARR, JS_N_PAT_OBJ, JS_N_PAT_DEFAULT, JS_N_PAT_REST,
     JS_N_OPTCHAIN /* placeholder for an optional-chain link */
@@ -898,9 +938,32 @@ struct HpeJs {
     JsObj *set_proto;
     JsObj *map_proto;
     JsObj *symbol_proto;
+    /* global symbol registry backing `Symbol.for` / `Symbol.keyFor` */
+    JsObj *symbol_registry;
+    JsObj *bigint_proto;
+    /* binary data: ArrayBuffer plus the typed-array views built over it */
+    JsObj *arraybuffer_proto;
+    JsObj *dataview_proto;
+    JsObj **ta_proto; /* [k_ta_count], indexed by TaKind */
+    JsObj *ta_proto_base;
     JsObj *date_proto;
-    /* generator support: collect `yield` values eagerly (see design doc §12.7) */
+    JsObj *weakmap_proto;
+    JsObj *weakset_proto;
+    JsObj *weakref_proto;
+    JsObj *finreg_proto;
+    /* generator support. `yield_sink` is the old eager-mode collector and stays
+     * only so a nested eager run still has somewhere to append; a real generator
+     * instead parks here while its fiber is suspended. */
     JsObj *yield_sink;
+    /* the coroutine backing a running generator, NULL outside one */
+    struct HpeJsGen *gen_active;
+    /* suspended generator waiting to be resumed, set by `yield` */
+    struct HpeJsGen *gen_waiting;
+    /* Unique marker object for `Generator.prototype.return`. Resuming with a
+     * return completion must unwind the body so `finally` blocks run, but must
+     * NOT be catchable by a user `catch`, so it travels as a distinguished
+     * object that `exec_try_catch` recognises and passes through. */
+    JsObj *gen_ret_sentinel;
     /* microtask queue (Promise jobs and then() reactions) */
     JsJob *jobs_head;
     JsJob *jobs_tail;
@@ -910,11 +973,22 @@ struct HpeJs {
     int timer_count;
     size_t timer_cap;
     int next_timer_id;
+    /* monotonic creation counter: a pump snapshots it so callbacks queued from
+     * inside another callback do not run until the next pump */
+    int next_timer_seq;
+    /* HTML timer nesting level of the callback currently on the stack, 0 when
+     * no timer callback is running. A timer created from inside a callback
+     * inherits this + 1, and past level 5 the 4 ms floor applies. */
+    int timer_level;
+    /* Set while a native constructor body runs, so it can tell `new X()` from
+     * a plain call; the two need different results (`this` vs an error). */
+    int in_ctor;
     /* modules */
     JsModule *modules;
     JsModule *current_module; /* module being evaluated (import/export target) */
     HpeJsModuleLoader loader;
     const char *current_dir; /* directory of the module currently being evaluated */
+    const char *entry_path;  /* host-supplied path of the entry module (import.meta.url) */
     int strict;              /* global "use strict" */
     int array_methods_done;  /* Array.prototype methods installed once */
     void *mutation_state;    /* HpeJsMutationState (see hpe_js_mutation.h) */
@@ -1041,6 +1115,43 @@ void hpe_js_set_current_dir(HpeJs *js, const char *dir);
  */
 void hpe_js_date_install(HpeJs *js);
 
+/**
+ * @brief 拆解后的公历字段（供 `Intl.DateTimeFormat` 使用）/ Split Gregorian fields, used by `Intl.DateTimeFormat`
+ *
+ * @note 月份为 1..12，星期为 0（周日）..6，与 `DateParts` 一致 / The month is 1..12 and the weekday is 0
+ *       (Sunday)..6, matching `DateParts`
+ */
+typedef struct HpeDateFields {
+    int year;
+    int month; /* 1..12 */
+    int day;
+    int weekday; /* 0 = Sunday */
+    int hour;
+    int minute;
+    int second;
+    int ms;
+} HpeDateFields;
+
+/**
+ * @brief 把 Date 值拆成 UTC 日历字段 / Split a Date value into UTC calendar fields
+ *
+ * @param[in]     datev Date 值 / The Date value
+ * @param[out]    out 接收拆解后的字段 / Receives the split fields
+ *
+ * @return 成功返回 1，非 Date 或无效日期返回 0 / 1 on success, 0 for a non-Date or an invalid date
+ */
+int hpe_js_date_fields(JsValue datev, HpeDateFields *out);
+
+/**
+ * @brief 创建 `Intl` 命名空间并挂在全局 / Build the `Intl` namespace and expose it globally
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ *
+ * @note 提供 `NumberFormat` / `DateTimeFormat` / `Collator` 及 `getCanonicalLocales` /
+ *       Provides `NumberFormat` / `DateTimeFormat` / `Collator` plus `getCanonicalLocales`
+ */
+void hpe_js_intl_install(HpeJs *js);
+
 /* regex (hpe_js_regex.c): compiled once per literal, matched on demand */typedef struct HpeRegex HpeRegex;
 /**
  * @brief 编译正则模式串为匹配程序 / Compile a regex pattern into a matcher program
@@ -1077,6 +1188,26 @@ int hpe_regex_search(HpeRegex *re, const char *subject, int start, int *captures
  * @return 捕获组个数，`re` 为 `NULL` 时返回 0 / The capture group count, or 0 when `re` is `NULL`
  */
 int hpe_regex_group_count(HpeRegex *re);
+
+/**
+ * @brief 取指定捕获组的名字 / Get a capture group's name
+ *
+ * @param[in] re 已编译的正则对象，可为 `NULL` / A compiled regex object, may be `NULL`
+ * @param[in] index 捕获组序号（1 起）/ Capture index, 1-based
+ *
+ * @return 组名字符串，无名或越界时返回 `NULL` / The group name, or `NULL` when unnamed or out of range
+ */
+const char *hpe_regex_group_name(HpeRegex *re, int index);
+
+/**
+ * @brief 取正则对象的标志位掩码 / Get a regex object's flag bit mask
+ *
+ * @param[in] re 已编译的正则对象，可为 `NULL` / A compiled regex object, may be `NULL`
+ *
+ * @return 标志位掩码（`i`=1、`m`=2、`s`=4、`u`=8、`y`=16、`d`=32），`re` 为 `NULL` 时返回 0 /
+ *         The flag bit mask, or 0 when `re` is `NULL`
+ */
+int hpe_regex_flags(HpeRegex *re);
 
 /**
  * @brief 由标志串设置 `/i /m /s` 开关 / Apply the `/i /m /s` switches from a flag string
@@ -1127,5 +1258,481 @@ int js_iter_len(HpeJs *js, JsValue v);
  * @see js_iter_len
  */
 JsValue js_iter_at(HpeJs *js, JsValue v, int i);
+
+/**
+ * @brief 按迭代模式从 Map / Set 取一项 / Pull one item from a Map / Set according to an iteration mode
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     src 数据源（Map / Set）/ The source, a Map or Set
+ * @param[in]     i 元素下标 / Element index
+ * @param[in]     mode 模式：1 键、2 值、3 `[键,值]`、4 `[值,值]` / Mode: 1 keys, 2 values, 3 `[key, value]`, 4 `[value, value]`
+ *
+ * @return 按模式换算出的项 / The item mapped through the mode
+ *
+ * @note 迭代器对象（`JS_OBJ_ITER`）的 `next`/展开共用此函数 / Shared by a collection iterator's `next`
+ *       and by spread
+ *
+ * @see js_iter_at
+ */
+JsValue js_iter_source_item(HpeJs *js, JsValue src, int i, int mode);
+
+/* ---------------- BigInt ---------------- */
+
+/**
+ * @brief 判断一个值是否为 BigInt 原语 / Test whether a value is a BigInt primitive
+ *
+ * @param[in] v 值 / Value
+ *
+ * @return 是 BigInt 返回 1，否则 0 / 1 when the value is a BigInt, otherwise 0
+ */
+int js_is_bigint(JsValue v);
+
+/**
+ * @brief 由 `long long` 构造 BigInt / Build a BigInt from a `long long`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     v 源数值 / Source value
+ *
+ * @return 新的 BigInt 值 / The new BigInt value
+ */
+JsValue js_bigint_from_i64(HpeJs *js, long long v);
+
+/**
+ * @brief 由指定进制的数字串构造 BigInt / Build a BigInt from a digit string in the given radix
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     digits 数字串（不含符号与进制前缀）/ Digit string, without sign or radix prefix
+ * @param[in]     radix 进制（2..36）/ The radix (2..36)
+ *
+ * @return 新的 BigInt 值 / The new BigInt value
+ *
+ * @note 非数字字符被忽略，因此调用方应先做语法校验 / Non-digit characters are skipped, so callers should validate the syntax first
+ */
+JsValue js_bigint_from_str(HpeJs *js, const char *digits, int radix);
+
+/**
+ * @brief 按进制把 BigInt 转成字符串 / Render a BigInt in the given radix
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     v BigInt 值 / A BigInt value
+ * @param[in]     radix 进制（2..36）/ The radix (2..36)
+ *
+ * @return arena 中的字符串 / A string in the arena
+ *
+ * @note 进制越界时抛出 `RangeError` / Throws a `RangeError` when the radix is out of range
+ */
+char *js_bigint_to_radix(HpeJs *js, JsValue v, int radix);
+
+/**
+ * @brief 判断 BigInt 是否为零 / Test whether a BigInt is zero
+ *
+ * @param[in] v BigInt 值 / A BigInt value
+ *
+ * @return 为零返回 1 / 1 when the value is zero
+ */
+int js_bigint_is_zero(JsValue v);
+
+/**
+ * @brief 取 BigInt 的符号 / Read the sign of a BigInt
+ *
+ * @param[in] v BigInt 值 / A BigInt value
+ *
+ * @return -1、0 或 1 / -1, 0 or 1
+ */
+int js_bigint_sign(JsValue v);
+
+/**
+ * @brief 把 BigInt 近似转成 double / Convert a BigInt to a double, approximately
+ *
+ * @param[in] v BigInt 值 / A BigInt value
+ *
+ * @return 最接近的 double；溢出为 ±Infinity / The nearest double, or ±Infinity on overflow
+ */
+double js_bigint_to_number(JsValue v);
+
+/**
+ * @brief BigInt 加/减 / BigInt addition and subtraction
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     l 左操作数 / Left operand
+ * @param[in]     r 右操作数 / Right operand
+ * @param[in]     sub 非零表示做减法 / Non-zero to subtract
+ *
+ * @return 结果 / The result
+ */
+JsValue js_bigint_add(HpeJs *js, JsValue l, JsValue r, int sub);
+
+/**
+ * @brief BigInt 乘法 / BigInt multiplication
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     l 左操作数 / Left operand
+ * @param[in]     r 右操作数 / Right operand
+ *
+ * @return 积 / The product
+ */
+JsValue js_bigint_mul(HpeJs *js, JsValue l, JsValue r);
+
+/**
+ * @brief BigInt 除法或取模 / BigInt division or remainder
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     l 被除数 / Dividend
+ * @param[in]     r 除数 / Divisor
+ * @param[in]     want_rem 非零表示取模 / Non-zero to take the remainder
+ *
+ * @return 商或余数 / The quotient or remainder
+ *
+ * @note 除数为零时抛出 `RangeError` / Throws a `RangeError` when the divisor is zero
+ */
+JsValue js_bigint_divmod(HpeJs *js, JsValue l, JsValue r, int want_rem);
+
+/**
+ * @brief BigInt 求负 / Negate a BigInt
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     v 操作数 / The operand
+ *
+ * @return `-v` / `-v`
+ */
+JsValue js_bigint_neg(HpeJs *js, JsValue v);
+
+/**
+ * @brief 比较两个 BigInt / Compare two BigInts
+ *
+ * @param[in] l 左操作数 / Left operand
+ * @param[in] r 右操作数 / Right operand
+ *
+ * @return 负数、0 或正数 / A negative number, zero or a positive number
+ */
+int js_bigint_cmp(JsValue l, JsValue r);
+
+/**
+ * @brief BigInt 幂运算 / BigInt exponentiation
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     l 底数 / Base
+ * @param[in]     r 指数 / Exponent
+ *
+ * @return `l ** r` / `l ** r`
+ *
+ * @note 指数为负时抛出 `RangeError` / Throws a `RangeError` for a negative exponent
+ */
+JsValue js_bigint_pow(HpeJs *js, JsValue l, JsValue r);
+
+/**
+ * @brief BigInt 按位与/或/异或 / BigInt bitwise and / or / xor
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     op `JS_OP_BAND` / `JS_OP_BOR` / `JS_OP_BXOR` / Operator
+ * @param[in]     l 左操作数 / Left operand
+ * @param[in]     r 右操作数 / Right operand
+ *
+ * @return 结果 / The result
+ *
+ * @note 按无限位二进制补码语义计算 / Computed with infinite-width two's-complement semantics
+ */
+JsValue js_bigint_bitop(HpeJs *js, int op, JsValue l, JsValue r);
+
+/**
+ * @brief BigInt 按位取反 / Bitwise complement of a BigInt
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     v 操作数 / The operand
+ *
+ * @return `~v` / `~v`
+ */
+JsValue js_bigint_not(HpeJs *js, JsValue v);
+
+/**
+ * @brief BigInt 移位 / Shift a BigInt
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     l 被移位的值 / The value being shifted
+ * @param[in]     r 移位量 / Shift count
+ * @param[in]     left 非零表示左移 / Non-zero for a left shift
+ *
+ * @return 结果 / The result
+ *
+ * @note 右移按算术移位（向下取整）语义 / A right shift follows arithmetic (floor) semantics
+ */
+JsValue js_bigint_shift(HpeJs *js, JsValue l, JsValue r, int left);
+
+/**
+ * @brief `BigInt.asIntN` / `BigInt.asUintN` 的共用实现 / Shared body of `BigInt.asIntN` and `BigInt.asUintN`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     bits 位宽 / Bit width
+ * @param[in]     v 被截断的 BigInt / The value to truncate
+ * @param[in]     signedp 非零表示有符号截断 / Non-zero for a signed truncation
+ *
+ * @return 截断后的 BigInt / The truncated BigInt
+ *
+ * @note 位宽非法（NaN、负数）时抛出 `RangeError` / Throws a `RangeError` for an invalid bit width
+ */
+JsValue js_bigint_asn(HpeJs *js, double bits, JsValue v, int signedp);
+
+/**
+ * @brief 安装 ArrayBuffer、DataView 与全部 TypedArray / Install ArrayBuffer, DataView and every TypedArray
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ *
+ * @note 由全局安装流程调用一次；TypedArray 原型按 `TaKind` 下标存入 `js->ta_proto` / Called once by the global installer; typed-array prototypes land in `js->ta_proto`, indexed by `TaKind`
+ */
+void hpe_js_buffer_install(HpeJs *js);
+
+/**
+ * @brief 判断是否为本引擎的 TypedArray / Test whether a value is one of this engine's typed arrays
+ *
+ * @param[in] v 待测值 / The value to test
+ *
+ * @return 是 TypedArray 返回 1 / 1 when it is a typed array
+ *
+ * @note `Array.isArray` 与 `js_values_equal` 用它排除 TypedArray / `Array.isArray` and `js_values_equal` use this to exclude typed arrays
+ */
+int hpe_js_is_typed_array(JsValue v);
+
+/* ---------------- real Symbol primitive ---------------- */
+
+/**
+ * @brief 新建一个唯一符号 / Create a fresh unique symbol
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     desc 描述文本，可为 `NULL` / Description, may be `NULL`
+ *
+ * @return 类型为 `JS_SYMBOL` 的值 / A value of type `JS_SYMBOL`
+ */
+JsValue js_symbol_new(HpeJs *js, const char *desc);
+JsValue js_symbol_well_known(HpeJs *js, const char *desc);
+
+/**
+ * @brief 判断一个值是否为符号 / Test whether a value is a symbol
+ *
+ * @param[in] v 待测值 / The value to test
+ *
+ * @return 是符号返回 1 / 1 when it is a symbol
+ */
+int js_is_symbol(JsValue v);
+
+/**
+ * @brief 取符号的唯一标识 / Read a symbol's unique identity
+ *
+ * @param[in] v 符号值 / The symbol value
+ *
+ * @return 自增标识；非符号返回 0 / The auto-incremented identity, or 0 for a non-symbol
+ */
+long long js_symbol_id(JsValue v);
+
+/**
+ * @brief 取符号的描述文本 / Read a symbol's description
+ *
+ * @param[in] v 符号值 / The symbol value
+ *
+ * @return 描述指针，可为 `NULL` / The description pointer, possibly `NULL`
+ */
+const char *js_symbol_desc(JsValue v);
+
+/**
+ * @brief 把符号转成属性键 / Render a symbol as a property key
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     v 符号值 / The symbol value
+ *
+ * @return 合成键 `"\x01#<id>"` / The synthetic key `"\x01#<id>"`
+ */
+char *js_symbol_key(HpeJs *js, JsValue v);
+
+/**
+ * @brief 判断属性键是否代表符号 / Test whether a property key represents a symbol
+ *
+ * @param[in] key 属性键 / Property key
+ *
+ * @return 是符号键返回 1 / 1 when the key stands for a symbol
+ */
+int js_key_is_symbol(const char *key);
+
+/**
+ * @brief 取符号的 `Symbol(desc)` 文本 / Render a symbol's `Symbol(desc)` text
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     v 符号值 / The symbol value
+ *
+ * @return arena 中的字符串 / A string in the arena
+ */
+char *js_symbol_text(HpeJs *js, JsValue v);
+
+/**
+ * @brief 在全局注册表中查取或新建符号 / Look up or create a symbol in the global registry
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     key 注册键 / The registry key
+ *
+ * @return 该键对应的共享符号 / The shared symbol for that key
+ */
+JsValue js_symbol_for(HpeJs *js, const char *key);
+
+/**
+ * @brief 反向查询注册键 `/` `Symbol.keyFor` / Reverse registry lookup for `Symbol.keyFor`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     v 符号值 / The symbol value
+ *
+ * @return 注册键字符串；未注册时返回 `undefined` / The registry key, or `undefined` when unregistered
+ */
+JsValue js_symbol_key_for(HpeJs *js, JsValue v);
+
+/**
+ * @brief 安装 `Symbol` 构造器、原型与全部知名符号 / Install the `Symbol` constructor, prototype and every well-known symbol
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ */
+void hpe_js_symbol_install(HpeJs *js);
+
+/* ---------------- lazy generators (hpe_js_gen.c) ---------------- */
+
+typedef struct HpeJsGen HpeJsGen;
+
+/**
+ * @brief 创建一个惰性生成器 / Create a lazy generator
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] fn 生成器函数对象 / The generator function object
+ * @param[in,out] closure 闭包捕获的环境 / The captured environment
+ * @param[in]     this_v 调用时的 this 值 / The `this` value of the call
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 实参个数 / Argument count
+ *
+ * @return 生成器对象值；创建协程失败时返回一个已结束的生成器 / The generator object; a failed coroutine yields an already-finished generator
+ *
+ * @note 函数体此时不执行，只建立协程 / The body does not run yet; only the coroutine is built
+ */
+JsValue hpe_js_gen_create(HpeJs *js, JsObj *fn, JsEnv *closure, JsValue this_v, JsValue *args,
+                          int argc);
+
+/**
+ * @brief 取对象背后的生成器状态 / Fetch the generator state behind an object
+ *
+ * @param[in] obj 待检查的对象，可为 `NULL` / The object to inspect, may be `NULL`
+ *
+ * @return 生成器状态；非生成器对象返回 `NULL` / The generator state, or `NULL` when the object is not a generator
+ */
+HpeJsGen *hpe_js_gen_of(JsObj *obj);
+
+/**
+ * @brief 从生成器拉取下一项 / Pull the next item from a generator
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] obj 生成器对象 / The generator object
+ * @param[out]    out 接收 `{ value, done }` / Receives the `{ value, done }` result
+ *
+ * @return 仍在运行返回 1；已结束返回 0 / 1 when still live, 0 when finished
+ */
+int hpe_js_gen_pull(HpeJs *js, JsObj *obj, JsValue *out);
+
+/**
+ * @brief 登记当前正在执行的生成器 / Register the generator currently running
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] g 生成器状态 / The generator state
+ */
+void hpe_js_gen_enter(HpeJs *js, HpeJsGen *g);
+
+/**
+ * @brief 取出当前正在执行的生成器 / Fetch the generator currently running
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ *
+ * @return 生成器状态；不在生成器体内时为 `NULL` / The generator state, or `NULL` outside a generator body
+ */
+HpeJsGen *hpe_js_gen_active(HpeJs *js);
+
+/**
+ * @brief 记录本次 `yield` 产出的值 / Record the value produced by the current `yield`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] g 生成器状态 / The generator state
+ * @param[in]     value 产出的值 / The produced value
+ */
+void hpe_js_gen_set_yielded(HpeJs *js, HpeJsGen *g, JsValue value);
+
+/**
+ * @brief 取回 `yield` 表达式的值（`next(v)` 送入的值）/ Retrieve the `yield` expression's value
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] g 生成器状态 / The generator state
+ *
+ * @return 送入的值 / The value sent in
+ */
+JsValue hpe_js_gen_get_sent(HpeJs *js, HpeJsGen *g);
+
+/**
+ * @brief 取生成器挂起所需的协程 / Fetch the coroutine a generator parks on
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] g 生成器状态 / The generator state
+ *
+ * @return 协程句柄 / The coroutine handle
+ */
+void *hpe_js_gen_coro(HpeJs *js, HpeJsGen *g);
+
+/**
+ * @brief 清除当前生成器登记 / Clear the current generator registration
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ */
+void hpe_js_gen_leave(HpeJs *js);
+
+/**
+ * @brief 让当前生成器在 `yield` 处挂起 / Park the current generator at a `yield`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     value 本次产出的值 / The value produced this time
+ *
+ * @note 只在 `gen_active` 非空时有效；返回时 `sent` 为 `next(v)` 送入的值 / Only meaningful while `gen_active` is set; on return `sent` holds what `next(v)` passed in
+ */
+void hpe_js_gen_suspend(HpeJs *js, JsValue value);
+
+/**
+ * @brief 取走 `throw(v)` 停放的异常 / Take the exception parked by `throw(v)`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] g 生成器状态 / The generator state
+ * @param[out]    out 接收异常值 / Receives the exception value
+ *
+ * @return 有待抛异常返回 1 / 1 when there was one
+ *
+ * @note 由 `yield` 恢复点在**协程栈上**调用 / Called by the `yield` resume point, **on the coroutine stack**
+ */
+int hpe_js_gen_take_pending_throw(HpeJs *js, HpeJsGen *g, JsValue *out);
+
+/**
+ * @brief 取走 `return(v)` 停放的返回完成标记 / Take the return-completion marker parked by `return(v)`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] g 生成器状态 / The generator state
+ * @param[out]    out 接收 `js->gen_ret_sentinel` / Receives `js->gen_ret_sentinel`
+ *
+ * @return 有待处理返回完成时返回 1 / 1 when there was one
+ *
+ * @note 由 `yield` 恢复点在**协程栈上**调用 / Called by the `yield` resume point, **on the coroutine stack**
+ */
+int hpe_js_gen_take_pending_return(HpeJs *js, HpeJsGen *g, JsValue *out);
+
+/**
+ * @brief 在独立栈上运行生成器函数体 / Run a generator body on its own stack
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] fn 生成器函数对象 / The generator function object
+ * @param[in,out] closure 捕获的环境 / The captured environment
+ * @param[in]     this_v 调用时的 this 值 / The `this` value of the call
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 实参个数 / Argument count
+ *
+ * @return 函数体的返回值 / The body's return value
+ *
+ * @note 由 `hpe_js_gen.c` 的协程入口调用，实现留在解释器里以便访问静态执行器 / Called from the coroutine entry in `hpe_js_gen.c`; the implementation lives in the interpreter so it can reach the static executor
+ */
+JsValue js_run_generator_body(HpeJs *js, JsObj *fn, JsEnv *closure, JsValue this_v, JsValue *args,
+                              int argc);
 
 #endif /* HPE_JS_INTERNAL_H */

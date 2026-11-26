@@ -19,8 +19,12 @@ typedef struct HpeWindowCallbacks {
     /* virtual-key press; `mods` is a mask of HPE_MOD_* captured at the moment
      * of the key event (needed for shortcuts such as Ctrl+V) */
     void (*on_key)(void *user, int vk_code, int mods);
+    /* virtual-key release, mirroring on_key; pages receive a `keyup` for it.
+     * May be NULL, in which case no `keyup` is delivered. */
+    void (*on_key_up)(void *user, int vk_code, int mods);
     /* typed text: unicode code point (ASCII today; surrogate pairs are skipped
-     * by the Win32 backend). Used by the address bar for path entry. */
+     * by the Win32 backend). Used by the address bar for path entry and by
+     * pages as the source of `keypress`. */
     void (*on_char)(void *user, int codepoint);
     /* mouse: x,y are viewport (client) coords; button 0 = left; down: 1 = pressed, 0 = released;
      * button -1 = pointer move (no button state change). `mods` is a mask of
@@ -133,6 +137,76 @@ double hpe_time_seconds(void); /* monotonic seconds since an unspecified origin 
  * @see hpe_time_seconds
  */
 double hpe_time_epoch_ms(void);
+
+/**
+ * @brief 求某个 UTC 时刻的系统时区偏移 / Resolve the system timezone offset at a UTC instant
+ *
+ * @param[in]     epoch_ms 自 Unix 纪元起的 UTC 毫秒 / UTC milliseconds since the Unix epoch
+ * @param[out]    out_name 接收时区名的缓冲，可为 `NULL` / Receives the timezone name, may be `NULL`
+ * @param[in]     cap `out_name` 的容量（字节，UTF-8）/ Capacity of `out_name` in bytes, UTF-8
+ * @param[out]    out_dst 接收是否为夏令时的标志，可为 `NULL` / Receives the daylight-saving flag, may be `NULL`
+ *
+ * @return 本地时间相对 UTC 的偏移分钟数（东为正，与 `getTimezoneOffset()` 反号）/ Offset in minutes of local time from UTC, positive east (the opposite sign of `getTimezoneOffset()`)
+ *
+ * @note 按**该时刻**的历史时区规则求解，因此跨夏令时切换点前后会得到不同偏移；无时区数据库的平台上退化为固定偏移 / Resolved with the **historical** rules in force at that instant, so the offset differs across a DST transition; a platform without a timezone database degrades to a fixed offset
+ *
+ * @see hpe_time_epoch_ms
+ */
+int hpe_time_utc_offset_minutes(double epoch_ms, char *out_name, size_t cap, int *out_dst);
+
+/**
+ * @brief 一段可挂起/恢复的执行栈 / A suspendable, resumable execution stack
+ *
+ * @note 生成器靠它把 `yield` 处的 C 调用栈原地冻结，`next()` 时从断点继续；
+ *       异常仍走 `longjmp`，因此**不能**跨上下文抛错，调用方须保证两侧都在同一上下文内。
+ *       Generators use this to freeze the C call stack at a `yield` and resume from that point on
+ *       `next()`; exceptions still travel via `longjmp`, so an error must **not** cross the boundary.
+ */
+typedef struct HpeCoro HpeCoro;
+
+/**
+ * @brief 在当前线程上创建一个协程 / Create a coroutine on the current thread
+ *
+ * @param[in]     entry 协程入口函数 / Coroutine entry point
+ * @param[in,out] user 透传给入口函数的指针 / Pointer forwarded to the entry function
+ * @param[in]     stack_size 栈字节数，0 表示默认 / Stack size in bytes, 0 for the default
+ *
+ * @return 新协程；失败返回 `NULL` / The new coroutine, or `NULL` on failure
+ *
+ * @note 入口函数返回即视为协程结束 / Returning from the entry function marks the coroutine as finished
+ *
+ * @see hpe_coro_resume hpe_coro_destroy
+ */
+HpeCoro *hpe_coro_create(void (*entry)(void *), void *user, size_t stack_size);
+
+/**
+ * @brief 把控制权交给协程，直到它 `yield` 或结束 / Hand control to a coroutine until it yields or finishes
+ *
+ * @param[in,out] coro 目标协程 / Target coroutine
+ *
+ * @return 协程仍在运行（只是 `yield` 了）返回 1；已结束返回 0 / 1 when it yielded and is still live, 0 when it finished
+ *
+ * @note 只能从创建它的线程调用 / Must be called from the creating thread
+ */
+int hpe_coro_resume(HpeCoro *coro);
+
+/**
+ * @brief 从协程内部把控制权交还调用者 / Yield control back to the resumer from inside a coroutine
+ *
+ * @param[in,out] coro 当前协程 / The current coroutine
+ *
+ * @note 只允许在协程入口函数内部调用 / Only valid inside the coroutine entry
+ */
+void hpe_coro_yield(HpeCoro *coro);
+
+/**
+ * @brief 销毁协程并释放其栈 / Destroy a coroutine and release its stack
+ *
+ * @param[in,out] coro 目标协程；`NULL` 时无操作 / Target coroutine; a `NULL` argument is a no-op
+ *
+ * @note 仍在运行的协程会被直接丢弃，不会执行清理 / A still-running coroutine is discarded without unwinding
+ */
+void hpe_coro_destroy(HpeCoro *coro);
 
 /**
  * @brief 读取整个文件到新分配的缓冲 / Read a whole file into a freshly allocated buffer

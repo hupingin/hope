@@ -9,9 +9,24 @@
 
 /* forward declarations used by the public selector-matching entry point */
 static int selector_matches(const HpeSelector *sel, const HpeDomNode *node);
+static void parse_selector_list(HpeRule *rule, const char *text, size_t length);
+static int parse_compound(const char **pp, const char *end, HpeCompound *out);
+static void selector_free(HpeSelector *sel);
 /* recursive stylesheet walker; @media blocks re-enter it with a deeper stack */
 static void css_parse_into(HpeStylesheet *sheet, const char *css, size_t length,
                            HpeMediaQuery *mq_stack, int mq_depth);
+
+/**
+ * @brief 判断字符是否为 ASCII 十进制数字 / Test whether a character is an ASCII decimal digit
+ *
+ * @param[in]     c 待检查字符 / Character to test
+ *
+ * @return 数字返回 1，否则 0 / 1 for a digit, 0 otherwise
+ */
+static int css_is_digit(char c)
+{
+    return c >= '0' && c <= '9';
+}
 
 /* ---------------- defaults ---------------- */
 
@@ -91,6 +106,25 @@ static void style_init_scalars(HpeStyle *s)
     s->list_style_type = HPE_LIST_DISC;
     s->list_style_position = HPE_LIST_OUTSIDE;
     s->background_image.kind = HPE_BG_NONE;
+    s->flex_wrap = 0;      /* nowrap */
+    s->order = 0;
+    s->flex_shrink = 1.0f; /* CSS initial value */
+    s->flex_basis = hpe_len_auto();
+    s->table_layout_fixed = 0;
+    s->border_spacing_h = 0.0f;
+    s->border_spacing_v = 0.0f;
+    s->direction_rtl = 0;
+    /* 经典滚动条的占位宽度：`scrollbar-width` 的初始值是 `auto`，即 12px 的经典
+     * 滚动条（不是 overlay 式）。0 是一个合法值，所以默认值不能用 0 当哨兵。 */
+    s->scrollbar_width = HPE_SCROLLBAR_WIDTH_AUTO;
+    /* replaced elements default to `object-fit: fill` and centre their content */
+    s->object_fit = HPE_OBJECT_FIT_FILL;
+    s->bg_repeat = HPE_BG_REPEAT_REPEAT;
+    s->object_pos.present = 0;
+    s->object_pos.x = 50.0f;
+    s->object_pos.y = 50.0f;
+    s->object_pos.x_pct = 1;
+    s->object_pos.y_pct = 1;
 }
 
 /**
@@ -471,7 +505,6 @@ static int parse_linear_gradient(const char *value, HpeBackground *bg)
     const char *lp, *rp;
     int count;
     float angle = 180.0f; /* css default: to bottom */
-
     bg->kind = HPE_BG_NONE;
     bg->stop_count = 0;
     bg->angle_deg = 180.0f;
@@ -914,6 +947,19 @@ static void apply_display(HpeStyle *d, const char *value)
     else if (!strcmp(value, "flex") || !strcmp(value, "inline-flex"))
         /* inline-flex is blockified: the engine has no inline-level flex container */
         d->display = HPE_DISPLAY_FLEX;
+    else if (!strcmp(value, "grid") || !strcmp(value, "inline-grid"))
+        d->display = HPE_DISPLAY_GRID;
+    else if (!strcmp(value, "table") || !strcmp(value, "inline-table"))
+        d->display = HPE_DISPLAY_TABLE;
+    else if (!strcmp(value, "table-row"))
+        d->display = HPE_DISPLAY_TABLE_ROW;
+    else if (!strcmp(value, "table-cell"))
+        d->display = HPE_DISPLAY_TABLE_CELL;
+    else if (!strcmp(value, "table-row-group") || !strcmp(value, "table-header-group") ||
+             !strcmp(value, "table-footer-group"))
+        d->display = HPE_DISPLAY_TABLE_ROW_GROUP;
+    else if (!strcmp(value, "table-caption"))
+        d->display = HPE_DISPLAY_TABLE_CAPTION;
     else if (!strcmp(value, "inline"))
         d->display = HPE_DISPLAY_INLINE;
     else
@@ -941,6 +987,11 @@ static void apply_color(HpeStyle *d, const char *value)
     }
 }
 
+/* the `background` shorthand and `object-position` reuse parsers that are
+ * defined further down with the other background longhands */
+static int parse_bg_url(const char *value, HpeBackground *bg);
+static void apply_background_position(HpeStyle *d, const char *value);
+
 /**
  * @brief 解析 `background`/`background-color` 简写 / Parse the `background`/`background-color` shorthand
  *
@@ -961,6 +1012,10 @@ static void apply_background(HpeStyle *d, const char *value)
         d->set2 |= HPE_PROP2_BACKGROUND_IMAGE;
         return;
     }
+    /* `background: url(...) ...` sets the external image layer; the colour, if
+     * any, is still picked up below by last_color_token */
+    if (parse_bg_url(value, &d->background_image))
+        d->set2 |= HPE_PROP2_BACKGROUND_IMAGE;
     if (!strcmp(value, "none") || !strcmp(value, "transparent")) {
         d->background = hpe_rgba(0, 0, 0, 0);
         d->set |= HPE_PROP_BACKGROUND;
@@ -1242,8 +1297,8 @@ static void apply_inset(HpeStyle *d, const char *value)
 /**
  * @brief 把 `flex-direction` 声明写入样式 / Write a `flex-direction` declaration into the style
  *
- * @details 仅 `column` 映射为 `HPE_FLEX_COLUMN`，其余（含 `row`）为 `HPE_FLEX_ROW`；不支持 `*-reverse`。
- *          Only `column` maps to `HPE_FLEX_COLUMN` and everything else, including `row`, is `HPE_FLEX_ROW`; `*-reverse` is not supported.
+ * @details `column`/`column-reverse` 映射为 `HPE_FLEX_COLUMN`，`row`/`row-reverse` 为 `HPE_FLEX_ROW`；带 `-reverse` 时置 `row_reverse`。
+ *          `column`/`column-reverse` map to `HPE_FLEX_COLUMN` and `row`/`row-reverse` to `HPE_FLEX_ROW`; the `-reverse` suffix sets `row_reverse`.
  *
  * @param[in,out] d 目标样式 / Target style
  * @param[in]     value 声明值 / Declaration value
@@ -1252,8 +1307,23 @@ static void apply_inset(HpeStyle *d, const char *value)
  */
 static void apply_flex_direction(HpeStyle *d, const char *value)
 {
-    d->flex_dir = !strcmp(value, "column") ? HPE_FLEX_COLUMN : HPE_FLEX_ROW;
+    char buf[32];
+    size_t len = strlen(value);
+    int reverse = 0;
+    if (len >= sizeof(buf))
+        len = sizeof(buf) - 1;
+    memcpy(buf, value, len);
+    buf[len] = '\0';
+    hpe_trim(buf);
+    if (len > 8 && !strcmp(buf + len - 8, "-reverse")) {
+        reverse = 1;
+        buf[len - 8] = '\0';
+        hpe_trim(buf);
+    }
+    d->flex_dir = !strcmp(buf, "column") ? HPE_FLEX_COLUMN : HPE_FLEX_ROW;
+    d->row_reverse = reverse;
     d->set |= HPE_PROP_FLEX_DIR;
+    d->set2 |= HPE_PROP2_ROW_REVERSE;
 }
 
 /**
@@ -1365,10 +1435,46 @@ static void apply_gap(HpeStyle *d, const char *value)
  */
 static void apply_flex_grow(HpeStyle *d, const char *value)
 {
-    HpeLength len = hpe_len_parse(value);
-    d->flex_grow = (len.unit == HPE_LEN_PX || len.unit == HPE_LEN_PCT) ? len.value : 0.0f;
-    d->set |= HPE_PROP_FLEX_GROW;
+    /* `flex: <grow> <shrink>? <basis>?` — also used for the lone flex-grow */
+    char buf[96];
+    char *sp, *tok;
+    int n = 0;
+    snprintf(buf, sizeof(buf), "%s", value);
+    if (hpe_str_ieq(buf, "none")) {
+        d->flex_grow = 0.0f;
+        d->flex_shrink = 0.0f;
+        d->flex_basis = hpe_len_auto();
+        d->set |= HPE_PROP_FLEX_GROW;
+        d->set2 |= HPE_PROP2_FLEX_SHRINK | HPE_PROP2_FLEX_BASIS;
+        return;
+    }
+    if (hpe_str_ieq(buf, "auto")) {
+        d->flex_grow = 1.0f;
+        d->flex_shrink = 1.0f;
+        d->flex_basis = hpe_len_auto();
+        d->set |= HPE_PROP_FLEX_GROW;
+        d->set2 |= HPE_PROP2_FLEX_SHRINK | HPE_PROP2_FLEX_BASIS;
+        return;
+    }
+    sp = buf;
+    while ((tok = strtok(sp, " \t")) != NULL && n < 3) {
+        HpeLength len;
+        sp = NULL;
+        len = hpe_len_parse(tok);
+        if (n == 0) {
+            d->flex_grow = (len.unit == HPE_LEN_PX || len.unit == HPE_LEN_PCT) ? len.value : 0.0f;
+            d->set |= HPE_PROP_FLEX_GROW;
+        } else if (n == 1 && (len.unit == HPE_LEN_PX || len.unit == HPE_LEN_PCT)) {
+            d->flex_shrink = len.value;
+            d->set2 |= HPE_PROP2_FLEX_SHRINK;
+        } else {
+            d->flex_basis = hpe_len_parse(tok);
+            d->set2 |= HPE_PROP2_FLEX_BASIS;
+        }
+        n++;
+    }
 }
+
 
 /**
  * @brief 把 `font-size` 声明写入样式 / Write a `font-size` declaration into the style
@@ -2030,24 +2136,167 @@ static void apply_list_style_position(HpeStyle *d, const char *value)
 }
 
 /**
+ * @brief 解析 `url(...)` 形式的背景图像引用 / Parse a `url(...)` background-image reference
+ *
+ * @details 只接受 `url(` 前缀并把括号内的引用（可带成对引号）抄进 `bg->url`；`none` 与其它取值返回 0。
+ *          Only a `url(` prefix is accepted and the reference inside the parentheses
+ *          (optionally quoted) is copied into `bg->url`; `none` and anything else return 0.
+ *
+ * @param[in]     value 属性值文本 / Property value text
+ * @param[in,out] bg 接收解析结果的背景描述 / Background description that receives the result
+ *
+ * @return 成功返回 1，否则返回 0 / 1 on success, 0 otherwise
+ *
+ * @note 成功时把 `bg->kind` 置为 `HPE_BG_URL` / On success `bg->kind` is set to `HPE_BG_URL`
+ *
+ * @see apply_background_image
+ */
+static int parse_bg_url(const char *value, HpeBackground *bg)
+{
+    const char *lp, *rp;
+    size_t n;
+
+    if (!value)
+        return 0;
+    while (*value && hpe_is_space(*value))
+        value++;
+    if (!hpe_starts_with_i(value, "url("))
+        return 0;
+    lp = strchr(value, '(');
+    rp = strrchr(lp, ')');
+    if (!rp || rp <= lp + 1)
+        return 0;
+    lp++;
+    while (lp < rp && hpe_is_space(*lp))
+        lp++;
+    while (rp > lp && hpe_is_space(rp[-1]))
+        rp--;
+    n = (size_t)(rp - lp);
+    if (n >= 2 && (lp[0] == '"' || lp[0] == '\'') && lp[n - 1] == lp[0]) {
+        lp++;
+        n -= 2;
+    }
+    if (n == 0 || n >= sizeof(bg->url))
+        return 0;
+    memcpy(bg->url, lp, n);
+    bg->url[n] = '\0';
+    bg->kind = HPE_BG_URL;
+    return 1;
+}
+
+/**
  * @brief 把 `background-image` 声明写入背景图层 / Write a `background-image` declaration into the image layer
  *
- * @details 能解析为线性渐变则写入渐变图层，`none` 则把图层类型置为 `HPE_BG_NONE`；两种情形都置位背景图层属性位。
- *          A linear gradient is written into the image layer and `none` clears the layer kind to `HPE_BG_NONE`; both set the background-image property bit.
+ * @details 能解析为线性渐变则写入渐变图层，能解析为 `url(...)` 则写入外链图层，`none` 则把图层类型置为 `HPE_BG_NONE`；各种情形都置位背景图层属性位。
+ *          A linear gradient is written into the gradient layer, a `url(...)` into the external
+ *          image layer and `none` clears the layer kind to `HPE_BG_NONE`; every case sets the
+ *          background-image property bit.
  *
  * @param[in,out] d 目标样式 / Target style
  * @param[in]     value 声明值 / Declaration value
  *
- * @see parse_linear_gradient apply_background
+ * @see parse_linear_gradient parse_bg_url apply_background
  */
 static void apply_background_image(HpeStyle *d, const char *value)
 {
     if (parse_linear_gradient(value, &d->background_image)) {
         d->set2 |= HPE_PROP2_BACKGROUND_IMAGE;
+    } else if (parse_bg_url(value, &d->background_image)) {
+        d->set2 |= HPE_PROP2_BACKGROUND_IMAGE;
     } else if (!strcmp(value, "none")) {
         d->background_image.kind = HPE_BG_NONE;
         d->set2 |= HPE_PROP2_BACKGROUND_IMAGE;
     }
+}
+
+/**
+ * @brief 把 `background-repeat` 声明写入样式 / Write a `background-repeat` declaration into the style
+ *
+ * @details 接受 `repeat` / `repeat-x` / `repeat-y` / `no-repeat`；两个 token 的简写只取第一个轴。
+ *          Accepts `repeat`, `repeat-x`, `repeat-y` and `no-repeat`; for the two-token shorthand
+ *          only the first axis is kept.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_background_image
+ */
+static void apply_background_repeat(HpeStyle *d, const char *value)
+{
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s", value ? value : "");
+    {
+        char *sp = buf;
+        int n = 0;
+        while (sp && *sp && n < 2) {
+            char *tok;
+            while (*sp == ' ' || *sp == '\t')
+                sp++;
+            if (!*sp)
+                break;
+            tok = sp;
+            while (*sp && *sp != ' ' && *sp != '\t')
+                sp++;
+            if (*sp)
+                *sp++ = '\0';
+            if (hpe_str_ieq(tok, "no-repeat"))
+                d->bg_repeat = HPE_BG_REPEAT_NO_REPEAT;
+            else if (hpe_str_ieq(tok, "repeat-x"))
+                d->bg_repeat = HPE_BG_REPEAT_X;
+            else if (hpe_str_ieq(tok, "repeat-y"))
+                d->bg_repeat = HPE_BG_REPEAT_Y;
+            else if (hpe_str_ieq(tok, "repeat"))
+                d->bg_repeat = HPE_BG_REPEAT_REPEAT;
+            n++;
+        }
+    }
+    d->set2 |= HPE_PROP2_BACKGROUND_REPEAT;
+}
+
+/**
+ * @brief 把 `object-fit` 声明写入样式 / Write an `object-fit` declaration into the style
+ *
+ * @details 接受 `fill` / `contain` / `cover` / `none` / `scale-down`，无法识别时按 `fill`。
+ *          Accepts `fill`, `contain`, `cover`, `none` and `scale-down`; anything else means `fill`.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_object_position
+ */
+static void apply_object_fit(HpeStyle *d, const char *value)
+{
+    if (hpe_str_ieq(value, "contain"))
+        d->object_fit = HPE_OBJECT_FIT_CONTAIN;
+    else if (hpe_str_ieq(value, "cover"))
+        d->object_fit = HPE_OBJECT_FIT_COVER;
+    else if (hpe_str_ieq(value, "none"))
+        d->object_fit = HPE_OBJECT_FIT_NONE;
+    else if (hpe_str_ieq(value, "scale-down"))
+        d->object_fit = HPE_OBJECT_FIT_SCALE_DOWN;
+    else
+        d->object_fit = HPE_OBJECT_FIT_FILL;
+    d->set2 |= HPE_PROP2_OBJECT_FIT;
+}
+
+/**
+ * @brief 把 `object-position` 声明写入样式 / Write an `object-position` declaration into the style
+ *
+ * @details 复用 `background-position` 的解析（关键字 / `%` / 长度）。
+ *          Reuses the `background-position` grammar (keywords, `%` and lengths).
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_object_fit
+ */
+static void apply_object_position(HpeStyle *d, const char *value)
+{
+    HpeStyle tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    apply_background_position(&tmp, value);
+    d->object_pos = tmp.bg_pos;
+    d->set2 |= HPE_PROP2_OBJECT_POSITION;
 }
 
 /**
@@ -2171,9 +2420,692 @@ static void apply_border_right_color(HpeStyle *d, const char *v) { apply_border_
 static void apply_border_bottom_color(HpeStyle *d, const char *v) { apply_border_side_color(d, v, 2, HPE_PROP2_BORDER_BOTTOM_COLOR); }
 static void apply_border_left_color(HpeStyle *d, const char *v) { apply_border_side_color(d, v, 3, HPE_PROP2_BORDER_LEFT_COLOR); }
 
+/**
+ * @brief 解析 `content` 声明并存入样式 / Parse a `content` declaration into the style
+ *
+ * @details 支持 `none`/`normal`（清除）、`"文本"` / `'文本'` 字符串字面量、`attr(name)`（取同名属性值）以及 `open-quote`/`close-quote` 等关键字；多个字面量按出现顺序拼接；转义序列 `\XX` 与 `\n` 被解码。
+ *          Accepts `none`/`normal` (clear), a `"text"` / `'text'` string literal, `attr(name)` (the named attribute's value) and keywords such as `open-quote`/`close-quote`; consecutive literals concatenate in order and the escapes `\XX` and `\n` are decoded.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @note 仅在伪元素选择器（`::before` / `::after`）上有可见效果；正文元素的 `content` 被记录但不生成盒 / Only visible on pseudo-element selectors (`::before` / `::after`); on a regular element the value is recorded but no box is generated
+ *
+ * @see apply_gen_content pseudo_content_for
+ */
+/* A quoted string in `content`, with the CSS `\\n` / `\\t` / escaped-quote
+ * handling. Returns the position just past the closing quote. */
+static const char *content_parse_string(HpeStyle *d, const char *p, int *n)
+{
+    char quote = *p++;
+    while (*p && *p != quote && *n < HPE_CONTENT_MAX - 1) {
+        if (*p == '\\' && p[1]) {
+            p++;
+            if (*p == 'n')
+                d->content[(*n)++] = '\n';
+            else if (*p == 't')
+                d->content[(*n)++] = '\t';
+            else
+                d->content[(*n)++] = *p;
+            p++;
+        } else {
+            d->content[(*n)++] = *p++;
+        }
+    }
+    if (*p == quote)
+        p++;
+    return p;
+}
+
+/* An `attr(name)` token: the name is stored for later resolution against the
+ * node. Returns the position past the closing parenthesis, or NULL on a
+ * malformed argument. */
+static const char *content_parse_attr(HpeStyle *d, const char *p)
+{
+    const char *close = strchr(p + 5, ')');
+    char name[96];
+    size_t ln;
+    if (!close)
+        return NULL;
+    ln = (size_t)(close - p - 5);
+    if (ln >= sizeof(name))
+        ln = sizeof(name) - 1;
+    memcpy(name, p + 5, ln);
+    name[ln] = '\0';
+    hpe_trim(name);
+    d->attr_content[0] = '\0';
+    snprintf(d->attr_content, sizeof(d->attr_content), "%s", name);
+    return close + 1;
+}
+
+static void apply_content(HpeStyle *d, const char *value)
+{
+    const char *p = value;
+    int n = 0;
+    d->content[0] = '\0';
+    d->has_content = 0;
+    d->set2 |= HPE_PROP2_CONTENT;
+    if (!*p || hpe_str_ieq(p, "none") || hpe_str_ieq(p, "normal"))
+        return;
+
+    while (*p && n < HPE_CONTENT_MAX - 1) {
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (!*p)
+            break;
+        if (*p == '"' || *p == '\'') {
+            p = content_parse_string(d, p, &n);
+        } else if (!strncmp(p, "attr(", 5)) {
+            p = content_parse_attr(d, p);
+            if (!p)
+                break;
+        } else if (!strncmp(p, "counter(", 8)) {
+            const char *close = strchr(p + 8, ')');
+            p = close ? close + 1 : p + 8;
+        } else if (!strncmp(p, "open-quote", 10)) {
+            d->content[n++] = '"';
+            p += 10;
+        } else if (!strncmp(p, "close-quote", 11)) {
+            d->content[n++] = '"';
+            p += 11;
+        } else {
+            break;
+        }
+        while (*p == ' ' || *p == '\t')
+            p++;
+    }
+    d->content[n] = '\0';
+    d->has_content = 1;
+}
+
+/**
+ * @brief 解析 `flex-wrap` / `flex-flow` 声明 / Parse a `flex-wrap` / `flex-flow` declaration
+ *
+ * @details `nowrap`/`wrap`/`wrap-reverse` 依次记 0/1/2；`flex-flow` 中同时出现的 `row`/`column` 部分交给 `apply_flex_direction` 处理。
+ *          `nowrap`/`wrap`/`wrap-reverse` map to 0/1/2; the `row`/`column` part of a `flex-flow` shorthand is forwarded to `apply_flex_direction`.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_flex_direction
+ */
+static void apply_flex_wrap(HpeStyle *d, const char *value)
+{
+    char buf[96];
+    snprintf(buf, sizeof(buf), "%s", value);
+    {
+        char *sp = buf;
+        char *w;
+        while ((w = strtok(sp, " \t")) != NULL) {
+            sp = NULL;
+            if (hpe_str_ieq(w, "wrap"))
+                d->flex_wrap = 1;
+            else if (hpe_str_ieq(w, "wrap-reverse"))
+                d->flex_wrap = 2;
+            else if (hpe_str_ieq(w, "nowrap"))
+                d->flex_wrap = 0;
+            else if (hpe_str_ieq(w, "row") || hpe_str_ieq(w, "row-reverse") ||
+                     hpe_str_ieq(w, "column") || hpe_str_ieq(w, "column-reverse"))
+                apply_flex_direction(d, w);
+        }
+    }
+    d->set2 |= HPE_PROP2_FLEX_WRAP;
+}
+
+/**
+ * @brief 解析 `order` 声明 / Parse an `order` declaration
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_flex_shrink
+ */
+static void apply_order(HpeStyle *d, const char *value)
+{
+    d->order = atoi(value);
+    d->set2 |= HPE_PROP2_ORDER;
+}
+
+/**
+ * @brief 解析 `flex-basis` 声明 / Parse a `flex-basis` declaration
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_flex_shrink
+ */
+static void apply_flex_basis(HpeStyle *d, const char *value)
+{
+    d->flex_basis = hpe_len_parse(value);
+    d->set2 |= HPE_PROP2_FLEX_BASIS;
+}
+
+/**
+ * @brief 解析 `flex-shrink` 声明 / Parse a `flex-shrink` declaration
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_flex_basis
+ */
+static void apply_flex_shrink(HpeStyle *d, const char *value)
+{
+    d->flex_shrink = (float)atof(value);
+    d->set2 |= HPE_PROP2_FLEX_SHRINK;
+}
+
+/**
+ * @brief 解析 `background-position` 声明 / Parse a `background-position` declaration
+ *
+ * @details 支持关键字 `left`/`right`/`top`/`bottom`/`center` 与 `%`/`px` 长度；单值时第二位默认 `center`。
+ *          Accepts the keywords `left`/`right`/`top`/`bottom`/`center` and `%`/`px` lengths; with a single value the second defaults to `center`.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_background_size
+ */
+static void apply_background_position(HpeStyle *d, const char *value)
+{
+    char buf[128];
+    char *sp, *tok;
+    int n = 0;
+    d->bg_pos.present = 1;
+    d->bg_pos.x_pct = d->bg_pos.y_pct = 0;
+    d->bg_pos.x = d->bg_pos.y = 0.0f;
+    snprintf(buf, sizeof(buf), "%s", value);
+    sp = buf;
+    while ((tok = strtok(sp, " \t,")) != NULL && n < 2) {
+        float v = 0.0f;
+        int is_pct = 0;
+        sp = NULL;
+        if (hpe_str_ieq(tok, "left"))
+            v = 0.0f, is_pct = 1;
+        else if (hpe_str_ieq(tok, "right"))
+            v = 100.0f, is_pct = 1;
+        else if (hpe_str_ieq(tok, "top"))
+            v = 0.0f, is_pct = 1;
+        else if (hpe_str_ieq(tok, "bottom"))
+            v = 100.0f, is_pct = 1;
+        else if (hpe_str_ieq(tok, "center"))
+            v = 50.0f, is_pct = 1;
+        else {
+            size_t ln = strlen(tok);
+            if (ln && tok[ln - 1] == '%') {
+                v = (float)atof(tok);
+                is_pct = 1;
+            } else {
+                v = (float)atof(tok);
+            }
+        }
+        if (n == 0)
+            d->bg_pos.x = v, d->bg_pos.x_pct = is_pct;
+        else
+            d->bg_pos.y = v, d->bg_pos.y_pct = is_pct;
+        n++;
+    }
+    if (n == 0) {
+        d->bg_pos.x = 0.0f, d->bg_pos.x_pct = 1;
+        d->bg_pos.y = 50.0f, d->bg_pos.y_pct = 1;
+    } else if (n == 1) {
+        d->bg_pos.y = 50.0f;
+        d->bg_pos.y_pct = 1;
+    }
+    d->set2 |= HPE_PROP2_BACKGROUND_POSITION;
+}
+
+/**
+ * @brief 解析 `background-size` 声明 / Parse a `background-size` declaration
+ *
+ * @details 支持 `auto`、`cover`、`contain` 与一到两个 `%`/`px` 长度。
+ *          Accepts `auto`, `cover`, `contain` and one or two `%`/`px` lengths.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_background_position
+ */
+static void apply_background_size(HpeStyle *d, const char *value)
+{
+    char buf[128];
+    char *sp, *tok;
+    int n = 0;
+    d->bg_pos.present = 1;
+    d->bg_pos.size_auto = d->bg_pos.size_cover = d->bg_pos.size_contain = 0;
+    d->bg_pos.sx_pct = d->bg_pos.sy_pct = 0;
+    d->bg_pos.size_x = d->bg_pos.size_y = 0.0f;
+    snprintf(buf, sizeof(buf), "%s", value);
+    sp = buf;
+    while ((tok = strtok(sp, " \t,")) != NULL && n < 2) {
+        sp = NULL;
+        if (hpe_str_ieq(tok, "auto")) {
+            if (n == 0)
+                d->bg_pos.size_auto = 1;
+        } else if (hpe_str_ieq(tok, "cover")) {
+            d->bg_pos.size_cover = 1;
+        } else if (hpe_str_ieq(tok, "contain")) {
+            d->bg_pos.size_contain = 1;
+        } else {
+            size_t ln = strlen(tok);
+            int is_pct = (ln && tok[ln - 1] == '%');
+            float v = (float)atof(tok);
+            if (n == 0)
+                d->bg_pos.size_x = v, d->bg_pos.sx_pct = is_pct;
+            else
+                d->bg_pos.size_y = v, d->bg_pos.sy_pct = is_pct;
+        }
+        n++;
+    }
+    d->set2 |= HPE_PROP2_BACKGROUND_SIZE;
+}
+
+/**
+ * @brief 解析 `grid-template-columns` / `grid-template-rows` 的轨道串 / Parse a `grid-template-*` track list
+ *
+ * @details 按空白切分轨道，识别 `Nfr`、`auto`、`%` 与普通长度；超过 `HPE_GRID_MAX_TRACKS` 的部分被忽略。
+ *          Tracks are split on whitespace and recognised as `Nfr`, `auto`, `%` or a plain length; anything beyond `HPE_GRID_MAX_TRACKS` is ignored.
+ *
+ * @param[in]     value 声明值 / Declaration value
+ * @param[out]    spec 接收解析出的轨道表 / Receives the parsed track list
+ *
+ * @see apply_grid_columns apply_grid_gap
+ */
+static void grid_push_track(HpeGridSpec *spec, const char *tok, size_t ln)
+{
+    HpeGridTrack *t;
+    if (spec->count >= HPE_GRID_MAX_TRACKS || ln == 0)
+        return;
+    t = &spec->tracks[spec->count++];
+    if (ln > 2 && tok[ln - 1] == 'r' && tok[ln - 2] == 'f') {
+        t->kind = 1; /* fr */
+        t->value = (float)atof(tok);
+    } else if (hpe_str_ieq(tok, "auto")) {
+        t->kind = 2;
+        t->value = 0.0f;
+    } else if (tok[ln - 1] == '%') {
+        t->kind = 3;
+        t->value = (float)atof(tok);
+    } else {
+        t->kind = 0; /* px / plain number */
+        t->value = (float)atof(tok);
+    }
+}
+
+/* Expand `repeat(N, <track list>)` by pushing the inner list N times. Returns
+ * the position just past the `)`, or NULL when the token is malformed. */
+static const char *grid_expand_repeat(const char *p, HpeGridSpec *spec)
+{
+    const char *open = p + 7;
+    const char *comma = strchr(open, ',');
+    int times = 0;
+    if (!comma)
+        return NULL;
+    {
+        const char *q;
+        for (q = open; q < comma && *q >= '0' && *q <= '9'; q++)
+            times = times * 10 + (*q - '0');
+        if (q != comma || times <= 0)
+            return NULL;
+    }
+    {
+        const char *in = comma + 1;
+        const char *close = strchr(in, ')');
+        int rep;
+        for (rep = 0; rep < times && spec->count < HPE_GRID_MAX_TRACKS; rep++) {
+            const char *ip = in;
+            while (ip < close) {
+                const char *ts;
+                size_t tl;
+                while (ip < close && (*ip == ' ' || *ip == '\t'))
+                    ip++;
+                ts = ip;
+                while (ip < close && *ip != ' ' && *ip != '\t')
+                    ip++;
+                tl = (size_t)(ip - ts);
+                if (tl)
+                    grid_push_track(spec, ts, tl);
+            }
+        }
+        return close ? close + 1 : in;
+    }
+}
+
+static void parse_grid_tracks(const char *value, HpeGridSpec *spec)
+{
+    const char *p = value;
+    memset(spec, 0, sizeof(*spec));
+    while (*p) {
+        const char *tok;
+        size_t ln;
+        while (*p == ' ' || *p == '\t' || *p == ',')
+            p++;
+        if (!*p)
+            break;
+        if (!strncmp(p, "none", 4) && !(p[4] && (p[4] == '-' || (p[4] >= 'a' && p[4] <= 'z')))) {
+            p += 4;
+            continue;
+        }
+        /* `repeat(N, <track list>)`: expand the inner list N times */
+        if (!strncmp(p, "repeat(", 7)) {
+            const char *next = grid_expand_repeat(p, spec);
+            if (next) {
+                p = next;
+                continue;
+            }
+        }
+        tok = p;
+        while (*p && *p != ' ' && *p != '\t')
+            p++;
+        ln = (size_t)(p - tok);
+        grid_push_track(spec, tok, ln);
+    }
+    spec->present = spec->count > 0;
+}
+
+/**
+ * @brief 解析 `grid-template-columns` 声明 / Parse a `grid-template-columns` declaration
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_grid_rows
+ */
+static void apply_grid_columns(HpeStyle *d, const char *value)
+{
+    parse_grid_tracks(value, &d->grid_cols);
+    d->set2 |= HPE_PROP2_GRID_TEMPLATE_COLUMNS;
+}
+
+/**
+ * @brief 解析 `grid-template-rows` 声明 / Parse a `grid-template-rows` declaration
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_grid_columns
+ */
+static void apply_grid_rows(HpeStyle *d, const char *value)
+{
+    parse_grid_tracks(value, &d->grid_rows);
+    d->set2 |= HPE_PROP2_GRID_TEMPLATE_ROWS;
+}
+
+/**
+ * @brief 解析 `gap` / `row-gap` / `column-gap` 声明 / Parse a `gap` / `row-gap` / `column-gap` declaration
+ *
+ * @details 视觉上沿用单值 `gap`（与 flex 的 `gap` 一致），多值时取第一个。
+ *          A single `gap` value is reused visually (matching the flex `gap`); with several values the first wins.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_gap
+ */
+static void apply_grid_gap(HpeStyle *d, const char *value)
+{
+    char buf[64];
+    char *sp;
+    snprintf(buf, sizeof(buf), "%s", value);
+    sp = strtok(buf, " \t");
+    if (sp)
+        d->grid_gap = (float)atof(sp);
+    d->gap = d->grid_gap;
+    d->set2 |= HPE_PROP2_GRID_GAP;
+}
+
+/**
+ * @brief 解析一条 `grid-*-start` / `grid-*-end` 的线值 / Parse one `grid-*-start` / `grid-*-end` line value
+ *
+ * @details 支持 `auto`（返回 0）、`N`（1 基线）与 `span N`（返回 `-N`）；无法识别时按 `auto` 处理。
+ *          `auto` yields 0, a bare `N` yields the 1-based line number and `span N` yields `-N`; anything unrecognised falls back to `auto`.
+ *
+ * @param[in] tok 去空白后的记号 / Whitespace-trimmed token
+ *
+ * @return 解析出的线值 / The parsed line value
+ *
+ * @note `span N` 需要调用方把 `span` 与数字作为两个记号分别处理 / The caller splits `span N` into two tokens
+ */
+static int parse_grid_line(const char *tok)
+{
+    if (!tok || !*tok || hpe_str_ieq(tok, "auto"))
+        return 0;
+    if (tok[0] >= '0' && tok[0] <= '9')
+        return atoi(tok);
+    return 0;
+}
+
+/**
+ * @brief 解析 `grid-column` / `grid-row` 声明 / Parse a `grid-column` / `grid-row` declaration
+ *
+ * @details 值可以是 `start`、`start / end`、`span N` 或 `start / span N`；`span` 记为负数以便与线号区分。
+ *          The value may be `start`, `start / end`, `span N` or `start / span N`; `span` is stored negative so it cannot be confused with a line number.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ * @param[in]     is_row 非零表示 `grid-row` / Non-zero selects `grid-row`
+ *
+ * @see apply_grid_columns
+ */
+static void apply_grid_line(HpeStyle *d, const char *value, int is_row)
+{
+    char buf[96];
+    char *sp, *tok;
+    int vals[2];
+    int n = 0;
+
+    snprintf(buf, sizeof(buf), "%s", value);
+    sp = buf;
+    while (n < 2 && (tok = strtok(sp, " /")) != NULL) {
+        sp = NULL;
+        if (hpe_str_ieq(tok, "span")) {
+            /* the next token is the span length */
+            char *num = strtok(NULL, " /");
+            int k = num ? atoi(num) : 1;
+            vals[n++] = k > 0 ? -k : -1;
+            continue;
+        }
+        vals[n++] = parse_grid_line(tok);
+    }
+    if (is_row) {
+        d->grid_row_start = vals[0];
+        d->grid_row_end = n > 1 ? vals[1] : 0;
+        d->set2 |= HPE_PROP2_GRID_ROW;
+    } else {
+        d->grid_col_start = vals[0];
+        d->grid_col_end = n > 1 ? vals[1] : 0;
+        d->set2 |= HPE_PROP2_GRID_COLUMN;
+    }
+}
+
+/**
+ * @brief 解析 `grid-column` 声明 / Parse a `grid-column` declaration
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_grid_line
+ */
+static void apply_grid_column(HpeStyle *d, const char *value)
+{
+    apply_grid_line(d, value, 0);
+}
+
+/**
+ * @brief 解析 `grid-row` 声明 / Parse a `grid-row` declaration
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_grid_line
+ */
+static void apply_grid_row(HpeStyle *d, const char *value)
+{
+    apply_grid_line(d, value, 1);
+}
+
+/**
+ * @brief 解析 `justify-items` 声明 / Parse a `justify-items` declaration
+ *
+ * @details 复用 `HpeAlignItems` 取值；`stretch` 是默认值。
+ *          Reuses the `HpeAlignItems` values; `stretch` is the default.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_align_items
+ */
+static void apply_justify_items(HpeStyle *d, const char *value)
+{
+    if (hpe_str_ieq(value, "start") || hpe_str_ieq(value, "flex-start"))
+        d->justify_items = HPE_ALIGN_ITEMS_FLEX_START;
+    else if (hpe_str_ieq(value, "center"))
+        d->justify_items = HPE_ALIGN_ITEMS_CENTER;
+    else if (hpe_str_ieq(value, "end") || hpe_str_ieq(value, "flex-end"))
+        d->justify_items = HPE_ALIGN_ITEMS_FLEX_END;
+    else
+        d->justify_items = HPE_ALIGN_ITEMS_STRETCH;
+    d->set2 |= HPE_PROP2_JUSTIFY_ITEMS;
+}
+
+/**
+ * @brief 解析 `align-content` 声明 / Parse an `align-content` declaration
+ *
+ * @details 复用 `HpeJustify` 取值，作用于整张网格在容器内的分布。
+ *          Reuses the `HpeJustify` values and distributes the whole grid inside its container.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_justify_content
+ */
+static void apply_align_content(HpeStyle *d, const char *value)
+{
+    if (hpe_str_ieq(value, "center"))
+        d->align_content = HPE_JUSTIFY_CENTER;
+    else if (hpe_str_ieq(value, "end") || hpe_str_ieq(value, "flex-end"))
+        d->align_content = HPE_JUSTIFY_END;
+    else if (hpe_str_ieq(value, "space-between"))
+        d->align_content = HPE_JUSTIFY_SPACE_BETWEEN;
+    else if (hpe_str_ieq(value, "space-around"))
+        d->align_content = HPE_JUSTIFY_SPACE_AROUND;
+    else
+        d->align_content = HPE_JUSTIFY_START;
+    d->set2 |= HPE_PROP2_ALIGN_CONTENT;
+}
+
+/**
+ * @brief 解析 `grid-auto-flow` 声明 / Parse a `grid-auto-flow` declaration
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @note 只区分 `row`（默认）与 `column` / Only `row` (the default) and `column` are distinguished
+ */
+static void apply_grid_auto_flow(HpeStyle *d, const char *value)
+{
+    d->grid_auto_flow = hpe_str_ieq(value, "column") ? 1 : 0;
+    d->set2 |= HPE_PROP2_GRID_AUTO_FLOW;
+}
+
+/**
+ * @brief 解析 `table-layout` 声明 / Parse a `table-layout` declaration
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_border_spacing
+ */
+static void apply_table_layout(HpeStyle *d, const char *value)
+{
+    d->table_layout_fixed = hpe_str_ieq(value, "fixed");
+    d->set2 |= HPE_PROP2_TABLE_LAYOUT;
+}
+
+/**
+ * @brief 解析 `border-spacing` 声明 / Parse a `border-spacing` declaration
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_table_layout
+ */
+static void apply_border_spacing(HpeStyle *d, const char *value)
+{
+    float h = (float)atof(value);
+    const char *sp = strpbrk(value, " \t");
+    float v = h;
+    if (sp)
+        v = (float)atof(sp + 1);
+    d->border_spacing_h = h;
+    d->border_spacing_v = v;
+    d->set2 |= HPE_PROP2_BORDER_SPACING;
+}
+
+/**
+ * @brief 解析 `scrollbar-width` 声明 / Parse a `scrollbar-width` declaration
+ *
+ * @details 接受 `auto`（缺省 12px）、`thin`（8px）、`none`（0，等效隐藏滚动条）与
+ *          具体长度；元素级滚动容器的滚动条占位与绘制都取该值。
+ *          Accepts `auto` (the 12px default), `thin` (8px), `none` (0, i.e. a hidden scrollbar) and a concrete length; the element scrollbar's reserved space and its painted width both read this value.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_overflow
+ */
+static void apply_scrollbar_width(HpeStyle *d, const char *value)
+{
+    char buf[32];
+    size_t n;
+    if (!value)
+        return;
+    while (*value == ' ' || *value == '\t')
+        value++;
+    n = strlen(value);
+    while (n > 0 && (value[n - 1] == ' ' || value[n - 1] == '\t' || value[n - 1] == ';'))
+        n--;
+    if (n >= sizeof(buf))
+        return;
+    memcpy(buf, value, n);
+    buf[n] = '\0';
+    if (hpe_str_ieq(buf, "auto")) {
+        d->scrollbar_width = 12.0f;
+    } else if (hpe_str_ieq(buf, "thin")) {
+        d->scrollbar_width = 8.0f;
+    } else if (hpe_str_ieq(buf, "none")) {
+        d->scrollbar_width = 0.0f;
+    } else {
+        const char *p = buf;
+        char *end = NULL;
+        double v;
+        if (*p == '-' || *p == '+')
+            p++;
+        if (*p < '0' || *p > '9')
+            return;
+        v = strtod(buf, &end);
+        if (end == buf)
+            return;
+        d->scrollbar_width = (float)v;
+    }
+    d->set2 |= HPE_PROP2_SCROLLBAR_WIDTH;
+}
+
+/**
+ * @brief 解析 `direction` 声明 / Parse a `direction` declaration
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see apply_white_space
+ */
+static void apply_direction(HpeStyle *d, const char *value)
+{
+    d->direction_rtl = hpe_str_ieq(value, "rtl");
+    d->set2 |= HPE_PROP2_DIRECTION;
+}
+
 /* name -> applier registry; the single source of truth for the property surface */
 typedef void (*PropApplier)(HpeStyle *d, const char *value);
-
 typedef struct {
     const char *name;
     PropApplier fn;
@@ -2258,6 +3190,33 @@ static const PropEntry k_prop_table[] = {
     {"border-right-color", apply_border_right_color},
     {"border-bottom-color", apply_border_bottom_color},
     {"border-left-color", apply_border_left_color},
+    {"content", apply_content},
+    {"flex-wrap", apply_flex_wrap},
+    {"flex-flow", apply_flex_wrap},
+    {"order", apply_order},
+    {"flex-basis", apply_flex_basis},
+    {"flex-shrink", apply_flex_shrink},
+    {"background-position", apply_background_position},
+    {"background-size", apply_background_size},
+    {"background-repeat", apply_background_repeat},
+    {"object-fit", apply_object_fit},
+    {"object-position", apply_object_position},
+    {"grid-template-columns", apply_grid_columns},
+    {"grid-template-rows", apply_grid_rows},
+    {"grid-column", apply_grid_column},
+    {"grid-column-start", apply_grid_column},
+    {"grid-column-end", apply_grid_column},
+    {"grid-row", apply_grid_row},
+    {"grid-row-start", apply_grid_row},
+    {"grid-row-end", apply_grid_row},
+    {"justify-items", apply_justify_items},
+    {"align-content", apply_align_content},
+    {"grid-auto-flow", apply_grid_auto_flow},
+    {"grid-gap", apply_grid_gap},
+    {"table-layout", apply_table_layout},
+    {"border-spacing", apply_border_spacing},
+    {"direction", apply_direction},
+    {"scrollbar-width", apply_scrollbar_width},
 };
 
 /**
@@ -2478,6 +3437,35 @@ static void compound_add_class(HpeCompound *c, const char *name)
  *
  * @see compound_add_class compound_add_attr
  */
+static void compound_free(HpeCompound *c);
+
+/**
+ * @brief 释放 `:not()` / `:is()` 参数中的嵌套选择器 / Release the nested selectors of `:not()` / `:is()`
+ *
+ * @details 每个嵌套选择器由若干复合部分组成，逐部分释放其内部资源后释放数组本体；`not_list` 与 `is_list` 都会处理。
+ *          Each nested selector consists of several compounds whose internal resources are released one by one before the array itself; both `not_list` and `is_list` are handled.
+ *
+ * @param[in,out] c 目标复合选择器 / Target compound selector
+ *
+ * @see compound_free
+ */
+static void nested_sel_lists_free(HpeCompound *c)
+{
+    int i, j;
+    for (i = 0; i < c->not_count; i++) {
+        for (j = 0; j < c->not_list[i].count; j++)
+            compound_free(&c->not_list[i].parts[j]);
+        if (c->not_list[i].parts)
+            hpe_free(c->not_list[i].parts);
+    }
+    for (i = 0; i < c->is_count; i++) {
+        for (j = 0; j < c->is_list[i].count; j++)
+            compound_free(&c->is_list[i].parts[j]);
+        if (c->is_list[i].parts)
+            hpe_free(c->is_list[i].parts);
+    }
+}
+
 static void compound_free(HpeCompound *c)
 {
     int i;
@@ -2499,8 +3487,15 @@ static void compound_free(HpeCompound *c)
     }
     if (c->attrs)
         hpe_free(c->attrs);
+    nested_sel_lists_free(c);
+    if (c->not_list)
+        hpe_free(c->not_list);
+    if (c->is_list)
+        hpe_free(c->is_list);
     memset(c, 0, sizeof(*c));
 }
+
+
 
 /**
  * @brief 解析一个 `.class` 或 `#id` token / Parse one `.class` or `#id` token
@@ -2538,10 +3533,203 @@ static int parse_class_or_id(HpeCompound *out, const char **pp, const char *end,
 }
 
 /**
+ * @brief 解析 `:nth-*(an+b)` 的括号参数 / Parse the parenthesised argument of `:nth-*(an+b)`
+ *
+ * @details 支持 `odd` / `even` 关键字、纯整数、`an+b` / `an-b` / `an` / `n` / `-n+a` 等写法；系数与常数允许带正负号并跳过空白。解析失败时把 `out->present` 清零（该伪类匹配任何下标），并发出一条调试信息。
+ *          Accepts the `odd` / `even` keywords, a plain integer and the `an+b` / `an-b` / `an` / `n` / `-n+a` forms; coefficients and constants may carry a sign and whitespace is skipped. On failure `out->present` is cleared (the pseudo then matches any index) and a debug message is emitted.
+ *
+ * @param[in,out] pp 解析游标指针，指向函数名之后 / Parse cursor pointing just past the function name
+ * @param[in]     end 输入缓冲区末尾 / End of the input buffer
+ * @param[in]     name 伪类名（用于诊断输出）/ Pseudo-class name, used for diagnostics
+ * @param[out]    out 接收解析出的 `an+b` / Receives the parsed `an+b`
+ *
+ * @return 成功返回 1，缺少左括号或右括号不配返回 0 / 1 on success, 0 when a bracket is missing or unbalanced
+ *
+ * @see nth_matches parse_pseudo
+ */
+/* Parse the optional `+b` / `-b` tail that follows an `an` term. Fills *b and
+ * *has_b; advances *q past the sign and digits. */
+static void nth_parse_b(const char **qq, int *b, int *has_b)
+{
+    const char *q = *qq;
+    int sneg, v = 0;
+    if (!(*q == '+' || *q == '-'))
+        return;
+    sneg = (*q++ == '-');
+    while (*q && hpe_is_space(*q))
+        q++;
+    while (css_is_digit(*q))
+        v = v * 10 + (*q++ - '0');
+    *b = sneg ? -v : v;
+    *has_b = 1;
+    *qq = q;
+}
+
+/* Parse the `an` (or bare integer / the `odd` / `even` keywords) head of an
+ * `:nth-*()` argument into *a / *b / *has_a / *has_b. */
+static void nth_parse_head(const char **qq, int *a, int *b, int *has_a, int *has_b)
+{
+    const char *q = *qq;
+    int neg = 0;
+    if (*q == '+' || *q == '-')
+        neg = (*q++ == '-');
+    if (*q == 'n' || *q == 'N') {
+        *a = neg ? -1 : 1;
+        *has_a = 1;
+        q++;
+    } else if (css_is_digit(*q)) {
+        int v = 0;
+        while (css_is_digit(*q))
+            v = v * 10 + (*q++ - '0');
+        if (*q == 'n' || *q == 'N') {
+            *a = neg ? -v : v;
+            *has_a = 1;
+            q++;
+        } else {
+            *b = neg ? -v : v;
+            *has_b = 1;
+        }
+    }
+    *qq = q;
+}
+
+static int parse_nth_arg(const char **pp, const char *end, const char *name, HpeNth *out)
+{
+    const char *p = *pp;
+    const char *close;
+    char body[64];
+    size_t n;
+    int a = 0, b = 0, has_a = 0, has_b = 0;
+    const char *q;
+
+    out->present = 0;
+    if (p >= end || *p != '(')
+        return 0;
+    close = p + 1;
+    while (close < end && *close != ')')
+        close++;
+    if (close >= end)
+        return 0;
+    n = (size_t)(close - p - 1);
+    if (n >= sizeof(body))
+        n = sizeof(body) - 1;
+    memcpy(body, p + 1, n);
+    body[n] = '\0';
+    q = body;
+    while (*q && hpe_is_space(*q))
+        q++;
+    if (hpe_str_ieq(q, "odd")) {
+        a = 2;
+        b = 1;
+        has_a = has_b = 1;
+    } else if (hpe_str_ieq(q, "even")) {
+        a = 2;
+        b = 0;
+        has_a = has_b = 1;
+    } else {
+        nth_parse_head(&q, &a, &b, &has_a, &has_b);
+        while (*q && hpe_is_space(*q))
+            q++;
+        if (has_a)
+            nth_parse_b(&q, &b, &has_b);
+    }
+    *pp = close + 1;
+    if (!has_a && !has_b) {
+        fprintf(stderr, "[hope] malformed :%s() ignored: '%.*s'\n", name, (int)n, body);
+        return 1;
+    }
+    out->a = a;
+    out->b = b;
+    out->present = 1;
+    return 1;
+}
+
+/**
+ * @brief 解析 `:not()` / `:is()` / `:where()` 的括号参数 / Parse the parenthesised argument of `:not()` / `:is()` / `:where()`
+ *
+ * @details 参数是一份以逗号分隔的选择器列表，按嵌套规则解析后挂到 `not_list` 或 `is_list`；`:where()` 只影响特异性（记 0）而不改变匹配语义。
+ *          The argument is a comma-separated selector list parsed recursively and attached to `not_list` or `is_list`; `:where()` only affects specificity (counted as zero) rather than matching.
+ *
+ * @param[in,out] out 目标复合选择器 / Target compound selector
+ * @param[in,out] pp 解析游标指针，指向函数名之后 / Parse cursor pointing just past the function name
+ * @param[in]     end 输入缓冲区末尾 / End of the input buffer
+ * @param[in]     name 伪类名 / Pseudo-class name
+ *
+ * @return 成功返回 1，括号不配返回 0 / 1 on success, 0 when the brackets are unbalanced
+ *
+ * @note `:not()`/`:is()` 只接受简单选择器（复合链），不支持组合符——与浏览器一致地降级 / Only compound selectors are accepted (no combinators), degrading the same way browsers do
+ *
+ * @see parse_one_selector parse_pseudo
+ */
+/* Find the `)` that closes the `(` at p, honouring nesting. Returns NULL when
+ * the parenthesis is unbalanced. */
+static const char *find_matching_paren(const char *p, const char *end)
+{
+    const char *close = p + 1;
+    int depth = 1;
+    while (close < end && depth > 0) {
+        if (*close == '(')
+            depth++;
+        else if (*close == ')')
+            depth--;
+        if (depth == 0)
+            break;
+        close++;
+    }
+    return close >= end ? NULL : close;
+}
+
+/* Parse the comma-separated selector list in `body` into a fresh array. */
+static void parse_sel_arg_list(const char *body, HpeSelector **arr, int *cnt)
+{
+    HpeRule tmp;
+    int i;
+    memset(&tmp, 0, sizeof(tmp));
+    parse_selector_list(&tmp, body, strlen(body));
+    if (tmp.selector_count > 0) {
+        *arr = (HpeSelector *)hpe_calloc((size_t)tmp.selector_count, sizeof(HpeSelector));
+        for (i = 0; i < tmp.selector_count; i++)
+            (*arr)[i] = tmp.selectors[i];
+        *cnt = tmp.selector_count;
+    }
+    if (tmp.selectors)
+        hpe_free(tmp.selectors);
+}
+
+static int parse_sel_arg(HpeCompound *out, const char **pp, const char *end, const char *name)
+{
+    const char *p = *pp;
+    const char *close;
+    HpeSelector **arr;
+    int *cnt;
+    char *body;
+
+    if (p >= end || *p != '(')
+        return 0;
+    close = find_matching_paren(p, end);
+    if (!close)
+        return 0;
+    body = hpe_strndup(p + 1, (size_t)(close - p - 1));
+    if (hpe_str_ieq(name, "not")) {
+        arr = &out->not_list;
+        cnt = &out->not_count;
+    } else {
+        arr = &out->is_list;
+        cnt = &out->is_count;
+        if (hpe_str_ieq(name, "where"))
+            out->is_where = 1;
+    }
+    parse_sel_arg_list(body, arr, cnt);
+    hpe_free(body);
+    *pp = close + 1;
+    return 1;
+}
+
+/**
  * @brief 解析一个 `:pseudo` token / Parse one `:pseudo` token
  *
- * @details `:root` 在缺少标签时补上 `html`，`:hover` 置位 `pseudo_hover`；其余动态/结构伪类被有意忽略，以便含它们的选择器仍能解析而不失败。
- *          `:root` supplies an `html` tag when the tag is absent and `:hover` sets `pseudo_hover`; other dynamic and structural pseudo-classes are deliberately ignored so a selector containing them still parses instead of failing.
+ * @details `::before`/`::after` 记为伪元素；`:root` 在缺少标签时补上 `html`；`:hover`/`:focus`/`:active`/`:visited`/`:link`/`:target` 置对应状态位；`:first-child` 一族与 `:empty`/`:checked`/`:disabled`/`:enabled` 置结构位；`:nth-*()` 解析 `an+b`；`:not()`/`:is()`/`:where()` 递归解析参数。未知伪类被有意忽略，使选择器仍能解析而不失败。
+ *          `::before`/`::after` mark a pseudo-element; `:root` supplies an `html` tag when absent; `:hover`/`:focus`/`:active`/`:visited`/`:link`/`:target` set the matching state bit; the `:first-child` family and `:empty`/`:checked`/`:disabled`/`:enabled` set structural bits; `:nth-*()` parse `an+b`; `:not()`/`:is()`/`:where()` recurse into their argument. Unknown pseudo-classes are ignored on purpose so the selector still parses.
  *
  * @param[in,out] out 目标复合选择器 / Target compound selector
  * @param[in,out] pp 解析游标指针 / Parse cursor pointer
@@ -2551,22 +3739,99 @@ static int parse_class_or_id(HpeCompound *out, const char **pp, const char *end,
  *
  * @return 成功返回 1，缺少标识符返回 0 / 1 on success, 0 when the identifier is missing
  *
- * @see read_ident parse_compound
+ * @see read_ident parse_compound parse_nth_arg parse_sel_arg
  */
+/* The `:hover` / `:focus` / `:active` / `:visited` / `:link` / `:target` state
+ * bits. Returns 1 when the identifier was recognised. */
+static int pseudo_state_bit(HpeCompound *out, const char *ident)
+{
+    if (hpe_str_ieq(ident, "hover"))
+        out->pseudo |= HPE_PS_HOVER;
+    else if (hpe_str_ieq(ident, "focus") || hpe_str_ieq(ident, "focus-visible") ||
+             hpe_str_ieq(ident, "focus-within"))
+        out->pseudo |= HPE_PS_FOCUS;
+    else if (hpe_str_ieq(ident, "active"))
+        out->pseudo |= HPE_PS_ACTIVE;
+    else if (hpe_str_ieq(ident, "visited"))
+        out->pseudo |= HPE_PS_VISITED;
+    else if (hpe_str_ieq(ident, "link") || hpe_str_ieq(ident, "any-link"))
+        out->pseudo |= HPE_PS_LINK;
+    else if (hpe_str_ieq(ident, "target"))
+        out->pseudo |= HPE_PS_TARGET;
+    else
+        return 0;
+    return 1;
+}
+
+/* The `:first-child` family and `:empty` / `:checked` / `:disabled` / `:enabled`
+ * structural bits. Returns 1 when recognised. */
+static int pseudo_structural_bit(HpeCompound *out, const char *ident)
+{
+    if (hpe_str_ieq(ident, "first-child"))
+        out->pseudo |= HPE_PS_FIRST_CHILD;
+    else if (hpe_str_ieq(ident, "last-child"))
+        out->pseudo |= HPE_PS_LAST_CHILD;
+    else if (hpe_str_ieq(ident, "only-child"))
+        out->pseudo |= HPE_PS_ONLY_CHILD;
+    else if (hpe_str_ieq(ident, "first-of-type"))
+        out->pseudo |= HPE_PS_FIRST_OF_TYPE;
+    else if (hpe_str_ieq(ident, "last-of-type"))
+        out->pseudo |= HPE_PS_LAST_OF_TYPE;
+    else if (hpe_str_ieq(ident, "only-of-type"))
+        out->pseudo |= HPE_PS_ONLY_OF_TYPE;
+    else if (hpe_str_ieq(ident, "empty"))
+        out->pseudo |= HPE_PS_EMPTY;
+    else if (hpe_str_ieq(ident, "checked"))
+        out->pseudo |= HPE_PS_CHECKED;
+    else if (hpe_str_ieq(ident, "disabled"))
+        out->pseudo |= HPE_PS_DISABLED;
+    else if (hpe_str_ieq(ident, "enabled"))
+        out->pseudo |= HPE_PS_ENABLED;
+    else
+        return 0;
+    return 1;
+}
+
+/* The `:nth-*()` family: pick the target slot and parse the `an+b` argument.
+ * Returns 1 on success, 0 when the argument is malformed. */
+static int pseudo_nth_arg(HpeCompound *out, const char **pp, const char *end, const char *ident)
+{
+    HpeNth *dst = &out->nth_last_of_type;
+    if (hpe_str_ieq(ident, "nth-child"))
+        dst = &out->nth_child;
+    else if (hpe_str_ieq(ident, "nth-last-child"))
+        dst = &out->nth_last_child;
+    else if (hpe_str_ieq(ident, "nth-of-type"))
+        dst = &out->nth_of_type;
+    return parse_nth_arg(pp, end, ident, dst);
+}
+
 static int parse_pseudo(HpeCompound *out, const char **pp, const char *end, char *ident,
                         size_t ident_size)
 {
     const char *p = *pp + 1; /* skip ':' */
 
+    if (p < end && *p == ':')
+        p++; /* `::before` — the double-colon form of a pseudo-element */
     if (!read_ident(&p, end, ident, ident_size))
         return 0;
-    if (hpe_str_ieq(ident, "root")) {
+    if (hpe_str_ieq(ident, "before") || hpe_str_ieq(ident, "after")) {
+        out->pseudo_element = hpe_str_ieq(ident, "before") ? HPE_PE_BEFORE : HPE_PE_AFTER;
+    } else if (hpe_str_ieq(ident, "root")) {
         if (!out->tag)
             out->tag = hpe_strdup("html");
-    } else if (hpe_str_ieq(ident, "hover")) {
-        out->pseudo_hover = 1;
+    } else if (pseudo_state_bit(out, ident) || pseudo_structural_bit(out, ident)) {
+        /* state / structural bits already set */
+    } else if (hpe_str_ieq(ident, "nth-child") || hpe_str_ieq(ident, "nth-last-child") ||
+               hpe_str_ieq(ident, "nth-of-type") || hpe_str_ieq(ident, "nth-last-of-type")) {
+        if (!pseudo_nth_arg(out, &p, end, ident))
+            return 0;
+    } else if (hpe_str_ieq(ident, "not") || hpe_str_ieq(ident, "is") ||
+               hpe_str_ieq(ident, "where")) {
+        if (!parse_sel_arg(out, &p, end, ident))
+            return 0;
     }
-    /* other dynamic / structural pseudo-classes are ignored on purpose */
+    /* unknown pseudo-classes are ignored on purpose so the selector still parses */
     *pp = p;
     return 1;
 }
@@ -2757,32 +4022,80 @@ static int parse_compound(const char **pp, const char *end, HpeCompound *out)
 }
 
 /**
+ * @brief 计算一个复合选择器贡献的特异性 / Specificity contributed by one compound selector
+ *
+ * @details id 记 100、每个类/属性选择器记 10、伪类记 10、伪元素记 1、标签记 1；`:where()` 的嵌套参数贡献 0，`:is()`/`:not()` 取参数中最高者。
+ *          An id counts 100, each class/attribute selector 10, each pseudo-class 10, a pseudo-element 1 and a tag 1; `:where()` contributes 0 and `:is()`/`:not()` take the highest value found among their arguments.
+ *
+ * @param[in]     part 复合选择器 / Compound selector
+ *
+ * @return 该部分贡献的特异性 / The specificity this part contributes
+ *
+ * @see selector_add_part sel_inner_specificity
+ */
+static int compound_specificity(const HpeCompound *part)
+{
+    int spec = 0;
+    int i, j;
+    if (part->id)
+        spec += 100;
+    spec += part->class_count * 10;
+    spec += part->attr_count * 10;
+    /* one pseudo-class bit pair per declaration; count bits */
+    {
+        unsigned bits = part->pseudo;
+        while (bits) {
+            if (bits & 1u)
+                spec += 10;
+            bits >>= 1;
+        }
+    }
+    if (part->nth_child.present || part->nth_last_child.present ||
+        part->nth_of_type.present || part->nth_last_of_type.present)
+        spec += 10;
+    if (!part->is_where) {
+        for (i = 0; i < part->is_count; i++) {
+            int best = 0;
+            for (j = 0; j < part->is_list[i].count; j++)
+                best = HPE_MAX(best, part->is_list[i].specificity);
+            spec += best;
+        }
+        for (i = 0; i < part->not_count; i++) {
+            int best = 0;
+            for (j = 0; j < part->not_list[i].count; j++)
+                best = HPE_MAX(best, part->not_list[i].specificity);
+            spec += best;
+        }
+    }
+    if (part->pseudo_element != HPE_PE_NONE)
+        spec += 1;
+    if (part->tag)
+        spec += 1;
+    return spec;
+}
+
+/**
  * @brief 给选择器追加一个复合部分并累加特异性 / Append one compound part to a selector and accumulate its specificity
  *
- * @details 扩容 `parts` 并以值拷贝存入该部分，然后累加特异性：id 记 100、每个类记 10、`:hover` 记 10（伪类按类计）、标签记 1。
- *          The `parts` array is grown and the compound copied in by value, then specificity accumulates: 100 for an id, 10 per class, 10 for `:hover` (a pseudo-class counts as a class) and 1 for a tag.
+ * @details 扩容 `parts` 并以值拷贝存入该部分，然后按 `compound_specificity` 累加特异性（id 100、类/属性/伪类 10、伪元素/标签 1，`:where()` 记 0）。
+ *          The `parts` array is grown and the compound copied in by value, then specificity accumulates through `compound_specificity` (id 100, class/attribute/pseudo-class 10, pseudo-element/tag 1, `:where()` zero).
  *
  * @param[in,out] sel 目标选择器 / Target selector
  * @param[in]     part 待追加的复合选择器 / Compound selector to append
  *
  * @return 恒返回 1 / Always returns 1
  *
- * @see parse_one_selector
+ * @see parse_one_selector compound_specificity
  */
 static int selector_add_part(HpeSelector *sel, const HpeCompound *part)
 {
     sel->parts = (HpeCompound *)hpe_grow(sel->parts, &sel->cap, (size_t)sel->count + 1,
                                          sizeof(HpeCompound));
     sel->parts[sel->count++] = *part;
-    if (part->id)
-        sel->specificity += 100;
-    sel->specificity += part->class_count * 10;
-    if (part->pseudo_hover)
-        sel->specificity += 10; /* pseudo-class counts as a class */
-    if (part->tag)
-        sel->specificity += 1;
+    sel->specificity += compound_specificity(part);
     return 1;
 }
+
 
 /**
  * @brief 释放选择器持有的全部内存 / Release every allocation held by a selector
@@ -2926,9 +4239,19 @@ static void parse_selector_list(HpeRule *rule, const char *text, size_t length)
         const char *part_start = p;
         const char *part_end;
         HpeSelector sel;
+        int depth = 0;
 
-        while (p < end && *p != ',')
+        /* a comma only separates selectors at parenthesis depth 0, so the
+         * argument lists of :not()/:is()/:where() stay intact */
+        while (p < end) {
+            if (*p == '(')
+                depth++;
+            else if (*p == ')')
+                depth--;
+            else if (*p == ',' && depth == 0)
+                break;
             p++;
+        }
         part_end = p;
         if (p < end)
             p++;
@@ -3052,27 +4375,196 @@ static int attr_op_matches(const HpeAttrSel *as, const char *attr_val)
 }
 
 /**
+ * @brief 判断 `an+b` 公式是否命中某个 1 基下标 / Test whether an `an+b` formula hits a 1-based index
+ *
+ * @details `a == 0` 时只比较 `b`；`a > 0` 时命中条件为 `i >= b` 且 `(i - b) % a == 0`；`a < 0` 时命中条件为 `i <= b` 且 `(b - i) % (-a) == 0`。未启用的公式（`present == 0`）恒返回 1。
+ *          With `a == 0` only `b` is compared; with `a > 0` the index hits when `i >= b` and `(i - b) % a == 0`; with `a < 0` it hits when `i <= b` and `(b - i) % (-a) == 0`. A disabled formula (`present == 0`) always returns 1.
+ *
+ * @param[in]     nth 公式 / The formula
+ * @param[in]     i 1 基下标 / 1-based index
+ *
+ * @return 命中返回 1，否则 0 / 1 on a hit, 0 otherwise
+ *
+ * @see compound_matches
+ */
+static int nth_matches(const HpeNth *nth, int i)
+{
+    int a = nth->a, b = nth->b;
+    if (!nth->present)
+        return 1;
+    if (a == 0)
+        return i == b;
+    if (a > 0) {
+        if (i < b)
+            return 0;
+        return ((i - b) % a) == 0;
+    }
+    if (i > b)
+        return 0;
+    return ((b - i) % (-a)) == 0;
+}
+
+/**
+ * @brief 统计节点在元素兄弟中的 1 基位置（同类型或全部）/ 1-based position of a node among its element siblings
+ *
+ * @details `of_type` 非 0 时只统计同名标签的兄弟；无视文本节点等非元素节点。数据来自 DOM 兄弟链，无需额外缓存。
+ *          With a non-zero `of_type` only siblings sharing the tag name are counted; non-element nodes such as text are ignored. The DOM sibling chain is walked directly, so no extra cache is needed.
+ *
+ * @param[in]     node 目标元素 / Target element
+ * @param[in]     of_type 是否只统计同类型元素 / Whether to only count same-type elements
+ * @param[out]    total 接收兄弟总数，可为 `NULL` / Receives the total number of siblings, may be `NULL`
+ *
+ * @return 该节点的 1 基下标 / The 1-based index of the node
+ *
+ * @see nth_matches compound_matches
+ */
+static int elem_index_of(const HpeDomNode *node, int of_type, int *total)
+{
+    const HpeDomNode *p;
+    int idx = 1;
+    int n = 1;
+    if (total)
+        *total = 1;
+    if (!node || !node->parent)
+        return 1;
+    for (p = node->parent->first_child; p; p = p->next_sibling) {
+        if (p == node)
+            break;
+        if (p->type == HPE_NODE_ELEMENT && (!of_type || (p->tag && node->tag && !strcmp(p->tag, node->tag))))
+            idx++;
+    }
+    for (p = node->next_sibling; p; p = p->next_sibling) {
+        if (p->type == HPE_NODE_ELEMENT && (!of_type || (p->tag && node->tag && !strcmp(p->tag, node->tag))))
+            n++;
+    }
+    if (total)
+        *total = idx + n - 1;
+    return idx;
+}
+
+/**
+ * @brief 判断元素是否为空（无元素或非空文本子节点）/ Test whether an element is empty
+ *
+ * @details 依 CSS 定义，只有元素子节点与含非空白的文本子节点会使其非空；注释与空白文本不算。
+ *          Per CSS an element is non-empty only when it has an element child or a text child containing non-whitespace; comments and whitespace-only text do not count.
+ *
+ * @param[in]     node 目标元素 / Target element
+ *
+ * @return 空元素返回 1 / 1 for an empty element
+ *
+ * @see compound_matches
+ */
+static int element_is_empty(const HpeDomNode *node)
+{
+    const HpeDomNode *p;
+    for (p = node->first_child; p; p = p->next_sibling) {
+        if (p->type == HPE_NODE_ELEMENT)
+            return 0;
+        if (p->type == HPE_NODE_TEXT && p->text && p->text[0]) {
+            const char *s = p->text;
+            while (*s) {
+                if (!hpe_is_space(*s))
+                    return 0;
+                s++;
+            }
+        }
+    }
+    return 1;
+}
+
+/**
  * @brief 判断复合选择器是否匹配一个元素节点 / Test whether a compound selector matches an element node
  *
- * @details 元素类型不符直接不匹配；依次校验标签、`hover` 状态、id、全部类名（逐个要求在 `class` 中）与全部属性选择器，全部通过才匹配。
- *          A non-element node fails immediately; the tag, hover state, id, every class (each required to appear in `class`) and every attribute selector are checked in turn and all must pass.
+ * @details 元素类型不符直接不匹配；依次校验标签、状态伪类、结构伪类（`an+b` 与 `:first-child` 一族）、id、全部类名与全部属性选择器，最后校验 `:not()`/`:is()` 参数，全部通过才匹配。
+ *          A non-element node fails immediately; the tag, state pseudo-classes, structural pseudo-classes (`an+b` and the `:first-child` family), id, every class and every attribute selector are checked in turn, then the `:not()`/`:is()` arguments, and all must pass.
  *
  * @param[in]     c 复合选择器 / Compound selector
  * @param[in]     node 待测试的 DOM 节点 / DOM node to test
  *
  * @return 匹配返回 1，否则返回 0 / 1 on a match, 0 otherwise
  *
- * @see attr_op_matches class_list_contains
+ * @see attr_op_matches class_list_contains nth_matches hpe_css_sel_matches_node
  */
-static int compound_matches(const HpeCompound *c, const HpeDomNode *node)
+/* State pseudo-classes driven by the node's interaction flags and attributes. */
+static int compound_state_matches(const HpeCompound *c, const HpeDomNode *node)
+{
+    if ((c->pseudo & HPE_PS_HOVER) && !node->hovered)
+        return 0;
+    if ((c->pseudo & HPE_PS_FOCUS) && !node->focused)
+        return 0;
+    if ((c->pseudo & HPE_PS_ACTIVE) && !node->active)
+        return 0;
+    if ((c->pseudo & HPE_PS_VISITED) && !node->visited)
+        return 0;
+    if ((c->pseudo & HPE_PS_LINK)) {
+        const char *href = hpe_dom_attr(node, "href");
+        if (!href || (strcmp(node->tag, "a") != 0 && strcmp(node->tag, "area") != 0))
+            return 0;
+    }
+    if ((c->pseudo & HPE_PS_TARGET) && !node->targeted)
+        return 0;
+    if ((c->pseudo & HPE_PS_CHECKED)) {
+        const char *chk = hpe_dom_attr(node, "checked");
+        const char *sel = hpe_dom_attr(node, "selected");
+        if (!chk && !sel)
+            return 0;
+    }
+    if ((c->pseudo & HPE_PS_DISABLED) && !hpe_dom_attr(node, "disabled"))
+        return 0;
+    if (c->pseudo & HPE_PS_ENABLED) {
+        const char *t = node->tag;
+        int form = t && (!strcmp(t, "input") || !strcmp(t, "button") || !strcmp(t, "select") ||
+                         !strcmp(t, "textarea") || !strcmp(t, "option"));
+        if (!form || hpe_dom_attr(node, "disabled"))
+            return 0;
+    }
+    return 1;
+}
+
+/* Positional pseudo-classes: the `:first-child` family, `:empty`, and `an+b`. */
+static int compound_positional_matches(const HpeCompound *c, const HpeDomNode *node)
+{
+    if (c->pseudo & (HPE_PS_FIRST_CHILD | HPE_PS_LAST_CHILD | HPE_PS_ONLY_CHILD |
+                     HPE_PS_FIRST_OF_TYPE | HPE_PS_LAST_OF_TYPE | HPE_PS_ONLY_OF_TYPE)) {
+        int total = 1;
+        int idx = elem_index_of(node, (c->pseudo & (HPE_PS_FIRST_OF_TYPE | HPE_PS_LAST_OF_TYPE |
+                                                     HPE_PS_ONLY_OF_TYPE)) != 0,
+                                &total);
+        if ((c->pseudo & HPE_PS_FIRST_CHILD) && idx != 1)
+            return 0;
+        if ((c->pseudo & HPE_PS_LAST_CHILD) && idx != total)
+            return 0;
+        if ((c->pseudo & HPE_PS_ONLY_CHILD) && total != 1)
+            return 0;
+        if ((c->pseudo & HPE_PS_FIRST_OF_TYPE) && idx != 1)
+            return 0;
+        if ((c->pseudo & HPE_PS_LAST_OF_TYPE) && idx != total)
+            return 0;
+        if ((c->pseudo & HPE_PS_ONLY_OF_TYPE) && total != 1)
+            return 0;
+    }
+    if ((c->pseudo & HPE_PS_EMPTY) && !element_is_empty(node))
+        return 0;
+    if (c->nth_child.present || c->nth_last_child.present || c->nth_of_type.present ||
+        c->nth_last_of_type.present) {
+        int total = 1;
+        int idx = elem_index_of(node, c->nth_of_type.present || c->nth_last_of_type.present, &total);
+        if (!nth_matches(&c->nth_child, idx))
+            return 0;
+        if (!nth_matches(&c->nth_last_child, total - idx + 1))
+            return 0;
+        if (!nth_matches(&c->nth_of_type, idx))
+            return 0;
+        if (!nth_matches(&c->nth_last_of_type, total - idx + 1))
+            return 0;
+    }
+    return 1;
+}
+
+/* The id, class list and attribute selectors. */
+static int compound_ident_matches(const HpeCompound *c, const HpeDomNode *node)
 {
     int i;
-    if (!node || node->type != HPE_NODE_ELEMENT)
-        return 0;
-    if (c->tag && strcmp(c->tag, node->tag) != 0)
-        return 0;
-    if (c->pseudo_hover && !node->hovered)
-        return 0;
     if (c->id) {
         const char *id = hpe_dom_attr(node, "id");
         if (!id || strcmp(id, c->id) != 0)
@@ -3094,6 +4586,46 @@ static int compound_matches(const HpeCompound *c, const HpeDomNode *node)
     }
     return 1;
 }
+
+/* `:not(...)` fails on any hit; `:is(...)` needs at least one. */
+static int compound_logical_matches(const HpeCompound *c, const HpeDomNode *node)
+{
+    int i;
+    for (i = 0; i < c->not_count; i++) {
+        int j;
+        for (j = 0; j < c->not_list[i].count; j++) {
+            if (selector_matches(&c->not_list[i], node))
+                return 0; /* :not(...) — any hit fails */
+        }
+    }
+    if (c->is_count > 0) {
+        int any = 0;
+        for (i = 0; i < c->is_count && !any; i++) {
+            int j;
+            for (j = 0; j < c->is_list[i].count && !any; j++)
+                any = selector_matches(&c->is_list[i], node);
+        }
+        if (!any)
+            return 0;
+    }
+    return 1;
+}
+
+static int compound_matches(const HpeCompound *c, const HpeDomNode *node)
+{
+    if (!node || node->type != HPE_NODE_ELEMENT)
+        return 0;
+    if (c->tag && strcmp(c->tag, node->tag) != 0)
+        return 0;
+    if (!compound_state_matches(c, node))
+        return 0;
+    if (!compound_positional_matches(c, node))
+        return 0;
+    if (!compound_ident_matches(c, node))
+        return 0;
+    return compound_logical_matches(c, node);
+}
+
 
 /**
  * @brief 测试单个选择器是否匹配给定节点 / Test whether a standalone selector matches a node
@@ -3581,10 +5113,263 @@ static void sheet_add_rule(HpeStylesheet *sheet, HpeRule *rule,
 }
 
 /**
+ * @brief 校验一个属性取值是否被引擎支持 / Validate whether a property value is supported by the engine
+ *
+ * @details 只对取值有限枚举的属性做严格校验（`display`、`position`、`overflow`、`float`、`text-align`、
+ *          `flex-direction`、`flex-wrap`、`box-sizing`、`visibility`），其余属性只要属性名本身已知即视为支持，
+ *          这与引擎「未知属性名是主要拒绝判据」的宽松策略一致。
+ *          Only properties with a small enumerable value set are validated strictly (`display`, `position`, `overflow`, `float`, `text-align`, `flex-direction`, `flex-wrap`, `box-sizing`, `visibility`); every other property counts as supported as soon as its name is known, mirroring the engine's lenient policy where an unknown property name is the main rejection criterion.
+ *
+ * @param[in]     name 属性名（小写）/ Property name, lower case
+ * @param[in]     value 属性值（已去空白）/ Property value, already trimmed
+ *
+ * @return 支持返回 1，否则返回 0 / 1 when supported, 0 otherwise
+ *
+ * @see supports_condition_ok
+ */
+/* The enumerated value set for a property, or NULL when the property accepts
+ * any value. */
+static const char *const *supports_value_set(const char *name)
+{
+    static const char *const display_vals[] = {"none", "inline", "block", "inline-block", "flex",
+                                               "inline-flex", "table", "table-row",
+                                               "table-cell", "table-row-group",
+                                               "table-header-group", "table-footer-group",
+                                               "table-caption", "inline-table", NULL};
+    static const char *const position_vals[] = {"static", "relative", "absolute", "fixed", NULL};
+    static const char *const overflow_vals[] = {"visible", "hidden", "auto", "scroll", NULL};
+    static const char *const float_vals[] = {"none", "left", "right", "inline-start",
+                                             "inline-end", NULL};
+    static const char *const align_vals[] = {"left", "right", "center", "justify", "start",
+                                             "end", NULL};
+    static const char *const flexdir_vals[] = {"row", "row-reverse", "column",
+                                               "column-reverse", NULL};
+    static const char *const flexwrap_vals[] = {"nowrap", "wrap", "wrap-reverse", NULL};
+    static const char *const boxsizing_vals[] = {"content-box", "border-box", NULL};
+    static const char *const visibility_vals[] = {"visible", "hidden", "collapse", NULL};
+    static const char *const scrollbar_vals[] = {"auto", "thin", "none", NULL};
+    if (!strcmp(name, "display"))
+        return display_vals;
+    if (!strcmp(name, "position"))
+        return position_vals;
+    if (!strcmp(name, "overflow") || !strcmp(name, "overflow-x") || !strcmp(name, "overflow-y"))
+        return overflow_vals;
+    if (!strcmp(name, "float"))
+        return float_vals;
+    if (!strcmp(name, "text-align"))
+        return align_vals;
+    if (!strcmp(name, "flex-direction"))
+        return flexdir_vals;
+    if (!strcmp(name, "flex-wrap"))
+        return flexwrap_vals;
+    if (!strcmp(name, "box-sizing"))
+        return boxsizing_vals;
+    if (!strcmp(name, "visibility"))
+        return visibility_vals;
+    if (!strcmp(name, "scrollbar-width"))
+        return scrollbar_vals;
+    return NULL;
+}
+
+static int supports_value_ok(const char *name, const char *value)
+{
+    const char *const *tbl = supports_value_set(name);
+    int i;
+
+    if (!tbl)
+        return 1;
+    for (i = 0; tbl[i]; i++) {
+        if (!strcmp(tbl[i], value))
+            return 1;
+    }
+    /* `scrollbar-width` also accepts any non-negative length */
+    if (!strcmp(name, "scrollbar-width")) {
+        const char *p = value;
+        if (*p == '+' || *p == '-')
+            p++;
+        if (*p >= '0' && *p <= '9')
+            return 1;
+    }
+    return 0;
+}
+
+/**
+ * @brief 测试一条 `(prop: value)` 支持条件 / Test one `(prop: value)` support condition
+ *
+ * @details 在属性表中查找属性名；不带 `:` 时仅测试属性是否存在。带值时先确认属性存在，再对取值有限枚举的属性
+ *          用 `supports_value_ok` 校验取值，其余属性名已知即视为支持。
+ *          The property name is looked up in the property table; without a `:` only its existence is tested. With a value the property must exist and, for properties with a fixed value set, the value is validated through `supports_value_ok`; every other known property is accepted.
+ *
+ * @param[in]     text 条件文本（可含外层空白）/ Condition text, possibly with surrounding spaces
+ * @param[in]     len 文本长度 / Text length
+ *
+ * @return 支持返回 1，否则返回 0 / 1 when supported, 0 otherwise
+ *
+ * @see supports_value_ok eval_supports
+ */
+static int supports_condition_ok(const char *text, size_t len)
+{
+    char buf[160];
+    char *colon;
+    size_t i;
+    size_t prop_count = sizeof(k_prop_table) / sizeof(k_prop_table[0]);
+    int known = 0;
+
+    while (len > 0 && (*text == ' ' || *text == '\t' || *text == '\n'))
+        text++, len--;
+    while (len > 0 && (text[len - 1] == ' ' || text[len - 1] == '\t' || text[len - 1] == '\n'))
+        len--;
+    if (len >= sizeof(buf))
+        return 1; /* too long to be a property test: assume supported */
+    memcpy(buf, text, len);
+    buf[len] = '\0';
+    colon = strchr(buf, ':');
+    if (colon)
+        *colon = '\0';
+    hpe_trim(buf);
+    if (!buf[0])
+        return 0;
+    for (i = 0; i < prop_count; i++) {
+        if (!strcmp(k_prop_table[i].name, buf)) {
+            known = 1;
+            break;
+        }
+    }
+    if (!known)
+        return 0;
+    if (!colon)
+        return 1;
+    /* `hpe_trim` edits the buffer in place, so trim into the value pointer
+     * before passing it on; the `: ` separator leaves a leading space */
+    {
+        char *val = colon + 1;
+        size_t vlen = strlen(val);
+        while (vlen > 0 && (val[0] == ' ' || val[0] == '\t'))
+            val++, vlen--;
+        while (vlen > 0 && (val[vlen - 1] == ' ' || val[vlen - 1] == '\t'))
+            val[--vlen] = '\0';
+        if (!val[0])
+            return 1;
+        return supports_value_ok(buf, val);
+    }
+}
+
+/**
+ * @brief 求值 `@supports` 条件（支持 `and` / `or` / `not` 与括号）/ Evaluate a `@supports` condition
+ *
+ * @details 支持 `(prop: value)`、`not <cond>`、`<cond> and <cond>`（用括号分组）以及 `<cond> or <cond>`；
+ *          裸标识符（如 `(display: grid)` 之外的语法）按不支持处理。求值失败时保守返回 0。
+ *          It supports `(prop: value)`, `not <cond>`, `<cond> and <cond>` (grouped with parentheses) and `<cond> or <cond>`; a bare identifier outside those forms is treated as unsupported. Evaluation failures conservatively return 0.
+ *
+ * @param[in]     text 条件文本 / Condition text
+ * @param[in]     len 文本长度 / Text length
+ *
+ * @return 条件成立返回 1，否则返回 0 / 1 when the condition holds, 0 otherwise
+ *
+ * @see supports_condition_ok parse_at_rule
+ */
+/* When the whole condition is wrapped in one matching pair of parentheses,
+ * unwrap it so `and`/`or`/`not` inside become visible. Returns 1 when the
+ * caller should recurse into `buf + 1 .. len - 2`. */
+static int supports_unwrap_parens(const char *buf, size_t len)
+{
+    int depth = 0;
+    size_t i;
+    if (buf[0] != '(')
+        return 0;
+    for (i = 0; i < len; i++) {
+        if (buf[i] == '(')
+            depth++;
+        else if (buf[i] == ')') {
+            depth--;
+            if (depth == 0) {
+                if (i == len - 1) {
+                    if (strchr(buf + 1, ':') && !strchr(buf + 1, '('))
+                        return 2; /* a bare (prop: value) group */
+                    return 1;
+                }
+                break; /* the leading group is only part of the condition */
+            }
+        }
+    }
+    return 0;
+}
+
+static int eval_supports(const char *text, size_t len);
+
+/* Split at the first top-level ` and ` / ` or ` outside parentheses and
+ * evaluate both sides. Returns -1 when no top-level operator is present, else
+ * 0 or 1 for the combined result. */
+static int supports_eval_split(const char *buf, size_t len)
+{
+    int depth = 0;
+    size_t i;
+    const char *op = NULL;
+    int leave = 0;
+    for (i = 0; i + 5 <= len; i++) {
+        if (buf[i] == '(')
+            depth++;
+        else if (buf[i] == ')')
+            depth--;
+        else if (depth == 0) {
+            if (!strncmp(buf + i, " and ", 5)) {
+                op = buf + i;
+                leave = 5;
+            } else if (!strncmp(buf + i, " or ", 4)) {
+                op = buf + i;
+                leave = 4;
+            } else {
+                continue;
+            }
+            break;
+        }
+    }
+    if (!op)
+        return -1;
+    if (leave == 5)
+        return eval_supports(buf, (size_t)(op - buf)) &&
+               eval_supports(op + 5, len - (size_t)(op - buf) - 5);
+    return eval_supports(buf, (size_t)(op - buf)) ||
+           eval_supports(op + 4, len - (size_t)(op - buf) - 4);
+}
+
+static int eval_supports(const char *text, size_t len)
+{
+    char buf[256];
+    int unwrapped, split;
+
+    while (len > 0 && (*text == ' ' || *text == '\t' || *text == '\n'))
+        text++, len--;
+    while (len > 0 && (text[len - 1] == ' ' || text[len - 1] == '\t' || text[len - 1] == '\n'))
+        len--;
+    if (len == 0 || len >= sizeof(buf))
+        return 0;
+    memcpy(buf, text, len);
+    buf[len] = '\0';
+
+    /* unwrap a fully parenthesised condition so `and`/`or`/`not` can be seen */
+    unwrapped = supports_unwrap_parens(buf, len);
+    if (unwrapped == 1)
+        return eval_supports(buf + 1, len - 2);
+    if (unwrapped == 2)
+        return supports_condition_ok(buf + 1, len - 2);
+    if (len >= 6 && hpe_str_ieq_n(buf, "not ", 4))
+        return !eval_supports(buf + 4, len - 4);
+
+    /* find a top-level ` and ` / ` or ` outside any parentheses */
+    split = supports_eval_split(buf, len);
+    if (split >= 0)
+        return split;
+    return supports_condition_ok(buf, len);
+}
+
+/**
  * @brief 解析一个 at-rule 的体 / Parse the body of an at-rule
  *
- * @details 以 `;` 结尾的语句型 at-rule 直接跳过；否则找到块体匹配的 `}`，若是 `@media` 且未超过嵌套上限则解析其条件并压栈，再以更深的栈递归 `css_parse_into`；其它 at-rule 整体跳过，避免未知块破坏后续规则流。
- *          A statement at-rule ending in `;` is skipped; otherwise the matching `}` of its body is found, and for an `@media` within the nesting limit its conditions are parsed and pushed before recursing into `css_parse_into` with a deeper stack; any other at-rule is skipped wholesale so an unknown block never corrupts the surrounding rule stream.
+ * @details 以 `;` 结尾的语句型 at-rule 直接跳过；否则找到块体匹配的 `}`。`@media` 在未超过嵌套上限时解析条件并压栈再递归；
+ *          `@supports` 条件成立时同样递归进入其块（不压媒体栈）；`@supports` 条件不成立或其它未知 at-rule 整体跳过，
+ *          避免未知块破坏后续规则流。
+ *          A statement at-rule ending in `;` is skipped; otherwise the matching `}` of its body is found. An `@media` within the nesting limit has its conditions parsed and pushed before recursing; a satisfied `@supports` also recurses into its block (without touching the media stack), while an unsatisfied `@supports` and any other unknown at-rule are skipped wholesale so an unknown block never corrupts the surrounding rule stream.
  *
  * @param[in,out] sheet 目标样式表 / Target stylesheet
  * @param[in,out] pp 解析游标指针 / Parse cursor pointer
@@ -3593,19 +5378,20 @@ static void sheet_add_rule(HpeStylesheet *sheet, HpeRule *rule,
  * @param[in,out] mq_stack 媒体查询栈 / Media query stack
  * @param[in]     mq_depth 当前嵌套深度 / Current nesting depth
  *
- * @see parse_media_query css_parse_into find_block_end
+ * @see parse_media_query eval_supports css_parse_into find_block_end
  */
 static void parse_at_rule(HpeStylesheet *sheet, const char **pp, const char *q,
                           const char *end, HpeMediaQuery *mq_stack, int mq_depth)
 {
     const char *p = *pp;
-    int is_media;
+    int is_media, is_supports;
 
     if (*q == ';') {
         *pp = q + 1;
         return;
     }
     is_media = (size_t)(q - p) >= 6 && hpe_str_ieq_n(p, "@media", 6);
+    is_supports = (size_t)(q - p) >= 9 && hpe_str_ieq_n(p, "@supports", 9);
     {
         const char *block = q + 1;
         const char *scan = find_block_end(block, end);
@@ -3623,6 +5409,8 @@ static void parse_at_rule(HpeStylesheet *sheet, const char **pp, const char *q,
         if (is_media)
             css_parse_into(sheet, block, (size_t)(scan - block), mq_stack,
                            mq_depth + (stacked ? 1 : 0));
+        else if (is_supports && eval_supports(p + 9, (size_t)(q - (p + 9))))
+            css_parse_into(sheet, block, (size_t)(scan - block), mq_stack, mq_depth);
         *pp = scan < end ? scan + 1 : end;
     }
 }
@@ -3925,6 +5713,48 @@ static const ScalarCopy k_scalars_word2[] = {
     SCALAR_COPY(HPE_PROP2_TRANSFORM, transform),
     SCALAR_COPY(HPE_PROP2_TRANSITION, has_transition),
     SCALAR_COPY(HPE_PROP2_ANIMATION, has_animation),
+    /* generated content (`content` carries the resolved text plus the
+     * `attr()` argument that is only resolved once the node is known) */
+    SCALAR_COPY(HPE_PROP2_CONTENT, content),
+    SCALAR_COPY(HPE_PROP2_CONTENT, attr_content),
+    SCALAR_COPY(HPE_PROP2_CONTENT, has_content),
+    /* flex item longhands */
+    SCALAR_COPY(HPE_PROP2_FLEX_WRAP, flex_wrap),
+    SCALAR_COPY(HPE_PROP2_ROW_REVERSE, row_reverse),
+    SCALAR_COPY(HPE_PROP2_ORDER, order),
+    SCALAR_COPY(HPE_PROP2_FLEX_BASIS, flex_basis),
+    SCALAR_COPY(HPE_PROP2_FLEX_SHRINK, flex_shrink),
+    /* background placement: `background-position` and `background-size` share
+     * the single `bg_pos` member, so both bits gate the same copy */
+    SCALAR_COPY(HPE_PROP2_BACKGROUND_POSITION | HPE_PROP2_BACKGROUND_SIZE, bg_pos),
+    /* `object-position` also reuses the HpeBgPos form */
+    SCALAR_COPY(HPE_PROP2_OBJECT_POSITION, object_pos),
+    SCALAR_COPY(HPE_PROP2_OBJECT_FIT, object_fit),
+    SCALAR_COPY(HPE_PROP2_BACKGROUND_REPEAT, bg_repeat),
+    SCALAR_COPY(HPE_PROP2_RADIAL_GRADIENT, bg_radial),
+    SCALAR_COPY(HPE_PROP2_RADIAL_GRADIENT, bg_radial_circle),
+    SCALAR_COPY(HPE_PROP2_RADIAL_GRADIENT, bg_radial_cx),
+    SCALAR_COPY(HPE_PROP2_RADIAL_GRADIENT, bg_radial_cy),
+    SCALAR_COPY(HPE_PROP2_RADIAL_GRADIENT, bg_radial_rx),
+    SCALAR_COPY(HPE_PROP2_RADIAL_GRADIENT, bg_radial_ry),
+    /* grid container specs */
+    SCALAR_COPY(HPE_PROP2_GRID_TEMPLATE_COLUMNS, grid_cols),
+    SCALAR_COPY(HPE_PROP2_GRID_TEMPLATE_ROWS, grid_rows),
+    SCALAR_COPY(HPE_PROP2_GRID_GAP, grid_gap),
+    /* grid item placement and container distribution */
+    SCALAR_COPY(HPE_PROP2_GRID_COLUMN, grid_col_start),
+    SCALAR_COPY(HPE_PROP2_GRID_COLUMN, grid_col_end),
+    SCALAR_COPY(HPE_PROP2_GRID_ROW, grid_row_start),
+    SCALAR_COPY(HPE_PROP2_GRID_ROW, grid_row_end),
+    SCALAR_COPY(HPE_PROP2_JUSTIFY_ITEMS, justify_items),
+    SCALAR_COPY(HPE_PROP2_ALIGN_CONTENT, align_content),
+    SCALAR_COPY(HPE_PROP2_GRID_AUTO_FLOW, grid_auto_flow),
+    /* table / writing mode / scrollbar */
+    SCALAR_COPY(HPE_PROP2_TABLE_LAYOUT, table_layout_fixed),
+    SCALAR_COPY(HPE_PROP2_BORDER_SPACING, border_spacing_h),
+    SCALAR_COPY(HPE_PROP2_BORDER_SPACING, border_spacing_v),
+    SCALAR_COPY(HPE_PROP2_DIRECTION, direction_rtl),
+    SCALAR_COPY(HPE_PROP2_SCROLLBAR_WIDTH, scrollbar_width),
 };
 
 /**
@@ -4408,6 +6238,102 @@ static void apply_important_pass(HpeStyle *style, const HpeImpMatch *imps, int n
  *
  * @see collect_matches apply_normal_declarations collect_imps apply_important_pass
  */
+/**
+ * @brief 选择器末段是否带有指定伪元素 / Whether a selector's final compound carries the given pseudo-element
+ *
+ * @param[in]     sel 选择器 / Selector
+ * @param[in]     which `HPE_PE_BEFORE` 或 `HPE_PE_AFTER` / `HPE_PE_BEFORE` or `HPE_PE_AFTER`
+ *
+ * @return 末段带该伪元素返回 1 / 1 when the subject compound carries it
+ *
+ * @see hpe_css_compute_pseudo
+ */
+static int selector_has_pseudo_element(const HpeSelector *sel, int which)
+{
+    if (sel->count <= 0)
+        return 0;
+    return sel->parts[sel->count - 1].pseudo_element == which;
+}
+
+/**
+ * @brief 收集命中指定伪元素的规则 / Collect the rules whose selector matches the given pseudo-element
+ *
+ * @details 只考虑末段带同向伪元素、媒体条件通过、且以宿主元素（末段去伪元素后）匹配的选择器；特异性取命中中的最高者。
+ *          Only selectors whose final compound carries the matching pseudo-element, whose media conditions pass and whose host part matches count; the specificity is the highest among the hits.
+ *
+ * @param[in]     sheet 样式表 / Stylesheet
+ * @param[in]     node 宿主元素 / Host element
+ * @param[in]     which 目标伪元素 / Target pseudo-element
+ * @param[in,out] matches 匹配数组（按需扩容）/ Match array, grown on demand
+ * @param[out]    count 载荷数量 / Payload count
+ * @param[in,out] cap 数组容量 / Array capacity
+ *
+ * @see hpe_css_compute_pseudo
+ */
+static void collect_pseudo_matches(const HpeStylesheet *sheet, const HpeDomNode *node, int which,
+                                   HpeMatch **matches, size_t *count, size_t *cap)
+{
+    int i, j;
+    for (i = 0; i < sheet->rule_count; i++) {
+        const HpeRule *rule = &sheet->rules[i];
+        int best = -1;
+        if (!rule_media_ok(rule, sheet))
+            continue;
+        for (j = 0; j < rule->selector_count; j++) {
+            const HpeSelector *sel = &rule->selectors[j];
+            if (!selector_has_pseudo_element(sel, which))
+                continue;
+            if (!selector_matches(sel, node))
+                continue;
+            if (sel->specificity > best)
+                best = sel->specificity;
+        }
+        if (best < 0)
+            continue;
+        *matches = (HpeMatch *)hpe_grow(*matches, cap, *count + 1, sizeof(HpeMatch));
+        (*matches)[*count].specificity = best;
+        (*matches)[*count].order = rule->order;
+        (*matches)[*count].decl = rule->decls;
+        (*count)++;
+    }
+}
+
+void hpe_css_compute_pseudo(HpeStylesheet *sheet, const HpeDomNode *node, const HpeStyle *host_style,
+                            int which, HpeStyle *out)
+{
+    HpeMatch *matches = NULL;
+    size_t match_count = 0, match_cap = 0;
+    HpeStyle style;
+
+    style = hpe_style_default();
+    if (host_style) {
+        /* generated content inherits from its host element, exactly like the
+         * host's own children do */
+        inherit_parent_style(&style, host_style);
+        style.color = host_style->color;
+        style.font_size = host_style->font_size;
+        style.font_weight = host_style->font_weight;
+        style.family = host_style->family;
+        style.line_height = host_style->line_height;
+        style.white_space = host_style->white_space;
+        style.text_align = host_style->text_align;
+        style.visibility = host_style->visibility;
+        style.list_style_type = host_style->list_style_type;
+        style.list_style_position = host_style->list_style_position;
+        style.letter_spacing = host_style->letter_spacing;
+        style.word_spacing = host_style->word_spacing;
+        style.text_indent = host_style->text_indent;
+        style.cursor = host_style->cursor;
+    }
+    if (sheet && node)
+        collect_pseudo_matches(sheet, node, which, &matches, &match_count, &match_cap);
+    sort_matches(matches, (int)match_count);
+    apply_normal_declarations(&style, matches, (int)match_count, NULL);
+    if (matches)
+        hpe_free(matches);
+    *out = style;
+}
+
 void hpe_css_compute(HpeStylesheet *sheet, const HpeDomNode *node, const HpeStyle *parent,
                      HpeStyle *out)
 {
@@ -4597,8 +6523,14 @@ const char *hpe_ua_stylesheet(void)
         "body { display: block; margin: 8px; }\n"
         "head, script, style, title, meta, link, base, noscript, template { display: none; }\n"
         "div, p, section, article, header, footer, main, nav, aside, ul, ol, li, dl, dt, dd,\n"
-        "table, thead, tbody, tfoot, tr, td, th, blockquote, pre, form, fieldset, figure,\n"
+        "blockquote, pre, form, fieldset, figure,\n"
         "figcaption, hr, address, center { display: block; }\n"
+        "table { display: table; border-spacing: 0; border-color: #c0c0c0; }\n"
+        "thead, tbody, tfoot { display: table-row-group; }\n"
+        "tr { display: table-row; }\n"
+        "td, th { display: table-cell; }\n"
+        "caption { display: table-caption; }\n"
+        "th { font-weight: bold; text-align: center; }\n"
         "span, a, b, i, em, strong, code, small, sub, sup, label, br, img, u, s, mark\n"
         "  { display: inline; }\n"
         "button, input, select, textarea { display: inline-block; font-size: 13px; text-align: center; }\n"
@@ -4616,6 +6548,5 @@ const char *hpe_ua_stylesheet(void)
         "code { font-size: 13px; }\n"
         "b, strong { font-weight: bold; }\n"
         "a { color: #1a0dab; }\n"
-        "hr { border: 1px solid #c0c0c0; height: 0; margin: 8px 0; }\n"
-        "table { border-color: #c0c0c0; }\n";
+        "hr { border: 1px solid #c0c0c0; height: 0; margin: 8px 0; }\n";
 }

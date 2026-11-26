@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Hope Engine - DOM API</title>
+  <style>
+    body {
+      margin: 0;
+      background-color: #f5f6f8;
+      color: #202124;
+      font-size: 15px;
+      line-height: 1.55;
+      font-family: sans-serif;
+    }
+    .page { width: 720px; margin: 24px auto; }
+    h1 { font-size: 26px; margin: 0 0 6px 0; color: #14213d; }
+    .subtitle { color: #5f6368; font-size: 13px; margin: 0 0 18px 0; }
+    .card {
+      background-color: #ffffff;
+      border: 1px solid #dcdfe4;
+      padding: 12px 18px;
+      margin: 0 0 14px 0;
+    }
+    .card h2 { font-size: 16px; margin: 0 0 8px 0; color: #1a73e8; }
+    .row { font-family: monospace; font-size: 13px; white-space: pre; }
+    .fail { color: #d93025; font-weight: bold; }
+    .ok { color: #188038; }
+    /* fixtures the geometry checks measure against */
+    .ruler {
+      width: 300px;
+      height: 40px;
+      margin: 0;
+      padding: 0;
+      border: 0;
+      background-color: #eef3ff;
+    }
+    .inner { width: 120px; height: 20px; background-color: #ffd479; }
+    #focusable {
+      width: 200px;
+      height: 24px;
+      border: 1px solid #1a73e8;
+      outline: 0;
+    }
+    #focusable:focus { background-color: #d6f5d6; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <h1>DOM API</h1>
+    <p class="subtitle">geometry &middot; traversal &middot; classList &middot; dataset &middot; innerText &middot; createTextNode &middot; removeEventListener &middot; getComputedStyle &middot; focus/blur/activeElement</p>
+    <div class="card"><h2>Results</h2><div id="out"></div></div>
+    <div class="card" id="fixtures"><h2>Fixtures</h2></div>
+  </div>
+<script>
+  var lines = [];
+  function check(label, got, want) {
+    var pass = String(got) === String(want);
+    lines.push((pass ? "  ok   " : "  FAIL ") + label + " = " + got + (pass ? "" : "   (want " + want + ")"));
+    return pass;
+  }
+  var passCount = 0, total = 0;
+
+  var fixtures = document.getElementById("fixtures");
+
+  // ---- 1. createTextNode ----
+  var t = document.createTextNode("plain text");
+  total++; if (check("createTextNode nodeType", t.nodeType, "3")) passCount++;
+  total++; if (check("createTextNode data", t.textContent, "plain text")) passCount++;
+  total++; if (check("createTextNode detached", t.parentNode, "null")) passCount++;
+  var tw = document.createElement("span");
+  tw.appendChild(t);
+  total++; if (check("text node appends", tw.textContent, "plain text")) passCount++;
+  fixtures.appendChild(tw);
+
+  // ---- 2. innerText (visible text == textContent here) ----
+  var it = document.createElement("p");
+  it.appendChild(document.createTextNode("alpha "));
+  var itB = document.createElement("b");
+  itB.textContent = "beta";
+  it.appendChild(itB);
+  total++; if (check("innerText nested", it.innerText, "alpha beta")) passCount++;
+  total++; if (check("innerText == textContent", it.innerText === it.textContent, "true")) passCount++;
+
+  // ---- 3. traversal: childNodes vs children ----
+  var host = document.createElement("div");
+  host.appendChild(document.createTextNode("gap"));
+  var c1 = document.createElement("i"); c1.textContent = "one";
+  var c2 = document.createElement("i"); c2.textContent = "two";
+  host.appendChild(c1);
+  host.appendChild(document.createTextNode("gap2"));
+  host.appendChild(c2);
+  fixtures.appendChild(host);
+  total++; if (check("childNodes includes text", host.childNodes.length, "4")) passCount++;
+  total++; if (check("children elements only", host.children.length, "2")) passCount++;
+  total++; if (check("children[0] is element", host.children[0].tagName, "I")) passCount++;
+  total++; if (check("children[1] text", host.children[1].textContent, "two")) passCount++;
+  total++; if (check("childNodes[0] is text", host.childNodes[0].nodeType, "3")) passCount++;
+
+  // ---- 4. traversal: element siblings / children ----
+  total++; if (check("firstElementChild", host.firstElementChild.tagName, "I")) passCount++;
+  total++; if (check("firstElementChild skips text", host.firstElementChild.textContent, "one")) passCount++;
+  total++; if (check("lastElementChild", host.lastElementChild.textContent, "two")) passCount++;
+  total++; if (check("nextElementSibling", c1.nextElementSibling.textContent, "two")) passCount++;
+  total++; if (check("previousElementSibling", c2.previousElementSibling.textContent, "one")) passCount++;
+  total++; if (check("nextElementSibling over text", c1.nextElementSibling.tagName, "I")) passCount++;
+  total++; if (check("no next at tail", c2.nextElementSibling, "null")) passCount++;
+  total++; if (check("no prev at head", c1.previousElementSibling, "null")) passCount++;
+  total++; if (check("parentElement", c1.parentElement.tagName, "DIV")) passCount++;
+  var tParent = t.parentElement;
+  total++; if (check("parentElement of text's parent", tParent.tagName, "SPAN")) passCount++;
+
+  // ---- 5. classList ----
+  var cl = document.createElement("div");
+  cl.className = "one two";
+  fixtures.appendChild(cl);
+  total++; if (check("classList.length", cl.classList.length, "2")) passCount++;
+  total++; if (check("classList.contains hit", cl.classList.contains("two"), "true")) passCount++;
+  total++; if (check("classList.contains miss", cl.classList.contains("three"), "false")) passCount++;
+  cl.classList.add("three");
+  total++; if (check("classList.add", cl.className, "one two three")) passCount++;
+  cl.classList.add("three");
+  total++; if (check("classList.add is idempotent", cl.className, "one two three")) passCount++;
+  cl.classList.add("four", "five");
+  total++; if (check("classList.add variadic", cl.className, "one two three four five")) passCount++;
+  cl.classList.remove("two");
+  total++; if (check("classList.remove", cl.className, "one three four five")) passCount++;
+  cl.classList.remove("nope");
+  total++; if (check("classList.remove miss is a no-op", cl.className, "one three four five")) passCount++;
+  total++; if (check("classList.toggle removes", cl.classList.toggle("one") + " " + cl.className,
+        "false three four five")) passCount++;
+  total++; if (check("classList.toggle adds", cl.classList.toggle("one") + " " + cl.className,
+        "true three four five one")) passCount++;
+  cl.classList.remove("three", "four", "five", "one");
+  total++; if (check("classList.remove all clears attr", cl.hasAttribute("class"), "false")) passCount++;
+  total++; if (check("classList empty length", cl.classList.length, "0")) passCount++;
+
+  // ---- 6. dataset ----
+  var ds = document.createElement("div");
+  ds.setAttribute("data-user-id", "42");
+  ds.setAttribute("data-role", "admin");
+  fixtures.appendChild(ds);
+  total++; if (check("dataset kebab -> camel", ds.dataset.userId, "42")) passCount++;
+  total++; if (check("dataset single word", ds.dataset.role, "admin")) passCount++;
+  ds.dataset.userId = "99";
+  total++; if (check("dataset write back", ds.getAttribute("data-user-id"), "99")) passCount++;
+  ds.dataset.newKey = "v";
+  total++; if (check("dataset new key kebab", ds.getAttribute("data-new-key"), "v")) passCount++;
+  total++; if (check("dataset camel round trip", ds.dataset.newKey, "v")) passCount++;
+
+  // ---- 7. geometry: offsetWidth/offsetHeight/offsetLeft/offsetTop ----
+  var ruler = document.createElement("div");
+  ruler.className = "ruler";
+  var inner = document.createElement("div");
+  inner.className = "inner";
+  ruler.appendChild(inner);
+  fixtures.appendChild(ruler);
+  total++; if (check("offsetWidth from layout", ruler.offsetWidth, "300")) passCount++;
+  total++; if (check("offsetHeight from layout", ruler.offsetHeight, "40")) passCount++;
+  total++; if (check("offsetWidth of child", inner.offsetWidth, "120")) passCount++;
+  total++; if (check("offsetHeight of child", inner.offsetHeight, "20")) passCount++;
+  // offsetLeft/offsetTop are document coordinates here (see the getter note),
+  // so a child sitting at its parent's origin shares the parent's offsets
+  total++; if (check("offsetLeft child tracks parent", inner.offsetLeft, ruler.offsetLeft)) passCount++;
+  total++; if (check("offsetTop child tracks parent", inner.offsetTop, ruler.offsetTop)) passCount++;
+  total++; if (check("offsetLeft of ruler on page", ruler.offsetLeft >= 0, "true")) passCount++;
+  total++; if (check("offsetTop grows down the page", ruler.offsetTop > 0, "true")) passCount++;
+  // clientWidth/Height still work next to the offsets
+  total++; if (check("clientWidth still works", ruler.clientWidth, "300")) passCount++;
+
+  // ---- 7b. getBoundingClientRect ----
+  var rect = ruler.getBoundingClientRect();
+  total++; if (check("rect exists", typeof rect, "object")) passCount++;
+  total++; if (check("rect.width", rect.width, "300")) passCount++;
+  total++; if (check("rect.height", rect.height, "40")) passCount++;
+  total++; if (check("rect.left == x", rect.left, rect.x)) passCount++;
+  total++; if (check("rect.top == y", rect.top, rect.y)) passCount++;
+  total++; if (check("rect.right == x + width", rect.right, rect.x + rect.width)) passCount++;
+  total++; if (check("rect.bottom == y + height", rect.bottom, rect.y + rect.height)) passCount++;
+  total++; if (check("rect.left matches offsetLeft (no scroll)", rect.left, ruler.offsetLeft)) passCount++;
+  total++; if (check("rect.top matches offsetTop (no scroll)", rect.top, ruler.offsetTop)) passCount++;
+  var detachedRect = document.createElement("div").getBoundingClientRect();
+  total++; if (check("detached rect is zero", detachedRect.width, "0")) passCount++;
+  total++; if (check("detached rect height zero", detachedRect.height, "0")) passCount++;
+
+  // ---- 8. removeEventListener ----
+  var box = document.createElement("div");
+  fixtures.appendChild(box);
+  var hits = [];
+  function onHit(e) { hits.push("a"); }
+  function onHitB(e) { hits.push("b"); }
+  box.addEventListener("click", onHit);
+  box.addEventListener("click", onHitB);
+  // the engine dispatches through its own click path; call the handlers the way
+  // a real event would by re-dispatching a click on the element
+  box.click();
+  total++; if (check("both listeners ran", hits.join(","), "a,b")) passCount++;
+  box.removeEventListener("click", onHit);
+  box.click();
+  total++; if (check("removeEventListener detaches one", hits.join(","), "a,b,b")) passCount++;
+  box.removeEventListener("click", onHitB);
+  box.click();
+  total++; if (check("removeEventListener detaches all", hits.join(","), "a,b,b")) passCount++;
+  total++; if (check("removeEventListener is idempotent",
+        (function () { box.removeEventListener("click", onHitB); box.click(); return hits.join(","); })(),
+        "a,b,b")) passCount++;
+
+  // ---- 8b. capture phase + once ----
+  // capture runs root-first, then bubble runs target-upwards
+  var order = [];
+  var outer = document.createElement("div");
+  var innerHit = document.createElement("div");
+  outer.appendChild(innerHit);
+  fixtures.appendChild(outer);
+  outer.addEventListener("click", function () { order.push("outer-capture"); }, true);
+  outer.addEventListener("click", function () { order.push("outer-bubble"); });
+  innerHit.addEventListener("click", function () { order.push("inner-bubble"); });
+  innerHit.addEventListener("click", function () { order.push("inner-capture"); }, true);
+  // On an ancestor, capture runs before bubble. On the target itself both kinds
+  // run in registration order (the spec's AT_TARGET), so inner-bubble comes
+  // first because it was registered first -- same as Chrome.
+  innerHit.click();
+  total++; if (check("capture then bubble order", order.join(","),
+        "outer-capture,inner-bubble,inner-capture,outer-bubble")) passCount++;
+
+  var legacyCapture = [];
+  var lc = document.createElement("div");
+  fixtures.appendChild(lc);
+  lc.addEventListener("click", function () { legacyCapture.push("bubble"); }, false);
+  lc.addEventListener("click", function () { legacyCapture.push("capture"); }, { capture: true });
+  lc.click();
+  // again AT_TARGET: registration order, not capture-first
+  total++; if (check("options object capture accepted", legacyCapture.join(","), "bubble,capture")) passCount++;
+
+  // a capture listener on an ancestor really does run first
+  var anc = [];
+  var ancOuter = document.createElement("div");
+  var ancInner = document.createElement("div");
+  ancOuter.appendChild(ancInner);
+  fixtures.appendChild(ancOuter);
+  ancInner.addEventListener("click", function () { anc.push("target"); });
+  ancOuter.addEventListener("click", function () { anc.push("ancestor"); }, true);
+  ancInner.click();
+  total++; if (check("ancestor capture precedes target", anc.join(","), "ancestor,target")) passCount++;
+
+  var onceCount = 0;
+  var onc = document.createElement("div");
+  fixtures.appendChild(onc);
+  onc.addEventListener("click", function () { onceCount++; }, { once: true });
+  onc.click();
+  onc.click();
+  onc.click();
+  total++; if (check("once fires exactly one time", onceCount, "1")) passCount++;
+
+  // ---- 8c. dispatchEvent + new Event ----
+  var dispLog = [];
+  var dOuter = document.createElement("div");
+  var dInner = document.createElement("div");
+  dOuter.appendChild(dInner);
+  fixtures.appendChild(dOuter);
+  dOuter.addEventListener("click", function () { dispLog.push("outer"); });
+  dInner.addEventListener("click", function (e) { dispLog.push("inner:" + e.clientX + "," + e.clientY); });
+  var evt = new Event("click", { bubbles: true });
+  evt.clientX = 7;
+  evt.clientY = 9;
+  var ret = dInner.dispatchEvent(evt);
+  total++; if (check("dispatchEvent returns true", ret, "true")) passCount++;
+  total++; if (check("dispatchEvent bubbles", dispLog.join(","), "inner:7,9,outer")) passCount++;
+  total++; if (check("Event is a function", typeof Event, "function")) passCount++;
+  total++; if (check("Event carries type", new Event("zoom").type, "zoom")) passCount++;
+  total++; if (check("Event bubbles defaults false", new Event("x").bubbles, "false")) passCount++;
+  total++; if (check("Event bubbles option honoured",
+        new Event("x", { bubbles: true }).bubbles, "true")) passCount++;
+  // a non-bubbling event must stay on its target
+  var nbLog = [];
+  dOuter.addEventListener("zoom", function () { nbLog.push("outer"); });
+  dInner.addEventListener("zoom", function () { nbLog.push("inner"); });
+  dInner.dispatchEvent(new Event("zoom"));
+  total++; if (check("bubbles:false stays on target", nbLog.join(","), "inner")) passCount++;
+
+  var kdLog = [];
+  dInner.addEventListener("keydown", function (e) {
+    kdLog.push(e.type + ":" + e.keyCode + ":" + e.ctrlKey + ":" + e.repeat);
+  });
+  var kd = new Event("keydown");
+  kd.keyCode = 13;
+  kd.ctrlKey = true;
+  dInner.dispatchEvent(kd);
+  total++; if (check("custom keydown fields", kdLog.join(","), "keydown:13:true:false")) passCount++;
+  total++; if (check("keydown on* property is a function",
+        typeof (dInner.onkeydown = function () {}), "function")) passCount++;
+  dInner.onkeydown = null;
+  total++; if (check("onkeydown cleared", String(dInner.onkeydown), "null")) passCount++;
+
+  // ---- 8d. on* properties for the extra event types ----
+  var onLog = [];
+  var op = document.createElement("div");
+  fixtures.appendChild(op);
+  op.onwheel = function () { onLog.push("wheel"); };
+  op.onmouseenter = function () { onLog.push("enter"); };
+  op.onkeyup = function () { onLog.push("keyup"); };
+  op.onmouseleave = function () { onLog.push("leave"); };
+  op.dispatchEvent(new Event("wheel"));
+  op.dispatchEvent(new Event("mouseenter"));
+  op.dispatchEvent(new Event("keyup"));
+  op.dispatchEvent(new Event("mouseleave"));
+  total++; if (check("on* props for wheel/enter/keyup/leave",
+        onLog.join(","), "wheel,enter,keyup,leave")) passCount++;
+  var mLog = [];
+  op.onmousemove = function () { mLog.push("mousemove"); };
+  op.onmouseover = function () { mLog.push("mouseover"); };
+  op.onmouseout = function () { mLog.push("mouseout"); };
+  op.onscroll = function () { mLog.push("scroll"); };
+  op.onkeypress = function () { mLog.push("keypress"); };
+  op.dispatchEvent(new Event("mousemove"));
+  op.dispatchEvent(new Event("mouseover"));
+  op.dispatchEvent(new Event("mouseout"));
+  op.dispatchEvent(new Event("scroll"));
+  op.dispatchEvent(new Event("keypress"));
+  total++; if (check("on* props for the rest",
+        mLog.join(","), "mousemove,mouseover,mouseout,scroll,keypress")) passCount++;
+
+  // mouseenter does not bubble, unlike mouseover
+  var enterLog = [];
+  var eOuter = document.createElement("div");
+  var eInner = document.createElement("div");
+  eOuter.appendChild(eInner);
+  fixtures.appendChild(eOuter);
+  eOuter.addEventListener("mouseenter", function () { enterLog.push("outer-enter"); });
+  eOuter.addEventListener("mouseover", function (e) { enterLog.push("outer-over:" + e.type); });
+  eInner.dispatchEvent(new Event("mouseenter", { bubbles: true }));
+  total++; if (check("mouseenter does not bubble",
+        enterLog.join(","), "")) passCount++;
+  eInner.dispatchEvent(new Event("mouseover", { bubbles: true }));
+  total++; if (check("mouseover does bubble", enterLog.join(","), "outer-over:mouseover")) passCount++;
+
+  // ---- 9. getComputedStyle ----
+  var styleHost = document.createElement("div");
+  styleHost.className = "ruler";
+  fixtures.appendChild(styleHost);
+  var cs = getComputedStyle(styleHost);
+  total++; if (check("computed style object", typeof cs, "object")) passCount++;
+  total++; if (check("getPropertyValue('display')", cs.getPropertyValue("display"), "block")) passCount++;
+  total++; if (check("getPropertyValue('width')", cs.getPropertyValue("width"), "300px")) passCount++;
+  total++; if (check("getPropertyValue('height')", cs.getPropertyValue("height"), "40px")) passCount++;
+  total++; if (check("camelCase display", cs.display, "block")) passCount++;
+  total++; if (check("camelCase fontSize is a string", typeof cs.fontSize, "string")) passCount++;
+  total++; if (check("unknown property is empty", cs.getPropertyValue("no-such-prop"), "")) passCount++;
+  total++; if (check("inline style visible without box",
+        (function () {
+          var d = document.createElement("div");
+          d.setAttribute("style", "display: flex");
+          return getComputedStyle(d).getPropertyValue("display");
+        })(), "flex")) passCount++;
+
+  // ---- 10. focus / blur / activeElement ----
+  var f = document.createElement("div");
+  f.id = "focusable";
+  fixtures.appendChild(f);
+  total++; if (check("activeElement starts empty", document.activeElement, "null")) passCount++;
+  f.focus();
+  total++; if (check("focus sets activeElement", document.activeElement.id, "focusable")) passCount++;
+  total++; if (check(":focus selector applies", getComputedStyle(f).getPropertyValue("background-color") !==
+        getComputedStyle(styleHost).getPropertyValue("background-color"), "true")) passCount++;
+  var g = document.createElement("div");
+  g.id = "focusable2";
+  fixtures.appendChild(g);
+  g.focus();
+  total++; if (check("focus moves to new element", document.activeElement.id, "focusable2")) passCount++;
+  g.blur();
+  total++; if (check("blur clears activeElement", document.activeElement, "null")) passCount++;
+  g.blur();
+  total++; if (check("blur on unfocused is a no-op", document.activeElement, "null")) passCount++;
+
+  // ---- summary ----
+  lines.unshift((passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total + " checks");
+  var cls = passCount === total ? "ok" : "fail";
+  var el = document.getElementById("out");
+  for (var li = 0; li < lines.length; li++) {
+    var row = document.createElement("div");
+    row.className = "row " + (li === 0 ? cls : "");
+    row.textContent = lines[li];
+    el.appendChild(row);
+  }
+  document.title = (passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total;
+</script>
+</body>
+</html>

@@ -31,11 +31,19 @@ fail=0
 
 # ---------------- 1. pixel baselines ----------------
 # `--dump` is headless and chrome-less, so identical geometry gives identical bytes.
-for f in boxes css css-cascade css-props dom-mutation event hello hover html-parse js-arrow js-features js js-builtins layout svg-shapes timers; do
+# A non-zero exit is a hard failure: the engine must tear down cleanly even on
+# pages that register timers (a bad free() there once corrupted the heap at exit).
+for f in boxes css css-cascade css-props dom-api dom-mutation event flex globals hello hover html-parse image js-arrow js-features js js-builtins grid layout scroll svg-shapes table timers; do
   html="examples/$f.html"
   [ -f "$html" ] || continue
   bmp="$OUT/$f.bmp"
   "$BIN" "$html" --width 400 --height 600 --dump "$bmp" >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" != 0 ]; then
+    printf '  %-12s CRASH (exit %s)\n' "$f" "$rc"
+    fail=1
+    continue
+  fi
   if [ "$REBASE" = 1 ]; then
     cp "$bmp" "$BASE/$f.bmp"
     printf '  %-12s rebased\n' "$f"
@@ -58,13 +66,30 @@ done
 # #out; HOPE_TEST_TEXT dumps that element's text so we can assert on it.
 # js-modern  : syntax + language semantics
 # js-builtins: standard built-in library (Date/Map/Set/Array/String/Number/Math/Object)
+# dom-api    : DOM query/traversal/geometry/events/dispatchEvent
 # dom-mutation: DOM mutation APIs + MutationObserver (needs live JS, so it is a script check)
+# globals    : performance/history/localStorage/sessionStorage/console extensions
 # html-parse : parser fault-tolerance (auto-closing, table/select/template)
-for f in js-modern js-builtins dom-mutation html-parse; do
+# eventloop  : task/microtask order + 4 ms nesting clamp (needs wall time: page:wait)
+for spec in js-modern js-builtins dom-api dom-mutation globals html-parse eventloop:1.2; do
+  f="${spec%%:*}"
+  wait_s=""
+  [ "$f" != "$spec" ] && wait_s="${spec#*:}"
   html="examples/$f.html"
   [ -f "$html" ] || continue
-  out="$(HOPE_TEST_TEXT=out "$BIN" "$html" --width 400 --height 600 \
-          --dump "$OUT/$f.bmp" 2>&1)"
+  if [ -n "$wait_s" ]; then
+    out="$(HOPE_TEST_TEXT=out HOPE_TEST_WAIT="$wait_s" "$BIN" "$html" \
+            --width 400 --height 600 --dump "$OUT/$f.bmp" 2>&1)"
+  else
+    out="$(HOPE_TEST_TEXT=out "$BIN" "$html" \
+            --width 400 --height 600 --dump "$OUT/$f.bmp" 2>&1)"
+  fi
+  rc=$?
+  if [ "$rc" != 0 ]; then
+    printf '  %-12s CRASH (exit %s)\n' "$f" "$rc"
+    fail=1
+    continue
+  fi
   title="$(printf '%s\n' "$out" | grep -o 'PASS [0-9]*/[0-9]*\|FAIL [0-9]*/[0-9]*' | head -1)"
   if [ -z "$title" ]; then
     printf '  %-12s NO RESULT (script did not run)\n' "$f"
@@ -79,21 +104,53 @@ for f in js-modern js-builtins dom-mutation html-parse; do
 done
 
 # ---------------- 3. ES modules (headless) ----------------
-mkdir -p "$OUT/mod"
+# Covers the §7.9 surface: default/named imports, `import * as ns`, renamed
+# imports, `export * from`, renamed re-exports, nested relative resolution and
+# `import.meta.url` for both an imported module and the entry module.
+mkdir -p "$OUT/mod/sub"
 cat > "$OUT/mod/util.js" <<'EOF'
 export const PI2 = Math.PI * 2;
 export function area(r) { return PI2 * r * r / 2; }
 export default function greet(n) { return "hi " + n; }
+export const NAME = "util";
+export const META = import.meta.url;
+EOF
+cat > "$OUT/mod/barrel.js" <<'EOF'
+export * from "./util.js";
+export { area as circleArea } from "./util.js";
+EOF
+cat > "$OUT/mod/sub/deep.js" <<'EOF'
+export const DEEP = "deep";
 EOF
 cat > "$OUT/mod/main.js" <<'EOF'
 import greet, { PI2, area } from "./util.js";
+import * as util from "./util.js";
+import { area as al } from "./util.js";
+import * as barrel from "./barrel.js";
+import { DEEP } from "./sub/deep.js";
 console.log(greet("hope"), PI2.toFixed(2), area(1).toFixed(2));
+console.log("ns", util.NAME, util.area(2).toFixed(4));
+console.log("renamed", al(1).toFixed(2));
+console.log("star", barrel.NAME, barrel.area(1).toFixed(2));
+console.log("reexport-renamed", barrel.circleArea(1).toFixed(2));
+console.log("nested", DEEP);
+console.log("meta", util.META.indexOf("util.js") >= 0);
+console.log("entry-meta", import.meta.url.indexOf("main.js") >= 0);
 EOF
-modout="$("$BIN" --module "$OUT/mod/main.js" 2>&1)"
-if [ "$modout" = "hi hope 6.28 3.14" ]; then
+modout="$("$BIN" --module "$OUT/mod/main.js" 2>&1 | tr -d '\r')"
+modwant='hi hope 6.28 3.14
+ns util 12.5664
+renamed 3.14
+star util 3.14
+reexport-renamed 3.14
+nested deep
+meta true
+entry-meta true'
+if [ "$modout" = "$modwant" ]; then
   echo "  es-modules   OK"
 else
-  echo "  es-modules   FAIL ($modout)"
+  echo "  es-modules   FAIL"
+  printf '%s\n' "$modout"
   fail=1
 fi
 

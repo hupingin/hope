@@ -135,6 +135,28 @@
   total++; if (check("regex global + split", "aaa".replace(/a/g, "b") + " " + "a1b22c".split(/\d+/).join("|"), "bbb a|b|c")) passCount++;
   total++; if (check("lookaround + \\b", /x(?=y)/.test("xy") + " " + /(?<=a)b/.test("ab") + " " + /\bcat\b/.test("a cat!"), "true true true")) passCount++;
 
+  // ---- 6b. named capture groups / u y d flags / \p{...} ----
+  var named = /(?<year>\d{4})-(?<month>\d{2})/.exec("2026-11");
+  total++; if (check("named group index", named[1] + " " + named[2], "2026 11")) passCount++;
+  total++; if (check("groups object", named.groups.year + " " + named.groups.month, "2026 11")) passCount++;
+  total++; if (check("unnamed groups undefined", /(\d)/.exec("7").groups === undefined, "true")) passCount++;
+  total++; if (check("named group in match()", "2026-11".match(/(?<y>\d{4})/).groups.y, "2026")) passCount++;
+  var sticky = /ab/y;
+  sticky.lastIndex = 2;
+  total++; if (check("sticky matches at lastIndex", sticky.exec("abab")[0], "ab")) passCount++;
+  total++; if (check("sticky does not slide", /ab/y.exec("xxab"), "null")) passCount++;
+  var idx = /(?<n>\d+)/d.exec("ab123");
+  total++; if (check("d flag whole indices", idx.indices[0].join(","), "2,5")) passCount++;
+  total++; if (check("d flag group indices", idx.indices[1].join(","), "2,5")) passCount++;
+  total++; if (check("d flag named indices", idx.indices.groups.n.join(","), "2,5")) passCount++;
+  total++; if (check("no indices without d", /\d/.exec("1").indices === undefined, "true")) passCount++;
+  total++; if (check("u flag accepted", /\d+/u.exec("ab42")[0], "42")) passCount++;
+  total++; if (check("\\p{L} letters", /\p{L}+/.exec("42abc")[0], "abc")) passCount++;
+  total++; if (check("\\p{L} cjk", /\p{L}+/.exec("你好 x")[0], "你好")) passCount++;
+  total++; if (check("\\p{Nd} digits", /\p{Nd}+/.exec("ab42")[0], "42")) passCount++;
+  total++; if (check("\\P{L} complement", /\P{L}+/.exec("ab12")[0], "12")) passCount++;
+  total++; if (check("\\p{} inside class", /[\p{Nd}]+/.exec("x7y8")[0], "7")) passCount++;
+
   // ---- 7. Promise / async await / generator ----
   var order = [];
   Promise.resolve(1).then(function (x) { order.push("p" + x); return x + 1; }).then(function (x) { order.push("p" + x); });
@@ -154,6 +176,112 @@
   class Priv { #n = 0; bump() { this.#n = this.#n + 1; return this.#n; } }
   var pr = new Priv();
   total++; if (check("private field #n", pr.bump() + "," + pr.bump(), "1,2")) passCount++;
+
+  // ---- 8b. Proxy / Reflect ----
+  var plog = [];
+  var pt = new Proxy({ a: 1 }, {
+    get: function (t, k) { plog.push("g" + k); return k === "ghost" ? 7 : t[k]; },
+    set: function (t, k, v) { plog.push("s" + k); t[k] = v * 2; return true; },
+    has: function (t, k) { return k === "hidden" ? true : k in t; }
+  });
+  pt.b = 5;
+  total++; if (check("proxy set trap", pt.a + " " + pt.b, "1 10")) passCount++;
+  total++; if (check("proxy get trap default", pt.ghost, "7")) passCount++;
+  total++; if (check("proxy has trap", ("hidden" in pt) + " " + ("nope" in pt), "true false")) passCount++;
+  total++; if (check("proxy traps ran", plog.join(","), "sb,ga,gb,gghost")) passCount++;
+  var rk = Reflect.ownKeys({ z: 1, y: 2 }).sort().join(",");
+  total++; if (check("Reflect.ownKeys", rk, "y,z")) passCount++;
+  total++; if (check("Reflect.apply", Reflect.apply(Math.max, null, [2, 9, 4]), "9")) passCount++;
+  var rp = Reflect.construct(function (x, y) { this.s = x + y; }.bind(null), [3, 4]);
+  total++; if (check("Reflect.construct", rp.s, "7")) passCount++;
+  total++; if (check("Reflect.getOwnPropertyDescriptor", Reflect.getOwnPropertyDescriptor({ q: 3 }, "q").value, "3")) passCount++;
+
+  // ---- 8c. escape / unescape ----
+  total++; if (check("escape space + tilde", escape("a b~"), "a%20b%7E")) passCount++;
+  total++; if (check("escape cjk", escape("中"), "%u4E2D")) passCount++;
+  total++; if (check("unescape %u", unescape("%u4E2D%u6587"), "中文")) passCount++;
+  total++; if (check("unescape roundtrip astral", unescape(escape("😀")) === "😀", "true")) passCount++;
+
+  // ---- 8d. Intl ----
+  var nf = new Intl.NumberFormat("en-US");
+  total++; if (check("NumberFormat grouping", nf.format(1234567), "1,234,567")) passCount++;
+  var nf2 = new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  total++; if (check("NumberFormat fixed 2", nf2.format(1234.5), "1,234.50")) passCount++;
+  var cf = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" });
+  total++; if (check("NumberFormat currency", cf.format(12.5), "$12.50")) passCount++;
+  var df = new Intl.DateTimeFormat("en-US", { timeZone: "UTC" });
+  total++; if (check("DateTimeFormat date", df.format(new Date(Date.UTC(2026, 10, 25))), "11/25/2026")) passCount++;
+  var co = new Intl.Collator("en-US");
+  total++; if (check("Collator compare", co.compare("a", "b") < 0 && co.compare("b", "a") > 0, "true")) passCount++;
+
+  // ---- 8e. WeakMap / WeakSet / WeakRef ----
+  var wk = new WeakMap();
+  var wkobj = {};
+  wk.set(wkobj, 42);
+  total++; if (check("WeakMap get/set/has", wk.get(wkobj) + " " + wk.has(wkobj) + " " + wk.has({}), "42 true false")) passCount++;
+  total++; if (check("WeakMap delete", wk.delete(wkobj) + " " + wk.has(wkobj), "true false")) passCount++;
+  var ws = new WeakSet();
+  ws.add(wkobj);
+  total++; if (check("WeakSet add/has", ws.has(wkobj) + " " + ws.has({}), "true false")) passCount++;
+  total++; if (check("WeakRef deref", new WeakRef(wkobj).deref() === wkobj, "true")) passCount++;
+
+  // ---- 8f. Map/Set 惰性迭代器 ----
+  var lm = new Map([["a", 1], ["b", 2]]);
+  var lit = lm.entries();
+  lit.next();
+  total++; if (check("Map iterator next", lit.next().value.join(":"), "b:2")) passCount++;
+  total++; if (check("iterator spread", [...lm.keys()].join(","), "a,b")) passCount++;
+  var ls = new Set([7, 8, 9]);
+  total++; if (check("Set spread", [...ls].join(","), "7,8,9")) passCount++;
+  var si = ls.values();
+  si.next();
+  total++; if (check("iterator resumes mid-way", [...si].join(","), "8,9")) passCount++;
+  total++; if (check("Set entries pairs", [...ls.entries()].map(function (p) { return p.join("/"); }).join(","), "7/7,8/8,9/9")) passCount++;
+
+  // ---- 8g. BigInt ----
+  total++; if (check("BigInt typeof", typeof 10n, "bigint")) passCount++;
+  total++; if (check("BigInt add/mul", (10n + 20n) + " " + (6n * 7n), "30 42")) passCount++;
+  total++; if (check("BigInt toString radix", (255n).toString(16), "ff")) passCount++;
+  total++; if (check("BigInt compare", (5n < 10n) + " " + (5n === 5n), "true true")) passCount++;
+  total++; if (check("BigInt.asIntN", BigInt.asIntN(8, 255n), "-1")) passCount++;
+
+  // ---- 8h. ArrayBuffer / TypedArray / DataView ----
+  var abuf = new ArrayBuffer(16);
+  total++; if (check("ArrayBuffer byteLength", abuf.byteLength, "16")) passCount++;
+  var au8 = new Uint8Array(abuf);
+  au8[0] = 255; au8[1] = 128;
+  total++; if (check("Uint8Array write", au8[0] + " " + au8[1] + " " + au8.length, "255 128 16")) passCount++;
+  total++; if (check("Uint8Array truncates", (function () { var x = new Uint8Array(1); x[0] = 1.7; return x[0]; })(), "1")) passCount++;
+  var ai16 = new Int16Array([1, -2, 3]);
+  total++; if (check("Int16Array from array", ai16.length + " " + ai16[1], "3 -2")) passCount++;
+  var af64 = new Float64Array([1.5, 2.25]);
+  total++; if (check("Float64Array", (af64[0] + af64[1]), "3.75")) passCount++;
+  total++; if (check("TypedArray.subarray", new Uint8Array([1, 2, 3, 4]).subarray(1, 3).join(","), "2,3")) passCount++;
+  total++; if (check("TypedArray.set", (function () {
+    var a = new Uint8Array(4); a.set([9, 8], 1); return a.join(",");
+  })(), "0,9,8,0")) passCount++;
+  total++; if (check("view aliases buffer", (function () {
+    var b = new ArrayBuffer(4), v = new Uint8Array(b); v[0] = 7; return new Uint8Array(b)[0];
+  })(), "7")) passCount++;
+  var adv = new DataView(new ArrayBuffer(8));
+  adv.setInt32(0, 0x01020304);
+  total++; if (check("DataView getInt32", adv.getInt32(0), "16909060")) passCount++;
+  adv.setUint8(4, 200);
+  total++; if (check("DataView getUint8", adv.getUint8(4), "200")) passCount++;
+  total++; if (check("ArrayBuffer.isView", ArrayBuffer.isView(au8) + " " + ArrayBuffer.isView(abuf), "true false")) passCount++;
+
+  // ---- 8i. Symbol 真实类型 + 知名符号 ----
+  total++; if (check("typeof symbol", typeof Symbol("t"), "symbol")) passCount++;
+  var as1 = Symbol("k"), as2 = Symbol("k");
+  total++; if (check("symbol identity unique", as1 === as2, "false")) passCount++;
+  total++; if (check("Symbol.for registry", Symbol.for("g") === Symbol.for("g"), "true")) passCount++;
+  total++; if (check("symbol description", as1.description, "k")) passCount++;
+  total++; if (check("symbol toString", String(Symbol("hi")), "Symbol(hi)")) passCount++;
+  total++; if (check("Symbol.iterator identity", Symbol.iterator === Symbol.iterator, "true")) passCount++;
+  total++; if (check("symbol key hidden", (function () {
+    var o = { plain: 1 }; o[Symbol("s")] = 2; return Object.keys(o).length + ":" + JSON.stringify(o);
+  })(), '1:{"plain":1}')) passCount++;
+  total++; if (check("well-known iterator in use", typeof [][Symbol.iterator], "function")) passCount++;
 
   lines.unshift((passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total + " checks");
   var cls = passCount === total ? "ok" : "fail";

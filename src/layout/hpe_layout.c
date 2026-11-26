@@ -1,9 +1,13 @@
 #include "layout/hpe_layout.h"
 
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "base/hpe_util.h"
+#include "platform/hpe_platform.h"
+#include "render/hpe_image.h"
 
 /* ---------------- layout context ---------------- */
 
@@ -241,6 +245,9 @@ static float layout_block(LayoutCtx *ctx, HpeBox *box, float x, float y, float a
                           float avail_height);
 static void layout_inline_block(LayoutCtx *ctx, HpeBox *box, float parent_inner_w);
 static float measure_preferred_w(LayoutCtx *ctx, HpeBox *box);
+/* the grid pass sizes its `auto` columns from the items' max-content widths,
+ * so it needs the table helper before the table section is defined */
+static float table_cell_pref_w(LayoutCtx *ctx, HpeBox *cell);
 
 /* ---------------- box tree ---------------- */
 
@@ -275,6 +282,132 @@ static HpeBox *build_svg_box(HpeDomNode *node, HpeStyle style)
 }
 
 /**
+ * @brief 为 `<img>` 元素构造替换盒 / Build the replaced box for an `<img>` element
+ *
+ * @details 解码 `src` 取得固有像素尺寸，把它记在盒上供排版求解 used 尺寸；作者通过 CSS
+ *          或 `width`/`height` 属性声明的尺寸优先，属性值只在样式未声明对应长属性时生效。
+ *          The `src` is decoded to obtain the intrinsic pixel size, which the box records so
+ *          layout can solve the used size; an author size from CSS or the `width`/`height`
+ *          attributes wins, with the attributes applied only when the corresponding longhand
+ *          was not declared by any style rule.
+ *
+ * @param[in]     node `<img>` DOM 节点 / The `<img>` DOM node
+ * @param[in]     style 计算样式 / Computed style
+ *
+ * @return 对应的盒 / The corresponding box
+ *
+ * @note 解码失败时盒仍有固有尺寸 0×0，CSS 尺寸仍可让它占位 / On a decode failure the box still has a 0x0 intrinsic size and a CSS size can still give it a box
+ *
+ * @see build_svg_box build_element
+ */
+static HpeBox *build_img_box(HpeDomNode *node, HpeStyle style)
+{
+    const char *src = hpe_dom_attr(node, "src");
+    const char *aw = hpe_dom_attr(node, "width");
+    const char *ah = hpe_dom_attr(node, "height");
+    HpeBox *box;
+    const HpeImage *img = NULL;
+    char path[1024];
+
+    /* an `<img>` is inline-level by default; an author `display: block` (or
+     * `inline-block`) is honoured, and absolute/fixed positioning blockifies it
+     * exactly like an ordinary element */
+    if (style.position == HPE_POS_ABSOLUTE || style.position == HPE_POS_FIXED ||
+        style.display == HPE_DISPLAY_BLOCK || style.display == HPE_DISPLAY_FLEX ||
+        style.display == HPE_DISPLAY_GRID || style.display == HPE_DISPLAY_TABLE)
+        box = box_new(HPE_BOX_BLOCK);
+    else
+        box = box_new(HPE_BOX_INLINE_BLOCK);
+
+    box->node = node;
+    box->is_replaced = 1;
+    box->repl_css_w = style.width;
+    box->repl_css_h = style.height;
+
+    if (src && src[0] && hpe_image_resolve_url(src, path, sizeof(path)))
+        img = hpe_image_cache_get(hpe_image_shared_cache(), path, HPE_IMG_UNKNOWN, -1, -1);
+    if (img) {
+        box->repl_w = img->width;
+        box->repl_h = img->height;
+    }
+
+    /* the `width`/`height` attributes are presentational hints: they lose to any
+     * authored CSS declaration, so only fill a longhand that is still `auto` */
+    if (aw && aw[0] && style.width.unit == HPE_LEN_AUTO)
+        box->repl_css_w = hpe_len_px((float)atof(aw));
+    if (ah && ah[0] && style.height.unit == HPE_LEN_AUTO)
+        box->repl_css_h = hpe_len_px((float)atof(ah));
+
+    box->style = style;
+    return box;
+}
+
+/**
+ * @brief 为一个元素的 `::before` / `::after` 生成内容盒 / Build the generated-content box for `::before` / `::after`
+ *
+ * @details 依次求值两份样式：先把父选择器链上的伪元素规则套用一次（`hpe_css_compute_pseudo`），仅当 `content` 非 `none` 时生成盒；`attr(name)` 形式的 `content` 在此时从节点属性解析为文本。
+ *          Two styles are evaluated in turn: the pseudo-element rules matching the parent are applied via `hpe_css_compute_pseudo`, a box is only built when `content` is not `none`, and an `attr(name)` `content` is resolved to text from the node's attribute at this point.
+ *
+ * @param[in]     node 宿主元素 / Host element
+ * @param[in]     sheet 样式表 / Stylesheet
+ * @param[in]     parent_style 宿主元素的计算样式 / The host element's computed style
+ * @param[in]     which `HPE_PE_BEFORE` 或 `HPE_PE_AFTER` / `HPE_PE_BEFORE` or `HPE_PE_AFTER`
+ *
+ * @return 生成盒；`content` 为 `none`/`normal` 或伪元素不可见时返回 `NULL` / The generated box, or `NULL` when `content` is `none`/`normal` or the pseudo-element is not visible
+ *
+ * @note 生成盒沿用宿主元素的 `display`（行内级或块级），文本来自 `content` / The generated box reuses the host's `display` (inline or block level) and its text comes from `content`
+ *
+ * @see build_children build_element
+ */
+static HpeBox *build_pseudo_box(HpeDomNode *node, HpeStylesheet *sheet, const HpeStyle *parent_style,
+                                int which)
+{
+    HpeStyle style;
+    HpeBox *box;
+    const char *txt;
+
+    hpe_css_compute_pseudo(sheet, node, parent_style, which, &style);
+    if (!style.has_content)
+        return NULL;
+    txt = style.content;
+    if (style.attr_content[0]) {
+        const char *av = hpe_dom_attr(node, style.attr_content);
+        char joined[HPE_CONTENT_MAX];
+        snprintf(joined, sizeof(joined), "%s%s", txt, av ? av : "");
+        snprintf(style.content, sizeof(style.content), "%s", joined);
+        style.attr_content[0] = '\0';
+        txt = style.content;
+    }
+    if (!txt[0])
+        return NULL;
+    /* A generated box carries text directly, so it has to be a text box: the
+     * inline walker only turns HPE_BOX_TEXT into text runs, and letting an
+     * anonymous inline carry the text would leak its style onto the siblings.
+     * Block-level content is wrapped in a block box holding that text box. */
+    if (style.display == HPE_DISPLAY_BLOCK || style.display == HPE_DISPLAY_FLEX ||
+        style.display == HPE_DISPLAY_GRID || style.display == HPE_DISPLAY_TABLE) {
+        HpeBox *outer = box_new(HPE_BOX_BLOCK);
+        HpeBox *inner = box_new(HPE_BOX_TEXT);
+        outer->node = node;
+        outer->style = style;
+        inner->node = node;
+        inner->style = style;
+        inner->text = hpe_strdup(txt);
+        inner->text_len = (int)strlen(txt);
+        inner->owns_text = 1;
+        box_append(outer, inner);
+        return outer;
+    }
+    box = box_new(HPE_BOX_TEXT);
+    box->node = node;
+    box->style = style;
+    box->text = hpe_strdup(txt); /* owned; released by hpe_layout_free */
+    box->text_len = (int)strlen(txt);
+    box->owns_text = 1;
+    return box;
+}
+
+/**
  * @brief 递归构建节点的子盒 / Recursively build the child boxes of a node
  *
  * @param[in,out] box 父盒 / Parent box
@@ -282,12 +415,18 @@ static HpeBox *build_svg_box(HpeDomNode *node, HpeStyle style)
  * @param[in]     sheet 样式表 / Stylesheet
  * @param[in]     style 父元素样式 / Parent style
  *
- * @note 元素子节点递归建盒，文本子节点生成文本盒 / Element children recurse; text children become text boxes
+ * @note 元素子节点递归建盒，文本子节点生成文本盒；首尾各尝试一次 `::before` / `::after` 生成盒 / Element children recurse, text children become text boxes, and a `::before` / `::after` generated box is attempted at the head and tail
+ *
+ * @see build_pseudo_box build_element
  */
 static void build_children(HpeBox *box, HpeDomNode *node, HpeStylesheet *sheet,
                            const HpeStyle *style)
 {
     HpeDomNode *child;
+    HpeBox *gen;
+    gen = build_pseudo_box(node, sheet, style, HPE_PE_BEFORE);
+    if (gen)
+        box_append(box, gen);
     for (child = node->first_child; child; child = child->next_sibling) {
         HpeBox *cb = NULL;
         if (child->type == HPE_NODE_ELEMENT) {
@@ -306,6 +445,9 @@ static void build_children(HpeBox *box, HpeDomNode *node, HpeStylesheet *sheet,
         if (cb)
             box_append(box, cb);
     }
+    gen = build_pseudo_box(node, sheet, style, HPE_PE_AFTER);
+    if (gen)
+        box_append(box, gen);
 }
 
 /**
@@ -328,26 +470,31 @@ static HpeBox *build_element(HpeDomNode *node, HpeStylesheet *sheet, const HpeSt
     if (style.display == HPE_DISPLAY_NONE)
         return NULL;
 
-    /* flex items blockify: an inline child of a flex container is a block box
-     * (CSS Flexbox §4 "Flex Items"), which is also what keeps its text from
-     * being dropped by the flex pass. */
-    if (parent_style && parent_style->display == HPE_DISPLAY_FLEX &&
+    /* flex / grid items blockify: an inline child of a flex or grid container
+     * is a block box (CSS Flexbox §4, CSS Grid §6), which is also what keeps
+     * its text from being dropped by the flex/grid pass. */
+    if (parent_style &&
+        (parent_style->display == HPE_DISPLAY_FLEX || parent_style->display == HPE_DISPLAY_GRID) &&
         style.display == HPE_DISPLAY_INLINE)
         style.display = HPE_DISPLAY_BLOCK;
 
     if (!strcmp(node->tag, "svg"))
         return build_svg_box(node, style);
+    if (!strcmp(node->tag, "img"))
+        return build_img_box(node, style);
 
     /* absolutely / fixed positioned boxes blockify their display;
-     * floated boxes are laid out as atomic inline-level (shrink-to-fit) boxes */
+     * floated boxes are laid out as atomic inline-level (shrink-to-fit) boxes.
+     * Every table-internal display (table, row-group, row, cell, caption) is
+     * block-level here: the table pass gives them their real geometry. */
     if (style.position == HPE_POS_ABSOLUTE || style.position == HPE_POS_FIXED)
         box = box_new(HPE_BOX_BLOCK);
     else if (style.float_side != HPE_FLOAT_NONE || style.display == HPE_DISPLAY_INLINE_BLOCK)
         box = box_new(HPE_BOX_INLINE_BLOCK);
-    else if (style.display == HPE_DISPLAY_BLOCK || style.display == HPE_DISPLAY_FLEX)
-        box = box_new(HPE_BOX_BLOCK);
-    else
+    else if (style.display == HPE_DISPLAY_INLINE)
         box = box_new(HPE_BOX_INLINE);
+    else
+        box = box_new(HPE_BOX_BLOCK);
 
     box->node = node;
     box->style = style;
@@ -1021,13 +1168,144 @@ static void flush_paragraph(LayoutCtx *ctx, HpeBox *block, HpeParagraph *para, f
 /* ---------------- block layout ---------------- */
 
 /**
+ * @brief 求解替换元素的 used 内容尺寸并写回样式 / Solve a replaced element's used content size and write it back into the style
+ *
+ * @details 按 CSS 替换元素尺寸规则求解：两个轴都 `auto` 时用固有尺寸；只有一个轴有声明值时另一轴按
+ *          固有宽高比缩放；两个轴都有声明值时原样使用。声明值按元素自身的 `box-sizing` 换算到内容盒，
+ *          固有尺寸天然就是内容盒尺寸。求解结果写回 `style.width`/`style.height`（px 内容盒值）并把
+ *          `box-sizing` 归一为 `content-box`，使后续的 `solve_content_width` / `block_resolve_height`
+ *          直接采用；原始声明保存在 `repl_css_*`，因此每次排版重算都幂等。
+ *          The CSS replaced-element sizing rules apply: with both axes `auto` the intrinsic size is
+ *          used, with one axis declared the other scales by the intrinsic ratio, and with both
+ *          declared they are used verbatim. A declared value is converted to the content box per the
+ *          element's own `box-sizing`, while the intrinsic size already is a content-box size. The
+ *          result is written into `style.width`/`style.height` as px content-box values with
+ *          `box-sizing` normalised to `content-box`, so `solve_content_width` and
+ *          `block_resolve_height` adopt it directly; the original declaration lives on in
+ *          `repl_css_*`, which keeps a re-run idempotent.
+ *
+ * @param[in]     ctx 布局上下文 / Layout context
+ * @param[in,out] box 替换元素盒 / The replaced-element box
+ * @param[in]     cb_w 包含块宽度（解析百分比宽度）/ Containing-block width, the basis for percentage widths
+ * @param[in]     cb_h 包含块高度（解析百分比高度）/ Containing-block height, the basis for percentage heights
+ *
+ * @note 固有尺寸为 0 时视为不会有固有宽高比，缺少声明的轴取 0 / A zero intrinsic size means no usable ratio, so an undeclared axis becomes 0
+ *
+ * @see layout_inline_block layout_block
+ */
+/**
+ * @brief 求替换元素的可用内容尺寸（已扣除盒模型外扩）/ Resolve a replaced element's available content size (border-box padding removed)
+ *
+ * @param[in]     ctx 布局上下文 / Layout context
+ * @param[in]     st 样式 / Style
+ * @param[in]     bw 声明的 width（-1 表示 auto）/ Declared width, -1 for auto
+ * @param[in]     bh 声明的 height（-1 表示 auto）/ Declared height, -1 for auto
+ * @param[in]     cb_w 包含块宽度 / Containing-block width
+ * @param[in]     cb_h 包含块高度 / Containing-block height
+ * @param[in,out] w 输入声明的 width，输出 content-box width / In: declared width; out: content-box width
+ * @param[in,out] h 输入声明的 height，输出 content-box height / In: declared height; out: content-box height
+ *
+ * @note `box-sizing: border-box` 时从声明值里减去外扩 / Under `box-sizing: border-box` the padding+border is subtracted from the declared value
+ *
+ * @see replaced_used_size
+ */
+static void repl_resolve_declared(LayoutCtx *ctx, HpeStyle *st, float bw, float bh, float cb_w,
+                                  float cb_h, float *w, float *h)
+{
+    float extra_w =
+        side_px(ctx, st, st->padding[3], cb_w) + side_px(ctx, st, st->padding[1], cb_w) +
+        (st->border_w[3] > 0.0f ? st->border_w[3] : 0.0f) +
+        (st->border_w[1] > 0.0f ? st->border_w[1] : 0.0f);
+    float extra_h =
+        side_px(ctx, st, st->padding[0], cb_h) + side_px(ctx, st, st->padding[2], cb_h) +
+        (st->border_w[0] > 0.0f ? st->border_w[0] : 0.0f) +
+        (st->border_w[2] > 0.0f ? st->border_w[2] : 0.0f);
+    if (st->box_sizing == HPE_BOX_SIZING_BORDER) {
+        if (bw >= 0.0f)
+            bw -= extra_w;
+        if (bh >= 0.0f)
+            bh -= extra_h;
+    }
+    *w = bw;
+    *h = bh;
+}
+
+/**
+ * @brief 按固有宽高比补齐缺失的那一维 / Fill the missing dimension from the intrinsic aspect ratio
+ *
+ * @param[in]  iw 固有宽 / Intrinsic width
+ * @param[in]  ih 固有高 / Intrinsic height
+ * @param[in]  bw 声明的 width（-1 表示 auto）/ Declared width, -1 for auto
+ * @param[in]  bh 声明的 height（-1 表示 auto）/ Declared height, -1 for auto
+ * @param[out] w 求得的使用宽 / Resolved used width
+ * @param[out] h 求得的使用高 / Resolved used height
+ *
+ * @note 两维都为 auto 时直接用固有尺寸 / With both dimensions auto the intrinsic size is used
+ *
+ * @see replaced_used_size
+ */
+static void repl_solve_size(float iw, float ih, float bw, float bh, float *w, float *h)
+{
+    if (bw < 0.0f && bh < 0.0f) {
+        *w = iw;
+        *h = ih;
+    } else if (bw < 0.0f) {
+        *h = bh;
+        *w = (ih > 0.0f) ? bh * (iw / ih) : iw;
+    } else if (bh < 0.0f) {
+        *w = bw;
+        *h = (iw > 0.0f) ? bw * (ih / iw) : ih;
+    } else {
+        *w = bw;
+        *h = bh;
+    }
+}
+
+static void replaced_used_size(LayoutCtx *ctx, HpeBox *box, float cb_w, float cb_h)
+{
+    HpeStyle *st = &box->style;
+    float iw = (float)box->repl_w;
+    float ih = (float)box->repl_h;
+    float bw = resolve_len(ctx, st, box->repl_css_w, cb_w); /* -1 = auto */
+    float bh = resolve_len(ctx, st, box->repl_css_h, cb_h);
+    float min_w, max_w, min_h, max_h, w, h;
+
+    repl_resolve_declared(ctx, st, bw, bh, cb_w, cb_h, &bw, &bh);
+    repl_solve_size(iw, ih, bw, bh, &w, &h);
+
+    /* min/max describe the content box here (box-sizing was normalised away) */
+    min_w = resolve_len(ctx, st, st->min_width, cb_w);
+    max_w = resolve_len(ctx, st, st->max_width, cb_w);
+    min_h = resolve_len(ctx, st, st->min_height, cb_h);
+    max_h = resolve_len(ctx, st, st->max_height, cb_h);
+    if (min_w > 0.0f && w < min_w)
+        w = min_w;
+    if (max_w > 0.0f && w > max_w)
+        w = max_w;
+    if (min_h > 0.0f && h < min_h)
+        h = min_h;
+    if (max_h > 0.0f && h > max_h)
+        h = max_h;
+    if (w < 0.0f)
+        w = 0.0f;
+    if (h < 0.0f)
+        h = 0.0f;
+
+    st->width = hpe_len_px(w);
+    st->height = hpe_len_px(h);
+    st->box_sizing = HPE_BOX_SIZING_CONTENT;
+    box->repl_used_w = w;
+    box->repl_used_h = h;
+}
+
+/**
  * @brief 排版一个行内块盒 / Lay out an inline-block box
  *
  * @param[in]     ctx 布局上下文 / Layout context
  * @param[in,out] box 行内块盒 / Inline-block box
  * @param[in]     parent_inner_w 父内容区宽度 / Parent inner width
  *
- * @note 有显式宽度时按该宽度排版，否则收缩适应 / Uses an explicit width when present, otherwise shrink-to-fit
+ * @note 有显式宽度时按该宽度排版，否则收缩适应；替换元素用固有尺寸 / Uses an explicit width when present, otherwise shrink-to-fit; a replaced element uses its intrinsic size
  */
 static void layout_inline_block(LayoutCtx *ctx, HpeBox *box, float parent_inner_w)
 {
@@ -1036,6 +1314,16 @@ static void layout_inline_block(LayoutCtx *ctx, HpeBox *box, float parent_inner_
                   side_px(ctx, st, st->padding[1], parent_inner_w) +
                   (st->border_w[3] > 0.0f ? st->border_w[3] : 0.0f) +
                   (st->border_w[1] > 0.0f ? st->border_w[1] : 0.0f);
+
+    /* A replaced element (an `<img>`) takes its used size from the intrinsic
+     * size and the author's declaration, so solve it before the ordinary
+     * width / shrink-to-fit paths (which would measure an empty content box).
+     * `layout_block` also runs the same solver, keeping both entry points
+     * consistent. */
+    if (box->is_replaced) {
+        layout_block(ctx, box, 0.0f, 0.0f, parent_inner_w, -1.0f);
+        return;
+    }
 
     if (st->width.unit != HPE_LEN_AUTO) {
         /* `width` is the content box for content-box sizing and the border box
@@ -1360,22 +1648,37 @@ static void place_float(LayoutCtx *ctx, HpeBox *container, HpeBox *fbox, float *
 
 /* ---------------- flex containers ----------------
  *
- * Single-line (nowrap) flex layout, which is what the reference pages use.
- * Implemented: row and column main axes, shrink-to-fit item sizing, `gap`,
- * `align-items` / `align-self`, `justify-content`, auto margins (the
- * `margin-left:auto` push idiom) and `flex-grow` distribution of positive free
- * space. `stretch` degrades to `flex-start` because item heights are driven by
- * their content, and text children are skipped: anonymous flex items are not
- * modelled by the box tree. */
+ * Flexbox layout on both main axes, with multi-line wrapping.
+ * Implemented: `row` / `row-reverse` / `column` / `column-reverse`,
+ * `flex-wrap` (nowrap / wrap / wrap-reverse), `order`-sorted items,
+ * `flex-basis` / `flex-grow` / `flex-shrink` resolution, `gap`,
+ * `justify-content` (start / center / end / space-between / space-around),
+ * `align-items` / `align-self` (stretch / flex-start / center / flex-end /
+ * baseline) and auto margins (the `margin-left:auto` push idiom).
+ * Anonymous flex items are not modelled by the box tree, so inline and text
+ * children are skipped. */
 
 typedef struct {
     HpeBox *box;
-    float m[4];    /* resolved margins (auto sides are distributed later) */
-    float w;       /* target border-box size on the main axis */
-    float outer_h; /* margin-box height, known once the item is laid out */
-    float grow;
+    float m[4];        /* resolved margins (auto sides are distributed later) */
+    float w;           /* resolved border-box main size on a row */
+    float basis;       /* flex base size used for shrink scaling */
+    float outer_main;  /* margin-box main size, drives wrapping */
+    float outer_h;     /* margin-box height once the item is laid out */
+    float grow, shrink;
+    int order;
     int auto_ml, auto_mr;
 } FlexItem;
+
+/* one flex line: a contiguous item range plus its resolved extents */
+typedef struct {
+    int start;  /* index of the line's first item */
+    int count;  /* number of items on the line */
+    float main; /* summed outer main sizes including gaps */
+    float cross;/* resolved cross size */
+    float lead; /* justify-content leading offset on the main axis */
+    float extra;/* justify-content extra spacing between items */
+} FlexLine;
 
 /**
  * @brief 求单个 flex item 的交叉轴偏移 / Cross-axis offset for one flex item
@@ -1386,7 +1689,7 @@ typedef struct {
  *
  * @return 交叉轴偏移 / Cross-axis offset
  *
- * @note `stretch` 与不支持的 `baseline` 退化为 `flex-start` / `stretch` and the unsupported `baseline` degrade to `flex-start`
+ * @note `stretch`/`baseline` 的数值偏移由调用方先行处理，此处退化为 `flex-start` / `stretch` and `baseline` offsets are handled by the caller, so they degrade to `flex-start` here
  */
 static float flex_cross_offset(int align, float cross, float outer)
 {
@@ -1398,174 +1701,40 @@ static float flex_cross_offset(int align, float cross, float outer)
 }
 
 /**
- * @brief 分配 flex 行主轴上的正剩余空间 / Distribute positive free space on a flex row's main axis
+ * @brief 取容器给某个 item 生效的 `align-self` / Resolve the effective `align-self` for one item
  *
  * @param[in]     st 容器样式 / Container style
+ * @param[in]     cs item 样式 / Item style
+ *
+ * @return 生效的对齐方式 / The alignment in effect
+ *
+ * @note item 的 `align-self != auto` 优先，否则回落容器的 `align-items` / A non-`auto` item `align-self` wins, otherwise the container `align-items` applies
+ */
+static int flex_effective_align(const HpeStyle *st, const HpeStyle *cs)
+{
+    return cs->align_self != HPE_ALIGN_ITEMS_AUTO ? cs->align_self : st->align_items;
+}
+
+/**
+ * @brief 按 `order` 稳定排序 flex item / Stably sort flex items by `order`
+ *
  * @param[in,out] items flex item 数组 / Flex item array
  * @param[in]     n item 个数 / Number of items
- * @param[in]     free_space 剩余空间 / Free space
- * @param[in]     grow_sum flex-grow 之和 / Sum of flex-grow factors
- * @param[in]     autos auto 外边距个数 / Number of auto margins
- * @param[out]    out_lead 主轴前导偏移 / Leading offset on the main axis
- * @param[out]    out_extra item 间额外间距 / Extra spacing between items
  *
- * @note 顺序为 auto 外边距、flex-grow、justify-content / The order is auto margins, then flex-grow, then `justify-content`
+ * @note 插入排序天然稳定，同 `order` 的项保持文档顺序 / Insertion sort is stable, so equal `order` values keep their document order
  */
-static void flex_row_free_space(HpeStyle *st, FlexItem *items, int n, float free_space,
-                                float grow_sum, int autos, float *out_lead, float *out_extra)
+static void flex_sort_items(FlexItem *items, int n)
 {
-    int i;
-    *out_lead = 0.0f;
-    *out_extra = 0.0f;
-    if (free_space <= 0.0f)
-        return;
-    if (autos > 0) {
-        /* auto margins soak up the free space before justify-content runs */
-        float share = free_space / (float)autos;
-        for (i = 0; i < n; i++) {
-            /* the resolved value has to reach the item's own layout pass,
-             * which resolves `auto` margins to zero on its own */
-            if (items[i].auto_ml) {
-                items[i].m[3] = share;
-                items[i].box->style.margin[3] = hpe_len_px(share);
-            }
-            if (items[i].auto_mr) {
-                items[i].m[1] = share;
-                items[i].box->style.margin[1] = hpe_len_px(share);
-            }
+    int i, j;
+    for (i = 1; i < n; i++) {
+        FlexItem key = items[i];
+        j = i - 1;
+        while (j >= 0 && items[j].order > key.order) {
+            items[j + 1] = items[j];
+            j--;
         }
-        return;
+        items[j + 1] = key;
     }
-    if (grow_sum > 0.0f) {
-        for (i = 0; i < n; i++) {
-            if (items[i].grow > 0.0f)
-                items[i].w += free_space * items[i].grow / grow_sum;
-        }
-        return;
-    }
-    if (st->justify == HPE_JUSTIFY_CENTER)
-        *out_lead = free_space * 0.5f;
-    else if (st->justify == HPE_JUSTIFY_END)
-        *out_lead = free_space;
-    else if (st->justify == HPE_JUSTIFY_SPACE_BETWEEN && n > 1)
-        *out_extra = free_space / (float)(n - 1);
-    else if (st->justify == HPE_JUSTIFY_SPACE_AROUND && n > 0) {
-        *out_lead = free_space / (float)(n * 2);
-        *out_extra = free_space / (float)n;
-    }
-}
-
-/**
- * @brief 在交叉轴上对齐各行 flex item / Align each flex item on the cross axis
- *
- * @param[in]     st 容器样式 / Container style
- * @param[in,out] items flex item 数组 / Flex item array
- * @param[in]     n item 个数 / Number of items
- * @param[in]     cross 交叉轴尺寸 / Cross-axis size
- *
- * @return 交叉轴尺寸 / The cross-axis size
- *
- * @note 每个 item 的 `align-self` 优先于容器的 `align-items` / Each item's `align-self` takes precedence over the container's `align-items`
- */
-static float flex_row_align(const HpeStyle *st, FlexItem *items, int n, float cross)
-{
-    int i;
-    for (i = 0; i < n; i++) {
-        FlexItem *it = &items[i];
-        int align = it->box->style.align_self != HPE_ALIGN_ITEMS_AUTO
-                        ? it->box->style.align_self
-                        : st->align_items;
-        float dy = flex_cross_offset(align, cross, it->outer_h);
-        if (dy != 0.0f)
-            box_shift(it->box, 0.0f, dy);
-    }
-    return cross;
-}
-
-/**
- * @brief 排版一条单行（nowrap）flex 行 / Lay out a single-line (nowrap) flex row
- *
- * @param[in]     ctx 布局上下文 / Layout context
- * @param[in,out] box flex 容器盒 / Flex container box
- * @param[in,out] items flex item 数组 / Flex item array
- * @param[in]     n item 个数 / Number of items
- * @param[in]     inner_w 内容区宽度 / Inner width
- * @param[in]     inner_h 内容区高度基准 / Inner height basis
- * @param[in]     own_h 容器自身高度，未定为负 / Container's own height, negative when unset
- *
- * @return 容器的交叉轴（高度）尺寸 / The container's cross-axis (height) size
- */
-static float layout_flex_row(LayoutCtx *ctx, HpeBox *box, FlexItem *items, int n, float inner_w,
-                             float inner_h, float own_h)
-{
-    HpeStyle *st = &box->style;
-    float total = 0.0f, free_space, line_h = 0.0f, cross, cursor, lead, extra;
-    float grow_sum = 0.0f;
-    int i, autos = 0;
-
-    for (i = 0; i < n; i++) {
-        total += items[i].w + items[i].m[1] + items[i].m[3];
-        autos += items[i].auto_ml + items[i].auto_mr;
-        grow_sum += items[i].grow;
-    }
-    if (n > 1)
-        total += st->gap * (float)(n - 1);
-    free_space = inner_w - total;
-
-    flex_row_free_space(st, items, n, free_space, grow_sum, autos, &lead, &extra);
-
-    /* pass 1: lay the items out along the main axis to collect cross sizes */
-    cursor = box->content_box.x + lead;
-    for (i = 0; i < n; i++) {
-        FlexItem *it = &items[i];
-        float avail = it->w + it->m[1] + it->m[3];
-        /* layout_block() takes the margin box origin and adds the margins itself */
-        layout_block(ctx, it->box, cursor, box->content_box.y, avail, inner_h);
-        it->outer_h = it->m[0] + it->box->border_box.h + it->m[2];
-        if (it->outer_h > line_h)
-            line_h = it->outer_h;
-        cursor += it->w + it->m[1] + it->m[3] + st->gap + extra;
-    }
-
-    cross = own_h > line_h ? own_h : line_h;
-    return flex_row_align(st, items, n, cross);
-}
-
-/**
- * @brief 排版一条单行 flex 列 / Lay out a single-line flex column
- *
- * @param[in]     ctx 布局上下文 / Layout context
- * @param[in,out] box flex 容器盒 / Flex container box
- * @param[in,out] items flex item 数组 / Flex item array
- * @param[in]     n item 个数 / Number of items
- * @param[in]     inner_w 内容区宽度 / Inner width
- * @param[in]     inner_h 内容区高度基准 / Inner height basis
- * @param[in]     own_h 容器自身高度，未定为负 / Container's own height, negative when unset
- *
- * @return 容器的交叉轴（高度）尺寸 / The container's cross-axis (height) size
- *
- * @note 列的主轴为纵向，交叉轴水平 / The column's main axis is vertical and its cross axis horizontal
- */
-static float layout_flex_column(LayoutCtx *ctx, HpeBox *box, FlexItem *items, int n, float inner_w,
-                                float inner_h, float own_h)
-{
-    HpeStyle *st = &box->style;
-    float cursor = box->content_box.y;
-    int i;
-
-    for (i = 0; i < n; i++) {
-        FlexItem *it = &items[i];
-        float avail = it->w + it->m[1] + it->m[3];
-        int align = it->box->style.align_self != HPE_ALIGN_ITEMS_AUTO
-                        ? it->box->style.align_self
-                        : st->align_items;
-        /* the cross axis is horizontal for a column: offset the margin box */
-        float dx = flex_cross_offset(align, inner_w, avail);
-        layout_block(ctx, it->box, box->content_box.x + dx, cursor, avail, inner_h);
-        it->outer_h = it->m[0] + it->box->border_box.h + it->m[2];
-        cursor += it->outer_h + st->gap;
-    }
-    return own_h > cursor - box->content_box.y ? own_h : cursor - box->content_box.y;
 }
 
 /**
@@ -1610,6 +1779,35 @@ static float flex_item_width(LayoutCtx *ctx, HpeBox *child, float inner_w)
 }
 
 /**
+ * @brief 求一个 flex item 的 `flex-basis` 解析后的主轴尺寸 / Resolve one flex item's `flex-basis` main size
+ *
+ * @param[in]     ctx 布局上下文 / Layout context
+ * @param[in,out] child item 对应的子盒 / Child box of the item
+ * @param[in]     inner_w 容器内容区宽度 / Container inner width
+ *
+ * @return 主轴基础尺寸（`flex-basis:auto` 时回落收缩适应宽度）/ The base main size, falling back to the shrink-to-fit width for `flex-basis:auto`
+ *
+ * @note 非 `auto` 的 `flex-basis` 覆盖 `width` / A non-`auto` `flex-basis` overrides `width`
+ */
+static float flex_item_basis(LayoutCtx *ctx, HpeBox *child, float inner_w)
+{
+    HpeStyle *cs = &child->style;
+    float w;
+    if (cs->flex_basis.unit == HPE_LEN_AUTO)
+        return flex_item_width(ctx, child, inner_w);
+    w = resolve_len(ctx, cs, cs->flex_basis, inner_w);
+    if (cs->box_sizing != HPE_BOX_SIZING_BORDER) {
+        w += side_px(ctx, cs, cs->padding[3], inner_w) +
+             side_px(ctx, cs, cs->padding[1], inner_w) +
+             (cs->border_w[3] > 0.0f ? cs->border_w[3] : 0.0f) +
+             (cs->border_w[1] > 0.0f ? cs->border_w[1] : 0.0f);
+    }
+    if (w < 0.0f)
+        w = 0.0f;
+    return w > inner_w ? inner_w : w;
+}
+
+/**
  * @brief 收集流内块级/行内块子盒为 flex items / Collect the in-flow block and inline-block children as flex items
  *
  * @param[in]     ctx 布局上下文 / Layout context
@@ -1646,10 +1844,490 @@ static FlexItem *flex_collect_items(LayoutCtx *ctx, HpeBox *box, float inner_w, 
         it->m[2] = margin_px(ctx, cs, cs->margin[2], inner_w);
         it->m[3] = margin_px(ctx, cs, cs->margin[3], inner_w);
         it->grow = cs->flex_grow > 0.0f ? cs->flex_grow : 0.0f;
-        it->w = flex_item_width(ctx, child, inner_w);
+        it->shrink = cs->flex_shrink;
+        it->order = cs->order;
+        it->basis = flex_item_basis(ctx, child, inner_w);
+        it->w = it->basis;
+        it->outer_main = it->w + it->m[1] + it->m[3];
     }
+    flex_sort_items(items, n);
     *out_n = n;
     return items;
+}
+
+/* auto margins soak up the free space before justify-content runs */
+static void flex_row_absorb_automargins(FlexItem *items, int n, float free_space, int autos)
+{
+    float share = free_space / (float)autos;
+    int i;
+    for (i = 0; i < n; i++) {
+        /* the resolved value has to reach the item's own layout pass, which
+         * resolves `auto` margins to zero on its own */
+        if (items[i].auto_ml) {
+            items[i].m[3] = share;
+            items[i].box->style.margin[3] = hpe_len_px(share);
+        }
+        if (items[i].auto_mr) {
+            items[i].m[1] = share;
+            items[i].box->style.margin[1] = hpe_len_px(share);
+        }
+    }
+}
+
+/* negative free space is taken back in proportion to shrink × basis */
+static void flex_row_apply_shrink(FlexItem *items, int n, float free_space, float shrink_sum)
+{
+    int i;
+    for (i = 0; i < n; i++) {
+        float scaled = items[i].shrink * items[i].basis;
+        if (scaled > 0.0f) {
+            items[i].w += free_space * scaled / shrink_sum;
+            if (items[i].w < 0.0f)
+                items[i].w = 0.0f;
+        }
+    }
+}
+
+static void flex_row_free_space(HpeStyle *st, FlexItem *items, int n, float free_space,
+                                float grow_sum, float shrink_sum, int autos, float *out_lead,
+                                float *out_extra)
+{
+    int i;
+    *out_lead = 0.0f;
+    *out_extra = 0.0f;
+    if (free_space > 0.0f && autos > 0) {
+        flex_row_absorb_automargins(items, n, free_space, autos);
+        return;
+    }
+    if (free_space > 0.0f && grow_sum > 0.0f) {
+        for (i = 0; i < n; i++) {
+            if (items[i].grow > 0.0f)
+                items[i].w += free_space * items[i].grow / grow_sum;
+        }
+        return;
+    }
+    if (free_space < 0.0f && shrink_sum > 0.0f) {
+        flex_row_apply_shrink(items, n, free_space, shrink_sum);
+        return;
+    }
+    if (st->justify == HPE_JUSTIFY_CENTER)
+        *out_lead = free_space * 0.5f;
+    else if (st->justify == HPE_JUSTIFY_END)
+        *out_lead = free_space;
+    else if (st->justify == HPE_JUSTIFY_SPACE_BETWEEN && n > 1)
+        *out_extra = free_space / (float)(n - 1);
+    else if (st->justify == HPE_JUSTIFY_SPACE_AROUND && n > 0) {
+        *out_lead = free_space / (float)(n * 2);
+        *out_extra = free_space / (float)n;
+    }
+}
+
+/**
+ * @brief 把 item 序列切成若干 flex 行 / Split the item sequence into flex lines
+ *
+ * @param[in]     items flex item 数组 / Flex item array
+ * @param[in]     n item 个数 / Number of items
+ * @param[in]     limit 主轴可用尺寸 / Available main-axis size
+ * @param[in]     gap item 间距 / Gap between items
+ * @param[in]     wrap 是否允许换行 / Whether wrapping is allowed
+ * @param[out]    out_nl 切出的行数 / Number of resulting lines
+ *
+ * @return 新分配的行数组，调用方负责释放 / Newly allocated line array owned by the caller
+ *
+ * @note `wrap` 为 0（nowrap）时全部 item 落在唯一一行 / With `wrap` 0 (nowrap) every item lands on a single line
+ */
+static FlexLine *flex_build_lines(const FlexItem *items, int n, float limit, float gap, int wrap,
+                                  int *out_nl)
+{
+    FlexLine *lines = NULL;
+    size_t cap = 0;
+    int nl = 0, i = 0;
+
+    if (!wrap)
+        limit = 0.0f; /* no break: everything stays on line 0 */
+    while (i < n) {
+        int j = i;
+        float sum = 0.0f;
+        while (j < n) {
+            float cand = (j == i) ? items[j].outer_main : sum + gap + items[j].outer_main;
+            if (wrap && j > i && limit > 0.0f && cand > limit)
+                break;
+            sum = cand;
+            j++;
+        }
+        lines = (FlexLine *)hpe_grow(lines, &cap, (size_t)nl + 1, sizeof(FlexLine));
+        lines[nl].start = i;
+        lines[nl].count = j - i;
+        lines[nl].main = sum;
+        lines[nl].cross = 0.0f;
+        lines[nl].lead = 0.0f;
+        lines[nl].extra = 0.0f;
+        nl++;
+        i = j;
+    }
+    *out_nl = nl;
+    return lines;
+}
+
+/**
+ * @brief 求一个 item 的首行基线相对其外边距盒顶部的距离 / Baseline offset of an item's first line from its margin-box top
+ *
+ * @param[in]     it flex item / Flex item
+ *
+ * @return 基线偏移；无文本行时回落为外边距盒高度 / The baseline offset, falling back to the margin-box height when the item has no text lines
+ */
+static float flex_item_baseline(const FlexItem *it)
+{
+    HpeBox *b = it->box;
+    if (b->line_count > 0)
+        return (b->lines[0].y + b->lines[0].baseline) - (b->border_box.y - it->m[0]);
+    return it->outer_h;
+}
+
+/**
+ * @brief 按交叉轴对齐规则平移单个 flex item / Translate one flex item according to its cross-axis alignment
+ *
+ * @param[in]     st 容器样式 / Container style
+ * @param[in,out] it flex item / Flex item
+ * @param[in]     cross 行交叉轴尺寸 / The line's cross size
+ * @param[in]     baseline 行内最高基线 / The line's highest baseline
+ *
+ * @note 仅做整体平移，不触发二次排版 / It only translates the whole box, never re-laying it out
+ */
+static void flex_place_item(const HpeStyle *st, FlexItem *it, float cross, float baseline)
+{
+    int align = flex_effective_align(st, &it->box->style);
+    float dy;
+    if (align == HPE_ALIGN_ITEMS_BASELINE)
+        dy = baseline - flex_item_baseline(it);
+    else
+        dy = flex_cross_offset(align, cross, it->outer_h);
+    if (dy != 0.0f)
+        box_shift(it->box, 0.0f, dy);
+}
+
+/**
+ * @brief 求一行内所有基线对齐项的基准 / Resolve the baseline shared by a line's baseline-aligned items
+ *
+ * @param[in]     st 容器样式 / Container style
+ * @param[in]     items flex item 数组 / Flex item array
+ * @param[in]     line 当前行 / Current line
+ *
+ * @return 行内最高基线 / The highest baseline on the line
+ */
+static float flex_line_baseline(const HpeStyle *st, const FlexItem *items, const FlexLine *line)
+{
+    float max_baseline = 0.0f;
+    int i;
+    for (i = 0; i < line->count; i++) {
+        const FlexItem *it = &items[line->start + i];
+        if (flex_effective_align(st, &it->box->style) == HPE_ALIGN_ITEMS_BASELINE) {
+            float bl = flex_item_baseline(it);
+            if (bl > max_baseline)
+                max_baseline = bl;
+        }
+    }
+    return max_baseline;
+}
+
+/**
+ * @brief 排版一个横向（row/row-reverse）flex 容器 / Lay out a horizontal (row / row-reverse) flex container
+ *
+ * @param[in]     ctx 布局上下文 / Layout context
+ * @param[in,out] box flex 容器盒 / Flex container box
+ * @param[in,out] items flex item 数组 / Flex item array
+ * @param[in]     n item 个数 / Number of items
+ * @param[in]     inner_w 内容区宽度 / Inner width
+ * @param[in]     inner_h 内容区高度基准 / Inner height basis
+ * @param[in]     own_h 容器自身高度，未定为负 / Container's own height, negative when unset
+ *
+ * @return 容器的交叉轴（高度）尺寸 / The container's cross-axis (height) size
+ *
+ * @note 两趟：先测量各行交叉轴尺寸，再落位并对齐 / Two passes: measure each line's cross size, then place and align
+ */
+/* With `align-items:stretch` an item without an explicit height fills the line
+ * box, exactly like a block with `height:auto` filling its containing block. */
+static void flex_row_stretch_line(HpeStyle *st, FlexLine *ln, FlexItem *items)
+{
+    int k;
+    for (k = 0; k < ln->count; k++) {
+        FlexItem *it = &items[ln->start + k];
+        int align = flex_effective_align(st, &it->box->style);
+        if (it->box->style.height.unit == HPE_LEN_AUTO && align == HPE_ALIGN_ITEMS_STRETCH) {
+            float target = ln->cross - it->m[0] - it->m[2];
+            if (target > it->box->border_box.h) {
+                it->box->border_box.h = target;
+                it->box->content_box.h = target;
+                it->box->pad_box.h = target;
+            }
+            it->outer_h = ln->cross;
+        }
+    }
+}
+
+/* Pass 1 for one row line: settle the line's main sizes and justify offsets,
+ * lay its items out once to learn the line's cross extent, then apply
+ * `align-items: stretch` for items without an explicit height. */
+static void flex_row_measure_line(LayoutCtx *ctx, HpeBox *box, FlexLine *ln, FlexItem *items,
+                                  float inner_w, float inner_h, float own_h, int nl)
+{
+    HpeStyle *st = &box->style;
+    int reverse = st->row_reverse;
+    float grow_sum = 0.0f, shrink_sum = 0.0f, free_space;
+    int autos = 0, k;
+    float cursor;
+
+    for (k = 0; k < ln->count; k++) {
+        int id = ln->start + k;
+        grow_sum += items[id].grow;
+        shrink_sum += items[id].shrink * items[id].basis;
+        autos += items[id].auto_ml + items[id].auto_mr;
+    }
+    free_space = inner_w - ln->main;
+    flex_row_free_space(st, &items[ln->start], ln->count, free_space, grow_sum, shrink_sum, autos,
+                        &ln->lead, &ln->extra);
+    cursor = reverse ? (box->content_box.x + inner_w - ln->lead)
+                     : (box->content_box.x + ln->lead);
+    for (k = 0; k < ln->count; k++) {
+        FlexItem *it = &items[ln->start + k];
+        float x;
+        it->outer_main = it->w + it->m[1] + it->m[3];
+        if (reverse) {
+            /* `-reverse` only flips where main-start sits; the items still run
+             * in DOM order, so the first item hugs the right edge */
+            cursor -= it->outer_main;
+            x = cursor;
+            cursor -= st->gap + ln->extra;
+        } else {
+            x = cursor;
+            cursor += it->outer_main + st->gap + ln->extra;
+        }
+        layout_block(ctx, it->box, x, box->content_box.y, it->outer_main, inner_h);
+        it->outer_h = it->m[0] + it->box->border_box.h + it->m[2];
+        if (it->outer_h > ln->cross)
+            ln->cross = it->outer_h;
+    }
+    /* a definite container height sets the line's cross size for a single line,
+     * which is what lets `align-items:stretch` fill it */
+    if (own_h > 0.0f && nl == 1 && own_h > ln->cross)
+        ln->cross = own_h;
+    flex_row_stretch_line(st, ln, items);
+}
+
+/* Pass 2: translate each line to its final cross offset and align its items. */
+static void flex_row_place_lines(HpeBox *box, FlexLine *lines, int nl, FlexItem *items,
+                                 int wrap_reverse)
+{
+    HpeStyle *st = &box->style;
+    float cursor_y = box->content_box.y;
+    int li, k;
+    for (li = 0; li < nl; li++) {
+        int idx = wrap_reverse ? (nl - 1 - li) : li;
+        FlexLine *ln = &lines[idx];
+        float base = box->content_box.y;
+        float dyl = cursor_y - base;
+        float bl = flex_line_baseline(st, items, ln);
+        for (k = 0; k < ln->count; k++) {
+            if (dyl != 0.0f)
+                box_shift(items[ln->start + k].box, 0.0f, dyl);
+            flex_place_item(st, &items[ln->start + k], ln->cross, bl);
+        }
+        cursor_y += ln->cross + st->gap;
+    }
+}
+
+static float flex_layout_row(LayoutCtx *ctx, HpeBox *box, FlexItem *items, int n, float inner_w,
+                             float inner_h, float own_h)
+{
+    HpeStyle *st = &box->style;
+    FlexLine *lines;
+    int nl = 0, li;
+    float total_cross = 0.0f;
+
+    lines = flex_build_lines(items, n, inner_w, st->gap, st->flex_wrap != 0, &nl);
+    for (li = 0; li < nl; li++)
+        flex_row_measure_line(ctx, box, &lines[li], items, inner_w, inner_h, own_h, nl);
+    for (li = 0; li < nl; li++)
+        total_cross += lines[li].cross;
+    if (nl > 1)
+        total_cross += st->gap * (float)(nl - 1);
+
+    flex_row_place_lines(box, lines, nl, items, st->flex_wrap == 2);
+
+    hpe_free(lines);
+    return own_h > total_cross ? own_h : total_cross;
+}
+
+/**
+ * @brief 排版一个纵向（column/column-reverse）flex 容器 / Lay out a vertical (column / column-reverse) flex container
+ *
+ * @param[in]     ctx 布局上下文 / Layout context
+ * @param[in,out] box flex 容器盒 / Flex container box
+ * @param[in,out] items flex item 数组 / Flex item array
+ * @param[in]     n item 个数 / Number of items
+ * @param[in]     inner_w 内容区宽度 / Inner width
+ * @param[in]     inner_h 内容区高度基准 / Inner height basis
+ * @param[in]     own_h 容器自身高度，未定为负 / Container's own height, negative when unset
+ *
+ * @return 容器的交叉轴（宽度、按列累计）尺寸 / The container's cross-axis extent
+ *
+ * @note 主轴为纵向，故先横向量出每个 item 的高度再按 `own_h` 分行 / The main axis is vertical, so each item is measured first and then split into lines against `own_h`
+ */
+/* A column's cross axis is horizontal: a `stretch` item without an explicit
+ * width fills the container, and any item wider than the container is capped. */
+static void flex_col_resolve_widths(HpeStyle *st, FlexItem *items, int n, float inner_w)
+{
+    int i;
+    for (i = 0; i < n; i++) {
+        FlexItem *it = &items[i];
+        int align = flex_effective_align(st, &it->box->style);
+        float avail = inner_w - it->m[1] - it->m[3];
+        if (avail < 0.0f)
+            avail = 0.0f;
+        if (align == HPE_ALIGN_ITEMS_STRETCH && it->box->style.width.unit == HPE_LEN_AUTO)
+            it->w = avail;
+        else if (it->w > avail)
+            it->w = avail;
+    }
+}
+
+/* Measure each column item's main (height) size at its resolved width. */
+static void flex_col_measure_items(LayoutCtx *ctx, HpeBox *box, FlexItem *items, int n,
+                                   float inner_h)
+{
+    int i;
+    for (i = 0; i < n; i++) {
+        FlexItem *it = &items[i];
+        layout_block(ctx, it->box, box->content_box.x + it->m[3], box->content_box.y,
+                     it->w + it->m[1] + it->m[3], inner_h);
+        it->outer_h = it->m[0] + it->box->border_box.h + it->m[2];
+        it->outer_main = it->outer_h;
+    }
+}
+
+/* On a column the main sizes can grow/shrink against a definite container
+ * height. */
+static void flex_col_flex_main(HpeStyle *st, FlexItem *items, int n, float own_h)
+{
+    float total = 0.0f, grow_sum = 0.0f, shrink_sum = 0.0f, free_space;
+    int i;
+    if (own_h <= 0.0f)
+        return;
+    for (i = 0; i < n; i++) {
+        total += items[i].outer_main;
+        grow_sum += items[i].grow;
+        shrink_sum += items[i].shrink * items[i].basis;
+    }
+    if (n > 1)
+        total += st->gap * (float)(n - 1);
+    free_space = own_h - total;
+    for (i = 0; i < n; i++) {
+        FlexItem *it = &items[i];
+        float delta = 0.0f;
+        if (free_space > 0.0f && grow_sum > 0.0f && it->grow > 0.0f)
+            delta = free_space * it->grow / grow_sum;
+        else if (free_space < 0.0f && shrink_sum > 0.0f && it->shrink > 0.0f)
+            delta = free_space * (it->shrink * it->basis) / shrink_sum;
+        if (delta == 0.0f)
+            continue;
+        it->box->border_box.h += delta;
+        it->box->content_box.h += delta;
+        it->box->pad_box.h += delta;
+        it->outer_h += delta;
+        it->outer_main = it->outer_h;
+    }
+}
+
+/* Size each line's cross extent: a definite container width sets a single line,
+ * otherwise the widest item's outer width does. */
+static void flex_col_line_cross(FlexLine *lines, int nl, FlexItem *items, float inner_w)
+{
+    int li;
+    for (li = 0; li < nl; li++) {
+        FlexLine *ln = &lines[li];
+        float max_w = 0.0f;
+        int k;
+        if (inner_w > 0.0f && nl == 1)
+            ln->cross = inner_w;
+        for (k = 0; k < ln->count; k++) {
+            FlexItem *it = &items[ln->start + k];
+            float ow = it->w + it->m[1] + it->m[3];
+            if (ow > max_w)
+                max_w = ow;
+        }
+        if (max_w > ln->cross)
+            ln->cross = max_w;
+    }
+}
+
+/* Stretch the auto-width, stretch-aligned items of a column line to the line's
+ * cross size before they are placed. */
+static void flex_col_stretch_line(HpeStyle *st, FlexLine *ln, FlexItem *items)
+{
+    int k;
+    for (k = 0; k < ln->count; k++) {
+        FlexItem *it = &items[ln->start + k];
+        if (it->box->style.align_self != HPE_ALIGN_ITEMS_AUTO &&
+            st->align_items != HPE_ALIGN_ITEMS_STRETCH)
+            continue;
+        if (flex_effective_align(st, &it->box->style) == HPE_ALIGN_ITEMS_STRETCH &&
+            it->box->style.width.unit == HPE_LEN_AUTO) {
+            it->w = ln->cross - it->m[1] - it->m[3];
+            if (it->w < 0.0f)
+                it->w = 0.0f;
+        }
+    }
+}
+
+static float flex_layout_column(LayoutCtx *ctx, HpeBox *box, FlexItem *items, int n, float inner_w,
+                                float inner_h, float own_h)
+{
+    HpeStyle *st = &box->style;
+    FlexLine *lines;
+    int nl = 0, i, k;
+    float cross_total = 0.0f, cursor_x;
+    int wrap_reverse = st->flex_wrap == 2;
+    int reverse = st->row_reverse;
+
+    flex_col_resolve_widths(st, items, n, inner_w);
+    flex_col_measure_items(ctx, box, items, n, inner_h);
+    flex_col_flex_main(st, items, n, own_h);
+
+    lines = flex_build_lines(items, n, own_h > 0.0f ? own_h : 0.0f, st->gap, st->flex_wrap != 0,
+                             &nl);
+    flex_col_line_cross(lines, nl, items, inner_w);
+
+    cursor_x = box->content_box.x;
+    for (i = 0; i < nl; i++) {
+        int idx = wrap_reverse ? (nl - 1 - i) : i;
+        FlexLine *ln = &lines[idx];
+        float cursor_y = reverse ? (box->content_box.y + (own_h > 0.0f ? own_h : ln->main))
+                                 : box->content_box.y;
+        flex_col_stretch_line(st, ln, items);
+        for (k = 0; k < ln->count; k++) {
+            FlexItem *it = &items[ln->start + k];
+            int align = flex_effective_align(st, &it->box->style);
+            float dx = flex_cross_offset(align, ln->cross, it->w + it->m[1] + it->m[3]);
+            float y;
+            if (reverse) {
+                cursor_y -= it->outer_main;
+                y = cursor_y;
+                cursor_y -= st->gap;
+            } else {
+                y = cursor_y;
+                cursor_y += it->outer_main + st->gap;
+            }
+            layout_block(ctx, it->box, cursor_x + dx, y, it->w + it->m[1] + it->m[3], inner_h);
+            it->outer_h = it->m[0] + it->box->border_box.h + it->m[2];
+        }
+        cursor_x += ln->cross + st->gap;
+        cross_total += ln->cross + st->gap;
+    }
+    if (cross_total > 0.0f)
+        cross_total -= st->gap;
+
+    hpe_free(lines);
+    return cross_total;
 }
 
 /**
@@ -1686,12 +2364,1057 @@ static float layout_flex(LayoutCtx *ctx, HpeBox *box, float inner_w, float inner
         return own_h > 0.0f ? own_h : 0.0f;
     }
     if (st->flex_dir == HPE_FLEX_COLUMN)
-        result = layout_flex_column(ctx, box, items, n, inner_w, inner_h, own_h);
+        result = flex_layout_column(ctx, box, items, n, inner_w, inner_h, own_h);
     else
-        result = layout_flex_row(ctx, box, items, n, inner_w, inner_h, own_h);
+        result = flex_layout_row(ctx, box, items, n, inner_w, inner_h, own_h);
     if (items)
         hpe_free(items);
     return result;
+}
+
+/* ---------------- grid ----------------
+ *
+ * A grid container has an explicit track list for the columns (and optionally
+ * the rows). Items are placed either explicitly (`grid-column` / `grid-row`)
+ * or by the auto-placement cursor, which walks the grid in row-major order and
+ * takes the next free slot wide enough for the item. Track sizing first gives
+ * every `px` / `%` track its resolved size and every `auto` track the largest
+ * preferred width of the items in it; the remaining space is then shared among
+ * the `fr` tracks in proportion to their factors. Rows are sized from their
+ * items' heights, so an implicit row (`grid-auto-rows`) simply wraps its
+ * content. */
+
+#define HPE_GRID_MAX_ITEMS 256
+/* the row dimension has to be bounded separately: a grid may have far more
+ * implicit rows than its column template has tracks */
+#define HPE_GRID_MAX_ROWS 64
+
+typedef struct {
+    HpeBox *box;
+    int col, row;         /* 0-based start cell */
+    int colspan, rowspan; /* at least 1 */
+} GridItem;
+
+/**
+ * @brief 取一个网格 item 的跨列/跨行数 / Resolve a grid item's column/row span
+ *
+ * @details 按 `grid-column` / `grid-row` 的「起始线 + 结束线」求跨数；任一端缺失时按 1 计。
+ *          The span comes from the `grid-column` / `grid-row` start and end lines; a missing end means one track.
+ *
+ * @param[in] start 起始线（1 基线，0 = auto，负值 = `span N`）/ Start line, 1-based (0 = auto, negative = `span N`)
+ * @param[in] end 结束线（同上）/ End line, same encoding
+ *
+ * @return 跨数（至少 1）/ The span, at least 1
+ *
+ * @note 负值把 `span N` 直接作为跨数 / A negative value is taken as the `span N` length
+ */
+static int grid_span_from_lines(int start, int end)
+{
+    if (end < 0)
+        return -end;
+    if (start < 0)
+        return -start;
+    if (start > 0 && end > start)
+        return end - start;
+    return 1;
+}
+
+/**
+ * @brief 取一个网格 item 的起始线 / Resolve a grid item's start line
+ *
+ * @param[in] start 声明值 / Declared value
+ *
+ * @return 0 基线的起始格；`auto` 或 `span` 时返回 -1 表示「交给自动放置」/ The 0-based start cell, or -1 for "let auto-placement decide"
+ */
+static int grid_start_cell(int start)
+{
+    if (start <= 0)
+        return -1;
+    return start - 1;
+}
+
+/**
+ * @brief 解算网格轨道尺寸 / Resolve the grid track sizes
+ *
+ * @details 第一遍给每个 `px` / `%` 轨道定值、`auto` 轨道取内容首选宽度；随后把
+ *           `avail - 已用 - 间距` 按 `fr` 因子分配给弹性轨道。`fr` 轨道为 0 时退化为 `auto`。
+ *          Pass one fixes the `px` / `%` tracks and gives every `auto` track its content's preferred width; the leftover after gaps is then distributed among the `fr` tracks by factor.
+ *
+ * @param[in,out] spec 轨道表 / Track list
+ * @param[in]     avail 可用主轴尺寸 / Available main-axis size
+ * @param[in]     gap 轨道间距 / Track gap
+ * @param[in]     auto_hint 每个 `auto` 轨道的提示宽度（内容首选宽）/ Hint width for each `auto` track
+ * @param[out]    out 每个轨道的最终尺寸 / Final size of every track
+ *
+ * @return 轨道总数 / The number of tracks
+ */
+static int grid_resolve_tracks(const HpeGridSpec *spec, float avail, float gap,
+                               const float *auto_hint, float *out)
+{
+    float used = 0.0f, fr_sum = 0.0f;
+    float gaps;
+    int i, n = spec->count;
+
+    for (i = 0; i < n; i++) {
+        const HpeGridTrack *t = &spec->tracks[i];
+        float w = 0.0f;
+        if (t->kind == 0) /* px */
+            w = t->value;
+        else if (t->kind == 3) /* % */
+            w = avail * t->value / 100.0f;
+        else if (t->kind == 2) /* auto */
+            w = auto_hint ? auto_hint[i] : 0.0f;
+        else /* fr */
+            fr_sum += t->value > 0.0f ? t->value : 1.0f;
+        out[i] = w;
+        used += w;
+    }
+    gaps = n > 1 ? gap * (float)(n - 1) : 0.0f;
+    if (fr_sum > 0.0f) {
+        float free_w = avail - used - gaps;
+        if (free_w < 0.0f)
+            free_w = 0.0f;
+        for (i = 0; i < n; i++) {
+            if (spec->tracks[i].kind == 1)
+                out[i] = free_w * (spec->tracks[i].value > 0.0f ? spec->tracks[i].value : 1.0f) /
+                         fr_sum;
+        }
+    }
+    return n;
+}
+
+/**
+ * @brief 布局一个网格容器 / Lay out a grid container
+ *
+ * @param[in]     ctx 布局上下文 / Layout context
+ * @param[in,out] box 网格容器盒 / Grid container box
+ * @param[in]     inner_w 内容区宽度 / Inner width
+ * @param[in]     inner_h 内容区高度基准 / Inner height basis
+ *
+ * @return 网格内容区高度 / The grid's content height
+ *
+ * @note 未显式指定列时按「有多少 item 就排多少列」单行铺开 / With no explicit `grid-template-columns` the items are laid out in a single row
+ */
+/* Everything layout_grid accumulates across its passes. */
+typedef struct {
+    GridItem items[HPE_GRID_MAX_ITEMS];
+    float col_w[HPE_GRID_MAX_TRACKS];
+    float row_h[HPE_GRID_MAX_ROWS];
+    float row_top[HPE_GRID_MAX_ROWS + 1];
+    float auto_hint[HPE_GRID_MAX_TRACKS];
+    int n, ncols, nrows;
+    float gap, x0, y0, inner_w, inner_h;
+} GridState;
+
+/* Collect the in-flow block-level children as grid items. Returns 0 when there
+ * is nothing to lay out. */
+static int grid_collect_items(HpeBox *box, GridState *g)
+{
+    HpeBox *child;
+    g->n = 0;
+    for (child = box->first_child; child && g->n < HPE_GRID_MAX_ITEMS; child = child->next) {
+        HpeStyle *cs = &child->style;
+        GridItem *it;
+        if (cs->position == HPE_POS_ABSOLUTE || cs->position == HPE_POS_FIXED)
+            continue;
+        /* only block-level children participate; stray inline/text nodes (the
+         * whitespace between the tags) are not grid items */
+        if (child->kind != HPE_BOX_BLOCK && child->kind != HPE_BOX_INLINE_BLOCK)
+            continue;
+        it = &g->items[g->n];
+        it->box = child;
+        it->col = -1;
+        it->row = -1;
+        it->colspan = grid_span_from_lines(cs->grid_col_start, cs->grid_col_end);
+        it->rowspan = grid_span_from_lines(cs->grid_row_start, cs->grid_row_end);
+        if (it->colspan > HPE_GRID_MAX_TRACKS)
+            it->colspan = HPE_GRID_MAX_TRACKS;
+        if (it->rowspan > HPE_GRID_MAX_TRACKS)
+            it->rowspan = HPE_GRID_MAX_TRACKS;
+        g->n++;
+    }
+    return g->n > 0;
+}
+
+/* Explicit column grid, or one column per item when no template is given. */
+static void grid_resolve_ncols(HpeStyle *st, GridState *g)
+{
+    int i;
+    if (st->grid_cols.present) {
+        g->ncols = st->grid_cols.count;
+        return;
+    }
+    g->ncols = 0;
+    for (i = 0; i < g->n; i++)
+        g->ncols += g->items[i].colspan;
+    if (g->ncols > HPE_GRID_MAX_TRACKS)
+        g->ncols = HPE_GRID_MAX_TRACKS;
+    if (g->ncols < 1)
+        g->ncols = 1;
+}
+
+/* Auto-placement: honour explicit positions, then fill the gaps.
+ * `taken[r][c]` records occupancy; the row dimension is bounded by
+ * HPE_GRID_MAX_ROWS so an over-long column template cannot overflow. Returns 0
+ * when placement hit a wall (the caller then just stops adding rows). */
+/* Mark the cells an item occupies in the occupancy grid. */
+static void grid_mark_taken(unsigned char taken[][HPE_GRID_MAX_TRACKS], int col, int row,
+                            int colspan, int rowspan)
+{
+    int r, c;
+    for (r = row; r < row + rowspan && r < HPE_GRID_MAX_ROWS; r++)
+        for (c = col; c < col + colspan && c < HPE_GRID_MAX_TRACKS; c++)
+            taken[r][c] = 1;
+}
+
+/* One axis fixed, the other auto: scan that axis for a free run, advancing the
+ * auto cursors, and report the chosen cell in *out_c / *out_r. On a no-room
+ * break the item still lands on the last tried cell, as the reference does. */
+/* Advance the auto cursor one step along the free axis. Returns 1 when the
+ * scan has exhausted every axis and the caller should stop probing. */
+static int grid_slide_cursor(const GridState *g, const GridItem *it, int col_flow, int flow_rows,
+                             int cc, int rr, int *cursor_c, int *cursor_r)
+{
+    if (it->row >= 0) {
+        /* row pinned: slide along the columns */
+        if (cc + 1 + it->colspan > g->ncols)
+            return 1;
+        *cursor_c = cc + 1;
+    } else if (it->col >= 0) {
+        /* column pinned: slide down the rows */
+        if (rr + 1 + it->rowspan > HPE_GRID_MAX_ROWS)
+            return 1;
+        *cursor_r = rr + 1;
+    } else if (col_flow) {
+        /* fully auto, column flow: walk down then wrap right */
+        if (rr + 1 + it->rowspan > flow_rows) {
+            *cursor_r = 0;
+            if (cc + 1 + it->colspan > HPE_GRID_MAX_TRACKS)
+                return 1;
+            *cursor_c = cc + 1;
+        } else {
+            *cursor_r = rr + 1;
+        }
+    } else {
+        /* fully auto: row-major walk */
+        if (cc + 1 + it->colspan > g->ncols) {
+            *cursor_c = 0;
+            if (rr + 1 + it->rowspan > HPE_GRID_MAX_ROWS)
+                return 1;
+            *cursor_r = rr + 1;
+        } else {
+            *cursor_c = cc + 1;
+        }
+    }
+    return 0;
+}
+
+static void grid_find_slot(const GridState *g, const GridItem *it,
+                           unsigned char taken[][HPE_GRID_MAX_TRACKS], int col_flow, int flow_rows,
+                           int *cursor_c, int *cursor_r, int *out_c, int *out_r)
+{
+    int cc, rr;
+    for (;;) {
+        int r, c, ok = 1;
+        cc = it->col >= 0 ? it->col : *cursor_c;
+        rr = it->row >= 0 ? it->row : *cursor_r;
+        if (cc < 0)
+            cc = 0;
+        if (rr < 0)
+            rr = 0;
+        if (cc + it->colspan > g->ncols)
+            ok = 0;
+        if (rr + it->rowspan > HPE_GRID_MAX_ROWS)
+            ok = 0;
+        if (ok) {
+            for (r = rr; r < rr + it->rowspan; r++)
+                for (c = cc; c < cc + it->colspan; c++)
+                    if (taken[r][c])
+                        ok = 0;
+        }
+        if (ok)
+            break;
+        if (grid_slide_cursor(g, it, col_flow, flow_rows, cc, rr, cursor_c, cursor_r))
+            break;
+    }
+    *out_c = cc;
+    *out_r = rr;
+}
+
+/* Advance the auto cursor past the item just placed. */
+static void grid_advance_cursor(const GridState *g, const GridItem *it, int col_flow, int flow_rows,
+                                int cc, int rr, int *cursor_c, int *cursor_r)
+{
+    if (col_flow) {
+        *cursor_r = rr + it->rowspan;
+        *cursor_c = cc;
+        if (*cursor_r >= flow_rows) {
+            *cursor_r = 0;
+            *cursor_c = cc + it->colspan;
+        }
+    } else {
+        *cursor_c = cc + it->colspan;
+        if (*cursor_c >= g->ncols) {
+            *cursor_c = 0;
+            *cursor_r = rr + it->rowspan;
+        } else {
+            *cursor_r = rr;
+        }
+    }
+}
+
+static int grid_autoplace(GridState *g, HpeStyle *st)
+{
+    unsigned char taken[HPE_GRID_MAX_ROWS][HPE_GRID_MAX_TRACKS];
+    int cursor_c = 0, cursor_r = 0;
+    /* `grid-auto-flow: column` walks down a column before moving right, so the
+     * row count comes from the row template (an implicit row is added only when
+     * no template is given). */
+    int col_flow = st->grid_auto_flow == 1;
+    int flow_rows = st->grid_rows.present ? st->grid_rows.count : 1;
+    int i;
+    if (flow_rows < 1)
+        flow_rows = 1;
+    if (flow_rows > HPE_GRID_MAX_ROWS)
+        flow_rows = HPE_GRID_MAX_ROWS;
+    memset(taken, 0, sizeof(taken));
+    for (i = 0; i < g->n; i++) {
+        HpeStyle *cs = &g->items[i].box->style;
+        int sc = grid_start_cell(cs->grid_col_start);
+        int sr = grid_start_cell(cs->grid_row_start);
+        int cc, rr;
+        if (sc >= 0)
+            g->items[i].col = sc;
+        if (sr >= 0)
+            g->items[i].row = sr;
+        /* an explicit position on both axes needs no scanning */
+        if (g->items[i].col >= 0 && g->items[i].row >= 0) {
+            grid_mark_taken(taken, g->items[i].col, g->items[i].row, g->items[i].colspan,
+                            g->items[i].rowspan);
+            continue;
+        }
+        grid_find_slot(g, &g->items[i], taken, col_flow, flow_rows, &cursor_c, &cursor_r, &cc, &rr);
+        g->items[i].col = cc;
+        g->items[i].row = rr;
+        grid_mark_taken(taken, cc, rr, g->items[i].colspan, g->items[i].rowspan);
+        grid_advance_cursor(g, &g->items[i], col_flow, flow_rows, cc, rr, &cursor_c, &cursor_r);
+    }
+    return 1;
+}
+
+/* Row track sizes from the template; `auto` / `fr` rows start at 0 and grow to
+ * fit their items later. nrows is settled from the placed items. */
+static void grid_row_tracks(HpeStyle *st, GridState *g)
+{
+    int i, r;
+    g->nrows = 1;
+    for (i = 0; i < g->n; i++) {
+        int end = g->items[i].row + g->items[i].rowspan;
+        if (end > g->nrows)
+            g->nrows = end;
+    }
+    if (g->nrows > HPE_GRID_MAX_ROWS)
+        g->nrows = HPE_GRID_MAX_ROWS;
+    memset(g->row_h, 0, sizeof(g->row_h));
+    if (st->grid_rows.present) {
+        int given = st->grid_rows.count < g->nrows ? st->grid_rows.count : g->nrows;
+        for (r = 0; r < given; r++) {
+            const HpeGridTrack *t = &st->grid_rows.tracks[r];
+            if (t->kind == 0)
+                g->row_h[r] = t->value;
+            else if (t->kind == 3)
+                g->row_h[r] = g->inner_h * t->value / 100.0f;
+        }
+    }
+}
+
+/* Hint each auto column with its single-column items' preferred width, then
+ * resolve the column tracks. */
+static void grid_col_tracks(LayoutCtx *ctx, HpeStyle *st, GridState *g)
+{
+    int i, c;
+    for (c = 0; c < g->ncols; c++)
+        g->auto_hint[c] = 0.0f;
+    for (i = 0; i < g->n; i++) {
+        float pw;
+        if (g->items[i].col < 0 || g->items[i].colspan != 1)
+            continue;
+        pw = table_cell_pref_w(ctx, g->items[i].box);
+        if (g->items[i].col < HPE_GRID_MAX_TRACKS && pw > g->auto_hint[g->items[i].col])
+            g->auto_hint[g->items[i].col] = pw;
+    }
+    if (st->grid_cols.present) {
+        grid_resolve_tracks(&st->grid_cols, g->inner_w, g->gap, g->auto_hint, g->col_w);
+    } else {
+        /* no explicit template: share the width equally between the columns */
+        float share =
+            (g->inner_w - (g->ncols > 1 ? g->gap * (float)(g->ncols - 1) : 0.0f)) / (float)g->ncols;
+        for (c = 0; c < g->ncols; c++)
+            g->col_w[c] = share > 0.0f ? share : 0.0f;
+    }
+    if (st->grid_cols.present && g->ncols > st->grid_cols.count) {
+        /* implicit columns beyond the template get the leftover share */
+        float extra = g->inner_w / (float)g->ncols;
+        for (c = st->grid_cols.count; c < g->ncols; c++)
+            g->col_w[c] = extra > 0.0f ? extra : 0.0f;
+    }
+}
+
+/* Row track sizes: every row gets the tallest single-row item in it, then a
+ * spanning item pushes its rows when it needs more room. */
+static void grid_measure_rows(LayoutCtx *ctx, GridState *g)
+{
+    int i, r, k;
+    for (r = 0; r < g->nrows; r++) {
+        for (i = 0; i < g->n; i++) {
+            float cw = 0.0f, h;
+            if (g->items[i].row != r || g->items[i].rowspan != 1)
+                continue;
+            for (k = 0; k < g->items[i].colspan && g->items[i].col + k < g->ncols; k++)
+                cw += g->col_w[g->items[i].col + k] + (k ? g->gap : 0.0f);
+            layout_block(ctx, g->items[i].box, g->x0, g->y0, cw > 0.0f ? cw : g->inner_w,
+                         g->inner_h);
+            h = g->items[i].box->border_box.h;
+            if (h > g->row_h[r])
+                g->row_h[r] = h;
+        }
+    }
+    for (i = 0; i < g->n; i++) {
+        float cw = 0.0f, have = 0.0f, need;
+        int last = g->items[i].row + g->items[i].rowspan - 1;
+        if (g->items[i].rowspan <= 1)
+            continue;
+        if (last >= g->nrows)
+            last = g->nrows - 1;
+        for (k = 0; k < g->items[i].colspan && g->items[i].col + k < g->ncols; k++)
+            cw += g->col_w[g->items[i].col + k] + (k ? g->gap : 0.0f);
+        layout_block(ctx, g->items[i].box, g->x0, g->y0, cw > 0.0f ? cw : g->inner_w, g->inner_h);
+        need = g->items[i].box->border_box.h;
+        for (k = g->items[i].row; k <= last; k++)
+            have += g->row_h[k] + (k > g->items[i].row ? g->gap : 0.0f);
+        if (need > have) {
+            float add = (need - have) / (float)(last - g->items[i].row + 1);
+            for (k = g->items[i].row; k <= last; k++)
+                g->row_h[k] += add;
+        }
+    }
+}
+
+/* align-content: compute the row offsets, then shift / spread the whole grid
+ * inside the container. */
+static void grid_align_content(HpeStyle *st, GridState *g)
+{
+    float total_h, extra;
+    int r;
+    g->row_top[0] = g->y0;
+    for (r = 1; r < g->nrows; r++)
+        g->row_top[r] = g->row_top[r - 1] + g->row_h[r - 1] + g->gap;
+    total_h = g->row_top[g->nrows - 1] + g->row_h[g->nrows - 1] - g->y0;
+    extra = g->inner_h - total_h;
+    if (extra <= 0.0f)
+        return;
+    if (st->align_content == HPE_JUSTIFY_CENTER) {
+        for (r = 0; r < g->nrows; r++)
+            g->row_top[r] += extra * 0.5f;
+    } else if (st->align_content == HPE_JUSTIFY_END) {
+        for (r = 0; r < g->nrows; r++)
+            g->row_top[r] += extra;
+    } else if (st->align_content == HPE_JUSTIFY_SPACE_BETWEEN && g->nrows > 1) {
+        float add = extra / (float)(g->nrows - 1);
+        for (r = 0; r < g->nrows; r++)
+            g->row_top[r] += add * (float)r;
+    } else if (st->align_content == HPE_JUSTIFY_SPACE_AROUND && g->nrows > 0) {
+        float unit = extra / (float)g->nrows;
+        for (r = 0; r < g->nrows; r++)
+            g->row_top[r] += unit * ((float)r + 0.5f);
+    }
+}
+
+/* Place pass: layout each item in its cell, then apply justify-items
+ * (stretch by default). */
+static void grid_place_items(LayoutCtx *ctx, HpeStyle *st, GridState *g)
+{
+    float col_x[HPE_GRID_MAX_TRACKS];
+    float x = g->x0;
+    int i, c;
+    for (c = 0; c < g->ncols; c++) {
+        col_x[c] = x;
+        x += g->col_w[c] + g->gap;
+    }
+    for (i = 0; i < g->n; i++) {
+        float cx, cw = 0.0f, ch;
+        int k, last = g->items[i].row + g->items[i].rowspan - 1;
+        if (g->items[i].col + g->items[i].colspan > g->ncols)
+            g->items[i].colspan = g->ncols - g->items[i].col;
+        if (g->items[i].colspan < 1)
+            g->items[i].colspan = 1;
+        if (last >= g->nrows)
+            last = g->nrows - 1;
+        for (k = 0; k < g->items[i].colspan; k++)
+            cw += g->col_w[g->items[i].col + k] + (k ? g->gap : 0.0f);
+        cx = col_x[g->items[i].col];
+        ch = g->row_top[last] + g->row_h[last] - g->row_top[g->items[i].row];
+        if (ch < 0.0f)
+            ch = 0.0f;
+        layout_block(ctx, g->items[i].box, cx, g->row_top[g->items[i].row], cw,
+                     ch > 0.0f ? ch : g->inner_h);
+        /* justify-items / align-items: stretch by default */
+        if (g->items[i].box->style.width.unit == HPE_LEN_AUTO &&
+            st->justify_items != HPE_ALIGN_ITEMS_CENTER &&
+            st->justify_items != HPE_ALIGN_ITEMS_FLEX_END) {
+            if (cw > g->items[i].box->border_box.w) {
+                float grow = cw - g->items[i].box->border_box.w;
+                g->items[i].box->content_box.w += grow;
+                g->items[i].box->pad_box.w += grow;
+                g->items[i].box->border_box.w += grow;
+            }
+        } else if (st->justify_items == HPE_ALIGN_ITEMS_CENTER) {
+            float dx = (cw - g->items[i].box->border_box.w) * 0.5f;
+            g->items[i].box->content_box.x += dx;
+            g->items[i].box->pad_box.x += dx;
+            g->items[i].box->border_box.x += dx;
+        } else if (st->justify_items == HPE_ALIGN_ITEMS_FLEX_END) {
+            float dx = cw - g->items[i].box->border_box.w;
+            g->items[i].box->content_box.x += dx;
+            g->items[i].box->pad_box.x += dx;
+            g->items[i].box->border_box.x += dx;
+        }
+    }
+}
+
+/**
+ * @brief 布局一个网格容器 / Lay out a grid container
+ *
+ * @param[in]     ctx 布局上下文 / Layout context
+ * @param[in,out] box 网格容器盒 / Grid container box
+ * @param[in]     inner_w 内容区宽度 / Inner width
+ * @param[in]     inner_h 内容区高度基准 / Inner height basis
+ *
+ * @return 网格内容区高度 / The grid's content height
+ *
+ * @note 未显式指定列时按「有多少 item 就排多少列」单行铺开 / With no explicit `grid-template-columns` the items are laid out in a single row
+ */
+static float layout_grid(LayoutCtx *ctx, HpeBox *box, float inner_w, float inner_h)
+{
+    HpeStyle *st = &box->style;
+    GridState g;
+
+    memset(&g, 0, sizeof(g));
+    g.gap = st->grid_gap;
+    g.x0 = box->content_box.x;
+    g.y0 = box->content_box.y;
+    g.inner_w = inner_w;
+    g.inner_h = inner_h;
+
+    if (!grid_collect_items(box, &g))
+        return 0.0f;
+    grid_resolve_ncols(st, &g);
+    grid_autoplace(&g, st);
+    grid_row_tracks(st, &g);
+    grid_col_tracks(ctx, st, &g);
+    grid_measure_rows(ctx, &g);
+    grid_align_content(st, &g);
+    grid_place_items(ctx, st, &g);
+    return g.row_top[g.nrows - 1] + g.row_h[g.nrows - 1] - g.y0;
+}
+
+/* ---------------- tables ----------------
+ *
+ * A table is laid out in three steps: collect the rows (descending through
+ * row groups), resolve the column widths from the cells' preferred widths, and
+ * finally place every cell in its column so the table can size its rows. The
+ * automatic table layout algorithm is approximated by the classic "maximum of
+ * the columns' preferred widths, then distribute the leftover proportionally"
+ * rule, which reproduces the reference rendering for content-shaped tables.
+ * `border-collapse` is not modelled: cells keep their own borders and the
+ * table's `border-spacing` (default 0) separates them. */
+
+#define HPE_TABLE_MAX_COLS 32
+
+typedef struct {
+    HpeBox **rows;
+    int count;
+    size_t cap;
+} TableRows;
+
+typedef struct {
+    float *w;
+    int count;
+} TableCols;
+
+/* one occupied cell of the grid: the box, its column span and the row index
+ * it starts at (used to carry a rowspan's height forward). */
+typedef struct {
+    HpeBox *box;
+    int col;
+    int colspan;
+    int rowspan;
+} TableSlot;
+
+/* the resolved grid geometry for one row: where each cell starts and which
+ * columns it covers; `n` counts the slots actually present in the row. */
+typedef struct {
+    TableSlot slots[HPE_TABLE_MAX_COLS];
+    int n;
+} TableRowSlots;
+
+/**
+ * @brief 收集表格中的行盒（穿过行组）/ Collect a table's row boxes, descending through row groups
+ *
+ * @param[in]     box 表格或行组盒 / Table or row-group box
+ * @param[in,out] out 行盒列表 / Row-box list
+ *
+ * @note 只收集 `table-row`，行组递归其子 / Only `table-row` boxes are collected while row groups recurse into their children
+ */
+static void table_collect_rows(HpeBox *box, TableRows *out)
+{
+    HpeBox *child;
+    for (child = box->first_child; child; child = child->next) {
+        HpeDisplay d = child->style.display;
+        if (d == HPE_DISPLAY_TABLE_ROW) {
+            out->rows = (HpeBox **)hpe_grow(out->rows, &out->cap, (size_t)out->count + 1,
+                                             sizeof(HpeBox *));
+            out->rows[out->count++] = child;
+        } else if (d == HPE_DISPLAY_TABLE_ROW_GROUP) {
+            table_collect_rows(child, out);
+        }
+    }
+}
+
+/**
+ * @brief 收集一行的单元格盒 / Collect the cell boxes of one row
+ *
+ * @param[in]     row 行盒 / Row box
+ * @param[out]    out 单元格数组 / Cell array
+ * @param[in]     max 数组容量 / Array capacity
+ *
+ * @return 单元格个数（不超过 `max`）/ Number of cells, capped at `max`
+ */
+static int table_row_cells(HpeBox *row, HpeBox **out, int max)
+{
+    HpeBox *c;
+    int n = 0;
+    for (c = row->first_child; c && n < max; c = c->next) {
+        if (c->style.display == HPE_DISPLAY_TABLE_CELL)
+            out[n++] = c;
+    }
+    return n;
+}
+
+/**
+ * @brief 读取单元格的正整数属性 / Read a positive integer cell attribute
+ *
+ * @param[in] cell 单元格盒 / Cell box
+ * @param[in] name 属性名 / Attribute name
+ *
+ * @return 属性值（至少 1）；缺失或非法时返回 1 / The value, clamped to at least 1; 1 when missing or malformed
+ */
+static int table_attr_span(HpeBox *cell, const char *name)
+{
+    const char *v = cell->node ? hpe_dom_attr(cell->node, name) : NULL;
+    int n = 0;
+    if (!v)
+        return 1;
+    while (*v >= '0' && *v <= '9') {
+        n = n * 10 + (*v - '0');
+        v++;
+    }
+    if (n < 1)
+        n = 1;
+    return n;
+}
+
+/**
+ * @brief 把一行的单元格放进网格槽位 / Place a row's cells into grid slots
+ *
+ * @details 依次按 `colspan` 宽度寻找下一个未被占用的列起点；`rowspan` 只记录，
+ *           其高度由被跨越行分摊（本实现按「起始行独自撑开」近似）。
+ *          Each cell takes the next free column run as wide as its `colspan`;
+ *          `rowspan` is recorded and charged to the starting row.
+ *
+ * @param[in]     row 行盒 / Row box
+ * @param[in,out] out 槽位结果 / Slot result
+ * @param[in]     covered 该行已被上方 `rowspan` 占用的列掩码 / Columns already taken by a rowspan from above
+ *
+ * @note 超过 `HPE_TABLE_MAX_COLS` 的单元被丢弃 / Cells beyond `HPE_TABLE_MAX_COLS` are dropped
+ */
+static void table_slots_for_row(HpeBox *row, TableRowSlots *out, const unsigned char *covered)
+{
+    HpeBox *cells[HPE_TABLE_MAX_COLS];
+    unsigned char used[HPE_TABLE_MAX_COLS];
+    int nc = table_row_cells(row, cells, HPE_TABLE_MAX_COLS);
+    int c, k;
+    memset(used, 0, sizeof(used));
+    /* seed with the columns a rowspan from above already occupies */
+    for (k = 0; k < HPE_TABLE_MAX_COLS; k++)
+        used[k] = covered[k] ? 1 : 0;
+    out->n = 0;
+    for (c = 0; c < nc && out->n < HPE_TABLE_MAX_COLS; c++) {
+        TableSlot *s = &out->slots[out->n];
+        int col = 0;
+        int cs = table_attr_span(cells[c], "colspan");
+        if (cs < 1)
+            cs = 1;
+        if (cs > HPE_TABLE_MAX_COLS)
+            cs = HPE_TABLE_MAX_COLS;
+        /* the first column run wide enough for this cell's span */
+        while (col + cs <= HPE_TABLE_MAX_COLS) {
+            int free_run = 1;
+            for (k = 0; k < cs; k++)
+                if (used[col + k])
+                    free_run = 0;
+            if (free_run)
+                break;
+            col++;
+        }
+        if (col + cs > HPE_TABLE_MAX_COLS)
+            col = HPE_TABLE_MAX_COLS - cs;
+        for (k = 0; k < cs; k++)
+            used[col + k] = 1;
+        s->box = cells[c];
+        s->col = col;
+        s->colspan = cs;
+        s->rowspan = table_attr_span(cells[c], "rowspan");
+        out->n++;
+    }
+}
+
+/**
+ * @brief 求一个单元格的首选（最大内容）宽度 / Resolve a cell's preferred (max-content) width
+ *
+ * @param[in]     ctx 布局上下文 / Layout context
+ * @param[in,out] cell 单元格盒 / Cell box
+ *
+ * @return 边框盒首选宽度 / Preferred border-box width
+ *
+ * @note 显式宽度按 box-sizing 折算内边距与边框 / An explicit width accounts for padding and border per `box-sizing`
+ */
+static float table_cell_pref_w(LayoutCtx *ctx, HpeBox *cell)
+{
+    HpeStyle *cs = &cell->style;
+    float extra = side_px(ctx, cs, cs->padding[3], ctx->vw) +
+                  side_px(ctx, cs, cs->padding[1], ctx->vw) +
+                  (cs->border_w[3] > 0.0f ? cs->border_w[3] : 0.0f) +
+                  (cs->border_w[1] > 0.0f ? cs->border_w[1] : 0.0f);
+    if (cs->width.unit != HPE_LEN_AUTO) {
+        float w = resolve_len(ctx, cs, cs->width, ctx->vw);
+        if (cs->box_sizing != HPE_BOX_SIZING_BORDER)
+            w += extra;
+        return w;
+    }
+    return measure_preferred_w(ctx, cell);
+}
+
+/**
+ * @brief 解算表格的列宽 / Resolve a table's column widths
+ *
+ * @param[in]     ctx 布局上下文 / Layout context
+ * @param[in,out] cols 列宽数组 / Column-width array
+ * @param[in]     ncols 列数 / Number of columns
+ * @param[in]     avail 表格内容区可用宽度 / Available content width of the table
+ * @param[in]     spacing 列间距（`border-spacing`）/ Column spacing (`border-spacing`)
+ *
+ * @note 先取各列所有单元格首选宽度的最大值，再把剩余（或不足）空间按比例分配 / Each column first takes the maximum of its cells' preferred widths, after which the leftover, or the shortfall, is spread proportionally
+ */
+static void table_resolve_cols(LayoutCtx *ctx, TableCols *cols, int ncols, float avail,
+                               float spacing)
+{
+    float total = 0.0f;
+    int i;
+    float gaps = ncols > 1 ? spacing * (float)(ncols - 1) : 0.0f;
+
+    for (i = 0; i < ncols; i++) {
+        if (cols->w[i] < 0.0f)
+            cols->w[i] = 0.0f;
+        total += cols->w[i];
+    }
+    if (ncols == 0)
+        return;
+    if (total + gaps <= 0.0f) {
+        /* no intrinsic widths at all: share the space equally */
+        float share = (avail - gaps) / (float)ncols;
+        for (i = 0; i < ncols; i++)
+            cols->w[i] = share > 0.0f ? share : 0.0f;
+        return;
+    }
+    if (total + gaps < avail) {
+        float extra = (avail - gaps - total) / total;
+        for (i = 0; i < ncols; i++)
+            cols->w[i] += cols->w[i] * extra;
+    } else if (total + gaps > avail) {
+        float scale = (avail - gaps) / total;
+        if (scale < 0.0f)
+            scale = 0.0f;
+        for (i = 0; i < ncols; i++)
+            cols->w[i] *= scale;
+    }
+    (void)ctx;
+}
+
+/**
+ * @brief 求一个网格槽位的总宽度 / Resolve the total width of a grid slot
+ *
+ * @param[in] cols 已解算的列宽 / Resolved column widths
+ * @param[in] spacing 列间距 / Column spacing
+ * @param[in] ncols 列数 / Column count
+ * @param[in] s 槽位 / Slot
+ *
+ * @return 该槽位跨越的列宽之和（含内部间距）/ Sum of the spanned columns plus the inner spacing
+ */
+static float table_slots_width(const TableCols *cols, float spacing, int ncols,
+                               const TableSlot *s)
+{
+    float w = 0.0f;
+    int k;
+    for (k = 0; k < s->colspan && s->col + k < ncols; k++)
+        w += cols->w[s->col + k] + (k ? spacing : 0.0f);
+    return w;
+}
+
+/**
+ * @brief 布局一个表格根盒 / Lay out a table root box
+ *
+ * @param[in]     ctx 布局上下文 / Layout context
+ * @param[in,out] box 表格盒 / Table box
+ * @param[in]     inner_w 内容区宽度 / Inner width
+ * @param[in]     inner_h 内容区高度基准 / Inner height basis
+ *
+ * @return 表格内容区高度 / The table's content height
+ *
+ * @note 单元格宽度按列统一，行高取该行单元格的最大外高 / Cell widths are unified per column and a row's height is the maximum outer height of its cells
+ */
+/* Everything the table passes share. */
+typedef struct {
+    HpeBox *box;
+    float inner_w, inner_h;
+    float spacing, spacing_v;
+    TableRows rows;
+    TableRowSlots *slots;
+    TableCols cols;
+    int ncols;
+} TableCtx;
+
+/* Pass 1: place every cell in a grid slot and derive the column count.
+ * Returns 0 when the table has no rows or no cells. */
+static int table_place_slots(TableCtx *t)
+{
+    int r, i;
+    t->ncols = 0;
+    t->slots = (TableRowSlots *)hpe_calloc((size_t)t->rows.count, sizeof(TableRowSlots));
+    for (r = 0; r < t->rows.count; r++) {
+        unsigned char covered[HPE_TABLE_MAX_COLS];
+        int k;
+        memset(covered, 0, sizeof(covered));
+        /* mark the columns spanned by rowspans started on earlier rows */
+        for (i = 0; i < r; i++) {
+            int s;
+            for (s = 0; s < t->slots[i].n; s++) {
+                TableSlot *p = &t->slots[i].slots[s];
+                if (p->rowspan > r - i) {
+                    for (k = p->col; k < p->col + p->colspan && k < HPE_TABLE_MAX_COLS; k++)
+                        covered[k] = 1;
+                }
+            }
+        }
+        table_slots_for_row(t->rows.rows[r], &t->slots[r], covered);
+        for (i = 0; i < t->slots[r].n; i++) {
+            int end = t->slots[r].slots[i].col + t->slots[r].slots[i].colspan;
+            if (end > t->ncols)
+                t->ncols = end;
+        }
+    }
+    if (t->ncols == 0)
+        return 0;
+    if (t->ncols > HPE_TABLE_MAX_COLS)
+        t->ncols = HPE_TABLE_MAX_COLS;
+    return 1;
+}
+
+/* Pass 2: per-column preferred width, splitting a spanning cell.
+ * A cell that spans n columns contributes its preferred width divided by n
+ * to each of those columns, which is what the automatic algorithm does
+ * when distributing a spanning cell's minimum. */
+static void table_col_pref_widths(LayoutCtx *ctx, TableCtx *t)
+{
+    int r, i, c;
+    t->cols.w = (float *)hpe_calloc((size_t)t->ncols, sizeof(float));
+    t->cols.count = t->ncols;
+    for (c = 0; c < t->ncols; c++)
+        t->cols.w[c] = -1.0f;
+    for (r = 0; r < t->rows.count; r++) {
+        for (i = 0; i < t->slots[r].n; i++) {
+            TableSlot *s = &t->slots[r].slots[i];
+            float pw = table_cell_pref_w(ctx, s->box) / (float)s->colspan;
+            int k;
+            for (k = 0; k < s->colspan && s->col + k < t->ncols; k++)
+                if (pw > t->cols.w[s->col + k])
+                    t->cols.w[s->col + k] = pw;
+        }
+    }
+    /* a span's total still wins over its parts' individual maxima */
+    for (r = 0; r < t->rows.count; r++) {
+        for (i = 0; i < t->slots[r].n; i++) {
+            TableSlot *s = &t->slots[r].slots[i];
+            float need, have = 0.0f;
+            int k;
+            if (s->colspan <= 1)
+                continue;
+            for (k = 0; k < s->colspan && s->col + k < t->ncols; k++)
+                have += t->cols.w[s->col + k] + (k ? t->spacing : 0.0f);
+            need = table_cell_pref_w(ctx, s->box);
+            if (need > have) {
+                float add = (need - have) / (float)s->colspan;
+                for (k = 0; k < s->colspan && s->col + k < t->ncols; k++)
+                    t->cols.w[s->col + k] += add;
+            }
+        }
+    }
+    table_resolve_cols(ctx, &t->cols, t->ncols, t->inner_w, t->spacing);
+}
+
+/* Row heights: measure each cell at its final column width; layout_block with a
+ * provisional y = 0 gives the natural height without committing the geometry,
+ * so the row height is known before final placement. A spanning cell then
+ * expands the rows it covers when its own height exceeds their combined band. */
+static void table_measure_rows(LayoutCtx *ctx, TableCtx *t, float *row_h)
+{
+    int r, i;
+    for (r = 0; r < t->rows.count; r++) {
+        for (i = 0; i < t->slots[r].n; i++) {
+            TableSlot *s = &t->slots[r].slots[i];
+            float cw = table_slots_width(&t->cols, t->spacing, t->ncols, s);
+            if (s->rowspan <= 1) {
+                layout_block(ctx, s->box, 0.0f, 0.0f, cw, t->inner_h);
+                if (s->box->border_box.h > row_h[r])
+                    row_h[r] = s->box->border_box.h;
+            }
+        }
+    }
+    for (r = 0; r < t->rows.count; r++) {
+        for (i = 0; i < t->slots[r].n; i++) {
+            TableSlot *s = &t->slots[r].slots[i];
+            float cw, have = 0.0f, need;
+            int k, last = r + s->rowspan - 1;
+            if (s->rowspan <= 1)
+                continue;
+            if (last >= t->rows.count)
+                last = t->rows.count - 1;
+            cw = table_slots_width(&t->cols, t->spacing, t->ncols, s);
+            layout_block(ctx, s->box, 0.0f, 0.0f, cw, t->inner_h);
+            need = s->box->border_box.h;
+            for (k = r; k <= last; k++)
+                have += row_h[k] + (k > r ? t->spacing_v : 0.0f);
+            if (need > have) {
+                float add = (need - have) / (float)(last - r + 1);
+                for (k = r; k <= last; k++)
+                    row_h[k] += add;
+            }
+        }
+    }
+}
+
+/* Pass 3: final placement. A cell always fills the column band it occupies,
+ * exactly as a browser does, and a vertically stretched cell fills its row band
+ * so backgrounds and borders tile without gaps. */
+static void table_place_cells(LayoutCtx *ctx, TableCtx *t, const float *row_h, const float *row_top)
+{
+    int r, c, i;
+    for (r = 0; r < t->rows.count; r++) {
+        for (i = 0; i < t->slots[r].n; i++) {
+            TableSlot *s = &t->slots[r].slots[i];
+            float cx = t->box->content_box.x;
+            float cw = table_slots_width(&t->cols, t->spacing, t->ncols, s);
+            int last = r + s->rowspan - 1;
+            float ch;
+            for (c = 0; c < s->col; c++)
+                cx += t->cols.w[c] + t->spacing;
+            if (last >= t->rows.count)
+                last = t->rows.count - 1;
+            ch = row_top[last] + row_h[last] - row_top[r];
+            layout_block(ctx, s->box, cx, row_top[r], cw, ch > 0.0f ? ch : t->inner_h);
+            if (cw > s->box->border_box.w) {
+                float grow = cw - s->box->border_box.w;
+                s->box->content_box.w += grow;
+                s->box->pad_box.w += grow;
+                s->box->border_box.w += grow;
+            }
+            if (s->box->style.height.unit == HPE_LEN_AUTO && ch > 0.0f) {
+                float got = s->box->border_box.h;
+                if (ch > got) {
+                    float grow = ch - got;
+                    s->box->content_box.h += grow;
+                    s->box->pad_box.h += grow;
+                    s->box->border_box.h += grow;
+                }
+            }
+        }
+    }
+}
+
+/* Lay the caption and every row out, returning the content bottom. */
+static float table_layout_rows(LayoutCtx *ctx, TableCtx *t, HpeBox *caption)
+{
+    float y = t->box->content_box.y;
+    float *row_h = (float *)hpe_calloc((size_t)t->rows.count, sizeof(float));
+    float *row_top = (float *)hpe_calloc((size_t)t->rows.count + 1, sizeof(float));
+    int r;
+    if (caption) {
+        layout_block(ctx, caption, t->box->content_box.x, y, t->inner_w, t->inner_h);
+        y += caption->border_box.h;
+    }
+    table_measure_rows(ctx, t, row_h);
+    /* row top edges: the first row sits at the content top, later rows are
+     * separated by `border-spacing` (the vertical component) */
+    row_top[0] = y;
+    for (r = 1; r < t->rows.count; r++)
+        row_top[r] = row_top[r - 1] + row_h[r - 1] + t->spacing_v;
+    table_place_cells(ctx, t, row_h, row_top);
+    y = row_top[t->rows.count - 1] + row_h[t->rows.count - 1];
+    hpe_free(row_top);
+    hpe_free(row_h);
+    return y;
+}
+
+static float layout_table(LayoutCtx *ctx, HpeBox *box, float inner_w, float inner_h)
+{
+    TableCtx t;
+    HpeBox *caption = NULL;
+    float y;
+
+    memset(&t, 0, sizeof(t));
+    t.box = box;
+    t.inner_w = inner_w;
+    t.inner_h = inner_h;
+    t.spacing = box->style.border_spacing_h;
+    t.spacing_v = box->style.border_spacing_v;
+
+    /* a caption is laid out above the rows and spans the whole table */
+    for (caption = box->first_child; caption; caption = caption->next)
+        if (caption->style.display == HPE_DISPLAY_TABLE_CAPTION)
+            break;
+
+    table_collect_rows(box, &t.rows);
+    if (t.rows.count == 0) {
+        if (t.rows.rows)
+            hpe_free(t.rows.rows);
+        return 0.0f;
+    }
+    if (!table_place_slots(&t)) {
+        hpe_free(t.slots);
+        hpe_free(t.rows.rows);
+        return 0.0f;
+    }
+    table_col_pref_widths(ctx, &t);
+    y = table_layout_rows(ctx, &t, caption);
+    {
+        float h = y - box->content_box.y;
+        if (h < 0.0f)
+            h = 0.0f;
+        hpe_free(t.cols.w);
+        hpe_free(t.slots);
+        hpe_free(t.rows.rows);
+        return h;
+    }
 }
 
 /**
@@ -1895,47 +3618,74 @@ static void block_flow_block_child(LayoutCtx *ctx, HpeBox *box, HpeBox *child, f
  *
  * @note flex 容器走 flex 分支；浮动子盒离开常规流 / A flex container takes the flex branch; floated children leave the flow
  */
+/* Non-block-flow containers (flex / table / grid) hand their inner layout to the
+ * dedicated routine. Returns 1 when the display was handled here. */
+static int block_flow_special_display(LayoutCtx *ctx, HpeBox *box, float inner_w,
+                                      float inner_h_base, int *out_had_block,
+                                      float *out_prev_bottom, float *out_bottom)
+{
+    HpeStyle *st = &box->style;
+    float inner_size;
+    if (st->display == HPE_DISPLAY_FLEX)
+        inner_size = layout_flex(ctx, box, inner_w, inner_h_base);
+    else if (st->display == HPE_DISPLAY_TABLE)
+        inner_size = layout_table(ctx, box, inner_w, inner_h_base);
+    else if (st->display == HPE_DISPLAY_GRID)
+        inner_size = layout_grid(ctx, box, inner_w, inner_h_base);
+    else
+        return 0;
+    *out_had_block = 0;
+    *out_prev_bottom = 0.0f;
+    *out_bottom = box->content_box.y + inner_size;
+    return 1;
+}
+
+/* One in-flow child: floats leave the flow, block children run their own flow,
+ * everything else joins the inline paragraph being built. */
+static void block_flow_child(LayoutCtx *ctx, HpeBox *box, HpeBox *child, float inner_w,
+                             float inner_h_base, const float m[4], const float b[4], int no_top_sep,
+                             BlockFlow *fl, HpeParagraph *para)
+{
+    if (child->style.float_side != HPE_FLOAT_NONE) {
+        /* floats leave the flow: text laid out before them stays before */
+        if (child->style.position != HPE_POS_ABSOLUTE &&
+            child->style.position != HPE_POS_FIXED) {
+            flush_paragraph(ctx, box, para, &fl->cur_y, inner_w);
+            place_float(ctx, box, child, &fl->cur_y);
+        }
+        return;
+    }
+    if (child->kind == HPE_BOX_BLOCK) {
+        /* out-of-flow boxes are positioned later, against their containing block */
+        if (child->style.position == HPE_POS_ABSOLUTE || child->style.position == HPE_POS_FIXED)
+            return;
+        flush_paragraph(ctx, box, para, &fl->cur_y, inner_w);
+        block_flow_block_child(ctx, box, child, inner_w, inner_h_base, m, b, no_top_sep, fl);
+    } else {
+        collect_inline(ctx, child, inner_w, para);
+    }
+}
+
 static float block_flow_children(LayoutCtx *ctx, HpeBox *box, float inner_w, float inner_h_base,
                                  const float m[4], const float b[4], int no_top_sep,
                                  int *out_had_block, float *out_prev_bottom)
 {
-    HpeStyle *st = &box->style;
     HpeParagraph para;
     HpeBox *child;
     BlockFlow fl;
+    float special_bottom;
 
-    if (st->display == HPE_DISPLAY_FLEX) {
-        *out_had_block = 0;
-        *out_prev_bottom = 0.0f;
-        return box->content_box.y + layout_flex(ctx, box, inner_w, inner_h_base);
-    }
+    if (block_flow_special_display(ctx, box, inner_w, inner_h_base, out_had_block, out_prev_bottom,
+                                   &special_bottom))
+        return special_bottom;
 
     fl.cur_y = box->content_box.y;
     fl.prev_bottom = 0.0f;
     fl.first = 1;
     fl.had_block = 0;
     memset(&para, 0, sizeof(para));
-    for (child = box->first_child; child; child = child->next) {
-        if (child->style.float_side != HPE_FLOAT_NONE) {
-            /* floats leave the flow: text laid out before them stays before */
-            if (child->style.position != HPE_POS_ABSOLUTE &&
-                child->style.position != HPE_POS_FIXED) {
-                flush_paragraph(ctx, box, &para, &fl.cur_y, inner_w);
-                place_float(ctx, box, child, &fl.cur_y);
-            }
-            continue;
-        }
-        if (child->kind == HPE_BOX_BLOCK) {
-            /* out-of-flow boxes are positioned later, against their containing block */
-            if (child->style.position == HPE_POS_ABSOLUTE ||
-                child->style.position == HPE_POS_FIXED)
-                continue;
-            flush_paragraph(ctx, box, &para, &fl.cur_y, inner_w);
-            block_flow_block_child(ctx, box, child, inner_w, inner_h_base, m, b, no_top_sep, &fl);
-        } else {
-            collect_inline(ctx, child, inner_w, &para);
-        }
-    }
+    for (child = box->first_child; child; child = child->next)
+        block_flow_child(ctx, box, child, inner_w, inner_h_base, m, b, no_top_sep, &fl, &para);
     flush_paragraph(ctx, box, &para, &fl.cur_y, inner_w);
     if (para.items)
         hpe_free(para.items);
@@ -2093,6 +3843,71 @@ static float block_content_height(LayoutCtx *ctx, HpeBox *box, float content_h, 
  *
  * @note 负责解析尺寸、排版子项、求解内容高，并放置流外后代 / Resolves the sizes, lays out the children, solves the content height and positions out-of-flow descendants
  */
+/* Re-derive the border and padding boxes from the settled content box. */
+static void block_box_rects(HpeBox *box, float inner_w, float inner_h, const float p[4],
+                            const float b[4])
+{
+    box->border_box = hpe_rect(box->content_box.x - b[3] - p[3],
+                               box->content_box.y - b[0] - p[0],
+                               inner_w + p[3] + p[1] + b[3] + b[1],
+                               inner_h + p[0] + p[2] + b[0] + b[2]);
+    box->pad_box = hpe_rect(box->content_box.x - p[3], box->content_box.y - p[0],
+                            inner_w + p[3] + p[1], inner_h + p[0] + p[2]);
+}
+
+/* Element-level scroll container. A classic (non-overlay) scrollbar takes inline
+ * space out of the content box, and `overflow:auto` only pays that cost once the
+ * content is known to overflow -- browsers respond by laying the subtree out a
+ * second time, which is exactly what the narrowing re-run below models.
+ * `overflow:scroll` reserves unconditionally. */
+static void block_scroll_container(LayoutCtx *ctx, HpeBox *box, float avail_width, float avail_height,
+                                   const float m[4], const float p[4], const float b[4], int no_top_sep,
+                                   int no_bottom_sep, int *had_block, float *prev_bottom,
+                                   float *inner_w, float *inner_h)
+{
+    HpeStyle *st = &box->style;
+    int vscroll, always;
+    float natural_h, port, over, gutter;
+    if (st->overflow_y != HPE_OVERFLOW_SCROLL && st->overflow_y != HPE_OVERFLOW_AUTO &&
+        st->overflow_x != HPE_OVERFLOW_SCROLL && st->overflow_x != HPE_OVERFLOW_AUTO)
+        return;
+
+    vscroll = st->overflow_y == HPE_OVERFLOW_SCROLL || st->overflow_y == HPE_OVERFLOW_AUTO;
+    gutter = st->scrollbar_width;
+    always = st->overflow_y == HPE_OVERFLOW_SCROLL;
+    natural_h = box->scroll_content_h;
+
+    box->is_scroll_container = 1;
+    if (vscroll && gutter > 0.0f && (always || natural_h > box->pad_box.h)) {
+        float cur_y, nw = *inner_w - gutter;
+        if (nw < 0.0f)
+            nw = 0.0f;
+        /* re-run the child layout in the narrowed content box; every child
+         * block frees its own line runs on entry, so this is idempotent */
+        block_reset_lines(box);
+        box->content_box.w = nw;
+        *inner_w = nw;
+        cur_y = block_flow_children(ctx, box, nw, avail_height, m, b, no_top_sep, had_block,
+                                    prev_bottom);
+        natural_h = cur_y - box->content_box.y;
+        if (natural_h < 0.0f)
+            natural_h = 0.0f;
+        box->scroll_content_h = natural_h;
+        *inner_h = block_content_height(ctx, box, natural_h, cur_y, *prev_bottom, *had_block,
+                                        no_bottom_sep, avail_width, avail_height, m, p, b);
+        box->content_box.h = *inner_h;
+        block_box_rects(box, nw, *inner_h, p, b);
+    }
+    port = box->pad_box.h;
+    over = box->scroll_content_h - port;
+    box->scroll_port_h = port;
+    box->scroll_max = over > 0.0f ? over : 0.0f;
+    if (box->scroll_y > box->scroll_max)
+        box->scroll_y = box->scroll_max;
+    if (box->scroll_y < 0.0f)
+        box->scroll_y = 0.0f;
+}
+
 static float layout_block(LayoutCtx *ctx, HpeBox *box, float x, float y, float avail_width,
                           float avail_height)
 {
@@ -2104,6 +3919,10 @@ static float layout_block(LayoutCtx *ctx, HpeBox *box, float x, float y, float a
     float prev_bottom = 0.0f;
 
     block_reset_lines(box);
+    /* a replaced element solves its used content size from the intrinsic size
+     * and the author's declaration before the ordinary width path runs */
+    if (box->is_replaced)
+        replaced_used_size(ctx, box, avail_width, avail_height);
     block_resolve_edges(ctx, st, avail_width, m, p, b, &no_top_sep, &no_bottom_sep);
     block_auto_margins(ctx, st, avail_width, m, p, b);
 
@@ -2118,16 +3937,21 @@ static float layout_block(LayoutCtx *ctx, HpeBox *box, float x, float y, float a
 
     cur_y = block_flow_children(ctx, box, inner_w, avail_height, m, b, no_top_sep, &had_block,
                                 &prev_bottom);
+    /* the natural content extent is what a scroll container has to be able to
+     * reach; `block_content_height` may then clamp it to the explicit height. */
+    {
+        float natural = cur_y - box->content_box.y;
+        if (natural < 0.0f)
+            natural = 0.0f;
+        box->scroll_content_h = natural;
+    }
     inner_h = block_content_height(ctx, box, cur_y - box->content_box.y, cur_y, prev_bottom,
                                    had_block, no_bottom_sep, avail_width, avail_height, m, p, b);
     box->content_box.h = inner_h;
+    block_box_rects(box, inner_w, inner_h, p, b);
 
-    box->border_box = hpe_rect(box->content_box.x - b[3] - p[3],
-                               box->content_box.y - b[0] - p[0],
-                               inner_w + p[3] + p[1] + b[3] + b[1],
-                               inner_h + p[0] + p[2] + b[0] + b[2]);
-    box->pad_box = hpe_rect(box->content_box.x - p[3], box->content_box.y - p[0],
-                            inner_w + p[3] + p[1], inner_h + p[0] + p[2]);
+    block_scroll_container(ctx, box, avail_width, avail_height, m, p, b, no_top_sep, no_bottom_sep,
+                           &had_block, &prev_bottom, &inner_w, &inner_h);
 
     block_apply_relative_offset(ctx, box, avail_width);
     block_position_abspos_children(ctx, box);
@@ -2384,6 +4208,8 @@ void hpe_layout_free(HpeBox *box)
         hpe_free(box->lines);
     if (box->floats.items)
         hpe_free(box->floats.items);
+    if (box->owns_text && box->text)
+        hpe_free((void *)box->text);
     hpe_free(box);
 }
 

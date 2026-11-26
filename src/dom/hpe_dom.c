@@ -593,6 +593,34 @@ void hpe_dom_remove_attr(HpeDomNode *node, const char *name)
 }
 
 /**
+ * @brief 设置文本节点的内容 / Set the content of a text node
+ *
+ * @details 仅接受文本节点；写入后以 `HPE_MUT_TEXT` 报告一次变更，使 MutationObserver 与引擎脏标记都能看到 `characterData` 修改。
+ *          Only text nodes are accepted; the write reports one `HPE_MUT_TEXT` change so both the MutationObserver bridge and the engine's dirty tracker observe a `characterData` modification.
+ *
+ * @param[in,out] node 文本节点（其他类型直接返回）/ Text node; other node types return immediately
+ * @param[in]     text 新内容（`NULL` 视为空串）/ New content, `NULL` falls back to the empty string
+ *
+ * @note 新值与旧值相同则不做任何事 / Does nothing when the new value equals the old one
+ *
+ * @see hpe_dom_text
+ */
+void hpe_dom_set_text(HpeDomNode *node, const char *text)
+{
+    const char *next = text ? text : "";
+    char *old;
+    if (!node || node->type != HPE_NODE_TEXT)
+        return;
+    if (node->text && !strcmp(node->text, next))
+        return;
+    old = hpe_strdup(node->text ? node->text : "");
+    hpe_free(node->text);
+    node->text = hpe_strdup(next);
+    notify_text(node, old);
+    hpe_free(old);
+}
+
+/**
  * @brief 按文档顺序查找首个指定标签的元素 / Find the first element with the given tag in document order
  *
  * @param[in,out] root 查找起点（自身不计入），可为 `NULL` / Search root, itself excluded; may be `NULL`

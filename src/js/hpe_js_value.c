@@ -122,26 +122,6 @@ static void *arena_grow(HpeJs *js, void *ptr, size_t old_count, size_t new_count
 }
 
 /**
- * @brief 按新字节数重分配 arena 数组 / Reallocate an arena-allocated array to a new byte size
- *
- * @param[in,out] js JS 运行时上下文 / JS runtime context
- * @param[in,out] ptr 旧数组，可为 `NULL` / The old array, may be `NULL`
- * @param[in]     n 要保留的元素个数 / Number of elements to preserve
- * @param[in]     elem 单个元素字节数 / Byte size of one element
- *
- * @return 新数组的起始地址 / Start of the new array
- *
- * @note 先按 `n * elem` 分配再原样拷贝，若 `n` 小于原长度会截断 / Allocates `n * elem` bytes and copies verbatim, truncating when `n` is smaller than the old length
- */
-static void *arena_realloc(HpeJs *js, void *ptr, size_t n, size_t elem)
-{
-    void *np = hpe_js_alloc(js, n * elem);
-    if (ptr)
-        memcpy(np, ptr, n * elem);
-    return np;
-}
-
-/**
  * @brief 构造 `undefined` 值 / Build an `undefined` value
  *
  * @return 类型为 `JS_UNDEF` 的值 / A value of type `JS_UNDEF`
@@ -651,7 +631,7 @@ int js_obj_prop_count(JsObj *obj)
  *
  * @return 键名个数 / The number of keys
  *
- * @note 键名数组用 `malloc` 分配，调用方需 `free`；仅枚举 `enumerable` 为真的属性 / The array is `malloc`ed and must be freed by the caller; only `enumerable` properties are included
+ * @note 键名数组用 `malloc` 分配，调用方需 `free`；仅枚举 `enumerable` 为真的属性。符号键被排除，因为规范规定它们不进入 `Object.keys`/for-in / The array is `malloc`ed and must be freed by the caller; only `enumerable` properties are included. Symbol keys are excluded because the spec keeps them out of `Object.keys` and for-in
  */
 int js_obj_own_keys(JsObj *obj, char ***out, int *count)
 {
@@ -669,11 +649,46 @@ int js_obj_own_keys(JsObj *obj, char ***out, int *count)
         return 0;
     }
     for (i = 0; i < obj->prop_count; i++) {
-        if (obj->props[i].enumerable)
-            keys[n++] = obj->props[i].key;
+        if (!obj->props[i].enumerable || js_key_is_symbol(obj->props[i].key))
+            continue;
+        keys[n++] = obj->props[i].key;
     }
     keys[n] = NULL;
     *out = keys;
+    *count = n;
+    return n;
+}
+
+/**
+ * @brief 取对象自身的符号键 / Read an object's own symbol keys
+ *
+ * @param[in,out] obj 目标对象 / Target object
+ * @param[out]    out 接收符号标识数组 / Receives the symbol identities
+ * @param[out]    count 接收个数 / Receives the count
+ *
+ * @return 符号个数 / The number of symbol keys
+ *
+ * @note 数组用 `malloc` 分配，调用方需 `free`；仅供 `Object.getOwnPropertySymbols` 使用 / The array is `malloc`ed and must be freed; used only by `Object.getOwnPropertySymbols`
+ */
+int js_obj_own_symbols(JsObj *obj, long long **out, int *count)
+{
+    long long *ids;
+    int i, n = 0;
+    if (!obj) {
+        *out = NULL;
+        *count = 0;
+        return 0;
+    }
+    ids = (long long *)malloc(sizeof(long long) * (size_t)(obj->prop_count + 1));
+    if (!ids) {
+        *out = NULL;
+        *count = 0;
+        return 0;
+    }
+    for (i = 0; i < obj->prop_count; i++)
+        if (js_key_is_symbol(obj->props[i].key))
+            ids[n++] = strtoll(obj->props[i].key + 2, NULL, 10);
+    *out = ids;
     *count = n;
     return n;
 }
@@ -739,6 +754,14 @@ int js_iter_len(HpeJs *js, JsValue v)
         return n;
     }
     if (v.t == JS_OBJ && v.obj) {
+        /* a live collection iterator yields "source length - cursor" remaining
+         * items, so for-of over an iterator object walks exactly the rest */
+        if (v.obj->kind == JS_OBJ_ITER) {
+            JsValue src = js_objval(v.obj->payload_obj);
+            int cursor = (int)js_to_number(js, js_obj_get(js, v.obj, "_i"));
+            int total = js_iter_len(js, src) - cursor;
+            return total > 0 ? total : 0;
+        }
         /* Map / Set iterate their backing store: a Map has one entry per key
          * (yielding [k, v] pairs), a Set yields the values it holds */
         if (v.obj->kind == JS_OBJ_MAP) {
@@ -789,6 +812,114 @@ static JsValue set_value_at(HpeJs *js, JsObj *o, int i)
 }
 
 /**
+ * @brief 由集合后备存储的键序取第 i 个值 / Read the i-th value in a collection's backing-store key order
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] o Set 风格的对象（含后备存储）/ A Set-style object with a backing store
+ * @param[in]     i 元素下标 / Element index
+ *
+ * @return 该位置的值；越界时为 `undefined` / The value at that position, or `undefined` when out of range
+ */
+static JsValue set_backing_value_at(HpeJs *js, JsObj *o, int i)
+{
+    char **keys = NULL;
+    int nk = 0;
+    JsValue out = js_undef();
+    if (!o->payload_obj)
+        return js_undef();
+    js_obj_own_keys(o->payload_obj, &keys, &nk);
+    if (i >= 0 && i < nk)
+        out = js_obj_get(js, o->payload_obj, keys[i]);
+    free(keys);
+    return out;
+}
+
+/**
+ * @brief 读数组后备存储的第 i 个元素 / Read element i of an array backing store
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] arr 存储数组，可为 `NULL` / The storage array, may be `NULL`
+ * @param[in]     i 元素下标 / Element index
+ *
+ * @return 该位置的元素；存储缺失时为 `undefined` / The element at that position, or `undefined` when there is no store
+ */
+static JsValue store_at(HpeJs *js, JsObj *arr, int i)
+{
+    if (!arr)
+        return js_undef();
+    return js_obj_get(js, arr, key_from_index(js, (double)i));
+}
+
+/**
+ * @brief 按索引写入数组后备存储 / Write element i of an array backing store
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] arr 存储数组 / The storage array
+ * @param[in]     i 元素下标 / Element index
+ * @param[in]     v 写入的值 / Value to store
+ *
+ * @note 同时把 `length` 提升到 `i + 1`，与 `Array.prototype` 的语义一致 / `length` is raised to
+ *       `i + 1`, matching `Array.prototype` semantics
+ */
+static void store_set(HpeJs *js, JsObj *arr, int i, JsValue v)
+{
+    char key[24];
+    double len;
+    snprintf(key, sizeof(key), "%d", i);
+    js_obj_set(js, arr, key, v);
+    len = js_to_number(js, js_obj_get(js, arr, "length"));
+    if ((double)(i + 1) > len)
+        js_obj_set(js, arr, "length", js_num((double)(i + 1)));
+}
+
+/**
+ * @brief 按迭代模式从 Map / Set 取一项 / Pull one item from a Map / Set according to an iteration mode
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     src 数据源（Map / Set）/ The source, a Map or Set
+ * @param[in]     i 元素下标 / Element index
+ * @param[in]     mode 模式：1 键、2 值、3 `[键,值]`、4 `[值,值]` / Mode: 1 keys, 2 values, 3 `[key, value]`, 4 `[value, value]`
+ *
+ * @return 按模式换算出的项 / The item mapped through the mode
+ *
+ * @note 模式 3/4 返回新构造的二元数组；模式 2 用于 Set 时等同于按值迭代 / Modes 3 and 4 build a fresh
+ *       two-element array; mode 2 over a Set is plain value iteration
+ */
+JsValue js_iter_source_item(HpeJs *js, JsValue src, int i, int mode)
+{
+    JsObj *o = (src.t == JS_OBJ) ? src.obj : NULL;
+    JsValue v;
+    if (!o)
+        return js_undef();
+    if (o->class_name && !strcmp(o->class_name, "Set")) {
+        v = set_backing_value_at(js, o, i);
+        if (mode == 4) {
+            JsObj *pair = js_array_new(js);
+            store_set(js, pair, 0, v);
+            store_set(js, pair, 1, v);
+            return js_objval(pair);
+        }
+        return v;
+    }
+    if (mode == 1)
+        return store_at(js, o->payload_obj, i);
+    if (mode == 2 || mode == 3) {
+        JsObj *pair = js_array_new(js);
+        char buf[24];
+        JsValue key = store_at(js, o->payload_obj, i);
+        JsValue val;
+        snprintf(buf, sizeof(buf), "v%d", i);
+        val = js_obj_get(js, o, buf);
+        if (mode == 2)
+            return val;
+        store_set(js, pair, 0, key);
+        store_set(js, pair, 1, val);
+        return js_objval(pair);
+    }
+    return js_undef();
+}
+
+/**
  * @brief 取可迭代值第 i 个元素 / Get the i-th element of an iterable value
  *
  * @details 字符串按码点返回单码点子串；Set 返回其第 i 个值；Map 返回 `[键, 值]` 二元数组；数组与类数组用键名下标读取。
@@ -819,21 +950,22 @@ JsValue js_iter_at(HpeJs *js, JsValue v, int i)
         }
     }
     if (v.t == JS_OBJ && v.obj) {
+        if (v.obj->kind == JS_OBJ_ITER) {
+            /* a collection iterator forwards the mode it was built with, and
+             * indexes from its cursor, so spread and destructuring see the same
+             * items as next() */
+            int cursor = (int)js_to_number(js, js_obj_get(js, v.obj, "_i"));
+            int total = js_iter_len(js, v);
+            if (i < 0 || i >= total)
+                return js_undef();
+            return js_iter_source_item(js, js_objval(v.obj->payload_obj), cursor + i,
+                                       v.obj->length_hint);
+        }
         if (v.obj->kind == JS_OBJ_MAP) {
             JsObj *o = v.obj;
             if (o->class_name && !strcmp(o->class_name, "Set"))
                 return set_value_at(js, o, i);
-            /* Map entry i -> [key, value]; values live as v<i> on the map */
-            if (o->payload_obj) {
-                JsObj *pair = js_array_new(js);
-                char buf[24];
-                js_obj_set(js, pair, "0", js_obj_get(js, o->payload_obj, key_from_index(js, (double)i)));
-                snprintf(buf, sizeof(buf), "v%d", i);
-                js_obj_set(js, pair, "1", js_obj_get(js, o, buf));
-                js_obj_set(js, pair, "length", js_num(2.0));
-                return js_objval(pair);
-            }
-            return js_undef();
+            return js_iter_source_item(js, v, i, 3);
         }
         {
             JsObj *src = v.obj->items ? v.obj->items : v.obj;
@@ -1065,6 +1197,14 @@ char *js_to_string(HpeJs *js, JsValue v)
         return hpe_js_strdup(js, v.num != 0.0 ? "true" : "false");
     case JS_NUM:
         return js_num_to_string(js, v.num);
+    case JS_BIGINT:
+        return js_bigint_to_radix(js, v, 10);
+    case JS_SYMBOL: {
+        /* String(sym) is allowed, but every implicit string coercion is not;
+         * js_to_string is the implicit path, so it must refuse. */
+        js_throw_value(js, js_make_error(js, "TypeError", "Cannot convert a Symbol value to a string"));
+        return hpe_js_strdup(js, "");
+    }
     case JS_STR:
         return v.str ? v.str : hpe_js_strdup(js, "");
     case JS_OBJ:
@@ -1217,6 +1357,12 @@ double js_to_number(HpeJs *js, JsValue v)
         return v.num != 0.0 ? 1.0 : 0.0;
     case JS_NUM:
         return v.num;
+    case JS_BIGINT:
+        js_throw_value(js, js_make_error(js, "TypeError", "Cannot convert a BigInt value to a number"));
+        return 0.0;
+    case JS_SYMBOL:
+        js_throw_value(js, js_make_error(js, "TypeError", "Cannot convert a Symbol value to a number"));
+        return 0.0;
     case JS_STR: {
         const char *s = v.str ? v.str : "";
         double d;
@@ -1263,6 +1409,10 @@ int js_truthy(JsValue v)
         return v.num != 0.0;
     case JS_NUM:
         return v.num != 0.0 && v.num == v.num;
+    case JS_BIGINT:
+        return !js_bigint_is_zero(v);
+    case JS_SYMBOL:
+        return 1;
     case JS_STR:
         return v.str && v.str[0];
     case JS_OBJ:
@@ -1270,6 +1420,36 @@ int js_truthy(JsValue v)
     default:
         return 0;
     }
+}
+
+/**
+ * @brief BigInt 与另一类型之间的宽松相等 / Loose equality between a BigInt and another type
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     a 左操作数 / Left operand
+ * @param[in]     b 右操作数 / Right operand
+ *
+ * @return 相等返回 1 / 1 when the values are equal
+ *
+ * @note 与数值比较时按数学值比较；与字符串比较时先把字符串转成 BigInt（整数串才可比）；与布尔值比较先转成数值 /
+ *       Numbers compare mathematically; a string is converted to a BigInt first (only integer strings
+ *       can match); a boolean is converted to a number first
+ */
+static int bigint_loose_equal(HpeJs *js, JsValue a, JsValue b)
+{
+    const JsValue *bi = a.t == JS_BIGINT ? &a : &b;
+    const JsValue *other = a.t == JS_BIGINT ? &b : &a;
+    if (other->t == JS_BIGINT)
+        return js_bigint_cmp(*bi, *other) == 0;
+    if (other->t == JS_NUM)
+        return js_bigint_to_number(*bi) == other->num;
+    if (other->t == JS_BOOL || other->t == JS_NULL || other->t == JS_UNDEF)
+        return 0;
+    if (other->t == JS_STR)
+        return js_bigint_cmp(*bi, js_bigint_from_str(js, other->str ? other->str : "", 10)) == 0;
+    if (other->t == JS_OBJ)
+        return js_values_equal(js, *bi, js_primitive_of(js, *other), 0);
+    return 0;
 }
 
 /**
@@ -1295,6 +1475,10 @@ int js_values_equal(HpeJs *js, JsValue a, JsValue b, int strict)
         case JS_BOOL:
         case JS_NUM:
             return a.num == b.num;
+        case JS_BIGINT:
+            return js_bigint_cmp(a, b) == 0;
+        case JS_SYMBOL:
+            return a.sym == b.sym;
         case JS_STR:
             return strcmp(a.str ? a.str : "", b.str ? b.str : "") == 0;
         case JS_OBJ:
@@ -1306,6 +1490,10 @@ int js_values_equal(HpeJs *js, JsValue a, JsValue b, int strict)
     if (strict)
         return 0;
     /* loose equality */
+    if (a.t == JS_SYMBOL || b.t == JS_SYMBOL)
+        return 0; /* a symbol only ever equals itself, which the strict path handled */
+    if (a.t == JS_BIGINT || b.t == JS_BIGINT)
+        return bigint_loose_equal(js, a, b);
     if (a.t == JS_NUM && b.t == JS_STR)
         return a.num == js_to_number(js, b);
     if (a.t == JS_STR && b.t == JS_NUM)
@@ -1332,6 +1520,8 @@ int js_is_callable(JsValue v)
 {
     if (v.t != JS_OBJ || !v.obj)
         return 0;
+    if (v.obj->kind == JS_OBJ_PROXY)
+        return v.obj->proxy_target != NULL && js_is_callable(js_objval(v.obj->proxy_target));
     return v.obj->kind == JS_OBJ_FUNC || v.obj->kind == JS_OBJ_NATIVE;
 }
 
@@ -1348,26 +1538,45 @@ int js_is_callable(JsValue v)
  *
  * @note 只够支撑 `obj == 1` 这类宽松比较 / Sufficient for loose comparisons such as `obj == 1`
  */
+int js_primitive_of_checked(HpeJs *js, JsValue v, JsValue *out)
+{
+    if (v.t != JS_OBJ || !v.obj) {
+        *out = v;
+        return 1;
+    }
+    if (v.obj->kind == JS_OBJ_ARRAY || v.obj->kind == JS_OBJ_PROMISE) {
+        *out = js_string(js, js_to_string(js, v));
+        return 1;
+    }
+    {
+        JsProp *p = js_obj_find_prop(v.obj, "valueOf");
+        if (p && p->getter.t == JS_UNDEF && js_is_callable(p->val)) {
+            JsValue r = js_invoke(js, p->val, v, NULL, 0, 0);
+            if (r.t != JS_OBJ) {
+                *out = r;
+                return 1;
+            }
+        }
+    }
+    {
+        JsProp *p = js_obj_find_prop(v.obj, "toString");
+        if (p && p->getter.t == JS_UNDEF && js_is_callable(p->val)) {
+            JsValue r = js_invoke(js, p->val, v, NULL, 0, 0);
+            if (r.t != JS_OBJ) {
+                *out = r;
+                return 1;
+            }
+        }
+    }
+    *out = js_string(js, js_to_string(js, v));
+    return 1;
+}
+
 JsValue js_primitive_of(HpeJs *js, JsValue v)
 {
-    JsProp *p;
-    if (v.t != JS_OBJ || !v.obj)
-        return v;
-    if (v.obj->kind == JS_OBJ_ARRAY || v.obj->kind == JS_OBJ_PROMISE)
-        return js_string(js, js_to_string(js, v));
-    p = js_obj_find_prop(v.obj, "valueOf");
-    if (p && p->getter.t == JS_UNDEF && js_is_callable(p->val)) {
-        JsValue r = js_invoke(js, p->val, v, NULL, 0, 0);
-        if (r.t != JS_OBJ)
-            return r;
-    }
-    p = js_obj_find_prop(v.obj, "toString");
-    if (p && p->getter.t == JS_UNDEF && js_is_callable(p->val)) {
-        JsValue r = js_invoke(js, p->val, v, NULL, 0, 0);
-        if (r.t != JS_OBJ)
-            return r;
-    }
-    return js_string(js, js_to_string(js, v));
+    JsValue out;
+    js_primitive_of_checked(js, v, &out);
+    return out;
 }
 
 /**

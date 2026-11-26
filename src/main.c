@@ -43,6 +43,7 @@ static int run_js_file(const char *path, int as_module)
     }
     hpe_path_dir(path, dir, sizeof(dir));
     hpe_js_set_current_dir(js, dir);
+    hpe_js_set_entry_path(js, as_module ? path : NULL);
     errbuf[0] = '\0';
     rc = as_module ? hpe_js_eval_module(js, src, dir, errbuf, sizeof(errbuf))
                    : hpe_js_eval(js, src, errbuf, sizeof(errbuf));
@@ -123,6 +124,7 @@ static int write_bmp(const char *path, const HpePixmap *pm)
 typedef struct {
     HpeEngine *engine;
     HpeWindow *window;
+    int mouse_x, mouse_y; /* last pointer position in window coords (wheel targeting) */
 } App;
 
 /**
@@ -187,14 +189,20 @@ static void app_resize(void *user, int width, int height)
  * @param[in,out] user `App *` 用户数据 / The `App *` user data
  * @param[in]     lines 滚动行数（正负表示方向）/ Number of lines, sign gives the direction
  *
- * @note 滚动引擎后请求重绘 / Scrolls the engine then requests a repaint
+ * @note 先派发 `wheel` 给页面；滚动引擎后请求重绘 / Dispatches `wheel` into the page first, then scrolls the engine and requests a repaint
  *
- * @see hpe_engine_scroll_by
+ * @see hpe_engine_scroll_by hpe_engine_wheel_event
  */
 static void app_scroll(void *user, float lines)
 {
     App *app = (App *)user;
-    hpe_engine_scroll_by(app->engine, lines);
+    /* the page sees the wheel first; the scroll chain then runs either way */
+    hpe_engine_wheel_event(app->engine, app->mouse_x, app->mouse_y, 0, lines, 0);
+    /* a scrollable element under the pointer consumes the wheel first; whatever
+     * it cannot scroll bubbles to the document through hpe_engine_wheel_scroll */
+    if (!hpe_engine_wheel_scroll(app->engine, app->mouse_x, app->mouse_y, lines))
+        hpe_engine_scroll_by(app->engine, lines);
+    hpe_engine_scroll_event(app->engine, NULL);
     hpe_window_invalidate(app->window);
 }
 
@@ -270,6 +278,10 @@ static void app_key(void *user, int vk, int mods)
     if (!key)
         key = chrome_key_for_vk(vk);
 
+    /* the page sees `keydown` before the chrome acts on it, like a browser */
+    if (hpe_engine_key_event(app->engine, vk, 0, mods, 0, 0))
+        hpe_window_invalidate(app->window);
+
     if (key && hpe_engine_key_mods(app->engine, key, mods)) {
         hpe_window_invalidate(app->window);
         return;
@@ -280,6 +292,24 @@ static void app_key(void *user, int vk, int mods)
     } else if (vk == VK_ESCAPE_CODE) {
         hpe_window_request_close(app->window);
     }
+}
+
+/**
+ * @brief 把按键抬起通知页面 / Notify the page that a key was released
+ *
+ * @param[in,out] user `App *` 用户数据 / The `App *` user data
+ * @param[in]     vk 虚拟键码 / Virtual key code
+ * @param[in]     mods 修饰键掩码 / Modifier mask
+ *
+ * @note 页面收到 `keyup`；有监听器触发时请求重绘 / The page receives `keyup`; requests a repaint when a listener ran
+ *
+ * @see app_key hpe_engine_key_event
+ */
+static void app_key_up(void *user, int vk, int mods)
+{
+    App *app = (App *)user;
+    if (hpe_engine_key_event(app->engine, vk, 0, mods, 1, 0))
+        hpe_window_invalidate(app->window);
 }
 
 /**
@@ -295,6 +325,8 @@ static void app_key(void *user, int vk, int mods)
 static void app_char(void *user, int codepoint)
 {
     App *app = (App *)user;
+    /* pages read typed text through `keypress`, so send it there as well */
+    hpe_engine_key_event(app->engine, codepoint, codepoint, 0, 2, 0);
     if (hpe_engine_key(app->engine, codepoint))
         hpe_window_invalidate(app->window);
 }
@@ -317,6 +349,8 @@ static void app_mouse(void *user, int x, int y, int button, int down, int mods)
 {
     App *app = (App *)user;
     int changed;
+    app->mouse_x = x;
+    app->mouse_y = y;
     if (button < 0)
         changed = hpe_engine_mouse_move(app->engine, x, y);
     else
@@ -351,6 +385,8 @@ typedef struct {
     int bench;
     int chrome;
     float scroll_lines;
+    float elem_scroll_lines; /* wheel lines to send to the element at --elem-scroll-at */
+    int elem_scroll_x, elem_scroll_y;
 } Options;
 
 /**
@@ -363,7 +399,7 @@ typedef struct {
 static void print_usage(void)
 {
     printf("usage: hope [file.html] [--width N] [--height N] [--dump out.bmp] "
-           "[--bench N] [--scroll-lines N] [--chrome]\n"
+           "[--bench N] [--scroll-lines N] [--elem-scroll X Y N] [--chrome]\n"
            "       hope --js script.js | --module module.js   (run a script only)\n"
            "       with no file argument the built-in blank page is shown\n");
 }
@@ -404,6 +440,11 @@ static int parse_args(int argc, char **argv, Options *o)
             return 0;
         } else if (!strcmp(argv[i], "--scroll-lines") && i + 1 < argc) {
             o->scroll_lines = (float)atof(argv[++i]);
+        } else if (!strcmp(argv[i], "--elem-scroll") && i + 2 < argc) {
+            /* `--elem-scroll X Y LINES`: wheel over (X,Y) by LINES */
+            o->elem_scroll_x = atoi(argv[++i]);
+            o->elem_scroll_y = atoi(argv[++i]);
+            o->elem_scroll_lines = (float)atof(argv[++i]);
         } else {
             o->path = argv[i];
         }
@@ -736,6 +777,82 @@ static void hook_test_click_at(HpeEngine *engine)
 }
 
 /**
+ * @brief 测试钩子：合成页面滚动条拖拽 / Test hook: synthesise a page-scrollbar drag
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @note 读 `HOPE_TEST_SCROLLBAR_DRAG`，形如 `x,y0,y1`：先在 `(x,y0)` 按下，再逐步移动到
+ *       `(x,y1)`，最后在同一 x 抬起；用打印状态行观察滚动位置变化
+ *       / Reads `HOPE_TEST_SCROLLBAR_DRAG` as `x,y0,y1`: presses at `(x,y0)`, walks the
+ *       pointer to `(x,y1)` and releases; the status line shows how the scroll moved
+ *
+ * @see hpe_engine_mouse_move hpe_engine_mouse_event
+ */
+static void hook_test_scrollbar_drag(HpeEngine *engine)
+{
+    const char *spec = getenv("HOPE_TEST_SCROLLBAR_DRAG");
+    int x = 0, y0 = 0, y1 = 0, i, steps = 8;
+    if (!spec || !*spec)
+        return;
+    if (sscanf(spec, "%d,%d,%d", &x, &y0, &y1) < 3)
+        return;
+    hpe_engine_mouse_move(engine, x, y0);
+    hpe_engine_mouse_event(engine, x, y0, 0, 1);
+    for (i = 1; i <= steps; i++)
+        hpe_engine_mouse_move(engine, x, y0 + (y1 - y0) * i / steps);
+    hpe_engine_mouse_event(engine, x, y1, 0, 0);
+}
+
+/**
+ * @brief 测试钩子：合成键盘 / 滚轮 / 滚动事件 / Test hook: synthesise keyboard, wheel and scroll events
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @note 读 `HOPE_TEST_EVENTS`，形如 `keydown:65;keyup:65;wheel:0,96;scroll`（分号分隔）。
+ *       `keydown`/`keyup` 的参数是虚拟键码；`wheel` 的参数是 `dx,dy`；`scroll` 无参数。
+ *       坐标取自 `HOPE_TEST_EVENT_AT`（`x,y`，默认 `100,200`），用于定位滚轮与指针事件的目标。
+ *       Reads `HOPE_TEST_EVENTS` as `keydown:65;keyup:65;wheel:0,96;scroll`, semicolon-separated.
+ *       The key names take a virtual key code, `wheel` takes `dx,dy` and `scroll` takes nothing.
+ *       Coordinates come from `HOPE_TEST_EVENT_AT` (`x,y`, defaulting to `100,200`) so wheel and
+ *       pointer events can be aimed at a specific element.
+ *
+ * @see hpe_engine_key_event hpe_engine_wheel_event hpe_engine_scroll_event
+ */
+static void hook_test_events(HpeEngine *engine)
+{
+    const char *spec = getenv("HOPE_TEST_EVENTS");
+    const char *at = getenv("HOPE_TEST_EVENT_AT");
+    char buf[512];
+    char *tok;
+    int px = 100, py = 200;
+    if (!spec || !*spec)
+        return;
+    if (at && *at)
+        sscanf(at, "%d,%d", &px, &py);
+    snprintf(buf, sizeof(buf), "%s", spec);
+    for (tok = strtok(buf, ";"); tok; tok = strtok(NULL, ";")) {
+        int arg = 0, dx = 0, dy = 0;
+        const char *colon = strchr(tok, ':');
+        if (colon)
+            arg = atoi(colon + 1);
+        if (!strncmp(tok, "keydown", 7))
+            hpe_engine_key_event(engine, arg, 0, 0, 0, 0);
+        else if (!strncmp(tok, "keyup", 5))
+            hpe_engine_key_event(engine, arg, 0, 0, 1, 0);
+        else if (!strncmp(tok, "keypress", 8))
+            hpe_engine_key_event(engine, arg, arg, 0, 2, 0);
+        else if (!strncmp(tok, "wheel", 5)) {
+            if (colon && sscanf(colon + 1, "%d,%d", &dx, &dy) >= 1)
+                hpe_engine_wheel_event(engine, px, py, dx, (float)dy / 48.0f, 0);
+        } else if (!strncmp(tok, "move", 4)) {
+            hpe_engine_mouse_move(engine, px, py);
+        } else if (!strncmp(tok, "scroll", 6)) {
+            hpe_engine_scroll_event(engine, NULL);
+        }
+    }
+}
+
+/**
  * @brief 报告地址栏最终状态 / Report the final address-bar state
  *
  * @param[in,out] engine 引擎实例 / Engine instance
@@ -803,6 +920,13 @@ static int run_headless(HpeEngine *engine, const Options *o)
         hpe_engine_render(engine);
         hpe_engine_scroll_by(engine, o->scroll_lines);
     }
+    if (o->elem_scroll_lines != 0.0f) {
+        /* element-level wheel: paint first, then deliver the wheel to whatever
+         * scroll container sits under (X,Y) */
+        hpe_engine_render(engine);
+        hpe_engine_wheel_scroll(engine, o->elem_scroll_x, o->elem_scroll_y,
+                                o->elem_scroll_lines);
+    }
     hpe_engine_render(engine);
     if (o->bench > 1) {
         double t0 = hpe_time_seconds();
@@ -850,6 +974,7 @@ static int run_window(HpeEngine *engine, int width, int height)
     callbacks.on_resize = app_resize;
     callbacks.on_scroll = app_scroll;
     callbacks.on_key = app_key;
+    callbacks.on_key_up = app_key_up;
     callbacks.on_char = app_char;
     callbacks.on_mouse = app_mouse;
     callbacks.on_tick = app_tick;
@@ -900,6 +1025,8 @@ int main(int argc, char **argv)
     hook_test_clipboard(engine);
     hook_test_addr_editor(engine);
     hook_test_click_at(engine);
+    hook_test_scrollbar_drag(engine);
+    hook_test_events(engine);
     report_addr_text(engine);
     report_meta(engine);
 

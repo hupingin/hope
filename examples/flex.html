@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Flexbox features</title>
+<style>
+  body { margin: 0; padding: 20px; font-size: 13px; color: #222; background: #f4f5f7; }
+  h3 { margin: 16px 0 6px; font-size: 14px; color: #14213d; }
+  .box { display: flex; width: 320px; height: 44px; background: #ffffff; border: 1px solid #c9ced6; }
+  .row { display: flex; width: 320px; height: 24px; background: #ffffff; border: 1px solid #c9ced6; }
+  .wrap { display: flex; flex-wrap: wrap; width: 200px; background: #ffffff; border: 1px solid #c9ced6; }
+  .col { display: flex; flex-direction: column; width: 320px; height: 90px; background: #ffffff; border: 1px solid #c9ced6; }
+  .a { background: #d93025; }
+  .b { background: #188038; }
+  .c { background: #1a73e8; }
+  .d { background: #f9ab00; }
+  /* 1. justify-content */
+  .jc-start { justify-content: flex-start; }
+  .jc-center { justify-content: center; }
+  .jc-end { justify-content: flex-end; }
+  .jc-between { justify-content: space-between; }
+  .jc-around { justify-content: space-around; }
+  .jc-start div, .jc-center div, .jc-end div, .jc-between div, .jc-around div {
+    width: 40px; height: 24px; margin: 10px 0;
+  }
+  /* 2. align-items */
+  .ai-stretch { align-items: stretch; }
+  .ai-center { align-items: center; }
+  .ai-start { align-items: flex-start; }
+  .ai-end { align-items: flex-end; }
+  .ai-center div, .ai-start div, .ai-end div { width: 40px; }
+  .ai-center .a, .ai-start .a, .ai-end .a { height: 20px; }
+  .ai-center .b, .ai-start .b, .ai-end .b { height: 32px; }
+  .ai-stretch div { width: 40px; }
+  /* 3. flex-grow */
+  .g1 { width: 30px; }
+  .grow .a { flex-grow: 1; }
+  .grow .b { flex-grow: 2; }
+  .grow .c { flex-grow: 1; }
+  /* 4. wrap */
+  .wrap div { width: 90px; height: 24px; }
+  /* 5. reverse + order */
+  .rev { flex-direction: row-reverse; }
+  .rev div, .ord div { width: 40px; height: 24px; margin: 10px 0; }
+  .o2 { order: 2; }
+  .o1 { order: 1; }
+  .o0 { order: 0; }
+  /* 6. column */
+  .col div { height: 24px; }
+  .col .stretch { }
+  .colstr { align-items: stretch; }
+  .colstr .fix { width: 60px; }
+</style>
+</head>
+<body>
+
+<h3>1. justify-content</h3>
+<div class="box jc-start"><div class="a"></div><div class="b"></div><div class="c"></div></div>
+<div class="box jc-center"><div class="a"></div><div class="b"></div><div class="c"></div></div>
+<div class="box jc-end"><div class="a"></div><div class="b"></div><div class="c"></div></div>
+<div class="box jc-between"><div class="a"></div><div class="b"></div><div class="c"></div></div>
+<div class="box jc-around"><div class="a"></div><div class="b"></div><div class="c"></div></div>
+
+<h3>2. align-items</h3>
+<div class="box ai-start"><div class="a"></div><div class="b"></div></div>
+<div class="box ai-center"><div class="a"></div><div class="b"></div></div>
+<div class="box ai-end"><div class="a"></div><div class="b"></div></div>
+<div class="box ai-stretch"><div class="a"></div><div class="b"></div></div>
+
+<h3>3. flex-grow</h3>
+<div class="box grow"><div class="a g1"></div><div class="b g1"></div><div class="c g1"></div></div>
+
+<h3>4. flex-wrap</h3>
+<div class="wrap"><div class="a"></div><div class="b"></div><div class="c"></div><div class="d"></div></div>
+
+<h3>5. row-reverse &amp; order</h3>
+<div class="row rev"><div class="a"></div><div class="b"></div><div class="c"></div></div>
+<div class="row ord"><div class="a o2"></div><div class="b o1"></div><div class="c o0"></div></div>
+
+<h3>6. column</h3>
+<div class="col"><div class="a"></div><div class="b"></div><div class="c"></div></div>
+<div class="col colstr"><div class="a"></div><div class="b fix"></div></div>
+
+</body>
+</html>

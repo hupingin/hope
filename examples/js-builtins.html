@@ -65,6 +65,51 @@
         (function () { try { new Date("x").toISOString(); return "no"; }
                        catch (e) { return e.name; } })(), "RangeError")) passCount++;
 
+  // ---- 1b. Date: timezone offset, DST and local vs UTC split ----
+  // The zone is whatever the host is configured with, so the checks are written as
+  // invariants that hold anywhere: they cross-check two independent code paths
+  // (the local-time constructor and getTimezoneOffset) rather than hard-coding +0800.
+  function tzShiftMin(ms) {
+    var d = new Date(ms);
+    // rebuild the same wall-clock fields as if UTC, and diff against the real instant
+    return (Date.UTC(d.getFullYear(), d.getMonth(), d.getDate(),
+                     d.getHours(), d.getMinutes(), d.getSeconds()) - ms) / 60000;
+  }
+  function pad2(n) { return (n < 10 ? "0" : "") + n; }
+  var tzProbe = Date.UTC(2026, 0, 15, 4, 0, 0);
+  var tzOff = new Date(tzProbe).getTimezoneOffset();
+  total++; if (check("getTimezoneOffset matches local/UTC shift",
+        tzOff, -tzShiftMin(tzProbe))) passCount++;
+  total++; if (check("getTimezoneOffset is finite",
+        typeof tzOff === "number" && tzOff === tzOff, "true")) passCount++;
+  var tzu = new Date(tzProbe);
+  total++; if (check("getUTCHours untouched", tzu.getUTCHours(), 4)) passCount++;
+  total++; if (check("local hour = UTC hour - offset/60",
+        tzu.getHours(), 4 - tzOff / 60)) passCount++;
+  total++; if (check("toISOString stays UTC",
+        tzu.toISOString(), "2026-01-15T04:00:00.000Z")) passCount++;
+  total++; if (check("ctor fields are local",
+        new Date(2026, 0, 15, 12, 0, 0).getHours(), 12)) passCount++;
+  total++; if (check("ctor local round-trips to the same instant",
+        new Date(new Date(2026, 0, 15, 12, 0, 0).getTime()).getHours(), 12)) passCount++;
+  var tzs = new Date(tzProbe);
+  tzs.setUTCHours(20);
+  total++; if (check("setUTCHours is UTC", tzs.getUTCHours(), 20)) passCount++;
+  total++; if (check("toString shows GMT offset",
+        new Date(tzProbe).toString().indexOf("GMT" + (tzOff <= 0 ? "+" : "-") +
+        pad2(Math.abs(tzOff) / 60 | 0) + pad2(Math.abs(tzOff) % 60)) >= 0, "true")) passCount++;
+  total++; if (check("getTimezoneOffset NaN on invalid",
+        new Date("x").getTimezoneOffset(), NaN)) passCount++;
+  total++; if (check("parse with explicit zone",
+        Date.parse("2026-01-15T12:00:00+08:00"), Date.UTC(2026, 0, 15, 4))) passCount++;
+  var tzJan = new Date(2026, 0, 15).getTimezoneOffset();
+  var tzJul = new Date(2026, 6, 15).getTimezoneOffset();
+  total++; if (check("DST rules are whole hours",
+        tzJan % 60 === 0 && tzJul % 60 === 0 &&
+        (tzJan === tzJul || Math.abs(tzJan - tzJul) === 60), "true")) passCount++;
+  total++; if (check("historical offset is plausible",
+        Math.abs(tzJan) <= 14 * 60 && Math.abs(tzJul) <= 14 * 60, "true")) passCount++;
+
   // ---- 2. Map / Set: iteration protocol ----
   total++; if (check("Set spread + dedup",
         [...new Set([1, 2, 2, 3])].join(","), "1,2,3")) passCount++;

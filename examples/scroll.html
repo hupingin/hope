@@ -1,0 +1,77 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>element scroll containers</title>
+<style>
+  body { margin: 8px; font-family: sans-serif; font-size: 11px; }
+  .cap { font-weight: bold; margin: 8px 0 3px 0; }
+
+  /* 1. overflow:auto with a fixed height — one row of content stays clipped
+   *    and a scrollbar appears on the right edge; the page is NOT stretched. */
+  .fixed { width: 180px; height: 60px; overflow: auto; border: 1px solid #333; }
+  .fixed div { height: 20px; line-height: 20px; border-bottom: 1px solid #ddd; }
+
+  /* 2. overflow:scroll — same behaviour, and the stripes make the scroll
+   *    offset obvious when the page is driven with --elem-scroll. */
+  .striped { width: 180px; height: 60px; overflow: scroll; border: 1px solid #333; }
+  .striped div { height: 20px; line-height: 20px; }
+  .striped .g { background: #d9f2d9; }
+  .striped .b { background: #d5e8f6; }
+
+  /* 3. content that fits — a scroll container with nothing to scroll must not
+   *    draw a scrollbar. */
+  .fits { width: 180px; height: 60px; overflow: auto; border: 1px solid #333; }
+  .fits div { height: 18px; line-height: 18px; }
+
+  /* 4. an outer scroller holding an inner one: the wheel must target the
+   *    innermost container under the pointer, then chain outward. */
+  .outer { width: 200px; height: 80px; overflow: auto; border: 1px solid #333;
+           padding: 2px; }
+  .outer .filler { height: 30px; line-height: 30px; background: #f6f2d5; }
+  .inner { width: 140px; height: 40px; overflow: auto; border: 1px solid #999;
+           margin: 4px 0; }
+  .inner div { height: 15px; line-height: 15px; background: #e8d5f6; }
+</style>
+</head>
+<body>
+
+<div class="cap">1. overflow:auto</div>
+<div class="fixed">
+  <div>row one</div>
+  <div>row two</div>
+  <div>row three</div>
+  <div>row four</div>
+  <div>row five</div>
+</div>
+
+<div class="cap">2. overflow:scroll</div>
+<div class="striped">
+  <div class="g">a</div>
+  <div class="b">b</div>
+  <div class="g">c</div>
+  <div class="b">d</div>
+  <div class="g">e</div>
+</div>
+
+<div class="cap">3. nothing to scroll</div>
+<div class="fits">
+  <div>one</div>
+  <div>two</div>
+  <div>three</div>
+</div>
+
+<div class="cap">4. nested scrollers</div>
+<div class="outer">
+  <div class="filler">outer filler</div>
+  <div class="inner">
+    <div>i1</div>
+    <div>i2</div>
+    <div>i3</div>
+    <div>i4</div>
+  </div>
+  <div class="filler">below the inner</div>
+</div>
+
+</body>
+</html>

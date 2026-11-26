@@ -17,6 +17,9 @@
 #include "render/hpe_pixmap.h"
 
 #define HPE_SCROLL_LINE_PX 48.0f
+/* page-level scrollbar gutter width (shown only alongside the browser chrome,
+ * so the headless --dump pixel baselines stay page-only) */
+#define HPE_PAGE_SCROLLBAR_W 12.0f
 #define HPE_ADDR_MAX 1024
 /* <link> resource hints we record (stylesheet excluded -- it is consumed) */
 #define HPE_MAX_LINKS 32
@@ -48,6 +51,8 @@ struct HpeEngine {
     int painted;          /* 1 once a full frame exists in the pixmap */
     int dirty;
     HpeDomNode *hover_node; /* element currently under the pointer (:hover) */
+    HpeDomNode *active_node; /* element the pointer is pressed on (:active) */
+    HpeDomNode *focus_node;  /* element owning the focus (:focus) */
     float content_height;
     /* author stylesheet bookkeeping: the number of rules parsed after the
      * user-agent sheet and the last (dom node, text revision) that produced
@@ -96,6 +101,11 @@ struct HpeEngine {
     float addr_click_x;
     int addr_click_count;
     char addr_committed[HPE_ADDR_MAX]; /* text as of focus time; Escape restores it */
+
+    /* page-level scrollbar drag: 1 while the thumb is being dragged, and the
+     * grab offset between the pointer and the thumb's top edge */
+    int page_sb_drag;
+    float page_sb_grab;
 };
 
 /**
