@@ -26,6 +26,7 @@ void hpe_pixmap_init(HpePixmap *pm, int width, int height)
     pm->width = width > 0 ? width : 0;
     pm->height = height > 0 ? height : 0;
     pm->stride = pm->width * 4;
+    pm->alpha_record = 0;
     pm->pixels = pm->width && pm->height
                      ? (uint32_t *)hpe_calloc((size_t)pm->width * (size_t)pm->height,
                                               sizeof(uint32_t))

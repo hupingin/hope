@@ -122,6 +122,20 @@ float hpe_font_measure(HpeFont *font, const char *text, int len);
 const HpeTextMask *hpe_font_mask(HpeFont *font, const char *text, int len);
 
 /**
+ * @brief 取带水平亚像素相位的覆盖率掩码（带缓存）/ Get a coverage mask with a horizontal sub-pixel phase, cached
+ *
+ * @param[in,out] font 字体对象 / Font object
+ * @param[in]     text UTF-8 文本 / UTF-8 text
+ * @param[in]     len 文本字节数 / Text length in bytes
+ * @param[in]     frac_x 笔位的小数部分（0..1），量化为 3 档并计入缓存键 / Fractional part of the pen x (0..1), quantised to 3 steps and folded into the cache key
+ *
+ * @return 缓存持有的掩码指针（借出，勿释放）；失败返回 `NULL` / A cache-owned mask pointer that must not be freed, or `NULL` on failure
+ *
+ * @see hpe_font_mask
+ */
+const HpeTextMask *hpe_font_mask_phase(HpeFont *font, const char *text, int len, float frac_x);
+
+/**
  * @brief 销毁全部缓存字体并释放其资源 / Destroy every cached font and release its resources
  *
  * @details 逐个释放掩码缓存、字宽缓存、平台字体与字体对象，并把缓存计数归零。

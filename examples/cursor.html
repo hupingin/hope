@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>cursor demo</title>
+<style>
+body { font-family: sans-serif; margin: 0; padding: 16px; }
+p { font-size: 14px; margin: 0 0 6px 0; }
+a.link { display: block; font-size: 15px; }
+#txt { display: block; margin: 8px 0; }
+#mv  { display: block; width: 160px; background: #eef2f7; cursor: move; padding: 8px; }
+#no  { display: block; width: 160px; background: #fdeaea; cursor: not-allowed; padding: 8px; }
+#ch  { display: block; width: 160px; background: #eaf7ee; cursor: crosshair; padding: 8px; }
+#wt  { display: block; width: 160px; background: #f5f0e6; cursor: wait; padding: 8px; }
+#ws  { display: block; width: 160px; background: #f0eef8; cursor: ew-resize; padding: 8px; }
+</style>
+</head>
+<body>
+<p id="plain">plain paragraph text</p>
+<a class="link" id="lnk" href="https://example.com/">a link</a>
+<span id="txt">inline text span</span>
+<div id="mv">move me</div>
+<div id="no">forbidden</div>
+<div id="ch">crosshair</div>
+<div id="wt">wait</div>
+<div id="ws">ew resize</div>
+</body>
+</html>

@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Inline element background / border fragments</title>
+<style>
+  body { margin: 0; padding: 12px; font-family: sans-serif; font-size: 14px;
+         color: #222222; background-color: #ffffff; }
+  p { margin: 0 0 14px 0; line-height: 22px; }
+</style>
+</head>
+<body>
+  <!-- 1. single-line inline background + padding + border -->
+  <p>before <span style="background:#ffe082; padding:2px 10px;
+     border:2px solid #f9ab00;">chip</span> after</p>
+
+  <!-- 2. wrapped inline: background per line, left border only on the first
+       fragment and right border only on the last -->
+  <p style="width:220px"><span style="background:#c8e6c9; border-left:4px solid
+     #188038; border-right:4px solid #d93025; padding:1px 6px;">this long
+     inline span wraps across two lines and its borders follow the
+     fragments</span></p>
+
+  <!-- 3. nested inline boxes -->
+  <p>outer <span style="background:#bbdefb;">mid <span style="background:#f9ab00;
+     padding:0 6px;">inner</span> tail</span> end</p>
+
+  <!-- 4. text-align center shifts fragments with the runs -->
+  <p style="text-align:center"><span style="background:#ffcdd2;
+     padding:2px 8px;">centered chip</span></p>
+</body>
+</html>

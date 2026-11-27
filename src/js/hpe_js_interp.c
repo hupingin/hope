@@ -105,6 +105,10 @@ static JsValue call_value(HpeJs *js, JsEnv *env, JsValue callee, JsValue thisv, 
                           int argc, int line);
 static Flow export_stmt(HpeJs *js, JsEnv *env, JsNode *n);
 static Flow import_stmt(HpeJs *js, JsEnv *env, JsNode *n);
+static JsValue dyn_import_eval(HpeJs *js, JsEnv *env, JsNode *n);
+/* `with` object binding resolution shared by the identifier read/write paths */
+enum { BIND_NONE, BIND_SLOT, BIND_WITH };
+static int env_find_binding(HpeJs *js, JsEnv *env, const char *name, JsValue **slot, JsObj **obj);
 static JsValue super_call(HpeJs *js, JsEnv *env, JsNode *n);
 static JsValue eval_super_member(HpeJs *js, JsEnv *env, JsNode *n);
 /* runs a loop node; `labels` holds the labels of the enclosing labelled
@@ -160,7 +164,7 @@ static JsValue reflect_get_proto(HpeJs *js, JsValue thisv, JsValue *a, int argc,
 static JsValue utf8_char_at(HpeJs *js, const char *s, int i);
 static int utf8_len(const char *s);
 static JsValue run_function_body(HpeJs *js, JsObj *fn, JsEnv *closure, JsValue this_v, JsValue *args,
-                                 int argc);
+                                 int argc, JsValue new_target);
 static void bind_pattern(HpeJs *js, JsEnv *env, JsNode *pat, JsValue value, int declare);
 static void assign_pattern(HpeJs *js, JsEnv *env, JsNode *pat, JsValue value);
 /* shared destructuring walkers: `apply` is the leaf bind/assign operation */
@@ -643,6 +647,41 @@ static JsValue promise_then(HpeJs *js, JsObj *p, JsValue on_ok, JsValue on_err)
 }
 
 /**
+ * @brief 按 thenable 规则用值 v 兑现 Promise p / Fulfil promise p with v following thenable rules
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] p 待兑现的 Promise 对象 / Promise object to fulfil
+ * @param[in]     v 兑现值 / Fulfilment value
+ *
+ * @note `promise_resolve_with` 的对外包装，供 `hpe_js_async.c` 交付 async 结果 / A public wrapper
+ *       around `promise_resolve_with`, used by `hpe_js_async.c` to publish an async result
+ */
+void js_resolve_promise(HpeJs *js, JsObj *p, JsValue v)
+{
+    promise_resolve_with(js, p, v);
+}
+
+/**
+ * @brief 在 Promise 上登记一对 C 函数反应 / Register a pair of C-function reactions on a promise
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] p 目标 Promise / Target promise
+ * @param[in]     on_ok 兑现时调用的 C 函数 / C function called on fulfilment
+ * @param[in]     on_err 拒绝时调用的 C 函数 / C function called on rejection
+ * @param[in,out] ud 传给两者的用户数据 / User data passed to both
+ *
+ * @note 与 `then` 的差别是不产生下游 Promise，处理器结果被丢弃——`await` 只需要一次通知，
+ *       不需要链式结果。`p` 已定局时反应会立即入队，由下一次队列排空执行。
+ *       Unlike `then` no downstream promise is produced and the handlers' results are discarded:
+ *       `await` needs a single notification, not a chain. A settled `p` enqueues the reaction at
+ *       once, to be run by the next drain.
+ */
+void js_promise_on_settle(HpeJs *js, JsObj *p, JsNativeFn on_ok, JsNativeFn on_err, void *ud)
+{
+    reaction_push(js, p, bind_native(js, on_ok, ud), bind_native(js, on_err, ud), NULL);
+}
+
+/**
  * @brief 迭代器对象的 next 方法 / The `next` method of an iterator object
  *
  * @param[in,out] js JS 运行时上下文 / JS runtime context
@@ -900,7 +939,6 @@ static JsValue member_get(HpeJs *js, JsEnv *env, JsValue base, const char *prop,
 static void member_set(HpeJs *js, JsEnv *env, JsValue base, const char *prop, JsValue value,
                        int line)
 {
-    HPE_UNUSED(env);
     if (base.t == JS_OBJ && base.obj) {
         JsObj *o = base.obj;
         JsProp *p;
@@ -918,6 +956,14 @@ static void member_set(HpeJs *js, JsEnv *env, JsValue base, const char *prop, Js
             JsValue args[1];
             args[0] = value;
             call_value(js, NULL, p->setter, base, args, 1, line);
+            return;
+        }
+        /* accessors above are unaffected; data properties honour seal/freeze:
+         * frozen blocks all writes, sealed blocks creating new properties */
+        if (o->num_val == 3 || (o->num_val == 1 && !p)) {
+            if (env && env->strict)
+                js_error(js, line, "cannot modify property '%s' of a %s object",
+                         prop, o->num_val == 3 ? "frozen" : "sealed");
             return;
         }
         if (o->kind == JS_OBJ_ARRAY && is_digits(prop)) {
@@ -1020,25 +1066,23 @@ static JsValue make_arguments_object(HpeJs *js, JsValue *args, int argc)
  *
  * @note 由 `call_value` / `run_generator` / `run_async` 等调用 / Called from `call_value`, `run_generator`, `run_async` and friends
  */
-static JsValue run_function_body(HpeJs *js, JsObj *fn, JsEnv *closure, JsValue this_v, JsValue *args,
-                                 int argc)
+/**
+ * @brief 把实参绑定到函数环境的形参 / Bind actual arguments to the formal parameters of a function environment
+ *
+ * @details 逐个处理形参：rest 参数把剩余实参收进数组；带默认值的形参在实参为 undefined 时求值默认表达式；其余按模式绑定。
+ *          Parameters are processed in order: a rest parameter collects the remaining arguments into an array; a parameter with a default evaluates the default when the argument is undefined; everything else binds through the pattern binder.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] fenv 函数环境（形参槽位所在）/ The function environment receiving the parameter slots
+ * @param[in,out] params 形参列表节点 / The parameter-list node
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 实参个数 / Actual argument count
+ *
+ * @see run_function_body bind_pattern
+ */
+static void bind_params(HpeJs *js, JsEnv *fenv, JsNode *params, JsValue *args, int argc)
 {
-    JsNode *code = fn->code;
-    JsNode *params = code->kids[0];
-    JsNode *body = code->kids[1];
-    JsEnv *fenv = js_env_new(js, closure);
-    Flow flow;
     int i;
-
-    if (!(fn->fn_flags & FN_ARROW)) {
-        fenv->has_this = 1;
-        fenv->thisv = this_v;
-        js_env_define(js, fenv, "arguments", make_arguments_object(js, args, argc));
-    }
-    if (fn->home) {
-        fenv->has_home = 1;
-        fenv->home = fn->home;
-    }
     for (i = 0; i < params->kid_count; i++) {
         JsNode *p = params->kids[i];
         JsValue v = i < argc ? args[i] : js_undef();
@@ -1060,10 +1104,40 @@ static JsValue run_function_body(HpeJs *js, JsObj *fn, JsEnv *closure, JsValue t
         }
         bind_pattern(js, fenv, p, v, 1);
     }
+}
+
+static JsValue run_function_body(HpeJs *js, JsObj *fn, JsEnv *closure, JsValue this_v, JsValue *args,
+                                 int argc, JsValue new_target)
+{
+    JsNode *code = fn->code;
+    JsNode *body = code->kids[1];
+    JsEnv *fenv = js_env_new(js, closure);
+    Flow flow;
+
+    if (fn->fn_flags & FN_STRICT)
+        fenv->strict = 1;
+    /* recursion guard: exceeded depth raises instead of exhausting the C stack;
+     * the counter is restored from `JsTryFrame.depth` when a throw unwinds */
+    if (++js->call_depth > js->depth_limit)
+        js_error(js, fn->code ? fn->code->line : 0,
+                 "Maximum call stack size exceeded");
+    if (!(fn->fn_flags & FN_ARROW)) {
+        fenv->has_this = 1;
+        fenv->thisv = this_v;
+        fenv->has_new_target = 1;
+        fenv->new_target = new_target;
+        js_env_define(js, fenv, "arguments", make_arguments_object(js, args, argc));
+    }
+    if (fn->home) {
+        fenv->has_home = 1;
+        fenv->home = fn->home;
+    }
+    bind_params(js, fenv, code->kids[0], args, argc);
     if (fn->name && *fn->name && !js_env_lookup(fenv, fn->name))
         js_env_define(js, fenv, fn->name, js_objval(fn));
 
     flow = exec_stmt(js, fenv, body);
+    js->call_depth--;
     return flow.action == FLOW_RETURN ? flow.ret : js_undef();
 }
 
@@ -1084,7 +1158,56 @@ static JsValue run_function_body(HpeJs *js, JsObj *fn, JsEnv *closure, JsValue t
 JsValue js_run_generator_body(HpeJs *js, JsObj *fn, JsEnv *closure, JsValue this_v, JsValue *args,
                               int argc)
 {
-    return run_function_body(js, fn, closure, this_v, args, argc);
+    return run_function_body(js, fn, closure, this_v, args, argc, js_undef());
+}
+
+/**
+ * @brief 在独立栈上运行 async 函数体 / Run an async body on its own stack
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] fn async 函数对象 / The async function object
+ * @param[in,out] closure 捕获的环境 / The captured environment
+ * @param[in]     this_v 调用时的 this 值 / The `this` value of the call
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 实参个数 / Argument count
+ *
+ * @return 函数体的返回值 / The body's return value
+ *
+ * @note 与生成器函数体走同一条执行路径，区别只在 `await` 会挂起协程而 `yield` 会产出值。
+ *       Shares the execution path with generator bodies; the only difference is that `await`
+ *       parks the coroutine rather than producing a value.
+ */
+JsValue js_run_async_body(HpeJs *js, JsObj *fn, JsEnv *closure, JsValue this_v, JsValue *args,
+                          int argc)
+{
+    return run_function_body(js, fn, closure, this_v, args, argc, js_undef());
+}
+
+/**
+ * @brief 解析类成员的属性键（字面名或计算名）/ Resolve a class member's property key (literal or computed)
+ *
+ * @details 计算名由解析器作为成员节点的末个子节点携带：方法/存取器为 kids[2]、字段为 kids[1]。存在时求值并经 `key_of_value` 转成属性键，否则用字面名。
+ *          The parser carries a computed name as the member node's last child: kids[2] for methods/accessors and kids[1] for fields. When present it is evaluated and converted through `key_of_value`; otherwise the literal name is used.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] env 求值计算名所用环境 / Environment used to evaluate a computed name
+ * @param[in]     m 类成员节点 / Class member node
+ *
+ * @return arena 中的属性键 / The property key in the arena
+ *
+ * @see class_install_member apply_class_fields
+ */
+static char *class_member_key(HpeJs *js, JsEnv *env, JsNode *m)
+{
+    if (m->kind == JS_N_FUNC) {
+        if (m->kid_count > 2 && m->kids[2])
+            return key_of_value(js, eval_expr(js, env, m->kids[2]));
+        return m->str;
+    }
+    if ((m->op == JS_MEMBER_FIELD || m->op == JS_MEMBER_STATIC_FIELD) &&
+        m->kid_count > 1 && m->kids[1])
+        return key_of_value(js, eval_expr(js, env, m->kids[1]));
+    return m->str;
 }
 
 /**
@@ -1120,7 +1243,7 @@ static void apply_class_fields(HpeJs *js, JsObj *ctor, JsValue instance)
             /* kids[0] = initialiser (may be NULL), kids[1] = computed key */
             JsValue v = (m->kid_count > 0 && m->kids[0]) ? eval_expr(js, fenv, m->kids[0])
                                                         : js_undef();
-            member_set(js, fenv, instance, m->str, v, m->line);
+            member_set(js, fenv, instance, class_member_key(js, fenv, m), v, m->line);
         }
     }
 }
@@ -1142,11 +1265,7 @@ static void apply_class_fields(HpeJs *js, JsObj *ctor, JsValue instance)
 static JsValue run_async(HpeJs *js, JsObj *fn, JsEnv *closure, JsValue this_v, JsValue *args,
                          int argc)
 {
-    JsObj *p = js_promise_new(js);
-    JsValue out = run_function_body(js, fn, closure, this_v, args, argc);
-    promise_resolve_with(js, p, out);
-    hpe_js_drain_jobs(js);
-    return js_objval(p);
+    return hpe_js_async_create(js, fn, closure, this_v, args, argc);
 }
 
 /**
@@ -1174,8 +1293,13 @@ static JsValue call_value(HpeJs *js, JsEnv *env, JsValue callee, JsValue thisv, 
     HPE_UNUSED(env);
     if (callee.t == JS_OBJ && callee.obj && callee.obj->kind == JS_OBJ_PROXY)
         return proxy_apply_call(js, callee.obj, thisv, args, argc, line);
-    if (!js_is_callable(callee))
+    if (!js_is_callable(callee)) {
+#ifdef HPE_GC_DEBUG
+        fprintf(stderr, "DBG not-callable t=%d obj=%p kind=%d\n", (int)callee.t,
+                (void *)callee.obj, callee.obj ? (int)callee.obj->kind : -1);
+#endif
         js_error(js, line, "value is not a function");
+    }
     fn = callee.obj;
     if (fn->fn_flags & FN_BOUND) {
         JsValue *all;
@@ -1195,11 +1319,14 @@ static JsValue call_value(HpeJs *js, JsEnv *env, JsValue callee, JsValue thisv, 
     if (fn->kind == JS_OBJ_NATIVE)
         return fn->native(js, thisv, args, argc, fn->native_ud);
     if (fn->kind == JS_OBJ_FUNC) {
+        /* sloppy-mode functions substitute the global object for an undefined `this` */
+        if (!(fn->fn_flags & (FN_STRICT | FN_ARROW)) && thisv.t == JS_UNDEF)
+            thisv = js_objval(js->global_obj);
         if (fn->fn_flags & FN_GEN)
             return hpe_js_gen_create(js, fn, fn->closure, thisv, args, argc);
         if (fn->fn_flags & FN_ASYNC)
             return run_async(js, fn, fn->closure, thisv, args, argc);
-        return run_function_body(js, fn, fn->closure, thisv, args, argc);
+        return run_function_body(js, fn, fn->closure, thisv, args, argc, js_undef());
     }
     js_error(js, line, "value is not a function");
     return js_undef();
@@ -1241,12 +1368,12 @@ JsValue js_invoke(HpeJs *js, JsValue fn, JsValue thisv, JsValue *args, int argc,
  * @note 基类在函数体之前安装字段，派生类在函数体（即 `super()`）之后安装 / A base class installs fields before the body while a derived class installs them after the body, i.e. after `super()`
  */
 static JsValue run_ctor_body(HpeJs *js, JsObj *ctor, JsValue this_v, JsValue *args, int argc,
-                             int derived)
+                             int derived, JsValue new_target)
 {
     JsValue out;
     if (!derived)
         apply_class_fields(js, ctor, this_v);
-    out = run_function_body(js, ctor, ctor->closure, this_v, args, argc);
+    out = run_function_body(js, ctor, ctor->closure, this_v, args, argc, new_target);
     if (derived)
         apply_class_fields(js, ctor, this_v);
     return out;
@@ -1296,11 +1423,52 @@ JsValue js_construct(HpeJs *js, JsValue callee, JsValue *args, int argc, int lin
         int derived = (fn->class_def && fn->home && fn->home->proto);
         instance->proto = (proto_v.t == JS_OBJ) ? proto_v.obj : js->object_proto;
         instance->class_name = fn->name ? fn->name : "Object";
-        out = run_ctor_body(js, fn, js_objval(instance), args, argc, derived);
+        out = run_ctor_body(js, fn, js_objval(instance), args, argc, derived, js_objval(fn));
         if (out.t == JS_OBJ && out.obj)
             return out;
         return js_objval(instance);
     }
+}
+
+/**
+ * @brief 沿环境链解析标识符绑定（尊重 `with` 对象）/ Resolve an identifier binding along the chain, honouring `with` objects
+ *
+ * @details 从最内层环境向外逐层查找：每层先查 `with` 对象（按规范遮蔽更外层的变量槽位），再查本层的变量槽位。
+ *          Levels are visited innermost first; at each level the `with` object is consulted before the level's own variable slots, matching the spec where a `with` environment shadows outer scopes.
+ *
+ * @param[in,out] env 起始环境 / Starting environment
+ * @param[in]     name 标识符名 / Identifier name
+ * @param[out]    slot 命中变量槽位时写入槽位指针 / Receives the slot pointer on a `BIND_SLOT` hit
+ * @param[out]    obj 命中 `with` 对象时写入对象指针 / Receives the object pointer on a `BIND_WITH` hit
+ *
+ * @return 绑定种类（`BIND_NONE` / `BIND_SLOT` / `BIND_WITH`）/ The binding kind (`BIND_NONE` / `BIND_SLOT` / `BIND_WITH`)
+ *
+ * @see eval_ident write_target
+ */
+static int env_find_binding(HpeJs *js, JsEnv *env, const char *name, JsValue **slot, JsObj **obj)
+{
+    JsEnv *e;
+    int i;
+    for (e = env; e; e = e->parent) {
+        if (e->with_obj && js_obj_has(e->with_obj, name)) {
+            /* Symbol.unscopables exempts the binding from the with object */
+            JsValue unsc = js_obj_get(js, e->with_obj, "Symbol.unscopables");
+            JsValue skip = (unsc.t == JS_OBJ && unsc.obj)
+                               ? js_obj_get(js, unsc.obj, name)
+                               : js_undef();
+            if (!js_truthy(skip)) {
+                *obj = e->with_obj;
+                return BIND_WITH;
+            }
+        }
+        for (i = 0; i < e->var_count; i++) {
+            if (e->vars[i].name[0] == name[0] && strcmp(e->vars[i].name, name) == 0) {
+                *slot = &e->vars[i].val;
+                return BIND_SLOT;
+            }
+        }
+    }
+    return BIND_NONE;
 }
 
 /**
@@ -1319,11 +1487,15 @@ JsValue js_construct(HpeJs *js, JsValue callee, JsValue *args, int argc, int lin
 static void bind_target(HpeJs *js, JsEnv *env, JsNode *id, JsValue v, int declare)
 {
     if (id->kind == JS_N_IDENT) {
-        if (declare)
+        if (declare) {
             js_env_declare(js, env, id->str, v);
-        else {
-            JsValue *slot = js_env_lookup(env, id->str);
-            if (slot)
+        } else {
+            JsValue *slot = NULL;
+            JsObj *wobj = NULL;
+            int b = env_find_binding(js, env, id->str, &slot, &wobj);
+            if (b == BIND_WITH)
+                member_set(js, env, js_objval(wobj), id->str, v, id->line);
+            else if (b == BIND_SLOT)
                 *slot = v;
             else if (env->strict)
                 js_error(js, id->line, "%s is not defined", id->str);
@@ -1634,6 +1806,17 @@ static JsValue js_instanceof(HpeJs *js, JsValue obj, JsValue ctor, int line)
     JsValue pv;
     if (!js_is_callable(ctor))
         js_error(js, line, "right-hand side of 'instanceof' is not callable");
+    if (ctor.t == JS_OBJ && ctor.obj) {
+        /* the exotic hook wins, even for a primitive left operand */
+        JsProp *h = js_obj_find_prop(ctor.obj, "Symbol.hasInstance");
+        if (h && js_is_callable(h->val)) {
+            JsValue args[1];
+            JsValue r;
+            args[0] = obj;
+            r = js_invoke(js, h->val, ctor, args, 1, line);
+            return js_bool(js_truthy(r));
+        }
+    }
     if (obj.t != JS_OBJ || !obj.obj)
         return js_bool(0);
     pv = member_get(js, NULL, ctor, "prototype", line);
@@ -1895,19 +2078,22 @@ static JsValue bigint_arith(HpeJs *js, int op, JsValue l, JsValue r)
  */
 static JsValue bin_add(HpeJs *js, JsValue l, JsValue r)
 {
-    if (l.t == JS_STR || r.t == JS_STR)
-        return bin_concat(js, l, r);
-    if (l.t == JS_BIGINT || r.t == JS_BIGINT) {
-        if (l.t != r.t)
-            bigint_mix_error(js, l, r);
-        return js_bigint_add(js, l, r, 0);
-    }
+    /* spec order: ToPrimitive (default hint) -> string concat -> ToNumeric;
+     * `+` always converts objects with the default hint, so the object check
+     * must come first (spec §13.9.1 Runtime Semantics) */
     if ((l.t == JS_OBJ && l.obj) || (r.t == JS_OBJ && r.obj)) {
         JsValue lp = js_primitive_of(js, l);
         JsValue rp = js_primitive_of(js, r);
         if (lp.t == JS_STR || rp.t == JS_STR)
             return bin_concat(js, lp, rp);
         return bin_add(js, lp, rp);
+    }
+    if (l.t == JS_STR || r.t == JS_STR)
+        return bin_concat(js, l, r);
+    if (l.t == JS_BIGINT || r.t == JS_BIGINT) {
+        if (l.t != r.t)
+            bigint_mix_error(js, l, r);
+        return js_bigint_add(js, l, r, 0);
     }
     return js_num(js_to_number(js, l) + js_to_number(js, r));
 }
@@ -2007,8 +2193,14 @@ static JsValue eval_bin(HpeJs *js, JsEnv *env, JsNode *n)
 static JsValue read_target(HpeJs *js, JsEnv *env, JsNode *target)
 {
     if (target->kind == JS_N_IDENT) {
-        JsValue *slot = js_env_lookup(env, target->str);
-        return slot ? *slot : js_undef();
+        JsValue *slot = NULL;
+        JsObj *wobj = NULL;
+        int b = env_find_binding(js, env, target->str, &slot, &wobj);
+        if (b == BIND_SLOT)
+            return *slot;
+        if (b == BIND_WITH)
+            return member_get(js, env, js_objval(wobj), target->str, target->line);
+        return js_undef();
     }
     if (target->kind == JS_N_MEMBER) {
         JsValue base = eval_expr(js, env, target->kids[0]);
@@ -2033,8 +2225,12 @@ static JsValue read_target(HpeJs *js, JsEnv *env, JsNode *target)
 static void write_target(HpeJs *js, JsEnv *env, JsNode *target, JsValue value)
 {
     if (target->kind == JS_N_IDENT) {
-        JsValue *slot = js_env_lookup(env, target->str);
-        if (slot)
+        JsValue *slot = NULL;
+        JsObj *wobj = NULL;
+        int b = env_find_binding(js, env, target->str, &slot, &wobj);
+        if (b == BIND_WITH)
+            member_set(js, env, js_objval(wobj), target->str, value, target->line);
+        else if (b == BIND_SLOT)
             *slot = value;
         else if (env->strict)
             js_error(js, target->line, "%s is not defined", target->str);
@@ -2293,25 +2489,26 @@ static void class_install_member(HpeJs *js, JsEnv *env, JsNode *m, JsObj *proto,
 {
     int kind = class_member_kind(m);
     JsObj *home = class_is_static_kind(kind) ? ctor : proto;
+    char *key = class_member_key(js, env, m);
 
     switch (kind) {
     case K_CTOR:
         break; /* the constructor is installed by class_eval itself */
     case K_METHOD:
     case K_STATIC_METHOD:
-        js_obj_set(js, home, m->str, make_method_home(js, env, m, home));
+        js_obj_set(js, home, key, make_method_home(js, env, m, home));
         break;
     case K_GET:
     case K_STATIC_GET:
-        js_obj_set_accessor(js, home, m->str, make_method_home(js, env, m, home), js_undef());
+        js_obj_set_accessor(js, home, key, make_method_home(js, env, m, home), js_undef());
         break;
     case K_SET:
     case K_STATIC_SET:
-        js_obj_set_accessor(js, home, m->str, js_undef(), make_method_home(js, env, m, home));
+        js_obj_set_accessor(js, home, key, js_undef(), make_method_home(js, env, m, home));
         break;
     case K_STATIC_FIELD: {
         JsValue v = (m->kid_count > 0 && m->kids[0]) ? eval_expr(js, env, m->kids[0]) : js_undef();
-        js_obj_set(js, home, m->str, v);
+        js_obj_set(js, home, key, v);
         break;
     }
     case K_STATIC_BLOCK: {
@@ -2806,7 +3003,11 @@ static JsValue super_call(HpeJs *js, JsEnv *env, JsNode *n)
 
     args_init(&al, js, n->kid_count > 0 ? n->kid_count : 1);
     args_build(&al, js, env, n, 0);
-    out = run_ctor_body(js, parent_v.obj, this_v, al.items, al.count, 1);
+    /* `super()` propagates the new.target of the surrounding construction */
+    for (e = env; e && !e->has_new_target; e = e->parent)
+        ;
+    out = run_ctor_body(js, parent_v.obj, this_v, al.items, al.count, 1,
+                        e ? e->new_target : js_undef());
     if (out.t == JS_OBJ)
         return out;
     return this_v;
@@ -2842,6 +3043,49 @@ static JsValue eval_call(HpeJs *js, JsEnv *env, JsNode *n)
     args_init(&al, js, n->kid_count > 1 ? n->kid_count : 1);
     args_build(&al, js, env, n, 1);
     return call_value(js, env, callee, thisv, al.items, al.count, n->line);
+}
+
+/**
+ * @brief 求值带标签的模板 `` tag`…` `` / Evaluate a tagged template `` tag`…` ``
+ *
+ * @details 先按 `eval_callee` 解析标签函数值与 `this`（方法标签以基对象为 `this`）；再构造冻结的 cooked 字符串数组并在其 `raw` 属性挂上冻结的 raw 字符串数组，与各替换表达式求值结果一起传给标签函数。
+ *          The tag function value and `this` are resolved through `eval_callee` (a method tag receives its base object as `this`); a frozen array of cooked strings carrying a frozen `raw` array of raw strings is then built and passed to the tag together with the evaluated substitutions.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] env 词法环境 / Lexical environment
+ * @param[in,out] n 标签模板节点（kids[0] 标签、kids[1] cooked、kids[2] raw、kids[3..] 替换表达式）/ Tagged template node (`kids[0]` tag, `kids[1]` cooked, `kids[2]` raw, `kids[3..]` substitutions)
+ *
+ * @return 标签函数的返回值 / The value returned by the tag function
+ *
+ * @note 与规范一致每次调用共享同一模板站点对象的行为未实现（当前每次新建冻结数组）/ The spec's per-call-site sharing of one template object is not implemented (a fresh frozen array is built per call)
+ *
+ * @see eval_callee call_value template_eval
+ */
+static JsValue tagged_template_eval(HpeJs *js, JsEnv *env, JsNode *n)
+{
+    JsValue callee = js_undef();
+    JsValue thisv = js_undef();
+    int ok = eval_callee(js, env, n, n->kids[0], &callee, &thisv);
+    int nsub = n->kid_count - 3;
+    JsObj *strings = js_array_new(js);
+    JsObj *rawarr = js_array_new(js);
+    JsValue *args;
+    int i;
+
+    if (!ok || !js_is_callable(callee))
+        return js_undef();
+    for (i = 0; i < n->kids[1]->kid_count; i++) {
+        array_push_value(js, strings, js_string(js, n->kids[1]->kids[i]->str));
+        array_push_value(js, rawarr, js_string(js, n->kids[2]->kids[i]->str));
+    }
+    js_obj_set(js, strings, "raw", js_objval(rawarr));
+    strings->num_val = 3; /* sealed | frozen, as Object.freeze does */
+    rawarr->num_val = 3;
+    args = (JsValue *)hpe_js_alloc(js, (size_t)(nsub + 1) * sizeof(JsValue));
+    args[0] = js_objval(strings);
+    for (i = 0; i < nsub; i++)
+        args[i + 1] = eval_expr(js, env, n->kids[3 + i]);
+    return call_value(js, env, callee, thisv, args, nsub + 1, n->line);
 }
 
 /**
@@ -2929,7 +3173,7 @@ static const char *typeof_name(JsValue v)
  *
  * @return 始终返回 `true` / Always returns `true`
  *
- * @note 删除不可配置属性的失败被报告为成功，符合解释器假定的非严格模式行为 / A failed delete of a non-configurable property is reported as success, matching the sloppy-mode behaviour assumed by the interpreter
+ * @note 删除封闭/冻结对象上的自有属性返回 `false`，严格模式下抛 `TypeError`；严格模式删除未限定标识符报错 / Deleting an own property of a sealed or frozen object returns `false` (a `TypeError` in strict mode); strict mode rejects deleting an unqualified identifier
  */
 static JsValue eval_delete(HpeJs *js, JsEnv *env, JsNode *target)
 {
@@ -2939,19 +3183,31 @@ static JsValue eval_delete(HpeJs *js, JsEnv *env, JsNode *target)
                          ? target->str
                          : key_of_value(js, eval_expr(js, env, target->kids[1]));
         if (base.t == JS_OBJ && base.obj) {
+            int ok = 1;
             if (proxy_is(base.obj)) {
-                int ok = 1;
                 if (proxy_bool_trap(js, base.obj, "deleteProperty", prop, &ok))
                     return js_bool(ok);
             }
-            js_obj_delete(js, base.obj, prop);
+            ok = js_obj_delete(js, base.obj, prop);
+            if (!ok) {
+                if (env && env->strict)
+                    js_error(js, target->line,
+                             "cannot delete property '%s' of a sealed or frozen object",
+                             prop);
+                return js_bool(0);
+            }
         }
         return js_bool(1);
     }
     if (target->kind == JS_N_IDENT) {
-        JsValue *slot = js_env_lookup(env, target->str);
-        if (slot)
-            *slot = js_undef();
+        if (env && env->strict)
+            js_error(js, target->line,
+                     "delete of an unqualified identifier in strict mode");
+        {
+            JsValue *slot = js_env_lookup(env, target->str);
+            if (slot)
+                *slot = js_undef();
+        }
     }
     return js_bool(1);
 }
@@ -3047,13 +3303,7 @@ static JsValue eval_await(HpeJs *js, JsEnv *env, JsNode *n)
 {
     JsValue v = eval_expr(js, env, n->kids[0]);
 
-    if (v.t == JS_OBJ && v.obj && v.obj->kind == JS_OBJ_PROMISE) {
-        hpe_js_drain_jobs(js);
-        if (v.obj->promise_state == 2)
-            js_throw_value(js, v.obj->promise_value);
-        return v.obj->promise_value;
-    }
-    return v;
+    return hpe_js_await(js, v);
 }
 
 /**
@@ -3156,10 +3406,14 @@ static JsValue eval_yield(HpeJs *js, JsEnv *env, JsNode *n, int delegate)
  */
 static JsValue eval_ident(HpeJs *js, JsEnv *env, JsNode *n)
 {
-    JsValue *slot = js_env_lookup(env, n->str);
+    JsValue *slot = NULL;
+    JsObj *wobj = NULL;
+    int b = env_find_binding(js, env, n->str, &slot, &wobj);
 
-    if (slot)
+    if (b == BIND_SLOT)
         return *slot;
+    if (b == BIND_WITH)
+        return member_get(js, env, js_objval(wobj), n->str, n->line);
     if (js_obj_has(js->global_obj, n->str))
         return js_obj_get(js, js->global_obj, n->str);
     js_error(js, n->line, "%s is not defined", n->str);
@@ -3309,6 +3563,28 @@ static JsValue eval_this_node(HpeJs *js, JsEnv *env, JsNode *n)
 }
 
 /**
+ * @brief 求值 `new.target` / Evaluate `new.target`
+ *
+ * @details 沿环境链找最近一个拥有 `new.target` 绑定（非箭头函数体）的环境；构造调用时为该构造函数，普通调用为 undefined。箭头函数经环境链继承外层值。
+ *          The environment chain is walked for the nearest scope owning a `new.target` binding (a non-arrow function body); it is the constructor under `new` and `undefined` for a plain call. Arrow functions inherit the outer value through the chain.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] env 词法环境 / Lexical environment
+ * @param[in,out] n 节点 / Node
+ *
+ * @return 当前激活的 `new.target` 值 / The current activation's `new.target` value
+ */
+static JsValue new_target_eval(HpeJs *js, JsEnv *env, JsNode *n)
+{
+    JsEnv *e = env;
+    HPE_UNUSED(js);
+    HPE_UNUSED(n);
+    while (e && !e->has_new_target)
+        e = e->parent;
+    return e ? e->new_target : js_undef();
+}
+
+/**
  * @brief 求值三元条件表达式 / Evaluate a ternary conditional expression
  *
  * @details 以第 0 个子节点作条件，真则取第 1 个子节点、假则取第 2 个子节点。
@@ -3413,7 +3689,8 @@ static const struct {
 } k_eval_table[] = {
     { JS_N_IDENT, eval_ident },          { JS_N_THIS, eval_this_node },
     { JS_N_ARRAY, eval_array_literal },  { JS_N_OBJECT, object_literal },
-    { JS_N_TEMPLATE, template_eval },    { JS_N_BIN, eval_bin },
+    { JS_N_TEMPLATE, template_eval },    { JS_N_TAGGED, tagged_template_eval },
+    { JS_N_BIN, eval_bin },
     { JS_N_UN, eval_unary },             { JS_N_TERNARY, eval_ternary },
     { JS_N_SEQ, eval_seq },              { JS_N_ASSIGN, eval_assign },
     { JS_N_MEMBER, eval_member },        { JS_N_SUPER_MEMBER, eval_super_member },
@@ -3422,6 +3699,8 @@ static const struct {
     { JS_N_AWAIT, eval_await },          { JS_N_YIELD, eval_yield_node },
     { JS_N_FUNC, make_method },          { JS_N_SPREAD, eval_spread },
     { JS_N_UPDATE, eval_update },        { JS_N_CLASS, class_eval },
+    { JS_N_NEW_TARGET, new_target_eval },
+    { JS_N_DYN_IMPORT, dyn_import_eval },
     { JS_N_BLOCK, eval_empty_expr },
 };
 
@@ -3519,6 +3798,7 @@ static void hoist_decls(HpeJs *js, JsEnv *env, JsNode *n)
     case JS_N_TRY:
     case JS_N_SWITCH:
     case JS_N_EXPORT:
+    case JS_N_WITH:
         for (i = 0; i < n->kid_count; i++)
             hoist_decls(js, env, n->kids[i]);
         return;
@@ -3849,6 +4129,67 @@ static int iter_is_pullable(JsValue v)
 }
 
 /**
+ * @brief 判断是否为需要走完整迭代协议的对象 / Test whether a value needs the full iterator protocol
+ *
+ * @details 内建种类（数组、Map/Set、生成器、迭代器、宿主集合）与类数组都有各自的快速路径，不在此列；只有带可调用 `Symbol.iterator` 的普通对象才走协议。
+ *          Built-in kinds (arrays, Map/Set, generators, iterators, host collections) and array-likes have dedicated fast paths; only a plain object carrying a callable `Symbol.iterator` goes through the protocol.
+ *
+ * @param[in]     v 待判断的值 / The value to test
+ *
+ * @return 需要走协议时为 1 / 1 when the protocol applies
+ */
+static int iter_is_protocol(JsValue v)
+{
+    JsProp *p;
+    if (v.t != JS_OBJ || !v.obj)
+        return 0;
+    if (v.obj->kind == JS_OBJ_ARRAY || v.obj->kind == JS_OBJ_MAP ||
+        v.obj->kind == JS_OBJ_GEN || v.obj->kind == JS_OBJ_ITER ||
+        v.obj->kind == JS_OBJ_PROMISE || v.obj->items || v.obj->payload_obj)
+        return 0;
+    if (js_obj_has(v.obj, "length"))
+        return 0; /* array-likes keep the index protocol */
+    p = js_obj_find_prop(v.obj, "Symbol.iterator");
+    return p && js_is_callable(p->val);
+}
+
+/**
+ * @brief 调用 `Symbol.iterator` 并把迭代器拉空成数组 / Call `Symbol.iterator` and drain the iterator into an array
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     v 带自定义迭代器的值 / The value with a custom iterator
+ *
+ * @return 装载全部产出项的新数组对象 / A fresh array holding every yielded item
+ *
+ * @note 迭代器缺失 `next` 或产出非对象结果时提前停止（宽容处理）/ Iteration stops early when the iterator lacks `next` or yields a non-object (permissive)
+ */
+static JsObj *iter_protocol_collect(HpeJs *js, JsValue v)
+{
+    JsObj *arr = js_array_new(js);
+    JsValue m = member_get(js, NULL, v, "Symbol.iterator", 0);
+    JsValue it;
+
+    if (!js_is_callable(m))
+        return arr;
+    it = js_invoke(js, m, v, NULL, 0, 0);
+    while (it.t == JS_OBJ && it.obj) {
+        JsValue nx = member_get(js, NULL, it, "next", 0);
+        JsValue r, done, val;
+        if (!js_is_callable(nx))
+            break;
+        r = js_invoke(js, nx, it, NULL, 0, 0);
+        if (r.t != JS_OBJ || !r.obj)
+            break;
+        done = js_obj_get(js, r.obj, "done");
+        val = js_obj_get(js, r.obj, "value");
+        if (js_truthy(done))
+            break;
+        array_push_value(js, arr, val);
+    }
+    return arr;
+}
+
+/**
  * @brief 按拉取式迭代收集全部项 / Collect every item through pull-based iteration
  *
  * @param[in,out] js JS 运行时上下文 / JS runtime context
@@ -3885,6 +4226,8 @@ static JsObj *iter_expand(HpeJs *js, JsValue v)
     int k, len;
     if (iter_is_pullable(v))
         return iter_collect(js, v.obj);
+    if (iter_is_protocol(v))
+        return iter_protocol_collect(js, v);
     arr = js_array_new(js);
     len = js_iter_len(js, v);
     for (k = 0; k < len; k++)
@@ -3922,6 +4265,19 @@ static Flow exec_forof(HpeJs *js, JsEnv *env, JsNode *n, const char *const *labe
         JsValue res;
         while (hpe_js_gen_pull(js, it.obj, &res)) {
             int act = loop_body_step(js, env, n->kids[0], js_obj_get(js, res.obj, "value"),
+                                     n->kids[2], labels, nlabels, out);
+            if (act == 1)
+                return flow_none();
+            if (act == 2)
+                return *out;
+        }
+        return flow_none();
+    }
+    if (iter_is_protocol(it)) {
+        JsObj *arr = iter_protocol_collect(js, it);
+        int len = array_length(js, arr), i;
+        for (i = 0; i < len; i++) {
+            int act = loop_body_step(js, env, n->kids[0], array_get_index(js, arr, i),
                                      n->kids[2], labels, nlabels, out);
             if (act == 1)
                 return flow_none();
@@ -4109,6 +4465,7 @@ static void exec_try_guard(HpeJs *js, JsEnv *env, JsNode *stmts, JsEnv *block_en
 {
     JsTryFrame f;
     f.prev = js->try_top;
+    f.depth = js->call_depth;
     js->try_top = &f;
     if (setjmp(f.jmp) == 0) {
         *flow = exec_block(js, block_env ? block_env : env, stmts);
@@ -4118,6 +4475,7 @@ static void exec_try_guard(HpeJs *js, JsEnv *env, JsNode *stmts, JsEnv *block_en
         js->thrown = js_undef();
     }
     js->try_top = f.prev;
+    js->call_depth = f.depth;
 }
 
 /**
@@ -4153,6 +4511,7 @@ static void exec_try_catch(HpeJs *js, JsEnv *env, JsNode *cc, JsValue thrown, Fl
         return;
     }
     f.prev = js->try_top;
+    f.depth = js->call_depth;
     js->try_top = &f;
     if (setjmp(f.jmp) == 0) {
         if (cc->kids[0])
@@ -4166,6 +4525,7 @@ static void exec_try_catch(HpeJs *js, JsEnv *env, JsNode *cc, JsValue thrown, Fl
         js->thrown = js_undef();
     }
     js->try_top = f.prev;
+    js->call_depth = f.depth;
 }
 
 /**
@@ -4188,6 +4548,7 @@ static void exec_try_finally(HpeJs *js, JsEnv *env, JsNode *fb, Flow *flow, int 
 {
     JsTryFrame f;
     f.prev = js->try_top;
+    f.depth = js->call_depth;
     js->try_top = &f;
     if (setjmp(f.jmp) == 0) {
         Flow ff = exec_block(js, env, fb);
@@ -4201,6 +4562,7 @@ static void exec_try_finally(HpeJs *js, JsEnv *env, JsNode *fb, Flow *flow, int 
         js->thrown = js_undef();
     }
     js->try_top = f.prev;
+    js->call_depth = f.depth;
 }
 
 /**
@@ -4459,6 +4821,36 @@ static Flow exec_noop(HpeJs *js, JsEnv *env, JsNode *n)
 
 /* statement kind -> executor; nodes that evaluate a subexpression as part of
  * their own bookkeeping are handled before this table */
+
+/**
+ * @brief 执行 `with (obj) body` 语句 / Execute a `with (obj) body` statement
+ *
+ * @details 求值对象表达式，为体语句新建一个携带对象环境的子环境；对象属性在该环境内作为标识符可见（读取与写入都经成员访问语义）。对象表达式为 null/undefined 时体语句仍执行，但无绑定注入。
+ *          The object expression is evaluated and a child environment carrying the object environment is created for the body; the object's properties become visible as identifiers inside it (reads and writes both follow member-access semantics). When the object is null/undefined the body still runs, just without injected bindings.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] env 词法环境 / Lexical environment
+ * @param[in,out] n 语句节点 / Statement node
+ *
+ * @return 体语句的控制流 / The control flow of the body statement
+ *
+ * @note 仅对象值注入绑定；原始值不经过 `ToObject` 包装（宽容偏差）/ Only object values inject bindings; primitives are not wrapped through `ToObject` (a permissive deviation)
+ *
+ * @see env_find_binding exec_stmt
+ */
+static Flow exec_with(HpeJs *js, JsEnv *env, JsNode *n)
+{
+    JsValue v = eval_expr(js, env, n->kids[0]);
+    JsEnv *wenv = js_env_new(js, env);
+
+    if (v.t == JS_OBJ && v.obj)
+        wenv->with_obj = v.obj;
+    return exec_stmt(js, wenv, n->kids[1]);
+}
+
+/**
+ * @brief 语句分派表 / Statement dispatch table
+ */
 static const struct {
     int kind;
     Flow (*fn)(HpeJs *js, JsEnv *env, JsNode *n);
@@ -4466,6 +4858,7 @@ static const struct {
     { JS_N_SWITCH, exec_switch }, { JS_N_TRY, exec_try },
     { JS_N_RETURN, exec_return }, { JS_N_LABEL, exec_label },
     { JS_N_EXPORT, export_stmt }, { JS_N_IMPORT, import_stmt },
+    { JS_N_WITH, exec_with },
     { JS_N_IF, exec_if },         { JS_N_THROW, exec_throw },
     { JS_N_EXPR, exec_expr_stmt }, { JS_N_EMPTY, exec_noop },
 };
@@ -4958,6 +5351,50 @@ static Flow import_stmt(HpeJs *js, JsEnv *env, JsNode *n)
         }
     }
     return flow;
+}
+
+/**
+ * @brief 求值动态导入 `import(spec)` / Evaluate a dynamic `import(spec)`
+ *
+ * @details 求值说明符并同步加载、运行目标模块，成功时以模块命名空间对象兑现 Promise；加载或求值抛出的异常经 try 帧捕获后转为 Promise 拒绝。
+ *          The specifier is evaluated and the target module is loaded and run synchronously; on success the module namespace object fulfils the promise, while any exception raised by loading or evaluation is caught through a try frame and turned into a rejection.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] env 词法环境 / Lexical environment
+ * @param[in,out] n 动态导入节点（kids[0] 说明符表达式）/ Dynamic import node whose `kids[0]` is the specifier expression
+ *
+ * @return 以命名空间对象兑现（或以错误拒绝）的 Promise / A promise fulfilled with the namespace object (or rejected with the error)
+ *
+ * @note 相对说明符按当前模块目录解析；模块已求值过则直接复用其命名空间 / A relative specifier resolves against the current module directory; an already evaluated module reuses its namespace
+ *
+ * @see module_run module_load import_stmt
+ */
+static JsValue dyn_import_eval(HpeJs *js, JsEnv *env, JsNode *n)
+{
+    JsObj *p = js_promise_new(js);
+    JsTryFrame frame;
+    JsValue spec, err;
+
+    frame.prev = js->try_top;
+    frame.depth = js->call_depth;
+    js->try_top = &frame;
+    if (setjmp(frame.jmp) != 0) {
+        err = js->thrown;
+        js->try_top = frame.prev;
+        js->call_depth = frame.depth;
+        js->thrown = js_undef();
+        js->in_catch = 0;
+        js_settle_promise(js, p, 2, err);
+        return js_objval(p);
+    }
+    spec = eval_expr(js, env, n->kids[0]);
+    {
+        JsModule *m = module_run(js, module_load(js, js_to_string(js, spec), js->current_dir));
+        js->try_top = frame.prev;
+        js->call_depth = frame.depth;
+        js_resolve_promise(js, p, js_objval(m->ns));
+    }
+    return js_objval(p);
 }
 
 /**
@@ -6799,7 +7236,14 @@ static JsValue array_concat(HpeJs *js, JsValue thisv, JsValue *a, int argc, void
             array_push_value(js, out, array_get_index(js, src, k));
     }
     for (i = 0; i < argc; i++) {
-        if (a[i].t == JS_OBJ && a[i].obj && a[i].obj->kind == JS_OBJ_ARRAY) {
+        int spread = a[i].t == JS_OBJ && a[i].obj && a[i].obj->kind == JS_OBJ_ARRAY;
+        if (spread) {
+            /* Symbol.isConcatSpreadable === false keeps the array whole */
+            JsValue ics = js_obj_get(js, a[i].obj, "Symbol.isConcatSpreadable");
+            if (ics.t != JS_UNDEF && !js_truthy(ics))
+                spread = 0;
+        }
+        if (spread) {
             int len = array_length(js, a[i].obj), k;
             for (k = 0; k < len; k++)
                 array_push_value(js, out, array_get_index(js, a[i].obj, k));
@@ -8077,9 +8521,14 @@ static JsValue object_this_toString(HpeJs *js, JsValue thisv, JsValue *a, int ar
         return js_string(js, buf);
     }
     {
+        /* Symbol.toStringTag overrides the built-in class tag (spec §19.1.3.6);
+           read via js_get_prop so getter (accessor) forms work too */
+        JsValue tagv = js_get_prop(js, NULL, thisv, "Symbol.toStringTag", 0);
         const char *cn = thisv.obj->class_name ? thisv.obj->class_name : "Object";
         if (!strcmp(cn, "Module"))
             cn = "Object";
+        if (tagv.t == JS_STR && tagv.str && tagv.str[0])
+            cn = tagv.str;
         snprintf(buf, sizeof(buf), "[object %s]", cn);
         return js_string(js, buf);
     }
@@ -10763,11 +11212,8 @@ static JsValue native_string_ctor(HpeJs *js, JsValue thisv, JsValue *a, int argc
      * so it must bypass js_to_string, which rejects symbols. */
     if (js_is_symbol(v))
         return js_string(js, js_symbol_text(js, v));
-    if (v.t == JS_OBJ && v.obj) {
-        JsValue p = js_primitive_of(js, v);
-        if (js_is_symbol(p))
-            return js_string(js, js_symbol_text(js, p));
-    }
+    /* js_to_string already runs ToString(ToPrimitive(v, "string")), so the
+     * Symbol.toPrimitive hook fires exactly once here. */
     return js_string(js, js_to_string(js, v));
 }
 
@@ -12064,11 +12510,64 @@ static void install_array_ctor(HpeJs *js)
 }
 
 /**
+ * @brief 实现 `String.raw` / Implement `String.raw`
+ *
+ * @details 取首个实参（模板站点对象）的 `raw` 数组，逐块拼接 raw 文本并在块间插入对应替换实参的字符串形式。
+ *          The `raw` array of the first argument (a template site object) is joined, inserting the string form of the matching substitution argument between chunks.
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     thisv 调用时的 this 值 / The `this` value of the call
+ * @param[in,out] a 操作数 / Operands
+ * @param[in]     argc 参数个数 / Argument count
+ * @param[in,out] ud 宿主回调透传的用户数据 / Opaque user data passed through to the host
+ *
+ * @return 拼接后的字符串 / The joined string
+ *
+ * @see install_string_ctor
+ */
+static JsValue string_raw(HpeJs *js, JsValue thisv, JsValue *a, int argc, void *ud)
+{
+    JsValue tpl = arg_at(a, argc, 0);
+    JsValue rawv;
+    JsObj *raw;
+    int n, i;
+    size_t total = 1, o = 0;
+    char *out;
+
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(ud);
+    rawv = tpl.t == JS_OBJ && tpl.obj ? js_obj_get(js, tpl.obj, "raw") : js_undef();
+    raw = rawv.t == JS_OBJ ? rawv.obj : NULL;
+    if (!raw)
+        js_error(js, 0, "String.raw requires a template object");
+    n = array_length(js, raw);
+    for (i = 0; i < n; i++)
+        total += strlen(js_to_string(js, array_get_index(js, raw, i)));
+    for (i = 0; i + 1 < n; i++)
+        total += strlen(js_to_string(js, arg_at(a, argc, i + 1)));
+    out = (char *)hpe_js_alloc(js, total + 8);
+    for (i = 0; i < n; i++) {
+        char *s = js_to_string(js, array_get_index(js, raw, i));
+        size_t sl = strlen(s);
+        memcpy(out + o, s, sl);
+        o += sl;
+        if (i + 1 < n) {
+            char *s2 = js_to_string(js, arg_at(a, argc, i + 1));
+            size_t sl2 = strlen(s2);
+            memcpy(out + o, s2, sl2);
+            o += sl2;
+        }
+    }
+    out[o] = '\0';
+    return js_string_len(js, out, o);
+}
+
+/**
  * @brief 安装 `String` 构造器与其静态方法 / Install the `String` constructor and its static methods
  *
  * @param[in,out] js JS 运行时上下文 / JS runtime context
  *
- * @note 安装 `fromCharCode` 与 `fromCodePoint` / Installs `fromCharCode` and `fromCodePoint`
+ * @note 安装 `fromCharCode`、`fromCodePoint` 与 `raw` / Installs `fromCharCode`, `fromCodePoint` and `raw`
  */
 static void install_string_ctor(HpeJs *js)
 {
@@ -12078,6 +12577,7 @@ static void install_string_ctor(HpeJs *js)
     sc = ctor_of(js, "String");
     def_method(js, sc, "fromCharCode", string_from_char_code, NULL);
     def_method(js, sc, "fromCodePoint", string_from_code_point, NULL);
+    def_method(js, sc, "raw", string_raw, NULL);
 }
 
 /**
@@ -13854,6 +14354,9 @@ static void install_global_object(HpeJs *js)
     def_value(js, js->global_obj, "alert", mk_native(js, native_alert, NULL));
     def_value(js, js->global_obj, "globalThis", global);
     HPE_UNUSED(global);
+    /* installs the __gc/__gcStats builtins and captures the main-stack
+     * baseline for conservative stack scanning */
+    hpe_js_gc_install(js);
 }
 
 /**
@@ -13874,6 +14377,11 @@ HpeJs *hpe_js_create(void)
     js->error = 0;
     js->timer_cap = 0;
     js->strict = 0;
+    js->call_depth = 0;
+    /* budget for ~300 nested JS calls; each costs roughly 2-3KB of C stack
+     * through run_function_body + exec_stmt + eval_expr chains, so this stays
+     * far inside the 1-2MB default Win32 stack */
+    js->depth_limit = 300;
     init_prototypes(js);
     install_object_proto(js);
     install_function_proto(js);
@@ -13981,9 +14489,11 @@ static int eval_common(HpeJs *js, const char *source, int module, char *errbuf, 
     if (js->thrown.t != JS_UNDEF)
         js->thrown = js_undef();
     frame.prev = js->try_top;
+    frame.depth = js->call_depth;
     js->try_top = &frame;
     if (setjmp(frame.jmp) != 0) {
         js->try_top = frame.prev;
+        js->call_depth = frame.depth;
         if (errbuf && errbuf_size) {
             char *s = js_to_string(js, js->thrown);
             snprintf(errbuf, errbuf_size, "%s", s ? s : "error");
@@ -13995,12 +14505,12 @@ static int eval_common(HpeJs *js, const char *source, int module, char *errbuf, 
     prog = module ? js_parse_module(js, source) : js_parse_program(js, source);
     {
         JsEnv *env = js->global_env;
+        env->strict = prog->strict; /* script directive prologue / module mode */
         if (module) {
             JsModule *m = (JsModule *)malloc(sizeof(JsModule));
             memset(m, 0, sizeof(*m));
-            m->path = hpe_js_strdup(js, (js->entry_path && *js->entry_path)
-                                            ? js->entry_path
-                                            : "<eval>");
+            const char *ep = (js->entry_path && *js->entry_path) ? js->entry_path : "<eval>";
+            m->path = hpe_js_strdup(js, ep);
             m->env = env;
             m->ns = js_module_ns_new(js, m);
             m->ns->proto = NULL;
@@ -14013,7 +14523,9 @@ static int eval_common(HpeJs *js, const char *source, int module, char *errbuf, 
         }
     }
     hpe_js_drain_jobs(js);
+    hpe_js_gc_maybe(js); /* safe point: only conservative roots alive here */
     js->try_top = frame.prev;
+    js->call_depth = frame.depth;
     js->in_catch = 0;
     return 0;
 }
@@ -14079,9 +14591,11 @@ int hpe_js_call(HpeJs *js, JsValue callee, JsValue thisv, JsValue *args, int arg
     if (!js)
         return -1;
     frame.prev = js->try_top;
+    frame.depth = js->call_depth;
     js->try_top = &frame;
     if (setjmp(frame.jmp) != 0) {
         js->try_top = frame.prev;
+        js->call_depth = frame.depth;
         fprintf(stderr, "hope: uncaught exception in callback: %s\n",
                 js_to_string(js, js->thrown));
         js->thrown = js_undef();
@@ -14090,7 +14604,9 @@ int hpe_js_call(HpeJs *js, JsValue callee, JsValue thisv, JsValue *args, int arg
     }
     call_value(js, NULL, callee, thisv, args, argc, 0);
     hpe_js_drain_jobs(js);
+    hpe_js_gc_maybe(js); /* safe point after every host-invoked callback */
     js->try_top = frame.prev;
+    js->call_depth = frame.depth;
     js->in_catch = 0;
     return 0;
 }

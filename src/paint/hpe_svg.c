@@ -130,6 +130,7 @@ typedef struct {
     int units;  /* 0 = objectBoundingBox, 1 = userSpaceOnUse */
     float x1, y1, x2, y2; /* linear axis */
     float cx, cy, r, fx, fy;
+    Mat gtm;    /* gradientTransform applied to the resolved coordinates */
     HpeRasterStop stops[SVG_MAX_STOPS];
     int stop_count;
 } SvgGrad;
@@ -147,6 +148,8 @@ typedef struct SvgCtx {
     float stroke_opacity;
     HpeDomNode *root; /* the <svg> root, for defs/id lookup */
     int use_depth;
+    int clip_mode;    /* painting clip geometry: force opaque fill, no stroke */
+    int marker_depth; /* guard against recursive marker content */
     float *cov_scratch; /* reusable per-row coverage buffer */
     int cov_cap;
 } SvgCtx;
@@ -191,6 +194,21 @@ static void blend_px(HpePixmap *pm, int x, int y, HpeColor c, float cov)
     sr = (float)c.r;
     sg = (float)c.g;
     sb = (float)c.b;
+    if (pm->alpha_record) {
+        /* offscreen group: keep the accumulated coverage in the alpha byte so
+         * the compositor can weight the whole group by clip/mask factors */
+        float da = (float)((d >> 24) & 0xFF) / 255.0f;
+        float oa = a + da * ia;
+        int r, g, b;
+        if (oa <= 0.0f)
+            return;
+        r = (int)((sr * a + dr * da * ia) / oa + 0.5f);
+        g = (int)((sg * a + dg * da * ia) / oa + 0.5f);
+        b = (int)((sb * a + db * da * ia) / oa + 0.5f);
+        *dst = (uint32_t)(oa * 255.0f + 0.5f) << 24 | (uint32_t)r << 16 |
+               (uint32_t)g << 8 | (uint32_t)b;
+        return;
+    }
     {
         int r = (int)(sr * a + dr * ia + 0.5f);
         int g = (int)(sg * a + dg * ia + 0.5f);
@@ -765,6 +783,15 @@ static void ctx_apply_style(SvgCtx *ctx, HpeDomNode *n)
         ctx->fill_opacity = f;
     if (attr_num(n, "stroke-opacity", &f))
         ctx->stroke_opacity = f;
+    if (ctx->clip_mode) {
+        /* clip geometry only cares about the filled silhouette: paint every
+         * shape opaque white and drop the stroke entirely */
+        ctx->fill = hpe_rgb(255, 255, 255);
+        ctx->has_fill = 1;
+        ctx->fill_opacity = 1.0f;
+        ctx->has_stroke = 0;
+        ctx->stroke_opacity = 1.0f;
+    }
 }
 
 /* ---------------- transform parsing ---------------- */
@@ -1076,6 +1103,10 @@ static int parse_gradient(HpeDomNode *n, SvgGrad *g)
     }
     units = attr(n, "gradientUnits");
     g->units = (units && !strcmp(units, "userSpaceOnUse")) ? 1 : 0;
+    {
+        const char *gt = attr(n, "gradientTransform");
+        g->gtm = gt ? parse_transform(gt) : mat_identity();
+    }
     parse_gradient_geometry(n, g);
     for (c = n->first_child; c; c = c->next_sibling) {
         if (c->type != HPE_NODE_ELEMENT || strcmp(c->tag, "stop"))
@@ -1103,6 +1134,54 @@ static int parse_gradient(HpeDomNode *n, SvgGrad *g)
  *
  * @note objectBoundingBox 单位下把分数坐标映射到形状的用户包围盒 / For objectBoundingBox units the fractional coordinates are mapped onto the shape's user bbox
  */
+/**
+ * @brief 把 gradientTransform 应用到渐变的原始坐标 / Apply gradientTransform to a gradient's raw coordinates
+ *
+ * @param[in,out] out 渐变描述，坐标被就地变换 / Gradient description, transformed in place
+ *
+ * @return gtm 非恒等时返回 1，否则 0 / 1 when the gtm is not the identity, else 0
+ *
+ * @note 线性端点按点变换；径向圆心平移、半径按名义缩放系数缩放 / Linear endpoints transform as points; a radial centre moves and its radius scales with the nominal scale
+ */
+static int grad_apply_gtm(SvgGrad *out)
+{
+    if (out->gtm.a == 1.0f && out->gtm.b == 0.0f && out->gtm.c == 0.0f &&
+        out->gtm.d == 1.0f)
+        return 0;
+    if (out->kind == 1) {
+        mat_apply(out->gtm, out->x1, out->y1, &out->x1, &out->y1);
+        mat_apply(out->gtm, out->x2, out->y2, &out->x2, &out->y2);
+    } else {
+        mat_apply(out->gtm, out->cx, out->cy, &out->cx, &out->cy);
+        out->r *= mat_scale(out->gtm);
+    }
+    return 1;
+}
+
+/**
+ * @brief 把 objectBoundingBox 分数坐标映射到形状用户包围盒 / Map objectBoundingBox fractional coordinates onto the shape's user bbox
+ *
+ * @param[in,out] out 渐变描述，坐标被就地映射 / Gradient description, mapped in place
+ * @param[in]     ux0 形状用户空间包围盒左 / Shape user-space bbox left
+ * @param[in]     uy0 形状用户空间包围盒上 / Shape user-space bbox top
+ * @param[in]     ux1 形状用户空间包围盒右 / Shape user-space bbox right
+ * @param[in]     uy1 形状用户空间包围盒下 / Shape user-space bbox bottom
+ */
+static void grad_map_bbox(SvgGrad *out, float ux0, float uy0, float ux1, float uy1)
+{
+    float bw = ux1 - ux0, bh = uy1 - uy0;
+    if (out->kind == 1) {
+        out->x1 = ux0 + out->x1 * bw;
+        out->y1 = uy0 + out->y1 * bh;
+        out->x2 = ux0 + out->x2 * bw;
+        out->y2 = uy0 + out->y2 * bh;
+    } else {
+        out->cx = ux0 + out->cx * bw;
+        out->cy = uy0 + out->cy * bh;
+        out->r = out->r * ((bw + bh) * 0.5f);
+    }
+}
+
 static int resolve_gradient(SvgCtx *ctx, HpeDomNode *n, const char *which, SvgGrad *out,
                             float ux0, float uy0, float ux1, float uy1)
 {
@@ -1129,20 +1208,14 @@ static int resolve_gradient(SvgCtx *ctx, HpeDomNode *n, const char *which, SvgGr
         return 0;
     if (!parse_gradient(def, out))
         return 0;
+    /* gradientTransform maps the gradient coordinate system to the target
+     * one: for objectBoundingBox units it acts on fractional coordinates
+     * BEFORE the bounding-box mapping, per the SVG transform composition
+     * order. */
+    grad_apply_gtm(out);
     /* objectBoundingBox: map fractional coordinates onto the shape's user bbox */
-    if (out->units == 0) {
-        float bw = ux1 - ux0, bh = uy1 - uy0;
-        if (out->kind == 1) {
-            out->x1 = ux0 + out->x1 * bw;
-            out->y1 = uy0 + out->y1 * bh;
-            out->x2 = ux0 + out->x2 * bw;
-            out->y2 = uy0 + out->y2 * bh;
-        } else {
-            out->cx = ux0 + out->cx * bw;
-            out->cy = uy0 + out->cy * bh;
-            out->r = out->r * ((bw + bh) * 0.5f);
-        }
-    }
+    if (out->units == 0)
+        grad_map_bbox(out, ux0, uy0, ux1, uy1);
     return 1;
 }
 
@@ -1759,36 +1832,6 @@ static void build_path(Polys *p, SvgCtx *ctx, const char *d)
     }
 }
 
-/**
- * @brief 收集元素子树内的文本 / Collect the text inside an element's subtree
- *
- * @param[in]     n 元素 / Element
- * @param[out]    buf 接收文本的缓冲区 / Buffer receiving the text
- * @param[in]     cap 缓冲区容量 / Buffer capacity
- * @param[in,out] len 已写入长度，被累加 / Length written so far, accumulated
- *
- * @note 跳过 title/desc 子元素；缓冲区满时不再追加 / Skips `title`/`desc` children; stops appending when the buffer is full
- */
-
-static void collect_text(HpeDomNode *n, char *buf, size_t cap, size_t *len)
-{
-    HpeDomNode *c;
-    for (c = n->first_child; c; c = c->next_sibling) {
-        if (c->type == HPE_NODE_TEXT && c->text) {
-            size_t l = strlen(c->text);
-            if (*len + l + 1 < cap) {
-                memcpy(buf + *len, c->text, l);
-                *len += l;
-                buf[*len] = '\0';
-            }
-        } else if (c->type == HPE_NODE_ELEMENT) {
-            if (!strcmp(c->tag, "title") || !strcmp(c->tag, "desc"))
-                continue;
-            collect_text(c, buf, cap, len);
-        }
-    }
-}
-
 /* resolved text-drawing attributes for one <text> element */
 typedef struct {
     char buf[1024];
@@ -1798,30 +1841,72 @@ typedef struct {
     HpeColor color;
     int align;    /* 0 start, 1 middle, 2 end */
     int baseline; /* 0 none, 1 middle, 2 hanging, 3 after-edge */
+    int adjust;   /* 0 spacing, 1 spacingAndGlyphs */
+    float rot[64]; /* per-glyph rotation in degrees */
+    int rot_count;
 } TextDraw;
 
 /**
- * @brief 读取 `<text>` 的文本与锚点属性 / Read a `<text>` element's text and anchor attributes
+ * @brief 填充文本属性的默认值 / Fill the text attribute defaults
  *
- * @param[in]     n `<text>` 元素 / The `<text>` element
- * @param[in]     ctx SVG 上下文 / SVG context
+ * @param[out] dt 文本绘制参数 / Text draw parameters
+ *
+ * @note 无 `font-size`/`x`/`y` 等属性时此前读到的是未初始化栈值，这里显式给默认 / Missing attributes used to leave stack garbage behind; explicit defaults now
+ */
+static void text_fill_defaults(TextDraw *dt)
+{
+    memset(dt, 0, sizeof(*dt));
+    dt->size = 12.0f;
+    dt->weight = 400;
+    dt->color = hpe_rgb(0, 0, 0);
+}
+
+/**
+ * @brief 解析逐字形 `rotate` 角度列表 / Parse the per-glyph `rotate` angle list
+ *
+ * @param[in]     n 元素 / The element
+ * @param[in,out] dt 文本绘制参数 / Text draw parameters
+ *
+ * @note 空白/逗号分隔；超过 64 个字形的角度被丢弃 / Separated by spaces or commas; angles beyond 64 glyphs are dropped
+ */
+static void text_read_rotate(HpeDomNode *n, TextDraw *dt)
+{
+    const char *v = attr(n, "rotate");
+    if (!v)
+        return;
+    while (*v && dt->rot_count < 64) {
+        char *end = NULL;
+        double a;
+        while (*v == ' ' || *v == ',' || *v == '\t' || *v == '\n')
+            v++;
+        if (!*v)
+            break;
+        a = strtod(v, &end);
+        if (end == v)
+            break;
+        dt->rot[dt->rot_count++] = (float)a;
+        v = end;
+    }
+}
+
+/**
+ * @brief 读取 `<text>` 的样式与定位属性（不收集文本）/ Read a text element's style and positioning attributes (no text collection)
+ *
+ * @param[in]     n 元素 / The element
  * @param[out]    dt 文本绘制参数 / Text draw parameters
  *
- * @return 有文本返回 1，否则 0 / 1 when there is text, else 0
- *
- * @note 解析 x/y/font-size/textLength/font-weight/fill 与 text-anchor、dominant-baseline / Parses x/y/font-size/textLength/font-weight/fill plus text-anchor and dominant-baseline
+ * @note 解析 x/y/font-size/textLength/lengthAdjust/font-weight/fill/text-anchor/
+ *       dominant-baseline/rotate；文本由调用方按段收集 / Parses x/y/font-size/
+ *       textLength/lengthAdjust/font-weight/fill/text-anchor/dominant-baseline/rotate;
+ *       the caller collects text per segment
  */
-static int draw_text_read_attrs(HpeDomNode *n, SvgCtx *ctx, TextDraw *dt)
+static void text_read_attrs(HpeDomNode *n, TextDraw *dt)
 {
-    const char *anchor, *baseline;
+    const char *anchor, *baseline, *adjust;
     float fw;
     HpeColor c;
 
-    dt->buf[0] = '\0';
-    dt->len = 0;
-    collect_text(n, dt->buf, sizeof(dt->buf), &dt->len);
-    if (dt->len == 0)
-        return 0;
+    text_fill_defaults(dt);
     attr_num(n, "x", &dt->x);
     attr_num(n, "y", &dt->y);
     attr_num(n, "font-size", &dt->size);
@@ -1830,6 +1915,9 @@ static int draw_text_read_attrs(HpeDomNode *n, SvgCtx *ctx, TextDraw *dt)
         dt->weight = (int)fw;
     if (attr_color(n, "fill", &c))
         dt->color = c;
+    text_read_rotate(n, dt);
+    adjust = attr(n, "lengthAdjust");
+    dt->adjust = (adjust && !strcmp(adjust, "spacingAndGlyphs")) ? 1 : 0;
 
     anchor = attr(n, "text-anchor");
     dt->align = 0;
@@ -1850,7 +1938,125 @@ static int draw_text_read_attrs(HpeDomNode *n, SvgCtx *ctx, TextDraw *dt)
         else if (!strcmp(baseline, "text-after-edge"))
             dt->baseline = 3;
     }
-    return 1;
+}
+
+/* ---------------- glyph mask transforms ----------------
+ * hpe_font_mask() returns cached masks, so any transformed variant is resampled
+ * into shared scratch memory (valid until the next transform call). */
+
+static unsigned char *gt_scratch;
+static size_t gt_cap;
+static HpeTextMask gt_view;
+
+/**
+ * @brief 确保变换掩码的暂存缓冲足以容纳 `w`x`h` / Ensure the mask scratch fits a `w`x`h` view
+ *
+ * @param[in] w 目标宽 / Target width
+ * @param[in] h 目标高 / Target height
+ *
+ * @return 覆盖暂存缓冲的掩码视图；分配失败返回 NULL / A mask view over the scratch buffer, or NULL on allocation failure
+ */
+static HpeTextMask *gt_reserve(int w, int h)
+{
+    size_t need = (size_t)w * (size_t)h;
+    if (need > gt_cap) {
+        unsigned char *n = (unsigned char *)realloc(gt_scratch, need);
+        if (!n)
+            return NULL;
+        gt_scratch = n;
+        gt_cap = need;
+    }
+    gt_view.coverage = gt_scratch;
+    gt_view.width = w;
+    gt_view.height = h;
+    return &gt_view;
+}
+
+/**
+ * @brief 水平重采样一个覆盖率掩码 / Horizontally resample a coverage mask
+ *
+ * @param[in] src 源掩码（缓存的，不可修改）/ Source mask (cached, must not change)
+ * @param[in] ratio 水平缩放比 / Horizontal scale ratio
+ *
+ * @return 变换后的掩码视图；内存不足返回 NULL / The transformed mask view, or NULL when out of memory
+ *
+ * @note 最近邻采样，基线保持不变 / Nearest sampling, baseline unchanged
+ */
+static const HpeTextMask *mask_hstretch(const HpeTextMask *src, float ratio)
+{
+    HpeTextMask *out;
+    int nw = (int)(src->width * ratio + 0.5f);
+    int x, y;
+    if (nw < 1)
+        nw = 1;
+    out = gt_reserve(nw, src->height);
+    if (!out)
+        return NULL;
+    out->baseline = src->baseline;
+    for (y = 0; y < src->height; y++) {
+        for (x = 0; x < nw; x++) {
+            int sx = (int)((float)x / ratio);
+            if (sx >= src->width)
+                sx = src->width - 1;
+            out->coverage[y * nw + x] = src->coverage[y * src->width + sx];
+        }
+    }
+    return out;
+}
+
+/**
+ * @brief 绕基线笔点旋转一个覆盖率掩码 / Rotate a coverage mask around its baseline pen point
+ *
+ * @param[in] src 源掩码（缓存的，不可修改）/ Source mask (cached, must not change)
+ * @param[in] deg 旋转角（度，顺时针为正）/ Rotation angle (degrees, clockwise positive)
+ *
+ * @return 变换后的掩码视图；内存不足返回 NULL / The transformed mask view, or NULL when out of memory
+ *
+ * @note 输出包围盒由四角旋转后的范围决定；输出的 `baseline` 行即笔点所在行 /
+ *       The output bounding box spans the rotated corners; the output `baseline`
+ *       row is where the pen point landed
+ */
+static const HpeTextMask *mask_rotate(const HpeTextMask *src, float deg)
+{
+    float rad = deg * 3.14159265f / 180.0f;
+    float cs = cosf(rad), sn = sinf(rad);
+    float vx[4] = {0.0f, (float)src->width, 0.0f, (float)src->width};
+    float vy[4] = {-(float)src->baseline, -(float)src->baseline,
+                   (float)(src->height - src->baseline),
+                   (float)(src->height - src->baseline)};
+    float minx = 0.0f, miny = 0.0f, maxx = 0.0f, maxy = 0.0f;
+    HpeTextMask *out;
+    int i, x, y;
+    for (i = 0; i < 4; i++) {
+        float rx = vx[i] * cs - vy[i] * sn;
+        float ry = vx[i] * sn + vy[i] * cs;
+        if (i == 0 || rx < minx)
+            minx = rx;
+        if (i == 0 || rx > maxx)
+            maxx = rx;
+        if (i == 0 || ry < miny)
+            miny = ry;
+        if (i == 0 || ry > maxy)
+            maxy = ry;
+    }
+    out = gt_reserve((int)ceilf(maxx - minx) + 1, (int)ceilf(maxy - miny) + 1);
+    if (!out)
+        return NULL;
+    out->baseline = (int)ceilf(-miny);
+    for (y = 0; y < out->height; y++) {
+        for (x = 0; x < out->width; x++) {
+            float dx = (float)x + 0.5f - (-minx);
+            float dy = (float)y + 0.5f - (-miny);
+            float sx = floorf(dx * cs + dy * sn);
+            float sy = floorf(-dx * sn + dy * cs);
+            int ix = (int)sx, iy = src->baseline + (int)sy;
+            out->coverage[y * out->width + x] =
+                (ix >= 0 && ix < src->width && iy >= 0 && iy < src->height)
+                    ? src->coverage[iy * src->width + ix]
+                    : 0;
+        }
+    }
+    return out;
 }
 
 /**
@@ -1893,52 +2099,186 @@ static void draw_text_stretched(SvgCtx *ctx, HpeFont *font, const char *buf, int
 }
 
 /**
- * @brief 绘制一个 `<text>` 元素 / Draw a `<text>` element
+ * @brief `lengthAdjust="spacingAndGlyphs"`：整段掩码水平拉伸到 textLength / `lengthAdjust="spacingAndGlyphs"`: stretch the whole run mask to textLength
+ */
+static void draw_text_stretched_mask(SvgCtx *ctx, HpeFont *font, const char *buf, int len,
+                                     float dev_x, float dev_y, float w_dev, const TextDraw *dt,
+                                     float scale)
+{
+    const HpeTextMask *mask = hpe_font_mask(font, buf, len);
+    float target = dt->text_len * (scale > 0.0f ? scale : 1.0f);
+    float ratio = w_dev > 1.0f ? target / w_dev : 1.0f;
+    if (!mask)
+        return;
+    if (ratio > 0.0f && ratio != 1.0f)
+        mask = mask_hstretch(mask, ratio);
+    if (mask)
+        hpe_draw_text_mask(ctx->pm, (int)floorf(dev_x), (int)floorf(dev_y), mask, dt->color);
+}
+
+/**
+ * @brief 逐字形绘制并应用 `rotate` 角度 / Draw glyph by glyph applying the `rotate` angles
+ *
+ * @param[in]     ctx SVG 上下文 / SVG context
+ * @param[in]     font 字体 / Font
+ * @param[in]     buf 文本缓冲区 / Text buffer
+ * @param[in]     len 文本字节长度 / Text byte length
+ * @param[in]     dev_x 设备起点 X / Device start X
+ * @param[in]     dev_y 设备基线 Y / Device baseline Y
+ * @param[in]     dt 文本绘制参数 / Text draw parameters
+ * @param[in]     adv_ratio 步进缩放比（textLength）/ Advance scale ratio (textLength)
+ *
+ * @note 角度多于字形时多余值被忽略，少于时余下字形不旋转；掩码绕各自基线笔点旋转 /
+ *       Extra angles are ignored and glyphs without one stay upright; each mask is
+ *       rotated around its own baseline pen point
+ */
+static void draw_text_glyphs_rot(SvgCtx *ctx, HpeFont *font, const char *buf, int len,
+                                 float dev_x, float dev_y, const TextDraw *dt, float adv_ratio)
+{
+    const char *p = buf;
+    float pen = dev_x;
+    int gi = 0;
+    while ((int)(p - buf) < len && *p) {
+        uint32_t cp = 0;
+        int adv = hpe_utf8_next(p, &cp);
+        const HpeTextMask *mask;
+        float ang;
+        if (adv <= 0)
+            break;
+        mask = hpe_font_mask(font, p, adv);
+        ang = gi < dt->rot_count ? dt->rot[gi] : 0.0f;
+        if (mask && ang != 0.0f)
+            mask = mask_rotate(mask, ang);
+        if (mask)
+            hpe_draw_text_mask(ctx->pm, (int)floorf(pen), (int)floorf(dev_y), mask, dt->color);
+        pen += hpe_font_advance(font, cp) * adv_ratio;
+        p += adv;
+        gi++;
+    }
+}
+
+/**
+ * @brief 在用户空间位置绘制一段文本，返回用户空间步进宽 / Draw one text segment at a user-space position; returns the user-space advance
+ *
+ * @param[in]     ctx SVG 上下文 / SVG context
+ * @param[in]     dt 文本绘制参数 / Text draw parameters
+ * @param[in]     buf 段文本 / Segment text
+ * @param[in]     len 段字节长 / Segment byte length
+ * @param[in]     ux 用户空间起点 X / User-space origin X
+ * @param[in]     uy 用户空间基线 Y / User-space baseline Y
+ *
+ * @return 用户空间步进宽度 / The user-space advance width
+ *
+ * @note 路径：逐字形 rotate → textLength（spacing 拉伸步进 / spacingAndGlyphs 拉伸掩码）→ 整段掩码 / Path: per-glyph rotate, then textLength (spacing stretches advances, spacingAndGlyphs stretches the mask), then a plain mask
+ */
+static float draw_text_run(SvgCtx *ctx, const TextDraw *dt, const char *buf, size_t len,
+                           float ux, float uy)
+{
+    float scale = mat_scale(ctx->ctm);
+    HpeFont *font = hpe_font_get(dt->size * scale, dt->weight, HPE_FONT_SANS);
+    float w_dev, dev_x, dev_y;
+    if (!font || !len || !buf[0])
+        return 0.0f;
+    w_dev = hpe_font_measure(font, buf, (int)len);
+    mat_apply(ctx->ctm, ux, uy, &dev_x, &dev_y);
+    if (dt->align == 1)
+        dev_x -= w_dev * 0.5f;
+    else if (dt->align == 2)
+        dev_x -= w_dev;
+    if (dt->baseline == 1)
+        dev_y += hpe_font_ascent(font) * 0.5f - hpe_font_descent(font) * 0.25f;
+    else if (dt->baseline == 2)
+        dev_y += hpe_font_ascent(font);
+    else if (dt->baseline == 3)
+        dev_y -= hpe_font_descent(font);
+
+    if (dt->rot_count > 0) {
+        float adv_ratio = dt->text_len > 0.0f ? dt->text_len * scale / w_dev : 1.0f;
+        draw_text_glyphs_rot(ctx, font, buf, (int)len, dev_x, dev_y, dt, adv_ratio);
+        return w_dev / scale;
+    }
+    if (dt->text_len > 0.0f && (int)len > 1) {
+        if (dt->adjust == 1)
+            draw_text_stretched_mask(ctx, font, buf, (int)len, dev_x, dev_y, w_dev, dt, scale);
+        else
+            draw_text_stretched(ctx, font, buf, (int)len, dev_x, dev_y, w_dev, dt->text_len,
+                                scale, dt->color);
+        return w_dev / scale;
+    }
+    {
+        const HpeTextMask *mask = hpe_font_mask(font, buf, (int)len);
+        if (mask)
+            hpe_draw_text_mask(ctx->pm, (int)floorf(dev_x), (int)floorf(dev_y), mask, dt->color);
+    }
+    return w_dev / scale;
+}
+
+/**
+ * @brief 把一个文本节点的字节追加到段缓冲 / Append a text node's bytes to the segment buffer
+ */
+static void seg_append(char *seg, size_t cap, size_t *len, const char *text)
+{
+    size_t l = strlen(text);
+    if (*len + l + 1 < cap) {
+        memcpy(seg + *len, text, l);
+        *len += l;
+        seg[*len] = '\0';
+    }
+}
+
+/**
+ * @brief 绘制一个 `<text>` 元素（含 `<tspan>` 子段）/ Draw a `<text>` element (including `<tspan>` sub-segments)
  *
  * @param[in]     ctx SVG 上下文 / SVG context
  * @param[in]     n `<text>` 元素 / The `<text>` element
  *
- * @note 锚点与基线关键字修正绘制起点；给出 textLength 且多字符时走拉伸绘制 / Anchor and baseline keywords adjust the origin; a `textLength` with more than one character goes through the stretched path
+ * @note 直接文本节点在当前笔位绘制；每个 `<tspan>` 可用 x/y 绝对重定位、dx/dy
+ *       相对偏移，并可覆盖 textLength/rotate；段后笔位按该段步进前进 / Direct
+ *       text nodes draw at the current pen; each `<tspan>` may absolutely
+ *       reposition via x/y or relatively via dx/dy and override textLength/rotate;
+ *       the pen advances by each segment's measured width
  */
 static void draw_text(SvgCtx *ctx, HpeDomNode *n)
 {
     TextDraw dt;
-    HpeFont *font;
-    float w, dev_x, dev_y, font_dev;
-    float scale = mat_scale(ctx->ctm);
+    HpeDomNode *c;
+    char seg[1024];
+    size_t seg_len = 0;
+    float pen_x, pen_y;
 
-    if (!draw_text_read_attrs(n, ctx, &dt))
-        return;
-    font_dev = dt.size * scale;
-    font = hpe_font_get(font_dev, dt.weight, HPE_FONT_SANS);
-    if (!font)
-        return;
-    w = hpe_font_measure(font, dt.buf, (int)dt.len);
-    mat_apply(ctx->ctm, dt.x, dt.y, &dev_x, &dev_y);
-
-    if (dt.align == 1)
-        dev_x -= w * 0.5f;
-    else if (dt.align == 2)
-        dev_x -= w;
-
-    if (dt.baseline == 1)
-        dev_y += hpe_font_ascent(font) * 0.5f - hpe_font_descent(font) * 0.25f;
-    else if (dt.baseline == 2)
-        dev_y += hpe_font_ascent(font);
-    else if (dt.baseline == 3)
-        dev_y -= hpe_font_descent(font);
-
-    if (dt.text_len > 0.0f && dt.len > 1) {
-        draw_text_stretched(ctx, font, dt.buf, (int)dt.len, dev_x, dev_y, w, dt.text_len, scale,
-                            dt.color);
-        return;
+    text_read_attrs(n, &dt);
+    pen_x = dt.x;
+    pen_y = dt.y;
+    for (c = n->first_child; c; c = c->next_sibling) {
+        if (c->type == HPE_NODE_TEXT && c->text) {
+            seg_append(seg, sizeof(seg), &seg_len, c->text);
+        } else if (c->type == HPE_NODE_ELEMENT && !strcmp(c->tag, "tspan")) {
+            float v;
+            if (seg_len) {
+                pen_x += draw_text_run(ctx, &dt, seg, seg_len, pen_x, pen_y);
+                seg_len = 0;
+            }
+            if (attr_num(c, "x", &v))
+                pen_x = v;
+            if (attr_num(c, "y", &v))
+                pen_y = v;
+            if (attr_num(c, "dx", &v))
+                pen_x += v;
+            if (attr_num(c, "dy", &v))
+                pen_y += v;
+            if (attr_num(c, "textLength", &v))
+                dt.text_len = v;
+            text_read_rotate(c, &dt);
+            {
+                HpeDomNode *t;
+                for (t = c->first_child; t; t = t->next_sibling)
+                    if (t->type == HPE_NODE_TEXT && t->text)
+                        seg_append(seg, sizeof(seg), &seg_len, t->text);
+            }
+        }
     }
-
-    {
-        const HpeTextMask *mask = hpe_font_mask(font, dt.buf, (int)dt.len);
-        if (mask)
-            hpe_draw_text_mask(ctx->pm, (int)floorf(dev_x), (int)floorf(dev_y), mask, dt.color);
-    }
+    if (seg_len)
+        draw_text_run(ctx, &dt, seg, seg_len, pen_x, pen_y);
 }
 
 /**
@@ -2323,6 +2663,540 @@ static int svg_is_metadata_tag(const char *tag)
            !strcmp(tag, "stop");
 }
 
+/* ---------------- clip-path / mask / filter / marker ---------------- */
+
+static void svg_element_dispatch(SvgCtx *ctx, HpeDomNode *n, Mat ctm);
+
+/* an offscreen group drawn for an element carrying clip-path/mask/filter */
+typedef struct {
+    HpePixmap pm;       /* offscreen RGBA buffer, alpha records coverage */
+    HpePixmap *saved;   /* the render target the group composites back onto */
+    int x0, y0;         /* device coords of the offscreen origin */
+    int w, h;
+} SvgGroup;
+
+/**
+ * @brief 解析 `url(#id)` 引用并校验目标标签 / Resolve a `url(#id)` reference and check the target tag
+ *
+ * @param[in] ctx SVG 上下文 / SVG context
+ * @param[in] v 属性值，形如 `url(#id)` / Attribute value such as `url(#id)`
+ * @param[in] tag 期望的 defs 元素标签 / Expected defs element tag
+ *
+ * @return 匹配的 defs 元素，失败返回 `NULL` / The matched defs element, or `NULL`
+ */
+static HpeDomNode *svg_ref_target(SvgCtx *ctx, const char *v, const char *tag)
+{
+    char id[128];
+    HpeDomNode *def;
+    const char *hash;
+    size_t len = 0;
+    if (!v || strncmp(v, "url(", 4) != 0)
+        return NULL;
+    hash = strchr(v, '#');
+    if (!hash)
+        return NULL;
+    hash++;
+    while (hash[len] && hash[len] != ')' && len < sizeof(id) - 1) {
+        id[len] = hash[len];
+        len++;
+    }
+    id[len] = '\0';
+    def = find_by_id(ctx->root, id);
+    /* the HTML parser lowercases tags: compare case-insensitively so mixed-case
+     * defs elements like clipPath resolve to their lowercased DOM tag */
+    return (def && def->tag && hpe_str_ieq(def->tag, tag)) ? def : NULL;
+}
+
+/**
+ * @brief 判断元素是否携带 clip-path/mask/filter 引用 / Test whether an element carries clip-path, mask or filter references
+ *
+ * @param[in] n DOM 元素 / DOM element
+ *
+ * @return 任一属性为 `url(...)` 引用时返回 1 / 1 when any of the attributes is a `url(...)` reference
+ */
+static int svg_has_paint_effects(HpeDomNode *n)
+{
+    const char *v = attr(n, "clip-path");
+    if (v && !strncmp(v, "url(", 4))
+        return 1;
+    v = attr(n, "mask");
+    if (v && !strncmp(v, "url(", 4))
+        return 1;
+    v = attr(n, "filter");
+    return v && !strncmp(v, "url(", 4);
+}
+
+/**
+ * @brief 把元素绘制切换到覆盖当前裁剪区的离屏组 / Switch element drawing to an offscreen group covering the active clip region
+ *
+ * @param[in,out] ctx SVG 上下文，`pm` 与 `ctm` 被改写 / SVG context, `pm` and `ctm` are rewritten
+ * @param[out]    g 离屏组描述 / Offscreen group descriptor
+ *
+ * @return 成功开启返回 1 / 1 on success
+ *
+ * @note 离屏缓冲开启 alpha 记录；ctm 平移分量减去离屏原点，使用户坐标落在组内 / The offscreen buffer records alpha; the ctm translation is shifted so user coords land inside the group
+ */
+static int svg_group_begin(SvgCtx *ctx, SvgGroup *g)
+{
+    int w = ctx->pm->clip_x1 - ctx->pm->clip_x0;
+    int h = ctx->pm->clip_y1 - ctx->pm->clip_y0;
+    memset(g, 0, sizeof(*g));
+    if (w <= 0 || h <= 0 || !ctx->pm->pixels)
+        return 0;
+    hpe_pixmap_init(&g->pm, w, h);
+    if (!g->pm.pixels)
+        return 0;
+    g->pm.alpha_record = 1;
+    g->saved = ctx->pm;
+    g->x0 = ctx->pm->clip_x0;
+    g->y0 = ctx->pm->clip_y0;
+    g->w = w;
+    g->h = h;
+    ctx->pm = &g->pm;
+    ctx->ctm.e -= (float)g->x0;
+    ctx->ctm.f -= (float)g->y0;
+    return 1;
+}
+
+/**
+ * @brief 渲染 clipPath/mask 内容为每像素系数并乘入系数缓冲 / Render clipPath or mask content into a per-pixel factor buffer
+ *
+ * @param[in] ctx SVG 上下文（ctm 已按离屏原点平移）/ SVG context (ctm already shifted by the offscreen origin)
+ * @param[in] g 离屏组描述 / Offscreen group descriptor
+ * @param[in] def `<clipPath>` 或 `<mask>` 元素 / The `<clipPath>` or `<mask>` element
+ * @param[in,out] fact 系数缓冲，逐像素相乘 / Factor buffer, multiplied per pixel
+ * @param[in] luminance 1=亮度掩码，0=剪裁形状 / 1 for a luminance mask, 0 for clip geometry
+ */
+static void svg_render_factor(SvgCtx *ctx, const SvgGroup *g, HpeDomNode *def,
+                              uint8_t *fact, int luminance)
+{
+    HpePixmap cov;
+    SvgCtx c2 = *ctx;
+    int i, n = g->w * g->h;
+    hpe_pixmap_init(&cov, g->w, g->h);
+    cov.alpha_record = 1;
+    c2.pm = &cov;
+    if (!luminance)
+        c2.clip_mode = 1;
+    ctx_apply_style(&c2, def);
+    draw_children(&c2, def, c2.ctm);
+    for (i = 0; i < n; i++) {
+        uint32_t s = cov.pixels[i];
+        float al = (float)(s >> 24) / 255.0f;
+        float f;
+        if (luminance) {
+            float lum = 0.299f * (float)((s >> 16) & 0xFF) +
+                        0.587f * (float)((s >> 8) & 0xFF) +
+                        0.114f * (float)(s & 0xFF);
+            f = lum / 255.0f * al;
+        } else {
+            f = al;
+        }
+        fact[i] = (uint8_t)((float)fact[i] * f + 0.5f);
+    }
+    hpe_pixmap_free(&cov);
+}
+
+/**
+ * @brief 汇总元素的 clip-path/mask 系数缓冲 / Build the combined clip-path and mask factor buffer of an element
+ *
+ * @param[in] ctx SVG 上下文 / SVG context
+ * @param[in] g 离屏组描述 / Offscreen group descriptor
+ * @param[in] n 携带效果的元素 / The element carrying the effects
+ *
+ * @return 系数缓冲（长度 w*h，0=完全透明），无效果时返回 `NULL` / The factor buffer (w*h entries, 0 = fully transparent), or `NULL` without effects
+ */
+static uint8_t *svg_group_factor(SvgCtx *ctx, const SvgGroup *g, HpeDomNode *n)
+{
+    HpeDomNode *clip = svg_ref_target(ctx, attr(n, "clip-path"), "clipPath");
+    HpeDomNode *mask = svg_ref_target(ctx, attr(n, "mask"), "mask");
+    uint8_t *fact;
+    if (!clip && !mask)
+        return NULL;
+    fact = (uint8_t *)hpe_calloc((size_t)g->w * (size_t)g->h, 1);
+    if (!fact)
+        return NULL;
+    /* seed to 255 and multiply: shapes outside the clip/mask contribute a
+     * zero coverage themselves, so the absent areas still end up at 0 */
+    memset(fact, 0xFF, (size_t)g->w * (size_t)g->h);
+    if (clip)
+        svg_render_factor(ctx, g, clip, fact, 0);
+    if (mask)
+        svg_render_factor(ctx, g, mask, fact, 1);
+    return fact;
+}
+
+/**
+ * @brief 单方向滑动窗口盒式模糊 / One-direction sliding-window box blur
+ *
+ * @param[in] p 平面数据 / Plane data
+ * @param[out] tmp 与平面等大的暂存 / Scratch the same size as the plane
+ * @param[in] w 平面宽 / Plane width
+ * @param[in] h 平面高 / Plane height
+ * @param[in] r 窗口半径 / Window radius
+ * @param[in] along_x 1=按行模糊，0=按列模糊 / 1 to blur along rows, 0 along columns
+ */
+static void box_blur_dir(float *p, float *tmp, int w, int h, int r, int along_x)
+{
+    int outer = along_x ? h : w;
+    int len = along_x ? w : h;
+    int st = along_x ? 1 : w;
+    int lo = along_x ? w : 1;
+    int i, j;
+    for (i = 0; i < outer; i++) {
+        const float *src = p + i * lo;
+        float *dst = tmp + i * lo;
+        float sum = 0.0f;
+        for (j = -r; j <= r; j++) {
+            int idx = j < 0 ? 0 : (j >= len ? len - 1 : j);
+            sum += src[idx * st];
+        }
+        for (j = 0; j < len; j++) {
+            int add = j + r + 1 < len ? j + r + 1 : len - 1;
+            int rem = j - r > 0 ? j - r : 0;
+            dst[j * st] = sum / (float)(2 * r + 1);
+            sum += src[add * st] - src[rem * st];
+        }
+    }
+    memcpy(p, tmp, (size_t)w * (size_t)h * sizeof(float));
+}
+
+/**
+ * @brief 对单个颜色平面做三次盒式模糊近似高斯 / Apply three box-blur passes approximating a gaussian on one plane
+ *
+ * @param[in,out] plane 平面数据，就地修改 / Plane data, modified in place
+ * @param[out] tmp 暂存缓冲 / Scratch buffer
+ * @param[in] w 平面宽 / Plane width
+ * @param[in] h 平面高 / Plane height
+ * @param[in] rx 水平盒半径 / Horizontal box radius
+ * @param[in] ry 垂直盒半径 / Vertical box radius
+ */
+static void box_blur_plane(float *plane, float *tmp, int w, int h, int rx, int ry)
+{
+    int it;
+    if (rx <= 0 && ry <= 0)
+        return;
+    for (it = 0; it < 3; it++) {
+        if (rx > 0)
+            box_blur_dir(plane, tmp, w, h, rx, 1);
+        if (ry > 0)
+            box_blur_dir(plane, tmp, w, h, ry, 0);
+    }
+}
+
+/**
+ * @brief 读取 `<filter>` 的高斯标准差与偏移 / Read the gaussian std deviation and offset of a `<filter>`
+ *
+ * @param[in] ctx SVG 上下文 / SVG context
+ * @param[in] n 携带 filter 属性的元素 / The element carrying the filter attribute
+ * @param[out] sx 水平标准差（设备像素）/ Horizontal std deviation in device pixels
+ * @param[out] sy 垂直标准差（设备像素）/ Vertical std deviation in device pixels
+ * @param[out] pdx 水平偏移（设备像素）/ Horizontal offset in device pixels
+ * @param[out] pdy 垂直偏移（设备像素）/ Vertical offset in device pixels
+ *
+ * @return 存在有效 filter 引用时返回 1 / 1 when a valid filter reference exists
+ *
+ * @note 子集：只支持 `feGaussianBlur` 与 `feOffset`，忽略其余图元与 filter region / Subset: only feGaussianBlur and feOffset are handled; other primitives and the filter region are ignored
+ */
+static int svg_filter_params(SvgCtx *ctx, HpeDomNode *n, float *sx, float *sy,
+                             int *pdx, int *pdy)
+{
+    HpeDomNode *f = svg_ref_target(ctx, attr(n, "filter"), "filter");
+    HpeDomNode *c;
+    float us = 0.0f, vs = 0.0f, dx = 0.0f, dy = 0.0f;
+    if (!f)
+        return 0;
+    for (c = f->first_child; c; c = c->next_sibling) {
+        const char *v;
+        if (c->type != HPE_NODE_ELEMENT)
+            continue;
+        if (hpe_str_ieq(c->tag, "feGaussianBlur")) {
+            v = attr(c, "stdDeviation");
+            if (v && sscanf(v, "%f %f", &us, &vs) >= 1) {
+                if (vs == 0.0f && !strchr(v, ' ') && !strchr(v, ','))
+                    vs = us;
+            }
+        } else if (hpe_str_ieq(c->tag, "feOffset")) {
+            attr_num(c, "dx", &dx);
+            attr_num(c, "dy", &dy);
+        }
+    }
+    {
+        float k = mat_scale(ctx->ctm);
+        *sx = us * k;
+        *sy = (vs > 0.0f ? vs : us) * k;
+        *pdx = (int)(dx * k);
+        *pdy = (int)(dy * k);
+    }
+    return us > 0.0f || dx != 0.0f || dy != 0.0f;
+}
+
+/**
+ * @brief 对离屏组做高斯模糊（预乘通道三盒模糊）/ Blur the offscreen group (three box passes on premultiplied channels)
+ *
+ * @param[in,out] pm 离屏像素缓冲 / Offscreen pixel buffer
+ * @param[in] sx 水平标准差（设备像素）/ Horizontal std deviation in device pixels
+ * @param[in] sy 垂直标准差（设备像素）/ Vertical std deviation in device pixels
+ */
+static void svg_filter_blur(HpePixmap *pm, float sx, float sy)
+{
+    int w = pm->width, h = pm->height, i;
+    size_t n = (size_t)w * (size_t)h;
+    float *ch = (float *)hpe_calloc(n * 4, sizeof(float));
+    float *tmp = (float *)hpe_calloc(n, sizeof(float));
+    int rx = sx > 0.0f ? (int)(sx * 1.732f + 0.5f) : 0;
+    int ry = sy > 0.0f ? (int)(sy * 1.732f + 0.5f) : 0;
+    if (!ch || !tmp) {
+        hpe_free(ch);
+        hpe_free(tmp);
+        return;
+    }
+    for (i = 0; i < w * h; i++) {
+        uint32_t s = pm->pixels[i];
+        /* premultiply by the RAW alpha (0..255) so the write-back division
+         * by the blurred alpha restores the straight colour exactly */
+        float a = (float)(s >> 24);
+        ch[i] = (float)((s >> 16) & 0xFF) * a;
+        ch[n + i] = (float)((s >> 8) & 0xFF) * a;
+        ch[2 * n + i] = (float)(s & 0xFF) * a;
+        ch[3 * n + i] = a;
+    }
+    box_blur_plane(ch, tmp, w, h, rx, ry);
+    box_blur_plane(ch + n, tmp, w, h, rx, ry);
+    box_blur_plane(ch + 2 * n, tmp, w, h, rx, ry);
+    box_blur_plane(ch + 3 * n, tmp, w, h, rx, ry);
+    for (i = 0; i < w * h; i++) {
+        float a = ch[3 * n + i];
+        uint32_t ao = (uint32_t)(a + 0.5f);
+        if (ao > 255u)
+            ao = 255u;
+        if (ao == 0u) {
+            pm->pixels[i] = 0;
+            continue;
+        }
+        {
+            uint32_t r = (uint32_t)(ch[i] / a + 0.5f);
+            uint32_t g = (uint32_t)(ch[n + i] / a + 0.5f);
+            uint32_t b = (uint32_t)(ch[2 * n + i] / a + 0.5f);
+            pm->pixels[i] = ao << 24 | (r > 255u ? 255u : r) << 16 |
+                            (g > 255u ? 255u : g) << 8 | (b > 255u ? 255u : b);
+        }
+    }
+    hpe_free(ch);
+    hpe_free(tmp);
+}
+
+/**
+ * @brief 把离屏组按系数与偏移合成回目标缓冲 / Composite the offscreen group back with factors and offset
+ *
+ * @param[in,out] ctx SVG 上下文，`pm` 已还原为目标缓冲 / SVG context, `pm` already restored to the target
+ * @param[in] g 离屏组描述 / Offscreen group descriptor
+ * @param[in] fact 每像素系数，可为 `NULL` / Per-pixel factors, may be `NULL`
+ * @param[in] odx 水平偏移（设备像素）/ Horizontal offset in device pixels
+ * @param[in] ody 垂直偏移（设备像素）/ Vertical offset in device pixels
+ *
+ * @note 目标按不透明处理：`out = src*m + dst*(1-m)`，m 为源 alpha 与系数的乘积 / The target is treated as opaque: out = src*m + dst*(1-m) with m the source alpha times the factor
+ */
+static void svg_group_composite(SvgCtx *ctx, const SvgGroup *g, const uint8_t *fact,
+                                int odx, int ody)
+{
+    HpePixmap *dst = ctx->pm;
+    int x, y;
+    for (y = 0; y < g->h; y++) {
+        int ty = g->y0 + y + ody;
+        if (ty < dst->clip_y0 || ty >= dst->clip_y1 || ty < 0 || ty >= dst->height)
+            continue;
+        for (x = 0; x < g->w; x++) {
+            int tx = g->x0 + x + odx;
+            uint32_t s = g->pm.pixels[y * g->w + x];
+            float sa = (float)(s >> 24) / 255.0f;
+            float f = fact ? (float)fact[y * g->w + x] / 255.0f : 1.0f;
+            float m = sa * f;
+            uint32_t d, r, gg, b;
+            if (m <= 0.002f)
+                continue;
+            if (tx < dst->clip_x0 || tx >= dst->clip_x1 || tx < 0 || tx >= dst->width)
+                continue;
+            d = dst->pixels[ty * dst->width + tx];
+            r = (uint32_t)((float)((s >> 16) & 0xFF) * m +
+                           (float)((d >> 16) & 0xFF) * (1.0f - m) + 0.5f);
+            gg = (uint32_t)((float)((s >> 8) & 0xFF) * m +
+                            (float)((d >> 8) & 0xFF) * (1.0f - m) + 0.5f);
+            b = (uint32_t)((float)(s & 0xFF) * m + (float)(d & 0xFF) * (1.0f - m) + 0.5f);
+            dst->pixels[ty * dst->width + tx] =
+                    0xFF000000u | (r > 255u ? 255u : r) << 16 |
+                    (gg > 255u ? 255u : gg) << 8 | (b > 255u ? 255u : b);
+        }
+    }
+}
+
+/**
+ * @brief 携带 clip-path/mask/filter 的元素的离屏绘制编排 / Offscreen orchestration for elements with clip-path/mask/filter
+ *
+ * @param[in,out] ctx SVG 上下文 / SVG context
+ * @param[in] n 元素 / The element
+ * @param[in] ctm 当前变换矩阵 / Current transformation matrix
+ *
+ * @note 先把元素整体画进离屏组，按需模糊，再乘以 clip/mask 系数合成回页面 / The element is drawn into an offscreen group, optionally blurred, then composited back weighted by the clip/mask factors
+ */
+static void svg_draw_with_effects(SvgCtx *ctx, HpeDomNode *n, Mat ctm)
+{
+    SvgGroup g;
+    HpePixmap *dst_pm;
+    float *keep_scratch;
+    int keep_cap;
+    uint8_t *fact;
+    float sx = 0.0f, sy = 0.0f;
+    int odx = 0, ody = 0, filt;
+    if (!svg_group_begin(ctx, &g))
+        return;
+    /* the caller's ctm is a value copy: shift it along with ctx->ctm so the
+     * dispatch maps user coords into the offscreen buffer */
+    ctm.e -= (float)g.x0;
+    ctm.f -= (float)g.y0;
+    dst_pm = g.saved;
+    fact = svg_group_factor(ctx, &g, n);
+    filt = svg_filter_params(ctx, n, &sx, &sy, &odx, &ody);
+    svg_element_dispatch(ctx, n, ctm);
+    keep_scratch = ctx->cov_scratch;
+    keep_cap = ctx->cov_cap;
+    if (filt)
+        svg_filter_blur(&g.pm, sx, sy);
+    ctx->pm = dst_pm;
+    ctx->ctm.e += (float)g.x0;
+    ctx->ctm.f += (float)g.y0;
+    ctx->cov_scratch = keep_scratch;
+    ctx->cov_cap = keep_cap;
+    svg_group_composite(ctx, &g, fact, odx, ody);
+    hpe_free(fact);
+    hpe_pixmap_free(&g.pm);
+}
+
+/**
+ * @brief 由相邻顶点方向求标记角度（方向矢量的角平分线）/ Marker angle from neighbouring segment directions (the bisector)
+ *
+ * @param[in] ix 入方向 x / Incoming direction x
+ * @param[in] iy 入方向 y / Incoming direction y
+ * @param[in] ox 出方向 x / Outgoing direction x
+ * @param[in] oy 出方向 y / Outgoing direction y
+ *
+ * @return 角度（度）/ The angle in degrees
+ */
+static float svg_marker_angle(float ix, float iy, float ox, float oy)
+{
+    float il = sqrtf(ix * ix + iy * iy), ol = sqrtf(ox * ox + oy * oy);
+    float bx, by, l;
+    if (il > 1e-6f && ol > 1e-6f) {
+        bx = ix / il + ox / ol;
+        by = iy / il + oy / ol;
+    } else if (il > 1e-6f) {
+        bx = ix;
+        by = iy;
+    } else if (ol > 1e-6f) {
+        bx = ox;
+        by = oy;
+    } else {
+        return 0.0f;
+    }
+    l = sqrtf(bx * bx + by * by);
+    if (l < 1e-6f)
+        return atan2f(iy, ix) * 57.2957795f;
+    return atan2f(by, bx) * 57.2957795f;
+}
+
+/**
+ * @brief 在一个路径顶点处绘制标记内容 / Draw marker content at one path vertex
+ *
+ * @param[in] ctx 形状的 SVG 上下文 / The shape's SVG context
+ * @param[in] m `<marker>` 定义元素 / The `<marker>` definition element
+ * @param[in] vx 顶点设备 X / Vertex device x
+ * @param[in] vy 顶点设备 y / Vertex device y
+ * @param[in] ang 切线角度（度）/ Tangent angle in degrees
+ */
+static void svg_marker_at(SvgCtx *ctx, HpeDomNode *m, float vx, float vy, float ang)
+{
+    SvgCtx sub = *ctx;
+    Mat t, rot, sc, tr;
+    float refx = 0.0f, refy = 0.0f, mw = 3.0f, mh = 3.0f, k = 1.0f, dummy = 0.0f;
+    const char *units = attr(m, "markerUnits");
+    const char *orient = attr(m, "orient");
+    const char *vbs = attr(m, "viewBox");
+    attr_num(m, "refX", &refx);
+    attr_num(m, "refY", &refy);
+    attr_num(m, "markerWidth", &mw);
+    attr_num(m, "markerHeight", &mh);
+    if (!units || strcmp(units, "userSpaceOnUse") != 0)
+        k = ctx->stroke_w;
+    if (orient && strcmp(orient, "auto") != 0 && sscanf(orient, "%f", &dummy) == 1)
+        ang = dummy;
+    t = mat_identity();
+    t.e = vx;
+    t.f = vy;
+    rot = transform_rotate(ang, &dummy, 1);
+    sc = mat_identity();
+    sc.a = sc.d = k * mat_scale(ctx->ctm);
+    sub.ctm = mat_mul(t, mat_mul(rot, sc));
+    if (vbs) {
+        float a2, b2, c2, d2;
+        if (sscanf(vbs, "%f %f %f %f", &a2, &b2, &c2, &d2) == 4 && c2 > 0.0f &&
+            d2 > 0.0f) {
+            Mat vb = mat_identity();
+            vb.a = mw / c2;
+            vb.d = mh / d2;
+            sub.ctm = mat_mul(sub.ctm, vb);
+        }
+    }
+    tr = mat_identity();
+    tr.e = -refx;
+    tr.f = -refy;
+    sub.ctm = mat_mul(sub.ctm, tr);
+    ctx_apply_style(&sub, m);
+    draw_children(&sub, m, sub.ctm);
+}
+
+/**
+ * @brief 沿路径顶点绘制 marker-start/mid/end / Draw marker-start, marker-mid and marker-end along path vertices
+ *
+ * @param[in] sub 形状的 SVG 上下文 / The shape's SVG context
+ * @param[in] n 形状元素 / The shape element
+ * @param[in] p 设备空间多边形列表 / Device-space polygon list
+ *
+ * @note 起点沿首段方向、终点沿末段方向、中间点取角平分线；marker 内容最多嵌套两层 / The start follows the first segment, the end the last one, mid vertices use the bisector; marker content nests at most two levels
+ */
+static void svg_draw_markers(SvgCtx *sub, HpeDomNode *n, Polys *p)
+{
+    HpeDomNode *ms = svg_ref_target(sub, attr(n, "marker-start"), "marker");
+    HpeDomNode *mm = svg_ref_target(sub, attr(n, "marker-mid"), "marker");
+    HpeDomNode *me = svg_ref_target(sub, attr(n, "marker-end"), "marker");
+    int s, i, vidx = 0, total = 0;
+    float px = 0.0f, py = 0.0f;
+    if (sub->marker_depth > 2 || (!ms && !mm && !me))
+        return;
+    for (s = 0; s < p->count; s++)
+        total += p->subs[s].count;
+    for (s = 0; s < p->count && vidx < total; s++) {
+        SubPath *sp = &p->subs[s];
+        for (i = 0; i < sp->count; i++, vidx++) {
+            float vx = sp->pts[i * 2], vy = sp->pts[i * 2 + 1];
+            float ix = i > 0 ? vx - sp->pts[(i - 1) * 2] : 0.0f;
+            float iy = i > 0 ? vy - sp->pts[(i - 1) * 2 + 1] : 0.0f;
+            float ox = i + 1 < sp->count ? sp->pts[(i + 1) * 2] - vx : 0.0f;
+            float oy = i + 1 < sp->count ? sp->pts[(i + 1) * 2 + 1] - vy : 0.0f;
+            float ang = svg_marker_angle(ix, iy, ox, oy);
+            HpeDomNode *m = vidx == 0 ? ms : (vidx == total - 1 ? me : mm);
+            if (m) {
+                sub->marker_depth++;
+                svg_marker_at(sub, m, vx, vy, ang);
+                sub->marker_depth--;
+            }
+            px = vx;
+            py = vy;
+        }
+    }
+    (void)px;
+    (void)py;
+}
+
 /**
  * @brief 绘制 `<use>` 引用的元素 / Draw the element referenced by a `<use>`
  *
@@ -2469,6 +3343,7 @@ static void draw_line_node(SvgCtx *sub, HpeDomNode *n)
     mat_apply(sub->ctm, x2, y2, &ddx, &ddy);
     sub_push(sp, ddx, ddy);
     paint_shape(sub, n, &p, fminf(x1, x2), fminf(y1, y2), fmaxf(x1, x2), fmaxf(y1, y2), 0, 1);
+    svg_draw_markers(sub, n, &p);
     polys_free(&p);
 }
 
@@ -2492,6 +3367,7 @@ static void draw_poly_node(SvgCtx *sub, HpeDomNode *n, const char *tag)
     points_path(&p, sub, pts, closed);
     if (p.count > 0)
         paint_shape(sub, n, &p, minx, miny, maxx, maxy, closed, 1);
+    svg_draw_markers(sub, n, &p);
     polys_free(&p);
 }
 
@@ -2512,6 +3388,7 @@ static void draw_path_node(SvgCtx *sub, HpeDomNode *n)
     path_bbox(attr(n, "d"), &bx0, &by0, &bx1, &by1);
     if (p.count > 0)
         paint_shape(sub, n, &p, bx0, by0, bx1, by1, 1, 1);
+    svg_draw_markers(sub, n, &p);
     polys_free(&p);
 }
 
@@ -2548,23 +3425,18 @@ static void draw_shape(SvgCtx *ctx, HpeDomNode *n, Mat ctm, const char *tag)
 }
 
 /**
- * @brief 绘制一个 SVG 元素 / Draw one SVG element
+ * @brief 按标签分派绘制一个元素（不含效果处理）/ Dispatch drawing of one element by tag (no effects handling)
  *
  * @param[in]     ctx SVG 上下文 / SVG context
  * @param[in]     n DOM 元素 / DOM element
  * @param[in]     ctm 当前变换矩阵 / Current transformation matrix
  *
- * @note 元数据标签跳过；先累积元素的 transform，再按标签分派到容器/use/形状 / Metadata tags are skipped; the element transform is accumulated first, then dispatch goes to container, `use` or shape
+ * @note 容器、use 与叶子形状共用此分派，供常规绘制与离屏效果路径复用 / Containers, use and leaf shapes share this dispatch, reused by both the plain path and the offscreen effects path
  */
-static void draw_element(SvgCtx *ctx, HpeDomNode *n, Mat ctm)
+static void svg_element_dispatch(SvgCtx *ctx, HpeDomNode *n, Mat ctm)
 {
     const char *tag = n->tag;
     SvgCtx sub;
-
-    if (!tag || svg_is_metadata_tag(tag))
-        return;
-    ctm = mat_mul(ctm, parse_transform(attr(n, "transform")));
-
     if (!strcmp(tag, "g") || !strcmp(tag, "svg")) {
         draw_container(ctx, &sub, n, ctm, tag);
         return;
@@ -2575,6 +3447,29 @@ static void draw_element(SvgCtx *ctx, HpeDomNode *n, Mat ctm)
         return;
     }
     draw_shape(ctx, n, ctm, tag);
+}
+
+/**
+ * @brief 绘制一个 SVG 元素 / Draw one SVG element
+ *
+ * @param[in]     ctx SVG 上下文 / SVG context
+ * @param[in]     n DOM 元素 / DOM element
+ * @param[in]     ctm 当前变换矩阵 / Current transformation matrix
+ *
+ * @note 元数据标签跳过；先累积元素的 transform；携带 clip-path/mask/filter 的元素整体走离屏效果路径 / Metadata tags are skipped; the element transform is accumulated first; elements with clip-path/mask/filter go through the offscreen effects path
+ */
+static void draw_element(SvgCtx *ctx, HpeDomNode *n, Mat ctm)
+{
+    const char *tag = n->tag;
+
+    if (!tag || svg_is_metadata_tag(tag))
+        return;
+    ctm = mat_mul(ctm, parse_transform(attr(n, "transform")));
+    if (svg_has_paint_effects(n)) {
+        svg_draw_with_effects(ctx, n, ctm);
+        return;
+    }
+    svg_element_dispatch(ctx, n, ctm);
 }
 
 /**

@@ -621,8 +621,8 @@ static void mat_mul(HpeTransform *dst, const HpeTransform *m, const HpeTransform
 /**
  * @brief 为单个变换函数名与两个参数构建仿射矩阵 / Build the affine matrix for one transform function name and its two arguments
  *
- * @details 支持 `translate`/`translatex`/`translatey`、`scale`/`scalex`/`scaley`、`rotate` 与 `skewx`/`skewy`；`rotate` 与 `skew` 的角度参数按度转弧度；`matrix` 不支持，保持单位矩阵。
- *          It supports `translate`/`translatex`/`translatey`, `scale`/`scalex`/`scaley`, `rotate` and `skewx`/`skewy`; the angles of `rotate` and the skew functions convert from degrees to radians; `matrix` is unsupported and leaves the identity.
+ * @details 支持 `translate`/`translatex`/`translatey`、`scale`/`scalex`/`scaley`、`rotate` 与 `skewx`/`skewy`；`rotate` 与 `skew` 的角度参数按度转弧度；`matrix(a,b,c,d,e,f)` 由 `apply_transform_fn` 单独处理。
+ *          It supports `translate`/`translatex`/`translatey`, `scale`/`scalex`/`scaley`, `rotate` and `skewx`/`skewy`; the angles of `rotate` and the skew functions convert from degrees to radians; `matrix(a,b,c,d,e,f)` is handled by `apply_transform_fn` directly.
  *
  * @param[in]     fn 小写的变换函数名 / Lowercased transform function name
  * @param[in]     v1 第一个参数 / First argument
@@ -665,7 +665,6 @@ static void transform_from_fn(const char *fn, float v1, float v2, HpeTransform *
         float r = v1 * 3.14159265f / 180.0f;
         m->b = tanf(r);
     }
-    /* "matrix" is not supported: leave the identity */
     m->identity =
         (m->a == 1.0f && m->b == 0.0f && m->c == 0.0f && m->d == 1.0f && m->e == 0.0f &&
          m->f == 0.0f);
@@ -690,6 +689,31 @@ static void apply_transform_fn(const char *fn, const char *body, HpeTransform *a
     char *comma = strchr(copy, ',');
     HpeTransform m;
 
+    if (!strcmp(fn, "matrix")) {
+        /* matrix(a, b, c, d, e, f): the full 2D affine matrix */
+        float mv[6] = {1.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f};
+        char *tok = copy;
+        int i;
+        for (i = 0; i < 6 && tok; i++) {
+            char *next = strchr(tok, ',');
+            if (next)
+                *next = '\0';
+            parse_float_token(hpe_trim(tok), &mv[i]);
+            tok = next ? next + 1 : NULL;
+        }
+        m.a = mv[0];
+        m.b = mv[1];
+        m.c = mv[2];
+        m.d = mv[3];
+        m.e = mv[4];
+        m.f = mv[5];
+        m.identity = (m.a == 1.0f && m.b == 0.0f && m.c == 0.0f && m.d == 1.0f &&
+                      m.e == 0.0f && m.f == 0.0f);
+        if (!m.identity)
+            mat_mul(acc, acc, &m);
+        hpe_free(copy);
+        return;
+    }
     if (comma) {
         *comma = '\0';
         parse_float_token(hpe_trim(comma + 1), &v2);
@@ -5132,8 +5156,8 @@ static void sheet_add_rule(HpeStylesheet *sheet, HpeRule *rule,
 static const char *const *supports_value_set(const char *name)
 {
     static const char *const display_vals[] = {"none", "inline", "block", "inline-block", "flex",
-                                               "inline-flex", "table", "table-row",
-                                               "table-cell", "table-row-group",
+                                               "inline-flex", "grid", "inline-grid", "table",
+                                               "table-row", "table-cell", "table-row-group",
                                                "table-header-group", "table-footer-group",
                                                "table-caption", "inline-table", NULL};
     static const char *const position_vals[] = {"static", "relative", "absolute", "fixed", NULL};
@@ -6547,6 +6571,7 @@ const char *hpe_ua_stylesheet(void)
         "pre { font-size: 13px; margin: 13px 0; }\n"
         "code { font-size: 13px; }\n"
         "b, strong { font-weight: bold; }\n"
-        "a { color: #1a0dab; }\n"
+        "a { color: #1a0dab; cursor: pointer; }\n"
+        "button, input, select, textarea { cursor: default; }\n"
         "hr { border: 1px solid #c0c0c0; height: 0; margin: 8px 0; }\n";
 }

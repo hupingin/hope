@@ -3824,6 +3824,8 @@ static void install_window_builtins(HpeJs *js, HpeDomNode *document)
  */
 void hpe_js_dom_install(HpeJs *js, HpeDomNode *document)
 {
+    /* the document tree roots the DOM listener chains for the GC */
+    js->dom_document = document;
     hpe_js_set_global_host(js, "document", document, HPE_HOST_DOCUMENT, &g_document_vt);
     install_window_builtins(js, document);
     hpe_js_timers_install(js);

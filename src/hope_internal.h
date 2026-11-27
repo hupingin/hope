@@ -21,6 +21,8 @@
  * so the headless --dump pixel baselines stay page-only) */
 #define HPE_PAGE_SCROLLBAR_W 12.0f
 #define HPE_ADDR_MAX 1024
+/* navigation history depth for the chrome's back/forward buttons */
+#define HPE_NAV_MAX 32
 /* <link> resource hints we record (stylesheet excluded -- it is consumed) */
 #define HPE_MAX_LINKS 32
 #define HPE_MAX_PATH 1024
@@ -106,6 +108,30 @@ struct HpeEngine {
      * grab offset between the pointer and the thumb's top edge */
     int page_sb_drag;
     float page_sb_grab;
+
+    /* cursor shown over the client area: the chrome strip resolves first
+     * (I-beam in the field, arrow elsewhere), then the hovered box's CSS
+     * `cursor` (inherited, so it already reflects the author/UA cascade) */
+    int page_cursor;
+
+    /* navigation history for the back/forward buttons: a ring of absolute
+     * document paths ("" means the built-in blank page) with `nav_pos` as the
+     * current entry. A fresh navigation (address bar, load) truncates the
+     * forward tail; back/forward merely move `nav_pos`. */
+    char nav[HPE_NAV_MAX][HPE_MAX_PATH];
+    int nav_count;
+    int nav_pos;
+    int nav_suppress; /* 1 while replaying history, so the replay is not re-pushed */
+    int chrome_hover_btn; /* nav button under the pointer, -1 when none */
+
+    /* address-bar caret blink: `caret_t` accumulates seconds since the last
+     * tick, `caret_on` is the current phase (visible for 0.5s, hidden for
+     * 0.5s), `tick_last` is the previous tick's timestamp and `caret_key`
+     * fingerprints caret position/focus so any change restarts the cycle */
+    double caret_t;
+    int caret_on;
+    double tick_last;
+    int caret_key;
 };
 
 /**
@@ -144,6 +170,19 @@ void hpe_engine_flush(HpeEngine *engine, int force);
  * @see hpe_engine_status
  */
 void hpe_engine_refresh_status(HpeEngine *engine);
+
+/**
+ * @brief 推进地址栏插入符闪烁时钟 / Advance the address-bar caret blink clock
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @return 闪烁相位翻转返回 1，否则 0 / 1 when the blink phase flipped, otherwise 0
+ *
+ * @note 实现位于 `hope.c`；由 `hpe_engine_tick` 与 `hpe_chrome_paint` 共同驱动 / Implemented in `hope.c`; driven from both `hpe_engine_tick` and `hpe_chrome_paint`
+ *
+ * @see hpe_engine_tick hpe_chrome_paint
+ */
+int hpe_engine_caret_advance(HpeEngine *engine);
 
 /**
  * @brief 取页面视口高度（窗口高减地址栏）/ Get the page viewport height (window height minus chrome)
@@ -212,6 +251,47 @@ int hpe_chrome_mouse(HpeEngine *engine, int x, int y, int down, int mods);
  * @see hpe_chrome_mouse
  */
 int hpe_chrome_mouse_move(HpeEngine *engine, int x, int y);
+
+/**
+ * @brief 查询条带内某点的光标语义 / Query the cursor semantics for a point inside the chrome strip
+ *
+ * @param[in]     engine 引擎实例 / Engine instance
+ * @param[in]     x X 坐标（设备坐标）/ X coordinate in device coordinates
+ * @param[in]     y Y 坐标（设备坐标）/ Y coordinate in device coordinates
+ *
+ * @return `HpeCursor` 值；点在条带之外返回 -1 / An `HpeCursor` value; -1 when the point is outside the strip
+ *
+ * @note 输入框内为 I-beam、条带其余处为箭头；实现位于 `hope_chrome.c` / I-beam inside the field and the arrow everywhere else in the strip; implemented in `hope_chrome.c`
+ *
+ * @see hpe_chrome_mouse
+ */
+int hpe_chrome_cursor_at(HpeEngine *engine, int x, int y);
+
+/**
+ * @brief 按下后退按钮并回到上一历史项 / Activate the back button and return to the previous history entry
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @return 发生了导航返回 1，否则 0 / 1 when a navigation happened, otherwise 0
+ *
+ * @note 无上一项时什么都不做；实现位于 `hope.c` / Does nothing without a previous entry; implemented in `hope.c`
+ *
+ * @see hpe_engine_forward
+ */
+int hpe_engine_back(HpeEngine *engine);
+
+/**
+ * @brief 按下前进按钮并前往下一历史项 / Activate the forward button and go to the next history entry
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @return 发生了导航返回 1，否则 0 / 1 when a navigation happened, otherwise 0
+ *
+ * @note 无下一项时什么都不做；实现位于 `hope.c` / Does nothing without a next entry; implemented in `hope.c`
+ *
+ * @see hpe_engine_back
+ */
+int hpe_engine_forward(HpeEngine *engine);
 
 /**
  * @brief 按地址栏内容（`addr`）导航 / Navigate using the address-bar contents (`addr`)

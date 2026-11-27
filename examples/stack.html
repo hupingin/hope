@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Hope Engine - stacking contexts</title>
+<style>
+  body { margin: 0; background-color: #f5f6f8; font-family: sans-serif; }
+  .case { width: 360px; height: 110px; margin: 14px 20px; position: relative;
+          background-color: #dde3ea; }
+  .label { font-size: 12px; color: #445; padding: 4px 8px; }
+  .base { position: absolute; left: 30px; top: 26px; width: 140px; height: 60px;
+          background-color: #e33; }
+  .over { position: absolute; left: 110px; top: 26px; width: 140px; height: 60px;
+          background-color: #2a6; }
+  /* case 1: negative z must sink BELOW the in-flow red box */
+  .neg { z-index: -1; background-color: #2266cc; }
+  /* case 2: positive z must rise above the in-flow red box */
+  .pos { z-index: 10; background-color: #2266cc; }
+  /* case 3: z:auto positioned box paints after in-flow siblings (doc order tie) */
+  .auto { background-color: #2266cc; }
+  /* case 4: opacity establishes a stacking context and sorts like z:0 */
+  .fade { opacity: 0.55; background-color: #2266cc; }
+  .note { font-size: 11px; color: #667; margin: 0 20px; }
+</style>
+</head>
+<body>
+  <p class="note">1 negative-z under static &middot; 2 positive-z over static &middot;
+     3 z:auto doc-order tie &middot; 4 opacity groups like z:0 &middot; 5 nested z inside z:auto parent</p>
+  <div class="case">
+    <div class="label">1 neg</div>
+    <div class="base"></div>
+    <div class="over neg"></div>
+  </div>
+  <div class="case">
+    <div class="label">2 pos</div>
+    <div class="base"></div>
+    <div class="over pos"></div>
+  </div>
+  <div class="case">
+    <div class="label">3 auto</div>
+    <div class="base"></div>
+    <div class="over auto"></div>
+  </div>
+  <div class="case">
+    <div class="label">4 fade</div>
+    <div class="base"></div>
+    <div class="over fade"></div>
+  </div>
+  <div class="case">
+    <div class="label">5 nested</div>
+    <div class="base"></div>
+    <div style="position: absolute; left: 110px; top: 26px; width: 140px; height: 60px;
+                background-color: #2266cc; z-index: auto;">
+      <div style="position: absolute; left: 0; top: 0; width: 60px; height: 30px;
+                  background-color: #eecc22;"></div>
+    </div>
+  </div>
+</body>
+</html>

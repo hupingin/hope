@@ -76,6 +76,15 @@ HpeJs *hpe_js_create(void);
 void hpe_js_destroy(HpeJs *js);
 
 /**
+ * @brief 在宿主最外层帧记录 GC 栈基线 / Record the GC stack baseline at the outermost host frame
+ *
+ * @note 在 `main()` 开头调用一次：GC 保守扫描 C 栈时以此为上界，确保后续所有
+ *       深层 eval 帧上的引用都被视为根 / Call once at the top of `main()`: the conservative
+ *       stack scan uses this as its upper bound so every deeper eval frame counts as a root
+ */
+void hpe_js_gc_capture_main_base(void);
+
+/**
  * @brief 把一个宿主对象暴露为全局变量 / Expose a host object as a global
  *
  * @param[in,out] js JS 运行时上下文 / JS runtime context

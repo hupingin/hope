@@ -29,6 +29,20 @@ typedef struct JsTimer {
 #define HPE_TIMER_MAX_PER_PUMP 10000
 
 /**
+ * @brief 把定时器表整体当作 GC 根扫描 / Expose the timer table to the GC as a conservative root
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ *
+ * @note JsTimer 布局对 GC 私有，故由本文件提供扫描；表内的回调 JsValue 借此保持可达 / The JsTimer layout is private to this file, so the scan lives here; callback JsValues stay reachable through it
+ */
+void hpe_js_timers_gc_scan(HpeJs *js)
+{
+    if (js->timers)
+        hpe_js_gc_scan_range(js, js->timers,
+                             (char *)js->timers + sizeof(JsTimer) * (size_t)js->timer_cap);
+}
+
+/**
  * @brief 按 id 查找定时器 / Find a timer by its id
  *
  * @param[in,out] js JS 运行时上下文 / JS runtime context

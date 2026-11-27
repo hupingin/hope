@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>SVG text upgrade - tspan / spacingAndGlyphs / rotate / gradientTransform</title>
+<style>
+  body { margin: 0; padding: 12px; font-family: sans-serif; font-size: 12px;
+         color: #222222; background-color: #ffffff; }
+  svg { display: block; margin-bottom: 8px; }
+</style>
+</head>
+<body>
+  <!-- 1. tspan: absolute x/y, relative dx/dy -->
+  <svg width="360" height="70" viewBox="0 0 360 70">
+    <text x="10" y="25" font-size="14" fill="#222222">A<tspan x="10" dy="20"
+      fill="#1a73e8">B on new line</tspan><tspan dx="6" dy="20"
+      fill="#d93025">C shifted right</tspan></text>
+  </svg>
+
+  <!-- 2. tspan: per-segment textLength + rotate override -->
+  <svg width="360" height="60" viewBox="0 0 360 60">
+    <text x="10" y="40" font-size="16" fill="#188038">
+      <tspan textLength="160">stretched</tspan>
+      <tspan x="190" rotate="0 15 30 45 60">tilt!</tspan>
+    </text>
+  </svg>
+
+  <!-- 3. lengthAdjust=spacingAndGlyphs: whole run (glyphs included) is stretched -->
+  <svg width="360" height="60" viewBox="0 0 360 60">
+    <text x="10" y="25" font-size="16" fill="#222222"
+          textLength="340" lengthAdjust="spacing">spacing: wide letter spacing</text>
+    <text x="10" y="50" font-size="16" fill="#1a73e8"
+          textLength="340" lengthAdjust="spacingAndGlyphs">spacingAndGlyphs: glyphs too</text>
+  </svg>
+
+  <!-- 4. rotate per glyph on the text element itself -->
+  <svg width="360" height="70" viewBox="0 0 360 70">
+    <text x="20" y="45" font-size="22" fill="#d93025"
+          rotate="-15 0 15 30 45 60 75 90 105 120">Wave glyph rotate</text>
+  </svg>
+
+  <!-- 5. gradientTransform: linear endpoints rotated, radial center offset -->
+  <svg width="360" height="90" viewBox="0 0 360 90">
+    <defs>
+      <linearGradient id="gtA" x1="0" y1="0" x2="1" y2="0"
+                      gradientTransform="rotate(90)">
+        <stop offset="0" stop-color="#1a73e8"/>
+        <stop offset="1" stop-color="#f9ab00"/>
+      </linearGradient>
+      <radialGradient id="gtR" cx="0.5" cy="0.5" r="0.5"
+                      gradientTransform="translate(-0.25,0) scale(0.5)">
+        <stop offset="0" stop-color="#ffffff"/>
+        <stop offset="1" stop-color="#7b1fa2"/>
+      </radialGradient>
+    </defs>
+    <rect x="10" y="10" width="150" height="70" fill="url(#gtA)"/>
+    <circle cx="235" cy="45" r="35" fill="url(#gtR)"/>
+    <rect x="290" y="10" width="60" height="70" fill="#188038"/>
+  </svg>
+</body>
+</html>

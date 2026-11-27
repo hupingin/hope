@@ -44,6 +44,7 @@ static void hope_layout_hook(void *ud);
 static void hope_viewport_hook(void *ud, float *w, float *h, float *sx, float *sy);
 static void key_names_of(int vk, int printable, char *key, char *code, size_t n);
 static HpeDomNode *node_from_hit(HpeEngine *engine, int x, int y);
+static void nav_push(HpeEngine *engine, const char *path);
 
 /* ---------------- stylesheets ---------------- */
 
@@ -984,6 +985,9 @@ HpeEngine *hpe_engine_create(int width, int height)
     HpeEngine *engine = (HpeEngine *)hpe_calloc(1, sizeof(HpeEngine));
     engine->width = width > 0 ? width : 800;
     engine->height = height > 0 ? height : 600;
+    engine->page_cursor = HPE_CURSOR_DEFAULT;
+    engine->caret_key = -1;
+    engine->chrome_hover_btn = -1;
     hpe_pixmap_init(&engine->pm, engine->width, engine->height);
     snprintf(engine->status, sizeof(engine->status), "hope: ready");
     return engine;
@@ -1032,12 +1036,14 @@ void hpe_engine_destroy(HpeEngine *engine)
  */
 static void reset_document(HpeEngine *engine, const char *path)
 {
+    /* strdup first: on reload `path` is `engine->path` itself, so freeing the
+     * old one before copying would read freed memory */
+    char *copy = path ? hpe_strdup(path) : NULL;
     if (engine->path) {
         hpe_free(engine->path);
         engine->path = NULL;
     }
-    if (path)
-        engine->path = hpe_strdup(path);
+    engine->path = copy;
     if (engine->root) {
         hpe_layout_free(engine->root);
         engine->root = NULL;
@@ -1250,24 +1256,33 @@ static int load_source(HpeEngine *engine, char *src, size_t size, const char *pa
 int hpe_engine_load_file(HpeEngine *engine, const char *path)
 {
     char *src;
+    char *keep; /* `path` may alias `engine->path`, which reset_document frees */
     size_t size = 0;
     char abs[2048];
 
     if (!engine || !path)
         return 0;
+    keep = hpe_strdup(path);
+    if (!keep)
+        return 0;
 
-    src = hpe_read_file(path, &size);
+    src = hpe_read_file(keep, &size);
     if (!src) {
-        snprintf(engine->error, sizeof(engine->error), "cannot open %s", path);
-        snprintf(engine->status, sizeof(engine->status), "hope: cannot open %s", path);
+        snprintf(engine->error, sizeof(engine->error), "cannot open %s", keep);
+        snprintf(engine->status, sizeof(engine->status), "hope: cannot open %s", keep);
+        hpe_free(keep);
         return 0;
     }
-    if (!load_source(engine, src, size, path))
+    if (!load_source(engine, src, size, keep)) {
+        hpe_free(keep);
         return 0;
+    }
     if (engine->chrome_h > 0) {
-        hpe_path_absolute(abs, sizeof(abs), path);
+        hpe_path_absolute(abs, sizeof(abs), keep);
         hpe_chrome_set_text(engine, abs);
+        nav_push(engine, abs);
     }
+    hpe_free(keep);
     return 1;
 }
 
@@ -1295,8 +1310,86 @@ int hpe_engine_load_blank(HpeEngine *engine)
     if (engine->chrome_h > 0) {
         hpe_chrome_set_text(engine, "");
         engine->addr_focus = 0;
+        nav_push(engine, NULL);
     }
     return 1;
+}
+
+/**
+ * @brief 把一次成功加载推入历史栈 / Push one successful load onto the navigation history
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     path 刚加载的绝对路径，NULL 表示内置空白页 / The absolute path just loaded, NULL for the built-in blank page
+ *
+ * @note 重放历史（`nav_suppress`）时不推入；新导航会截断 `nav_pos` 之后的前进尾巴；同样的连续路径不重复推入；栈满时丢弃最旧一项 / Nothing is pushed while replaying history (`nav_suppress`); a fresh navigation truncates the forward tail past `nav_pos`; a repeated consecutive path is not pushed twice; the oldest entry is dropped when the ring is full
+ *
+ * @see hpe_engine_back hpe_engine_forward
+ */
+static void nav_push(HpeEngine *engine, const char *path)
+{
+    const char *abs = path ? path : "";
+    if (engine->nav_suppress)
+        return;
+    if (engine->nav_count > 0 && !strcmp(engine->nav[engine->nav_pos], abs))
+        return; /* same page: reload must not grow the history */
+    if (engine->nav_pos + 1 < engine->nav_count)
+        engine->nav_count = engine->nav_pos + 1; /* drop the forward tail */
+    if (engine->nav_count >= HPE_NAV_MAX) {
+        int i;
+        for (i = 1; i < HPE_NAV_MAX; i++)
+            memcpy(engine->nav[i - 1], engine->nav[i], HPE_MAX_PATH);
+        engine->nav_count = HPE_NAV_MAX - 1;
+        engine->nav_pos = engine->nav_count - 1;
+    }
+    if (engine->nav_count == 0)
+        engine->nav_pos = 0;
+    else
+        engine->nav_pos = engine->nav_count;
+    snprintf(engine->nav[engine->nav_pos], HPE_MAX_PATH, "%s", abs);
+    engine->nav_count = engine->nav_pos + 1;
+}
+
+/**
+ * @brief 重放历史栈中的某一项 / Replay one entry of the navigation history
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     pos 目标历史下标 / Target history index
+ *
+ * @return 加载成功返回 1，否则 0 / 1 when the entry loaded, otherwise 0
+ *
+ * @note 置 `nav_suppress` 使加载路径不再推入历史，随后恢复 / Sets `nav_suppress` so the load path does not push again, then restores it
+ *
+ * @see nav_push hpe_engine_back
+ */
+static int nav_replay(HpeEngine *engine, int pos)
+{
+    int ok;
+    if (pos < 0 || pos >= engine->nav_count)
+        return 0;
+    engine->nav_pos = pos;
+    engine->nav_suppress = 1;
+    if (engine->nav[pos][0])
+        ok = hpe_engine_load_file(engine, engine->nav[pos]);
+    else
+        ok = hpe_engine_load_blank(engine);
+    engine->nav_suppress = 0;
+    if (ok)
+        engine->dirty = HPE_DIRTY_FULL;
+    return ok;
+}
+
+int hpe_engine_back(HpeEngine *engine)
+{
+    if (!engine || engine->nav_pos <= 0)
+        return 0;
+    return nav_replay(engine, engine->nav_pos - 1);
+}
+
+int hpe_engine_forward(HpeEngine *engine)
+{
+    if (!engine || engine->nav_pos + 1 >= engine->nav_count)
+        return 0;
+    return nav_replay(engine, engine->nav_pos + 1);
 }
 
 /**
@@ -1439,6 +1532,10 @@ int hpe_engine_wheel_scroll(HpeEngine *engine, int x, int y, float lines)
     float cy, delta, want_line = lines * HPE_SCROLL_LINE_PX;
     if (!engine || !engine->root)
         return 0;
+    /* the chrome strip is not part of the document: a wheel over the address bar
+     * scrolls neither an element nor the page (the event is just consumed) */
+    if (engine->chrome_h > 0 && y < engine->chrome_h)
+        return 1;
     /* window coords: the page viewport starts below the browser chrome */
     cy = (float)(y - engine->chrome_h);
     target = find_scroll_container(engine->root, (float)x, cy, engine->scroll_y, 0.0f, NULL);
@@ -2263,6 +2360,37 @@ static void clear_target_flags(HpeDomNode *node)
 }
 
 /**
+ * @brief 解析窗口某点应显示的光标 / Resolve the cursor to show for a window point
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     x X 坐标（窗口坐标）/ X coordinate in window space
+ * @param[in]     y Y 坐标（窗口坐标）/ Y coordinate in window space
+ *
+ * @note 地址栏条带优先（输入框内 I-beam、其余箭头）；页面内取命中盒解析出的 `cursor`（继承属性，已反映作者/UA 级联），`auto` 时文本盒用 I-beam、其余用箭头；结果存入 `engine->page_cursor` 供平台层 `query_cursor` 读取 / The chrome strip wins (I-beam in the field, arrow elsewhere); over the page the hit box's resolved `cursor` is used (an inherited property, so it already reflects the author/UA cascade), falling back to the I-beam for text boxes and the arrow otherwise; the result is stored in `engine->page_cursor` for the platform layer's `query_cursor`
+ *
+ * @see hpe_engine_mouse_move node_from_hit
+ */
+static void page_cursor_update(HpeEngine *engine, int x, int y)
+{
+    HpeBox *hit;
+    int cur = hpe_chrome_cursor_at(engine, x, y);
+    if (cur >= 0) {
+        engine->page_cursor = cur;
+        return;
+    }
+    hit = hit_test_box(engine->root, (float)x, (float)(y - engine->chrome_h), engine->scroll_y);
+    if (!hit) {
+        engine->page_cursor = HPE_CURSOR_DEFAULT;
+        return;
+    }
+    if (hit->style.cursor != HPE_CURSOR_AUTO)
+        engine->page_cursor = hit->style.cursor;
+    else
+        engine->page_cursor =
+            hit->kind == HPE_BOX_TEXT ? HPE_CURSOR_TEXT : HPE_CURSOR_DEFAULT;
+}
+
+/**
  * @brief 处理指针移动：更新 `:hover` 并派发 `mousemove` / Handle a pointer move: update `:hover` and fire `mousemove`
  *
  * @param[in,out] engine 引擎实例，NULL 或无盒树时返回 0 / Engine instance, returns 0 when NULL or without a box tree
@@ -2275,6 +2403,33 @@ static void clear_target_flags(HpeDomNode *node)
  *
  * @see node_from_hit clear_hover_flags
  */
+/**
+ * @brief 悬停元素变化时派发 `mouseleave`/`mouseenter` / Fire `mouseleave`/`mouseenter` when the hovered element changed
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     node 新的悬停元素 / The newly hovered element
+ * @param[in]     x X 坐标（窗口坐标）/ X coordinate in window space
+ * @param[in]     y Y 坐标（窗口坐标）/ Y coordinate in window space
+ *
+ * @note 事件对象带坐标与 `related`（指针来自的旧元素）；无 JS 上下文时不派发 / The event object carries the coordinates and `related` (the element the pointer came from); nothing is dispatched without a JS context
+ *
+ * @see hpe_engine_mouse_move
+ */
+static void hover_notify(HpeEngine *engine, HpeDomNode *node, int x, int y)
+{
+    HpeJsEventInit init;
+    if (!engine->js)
+        return;
+    memset(&init, 0, sizeof(init));
+    init.client_x = x;
+    init.client_y = y - engine->chrome_h;
+    init.related = engine->hover_node; /* where the pointer came from */
+    if (engine->hover_node)
+        hpe_js_dom_dispatch_self(engine->js, engine->hover_node, "mouseleave", &init);
+    if (node)
+        hpe_js_dom_dispatch_self(engine->js, node, "mouseenter", &init);
+}
+
 int hpe_engine_mouse_move(HpeEngine *engine, int x, int y)
 {
     HpeDomNode *node;
@@ -2282,6 +2437,7 @@ int hpe_engine_mouse_move(HpeEngine *engine, int x, int y)
 
     if (!engine || !engine->root)
         return 0;
+    page_cursor_update(engine, x, y);
     /* a live page-scrollbar drag keeps tracking the pointer, even off the gutter */
     if (engine->page_sb_drag) {
         page_scrollbar_seek(engine, (float)y);
@@ -2299,18 +2455,7 @@ int hpe_engine_mouse_move(HpeEngine *engine, int x, int y)
         clear_hover_flags(engine->doc);
         if (node)
             node->hovered = 1;
-        if (engine->js) {
-            HpeJsEventInit init;
-            memset(&init, 0, sizeof(init));
-            init.client_x = x;
-            init.client_y = y - engine->chrome_h;
-            init.related = engine->hover_node; /* where the pointer came from */
-            if (engine->hover_node)
-                hpe_js_dom_dispatch_self(engine->js, engine->hover_node, "mouseleave",
-                                         &init);
-            if (node)
-                hpe_js_dom_dispatch_self(engine->js, node, "mouseenter", &init);
-        }
+        hover_notify(engine, node, x, y);
         engine->hover_node = node;
     }
 
@@ -2331,27 +2476,73 @@ int hpe_engine_mouse_move(HpeEngine *engine, int x, int y)
 }
 
 /**
+ * @brief 推进地址栏插入符闪烁时钟 / Advance the address-bar caret blink clock
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @return 闪烁相位翻转返回 1（调用方应标记地址栏重绘），否则 0 / 1 when the blink phase flipped (the caller should mark the bar for repaint), otherwise 0
+ *
+ * @note 累积自上次推进以来的秒数（截断到 0.5s 以内）；焦点、插入符位置或选区端点变化时重启周期并立即可见；相位为 0.5s 可见 + 0.5s 隐藏，有选区时隐藏（与 Chrome 一致）。由 `hpe_engine_tick` 与 `hpe_chrome_paint` 共同驱动，因累积的是真实流逝时间，重复调用不会产生漂移 / Accumulates the seconds since the last advance (clamped within 0.5s); a focus, caret-position or selection-end change restarts the cycle and shows the caret immediately; the phase is 0.5s visible + 0.5s hidden, and the caret hides while a selection is live (matching Chrome). Driven from both `hpe_engine_tick` and `hpe_chrome_paint`; because it accumulates real elapsed time, repeated calls cause no drift
+ *
+ * @see hpe_engine_tick hpe_chrome_paint
+ */
+int hpe_engine_caret_advance(HpeEngine *engine)
+{
+    double now, dt;
+    int key, on;
+
+    if (!engine)
+        return 0;
+    now = hpe_time_seconds();
+    dt = now - engine->tick_last;
+    if (dt < 0.0 || dt > 0.5)
+        dt = dt < 0.0 ? 0.0 : 0.5;
+    engine->tick_last = now;
+    /* any focus/caret/selection change restarts the cycle with the caret shown */
+    key = engine->addr_focus ? engine->addr_caret ^ (engine->addr_anchor << 16) : -1;
+    if (key != engine->caret_key) {
+        engine->caret_key = key;
+        engine->caret_t = 0.0;
+        on = engine->addr_focus && engine->addr_caret == engine->addr_anchor;
+    } else {
+        engine->caret_t += dt;
+        on = engine->addr_focus && engine->addr_caret == engine->addr_anchor &&
+             fmod(engine->caret_t, 1.0) < 0.5;
+    }
+    if (on == engine->caret_on)
+        return 0;
+    engine->caret_on = on;
+    return 1;
+}
+
+/**
  * @brief 泵到期定时器与 rAF 回调 / Drain due timers and rAF callbacks
  *
- * @param[in,out] engine 引擎实例，无 JS 上下文时返回 0 / Engine instance, returns 0 without a JS context
+ * @param[in,out] engine 引擎实例，NULL 时返回 0 / Engine instance, returns 0 when NULL
  *
- * @return 有回调运行返回 1，否则 0 / 1 when at least one callback ran, otherwise 0
+ * @return 有回调运行或插入符闪烁相位翻转返回 1（页面应重绘），否则 0 / 1 when a callback ran or the caret blink phase flipped (the page should be repainted), otherwise 0
  *
- * @note 有回调时惰性 flush 并刷新状态 / Lazily flushes and refreshes the status when a callback ran
+ * @note 有回调时惰性 flush 并刷新状态；插入符时钟独立于 JS 上下文，在无脚本时同样工作 / Lazily flushes and refreshes the status when a callback ran; the caret clock runs independently of the JS context, so blinking works without scripts
  *
- * @see hpe_engine_flush
+ * @see hpe_engine_flush hpe_engine_caret_advance
  */
 int hpe_engine_tick(HpeEngine *engine)
 {
     int fired = 0;
-    if (!engine || !engine->js)
+    int caret_repaint;
+    if (!engine)
         return 0;
+    caret_repaint = hpe_engine_caret_advance(engine);
+    if (caret_repaint && engine->dirty == HPE_DIRTY_NONE)
+        engine->dirty = HPE_DIRTY_CHROME;
+    if (!engine->js)
+        return caret_repaint;
     hpe_js_run_timers(engine->js, hpe_time_seconds(), &fired);
     if (fired) {
         hpe_engine_flush(engine, 0); /* only relayout if a timer touched the DOM */
         hpe_engine_refresh_status(engine);
     }
-    return fired;
+    return fired || caret_repaint;
 }
 
 /**
@@ -2435,6 +2626,7 @@ int hpe_engine_mouse_event_mods(HpeEngine *engine, int x, int y, int button, int
     HPE_UNUSED(button);
     if (!engine || !engine->root)
         return 0;
+    page_cursor_update(engine, x, y);
 
     /* the page scrollbar is chrome: it takes precedence over the page */
     if (page_scrollbar_mouse(engine, x, y, down))

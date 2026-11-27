@@ -31,6 +31,8 @@ set(HOPE_CORE_SOURCES
     src/js/hpe_js_buffer.c
     src/js/hpe_js_symbol.c
     src/js/hpe_js_gen.c
+    src/js/hpe_js_async.c
+    src/js/hpe_js_gc.c
     src/hope.c
     src/hope_chrome.c
 )

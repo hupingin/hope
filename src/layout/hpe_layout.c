@@ -14,7 +14,80 @@
 typedef struct {
     float vw, vh;         /* viewport size; used as the initial containing block */
     float root_font_size; /* the root element's font size, for `rem` */
+    /* abspos boxes are collected during the ordinary pass and positioned in a
+     * deferred pass: a containing block ancestor's pad_box is only final once
+     * its own subtree (which includes this abspos box) has been laid out */
+    HpeBox **abspos;
+    int abspos_count, abspos_cap;
+    int abspos_fixup; /* 1 while the deferred pass runs: position immediately */
 } LayoutCtx;
+
+/**
+ * @brief 初始化布局上下文 / Initialize a layout context
+ *
+ * @param[out]    ctx 布局上下文 / Layout context
+ * @param[in]     vw 视口宽度 / Viewport width
+ * @param[in]     vh 视口高度，非正时取 4*vw / Viewport height, 4*vw when not positive
+ * @param[in]     root_font 根元素字号，非正时取 16 / Root font size, 16 when not positive
+ */
+static void layout_ctx_init(LayoutCtx *ctx, float vw, float vh, float root_font)
+{
+    ctx->vw = vw;
+    ctx->vh = vh > 0.0f ? vh : vw * 4.0f;
+    ctx->root_font_size = root_font > 0.0f ? root_font : 16.0f;
+    ctx->abspos = NULL;
+    ctx->abspos_count = 0;
+    ctx->abspos_cap = 0;
+    ctx->abspos_fixup = 0;
+}
+
+static void layout_abspos(LayoutCtx *ctx, HpeBox *box); /* defined below */
+
+/**
+ * @brief 执行延迟的绝对定位 pass 并释放收集缓冲 / Run the deferred abspos pass and release the collection buffer
+ *
+ * @param[in,out] ctx 布局上下文 / Layout context
+ *
+ * @note 收集序即文档序（外层先于内层），因此嵌套 abspos 的包含块在补算时已定稿；
+ *       补算期间新发现的 abspos 直接就地定位 / Collection order is document order (outer before
+ *       inner), so nested abspos containing blocks are final by fixup time; abspos found during
+ *       the fixup itself is positioned immediately
+ */
+static void abspos_flush(LayoutCtx *ctx)
+{
+    int i;
+    ctx->abspos_fixup = 1;
+    for (i = 0; i < ctx->abspos_count; i++)
+        layout_abspos(ctx, ctx->abspos[i]);
+    ctx->abspos_fixup = 0;
+    free(ctx->abspos);
+    ctx->abspos = NULL;
+    ctx->abspos_count = 0;
+    ctx->abspos_cap = 0;
+}
+
+/**
+ * @brief 把一个 abspos 盒登记到延迟列表 / Queue an abspos box for the deferred pass
+ *
+ * @param[in,out] ctx 布局上下文 / Layout context
+ * @param[in,out] box 待定位的流外盒 / The out-of-flow box to position later
+ *
+ * @note 缓冲扩容失败时退回立即定位，保证降级仍可见 / Falls back to immediate positioning when the buffer cannot grow
+ */
+static void abspos_queue(LayoutCtx *ctx, HpeBox *box)
+{
+    if (ctx->abspos_count == ctx->abspos_cap) {
+        int ncap = ctx->abspos_cap ? ctx->abspos_cap * 2 : 16;
+        HpeBox **ni = (HpeBox **)realloc(ctx->abspos, (size_t)ncap * sizeof(HpeBox *));
+        if (!ni) {
+            layout_abspos(ctx, box); /* degrade to the old immediate behaviour */
+            return;
+        }
+        ctx->abspos = ni;
+        ctx->abspos_cap = ncap;
+    }
+    ctx->abspos[ctx->abspos_count++] = box;
+}
 
 /**
  * @brief 取样式对应的字体对象 / Fetch the font object for a style
@@ -510,6 +583,8 @@ typedef struct {
     const HpeStyle *style;
     int hard_break;
     HpeBox *atomic_box; /* non-NULL => atomic inline-level (inline-block) box */
+    HpeBox *inline_box; /* non-NULL => inline open/close marker (`open` flag) */
+    int open;           /* 1 = inline box opens here, 0 = closes here */
 } HpeSegment;
 
 typedef struct {
@@ -557,6 +632,24 @@ static void para_add_atomic(HpeParagraph *para, HpeBox *box)
 }
 
 /**
+ * @brief 向段落追加一个行内盒开/闭标记 / Append an inline open/close marker to a paragraph
+ *
+ * @param[in,out] para 段落 / Paragraph
+ * @param[in]     box 行内盒 / The inline box
+ * @param[in]     open 1=开始，0=结束 / 1 to open, 0 to close
+ */
+static void para_add_inline(HpeParagraph *para, HpeBox *box, int open)
+{
+    HpeSegment *seg;
+    para->items = (HpeSegment *)hpe_grow(para->items, &para->cap, (size_t)para->count + 1,
+                                         sizeof(HpeSegment));
+    seg = &para->items[para->count++];
+    memset(seg, 0, sizeof(*seg));
+    seg->inline_box = box;
+    seg->open = open;
+}
+
+/**
  * @brief 收集行内级内容到段落 / Collect inline-level content into a paragraph
  *
  * @param[in]     ctx 布局上下文 / Layout context
@@ -564,7 +657,10 @@ static void para_add_atomic(HpeParagraph *para, HpeBox *box)
  * @param[in]     inner_w 内容区宽度 / Inner width
  * @param[out]    para 接收内容的段落 / Paragraph receiving the content
  *
- * @note 行内块盒在此先行排版以便行构建器得知其尺寸；浮动盒被跳过 / Inline-block boxes are laid out here so the line builder knows their size; floated boxes are skipped
+ * @note 行内块盒在此先行排版以便行构建器得知其尺寸；浮动盒被跳过；行内盒发出
+ *       开/闭标记供行内碎片记录 / Inline-block boxes are laid out here so the line
+ *       builder knows their size; floated boxes are skipped; inline boxes emit
+ *       open/close markers for inline fragment recording
  */
 static void collect_inline(LayoutCtx *ctx, HpeBox *box, float inner_w, HpeParagraph *para)
 {
@@ -585,8 +681,12 @@ static void collect_inline(LayoutCtx *ctx, HpeBox *box, float inner_w, HpeParagr
         para_add(para, NULL, 0, &box->style, 1);
         return;
     }
+    if (box->kind == HPE_BOX_INLINE)
+        para_add_inline(para, box, 1);
     for (child = box->first_child; child; child = child->next)
         collect_inline(ctx, child, inner_w, para);
+    if (box->kind == HPE_BOX_INLINE)
+        para_add_inline(para, box, 0);
 }
 
 /**
@@ -678,6 +778,33 @@ static void band_edges(HpeFloatBand *band, float cb_x, float cb_w, float y0, flo
 }
 
 /**
+ * @brief 判定一个盒是否建立块格式化上下文（BFC）/ Test whether a box establishes a block formatting context
+ *
+ * @param[in] box 目标盒 / The box to test
+ *
+ * @return 建立返回 1，否则 0 / 1 when it establishes a BFC, otherwise 0
+ *
+ * @note 浮动、绝对/固定定位、行内块、表格单元与 `overflow` 非 `visible` 的块容器
+ *       均建立 BFC / Floats, absolutely/fixed positioned boxes, inline-blocks, table
+ *       cells and block containers with a non-visible `overflow` all establish one
+ */
+static int establishes_bfc(HpeBox *box)
+{
+    const HpeStyle *s = &box->style;
+    if (s->float_side != HPE_FLOAT_NONE)
+        return 1;
+    if (s->position == HPE_POS_ABSOLUTE || s->position == HPE_POS_FIXED)
+        return 1;
+    if (box->kind == HPE_BOX_INLINE_BLOCK)
+        return 1;
+    if (s->display == HPE_DISPLAY_TABLE_CELL || s->display == HPE_DISPLAY_INLINE_BLOCK)
+        return 1;
+    if (s->overflow_x != HPE_OVERFLOW_VISIBLE || s->overflow_y != HPE_OVERFLOW_VISIBLE)
+        return 1;
+    return 0;
+}
+
+/**
  * @brief 沿同一 BFC 的祖先链合并浮动态带范围 / Merge float band extents along the ancestor chain of the same BFC
  *
  * @param[in]     block 目标块盒 / Target block box
@@ -686,14 +813,24 @@ static void band_edges(HpeFloatBand *band, float cb_x, float cb_w, float y0, flo
  * @param[out]    out_left 可用左边界 / Available left edge
  * @param[out]    out_right 可用右边界 / Available right edge
  *
- * @note 结果夹紧到块自身的内容盒；浮动祖先本身即是 BFC，遍历到此为止 / The result is clamped to the block's own content box; a floated ancestor is itself a BFC, so the walk stops there
+ * @note 结果夹紧到块自身的内容盒；任何建立 BFC 的祖先（浮动、行内块、
+ *       `overflow` 非 visible、定位、表格单元）都会终止避让继承 / The result is clamped to the block's own content box; any BFC-establishing ancestor (float, inline-block, non-visible overflow, positioned, table cell) stops the walk
  */
 static void band_edges_inherited(HpeBox *block, float y0, float y1, float *out_left,
                                  float *out_right)
 {
-    HpeBox *b = block->parent;
+    HpeBox *b;
     float L = block->content_box.x;
     float R = block->content_box.x + block->content_box.w;
+    /* a BFC root walls off floats that live outside it: its line boxes dodge
+     * only the floats of its own band (handled by the paragraph state), never
+     * the bands of ancestors */
+    if (establishes_bfc(block)) {
+        *out_left = L;
+        *out_right = R;
+        return;
+    }
+    b = block->parent;
     while (b) {
         if (b->floats.count > 0) {
             float l, r;
@@ -703,8 +840,8 @@ static void band_edges_inherited(HpeBox *block, float y0, float y1, float *out_l
             if (r < R)
                 R = r;
         }
-        if (b->style.float_side != HPE_FLOAT_NONE)
-            break; /* floated boxes establish a BFC */
+        if (establishes_bfc(b))
+            break; /* any BFC boundary stops the inherited float avoidance */
         b = b->parent;
     }
     if (L < block->content_box.x)
@@ -848,6 +985,10 @@ static void finalize_line(LayoutCtx *ctx, HpeBox *block, int li, float inner_w, 
     if (offset > 0.0f) {
         for (r = 0; r < line->run_count; r++)
             line->runs[r].x += offset;
+        for (r = 0; r < line->frag_count; r++) {
+            line->frags[r].x0 += offset;
+            line->frags[r].x1 += offset;
+        }
     }
 
     line_place_atomics(ctx, block, line, inner_w);
@@ -867,6 +1008,13 @@ typedef struct {
     int pending_space;    /* a collapsed space waits to be emitted before the next word */
     float indent;
     int indent_pending;   /* text-indent shifts only the first line */
+    /* stack of inline boxes currently open, for per-line fragment recording */
+    HpeBox *open_b[24];
+    float open_x0[24];    /* fragment left edge of the current line */
+    float open_carry[24]; /* own left advance folded into pad_carry (no line yet) */
+    int open_started[24]; /* 1 once the box has emitted its first fragment */
+    int open_n;
+    float pad_carry;      /* inline pad/border advances made while no line is open */
 } ParaState;
 
 /**
@@ -880,6 +1028,7 @@ typedef struct {
 static void para_open_line(ParaState *ps, float lh_est)
 {
     float L, R;
+    int i;
     band_edges_inherited(ps->block, ps->row_y, ps->row_y + lh_est, &L, &R);
     ps->line_x0 = L - ps->block->content_box.x;
     ps->line_x1 = R - ps->block->content_box.x;
@@ -890,7 +1039,109 @@ static void para_open_line(ParaState *ps, float lh_est)
         ps->x += ps->indent;
         ps->indent_pending = 0;
     }
+    /* inline pad/border shifts that happened before any line existed */
+    ps->x += ps->pad_carry;
+    ps->pad_carry = 0.0f;
+    /* continuing inline boxes restart their fragment at the new line start;
+     * boxes whose own left advance went into pad_carry back off that amount
+     * so their fragment starts at the border-box edge */
+    for (i = 0; i < ps->open_n; i++) {
+        if (ps->open_started[i])
+            ps->open_x0[i] = ps->x;
+        else
+            ps->open_x0[i] = ps->x - ps->open_carry[i];
+    }
     ps->line_idx = line_begin(ps->block);
+}
+
+/**
+ * @brief 为行内盒在当前行记录一个碎片 / Record one inline-box fragment on the open line
+ *
+ * @param[in,out] ps 段落排版状态 / Paragraph layout state
+ * @param[in]     box 行内盒 / The inline box
+ * @param[in]     x0 碎片内容左缘 / Fragment content left edge
+ * @param[in]     x1 碎片内容右缘 / Fragment content right edge
+ * @param[in]     flags 1=盒从此行开始，2=盒在此行结束 / 1 = box starts on this line, 2 = box ends here
+ */
+static void para_frag_push(ParaState *ps, HpeBox *box, float x0, float x1, int flags)
+{
+    HpeLine *line = &ps->block->lines[ps->line_idx];
+    HpeInlineFrag *fr;
+    HpeFont *f;
+    if (x1 <= x0 + 0.01f)
+        return;
+    line->frags = (HpeInlineFrag *)hpe_grow(line->frags, &line->frag_cap,
+                                            (size_t)line->frag_count + 1,
+                                            sizeof(HpeInlineFrag));
+    fr = &line->frags[line->frag_count++];
+    fr->box = box;
+    fr->x0 = x0;
+    fr->x1 = x1;
+    fr->flags = flags;
+    f = font_for(&box->style);
+    fr->ascent = hpe_font_ascent(f);
+    fr->descent = hpe_font_descent(f);
+}
+
+/**
+ * @brief 处理一个行内盒开标记：入栈并推进左内边距/边框 / Handle an inline open marker: push and advance the left pad/border
+ *
+ * @param[in,out] ps 段落排版状态 / Paragraph layout state
+ * @param[in]     box 行内盒 / The inline box
+ */
+static void para_inline_open(ParaState *ps, HpeBox *box)
+{
+    const HpeStyle *st = &box->style;
+    float adv;
+    if (ps->open_n >= 24)
+        return;
+    ps->open_b[ps->open_n] = box;
+    ps->open_x0[ps->open_n] = ps->x;
+    ps->open_started[ps->open_n] = 0;
+    adv = margin_px(ps->ctx, st, st->margin[3], ps->inner_w) +
+          side_px(ps->ctx, st, st->padding[3], ps->inner_w) +
+          (st->border_w[3] > 0.0f ? st->border_w[3] : 0.0f);
+    if (ps->line_idx >= 0) {
+        ps->open_carry[ps->open_n] = 0.0f;
+        ps->x += adv;
+    } else {
+        ps->open_carry[ps->open_n] = adv;
+        ps->pad_carry += adv;
+    }
+    ps->open_n++;
+}
+
+/**
+ * @brief 处理一个行内盒闭标记：记录碎片、弹出并推进右内边距/边框 / Handle an inline close marker: emit the fragment, pop and advance the right pad/border
+ *
+ * @param[in,out] ps 段落排版状态 / Paragraph layout state
+ * @param[in]     box 行内盒 / The inline box
+ */
+static void para_inline_close(ParaState *ps, HpeBox *box)
+{
+    const HpeStyle *st;
+    float adv;
+    int i = ps->open_n - 1, k;
+    while (i >= 0 && ps->open_b[i] != box)
+        i--;
+    if (i < 0)
+        return;
+    if (ps->line_idx >= 0)
+        para_frag_push(ps, box, ps->open_x0[i], ps->x, ps->open_started[i] ? 2 : 3);
+    st = &box->style;
+    adv = side_px(ps->ctx, st, st->padding[1], ps->inner_w) +
+          (st->border_w[1] > 0.0f ? st->border_w[1] : 0.0f) +
+          margin_px(ps->ctx, st, st->margin[1], ps->inner_w);
+    if (ps->line_idx >= 0)
+        ps->x += adv;
+    else
+        ps->pad_carry += adv;
+    for (k = i; k < ps->open_n - 1; k++) {
+        ps->open_b[k] = ps->open_b[k + 1];
+        ps->open_x0[k] = ps->open_x0[k + 1];
+        ps->open_started[k] = ps->open_started[k + 1];
+    }
+    ps->open_n--;
 }
 
 /**
@@ -900,6 +1151,13 @@ static void para_open_line(ParaState *ps, float lh_est)
  */
 static void para_close_line(ParaState *ps)
 {
+    int i;
+    /* every still-open inline box gets a fragment for the line being closed */
+    for (i = 0; i < ps->open_n; i++) {
+        para_frag_push(ps, ps->open_b[i], ps->open_x0[i], ps->x,
+                       ps->open_started[i] ? 0 : 1);
+        ps->open_started[i] = 1;
+    }
     finalize_line(ps->ctx, ps->block, ps->line_idx, ps->inner_w, ps->band, &ps->row_y);
     ps->line_idx = -1;
 }
@@ -1153,6 +1411,9 @@ static void flush_paragraph(LayoutCtx *ctx, HpeBox *block, HpeParagraph *para, f
         HpeSegment *seg = &para->items[i];
         if (seg->atomic_box)
             para_place_atomic(&ps, seg->atomic_box);
+        else if (seg->inline_box)
+            seg->open ? para_inline_open(&ps, seg->inline_box)
+                      : para_inline_close(&ps, seg->inline_box);
         else if (seg->hard_break)
             para_hard_break(&ps, seg->style);
         else
@@ -1327,11 +1588,16 @@ static void layout_inline_block(LayoutCtx *ctx, HpeBox *box, float parent_inner_
 
     if (st->width.unit != HPE_LEN_AUTO) {
         /* `width` is the content box for content-box sizing and the border box
-         * for border-box; layout_block applies that interpretation itself. */
+         * for border-box; layout_block applies that interpretation itself.
+         * Convert to px first: layout_block would otherwise resolve the same
+         * percentage a second time against this already-resolved width. */
         float w = resolve_len(ctx, st, st->width, parent_inner_w);
+        HpeLength saved_w = st->width;
         if (w < 0.0f)
             w = 0.0f;
+        st->width = hpe_len_px(w);
         layout_block(ctx, box, 0.0f, 0.0f, w, -1.0f);
+        st->width = saved_w;
         return;
     }
 
@@ -1472,12 +1738,51 @@ static float abspos_width(LayoutCtx *ctx, HpeBox *box, HpeRect cb, float mL, flo
 }
 
 /**
+ * @brief 求绝对定位盒的 margin 盒左缘 / Compute the margin-box left edge of an absolutely positioned box
+ *
+ * @param[in]     ctx 布局上下文 / Layout context
+ * @param[in]     st 计算样式 / Computed style
+ * @param[in]     cb 包含块矩形 / Containing block rect
+ * @param[in]     mL 左外边距 / Left margin
+ * @param[in]     mR 右外边距 / Right margin
+ * @param[in]     hasL 左 inset 非 auto 为 1 / 1 when the left inset is not auto
+ * @param[in]     L 左 inset / Left inset
+ * @param[in]     hasR 右 inset 非 auto 为 1 / 1 when the right inset is not auto
+ * @param[in]     R 右 inset / Right inset
+ * @param[in]     w used 内容宽 / Used content width
+ *
+ * @return margin 盒左缘（layout_block 的 x 语义）/ The margin-box left edge (layout_block's x)
+ *
+ * @note 右锚定按规范从 margin 盒右缘推算：须扣除外边距、水平内边距与边框，
+ *       否则 border 盒会越过 inset 位置 / The right anchor derives from the margin-box
+ *       right edge: horizontal margins, padding and border are subtracted, or the border
+ *       box would overrun the inset position
+ */
+static float abspos_anchor_x(LayoutCtx *ctx, HpeStyle *st, HpeRect cb, float mL, float mR,
+                             int hasL, float L, int hasR, float R, float w)
+{
+    float pad_lr = side_px(ctx, st, st->padding[3], cb.w) +
+                   side_px(ctx, st, st->padding[1], cb.w);
+    float bor_lr = st->border_w[3] + st->border_w[1];
+    if (hasL)
+        return cb.x + L;
+    if (hasR)
+        return cb.x + cb.w - R - mR - pad_lr - bor_lr - w;
+    return cb.x + mL;
+}
+
+/**
  * @brief 相对包含块放置一个绝对/固定定位盒 / Position an absolutely/fixed positioned box against its containing block
  *
  * @param[in]     ctx 布局上下文 / Layout context
  * @param[in,out] box 定位盒 / Positioned box
  *
- * @note 固定定位以视口为包含块；同时给出上下 inset 且高度 auto 时拉伸到包含块 / Fixed positioning uses the viewport as containing block; when both top and bottom insets are given and the height is `auto` the box stretches to the containing block
+ * @note 固定定位以视口为包含块；同时给出上下 inset 且高度 auto 时拉伸到包含块；
+ *       宽度在此一次性解算后换算成 px，避免 layout_block 的百分比路径把
+ *       `width:50%` 以 used 宽度为基准再解一次 / Fixed positioning uses the viewport as
+ *       containing block; with both vertical insets and an auto height the box stretches.
+ *       The width is resolved once here and converted to px so layout_block's percentage
+ *       path cannot resolve `width: 50%` against the used width a second time
  */
 static void layout_abspos(LayoutCtx *ctx, HpeBox *box)
 {
@@ -1497,8 +1802,7 @@ static void layout_abspos(LayoutCtx *ctx, HpeBox *box)
     float T = abspos_inset(ctx, st, 0, cb.h);
     float B = abspos_inset(ctx, st, 2, cb.h);
     float w = abspos_width(ctx, box, cb, mL, mR, hasL, L, hasR, R);
-    float x = hasL ? cb.x + L
-                   : (hasR ? cb.x + cb.w - R - w : cb.x + mL);
+    float x = abspos_anchor_x(ctx, st, cb, mL, mR, hasL, L, hasR, R, w);
     float ypass = hasT ? cb.y + T
                        : (hasB ? cb.y : cb.y + mT); /* hasB: fixed up after measuring */
     int forced_h = 0;
@@ -1511,7 +1815,12 @@ static void layout_abspos(LayoutCtx *ctx, HpeBox *box)
         forced_h = 1;
     }
 
-    layout_block(ctx, box, x, ypass, w, cb.h);
+    {
+        HpeLength saved_w = st->width;
+        st->width = hpe_len_px(w);
+        layout_block(ctx, box, x, ypass, w, cb.h);
+        st->width = saved_w;
+    }
 
     if (hasB && !hasT) {
         float margin_h = mT + box->border_box.h + mB;
@@ -3594,6 +3903,13 @@ static void block_flow_block_child(LayoutCtx *ctx, HpeBox *box, HpeBox *child, f
         float gap = collapse_margins(fl->prev_bottom, cm[0]);
         ypass = prev_border_bottom + gap - cm[0];
     }
+    /* a block-level child honours `clear`: drop its margin box below every
+     * same-side float recorded in this container's band */
+    if (child->style.clear_side != HPE_CLEAR_NONE) {
+        float clear_y = float_clear_offset(&box->floats, (int)child->style.clear_side, ypass);
+        if (clear_y > ypass)
+            ypass = clear_y;
+    }
     fl->cur_y = ypass;
     fl->cur_y += layout_block(ctx, child, box->content_box.x, fl->cur_y, inner_w, inner_h_base);
     fl->prev_bottom = cm[2];
@@ -3787,8 +4103,13 @@ static void block_position_abspos_children(LayoutCtx *ctx, HpeBox *box)
     for (child = box->first_child; child; child = child->next) {
         if (child->kind == HPE_BOX_BLOCK &&
             (child->style.position == HPE_POS_ABSOLUTE ||
-             child->style.position == HPE_POS_FIXED))
-            layout_abspos(ctx, child);
+             child->style.position == HPE_POS_FIXED)) {
+            /* deferred pass: position immediately; normal pass: queue */
+            if (ctx->abspos_fixup)
+                layout_abspos(ctx, child);
+            else
+                abspos_queue(ctx, child);
+        }
     }
 }
 
@@ -4073,11 +4394,10 @@ static int rebuild_box_in_place(HpeDomNode *dom, HpeStylesheet *sheet)
 static void relayout_existing(HpeBox *root, float vw, float vh)
 {
     LayoutCtx ctx;
-    ctx.vw = vw;
-    ctx.vh = vh > 0.0f ? vh : vw * 4.0f;
-    ctx.root_font_size = root->style.font_size > 0.0f ? root->style.font_size : 16.0f;
+    layout_ctx_init(&ctx, vw, vh, root->style.font_size);
     if (root->kind == HPE_BOX_BLOCK)
         layout_block(&ctx, root, 0.0f, 0.0f, vw, ctx.vh);
+    abspos_flush(&ctx);
     bind_boxes(root);
 }
 
@@ -4148,6 +4468,10 @@ HpeBox *hpe_layout_build(HpeDomNode *document, HpeStylesheet *sheet, float viewp
      * and abspos `bottom:` both resolve against it */
     ctx.vh = viewport_height > 0.0f ? viewport_height : viewport_width * 4.0f;
     ctx.root_font_size = 16.0f; /* refined once the root style is known */
+    ctx.abspos = NULL;
+    ctx.abspos_count = 0;
+    ctx.abspos_cap = 0;
+    ctx.abspos_fixup = 0;
 
     root_parent = hpe_style_default();
     root = build_element(html, sheet, &root_parent);
@@ -4158,6 +4482,7 @@ HpeBox *hpe_layout_build(HpeDomNode *document, HpeStylesheet *sheet, float viewp
         ctx.root_font_size = root->style.font_size;
     if (root->kind == HPE_BOX_BLOCK)
         layout_block(&ctx, root, 0.0f, 0.0f, viewport_width, ctx.vh);
+    abspos_flush(&ctx);
     bind_boxes(root);
     return root;
 }
@@ -4203,6 +4528,8 @@ void hpe_layout_free(HpeBox *box)
     for (i = 0; i < box->line_count; i++) {
         if (box->lines[i].runs)
             hpe_free(box->lines[i].runs);
+        if (box->lines[i].frags)
+            hpe_free(box->lines[i].frags);
     }
     if (box->lines)
         hpe_free(box->lines);

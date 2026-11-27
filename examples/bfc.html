@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Hope Engine - BFC and clear</title>
+<style>
+  body { margin: 0; background-color: #f5f6f8; font-family: sans-serif; font-size: 13px; }
+  .wrap { width: 360px; margin: 12px 20px; position: relative; }
+  .label { color: #445; margin: 12px 20px 0 20px; }
+  .f { float: left; width: 80px; height: 40px; background-color: #2a6; color: #fff; }
+  .bfc { overflow: hidden; background-color: #fdf6d8; }
+  .plain { background-color: #e8f0fe; }
+  .cleared { clear: both; background-color: #fde2e2; }
+  .note { font-size: 11px; color: #667; margin: 0 20px; }
+</style>
+</head>
+<body>
+  <p class="note">1 BFC text ignores the ancestor float &middot; 2 plain text dodges it &middot;
+     3 clear:both drops the block below the float</p>
+
+  <div class="wrap">
+    <div class="f">F1</div>
+    <div class="bfc">BFC: this text starts at the left edge because overflow:hidden
+      establishes a block formatting context.</div>
+  </div>
+
+  <div class="wrap">
+    <div class="f">F2</div>
+    <div class="plain">plain: this text dodges the float and flows to its right,
+      wrapping under it once past the bottom.</div>
+  </div>
+
+  <div class="wrap" style="height: 120px;">
+    <div class="f">F3</div>
+    <div class="cleared">cleared: this block sits below the float, not beside it.</div>
+  </div>
+</body>
+</html>

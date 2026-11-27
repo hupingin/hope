@@ -47,22 +47,87 @@ static void block_new(HpeJs *js, size_t size)
  *
  * @return 指向已清零内存的指针 / Pointer to the zeroed memory
  *
- * @note 当前块剩余空间不足时自动追加新块；分配的内存不能单独释放，随 arena 整体回收 / A new block is appended when the current one is full; individual allocations cannot be freed and are reclaimed with the whole arena
+ * @note 每次分配都带一个 `JsChunkHdr` 块头供 GC 遍历；优先复用空闲链表上的块（超长则切分），
+ *       否则从当前块线性推进；内存不能单独 free，由 GC 回收后进入空闲链表。
+ *       Every allocation carries a `JsChunkHdr` so the GC can walk blocks; the free list is
+ *       reused first (oversized chunks are split), otherwise the current block is bumped.
+ *       Memory is never freed individually — the GC returns it to the free list.
  */
 void *hpe_js_alloc(HpeJs *js, size_t size)
 {
-    JsBlock *b = js->blocks;
+    return hpe_js_alloc_typed(js, size, GC_T_PLAIN);
+}
+
+/**
+ * @brief 从空闲链表取一个能装下 `size` 的块并摘链 / Pop a free chunk that fits `size` from the free list
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     size 需要的载荷字节数 / Required payload byte count
+ *
+ * @return 命中的块头，空闲链表为空或无合适块返回 `NULL` / The matched header, or `NULL` when no free chunk fits
+ */
+static JsChunkHdr *gc_free_pop(HpeJs *js, size_t size)
+{
+    JsChunkHdr **pp = (JsChunkHdr **)&js->gc_free;
+    while (*pp) {
+        JsChunkHdr *h = *pp;
+        void **nextp = (void **)((char *)(h + 1));
+        if (h->size >= size) {
+            *pp = (JsChunkHdr *)*nextp;
+            return h;
+        }
+        pp = (JsChunkHdr **)nextp;
+    }
+    return NULL;
+}
+
+/**
+ * @brief 按提示标签从 arena 分配已清零内存 / Allocate zeroed memory from the arena with an allocator tag
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     size 请求字节数，向上对齐到 8 的倍数 / Requested byte count, rounded up to a multiple of 8
+ * @param[in]     tag GC_T_* 分配提示（生成器/async 状态块供 GC 识别）/ GC_T_* hint (generator/async state chunks, for the GC)
+ *
+ * @return 指向已清零载荷的指针 / Pointer to the zeroed payload
+ */
+void *hpe_js_alloc_typed(HpeJs *js, size_t size, int tag)
+{
+    JsChunkHdr *h;
     size = (size + 7u) & ~(size_t)7u;
-    if (!b || b->used + size > b->size) {
-        block_new(js, size);
-        b = js->blocks;
+    h = gc_free_pop(js, size);
+    if (!h) {
+        JsBlock *b = js->blocks;
+        if (!b || b->used + sizeof(JsChunkHdr) + size > b->size) {
+            block_new(js, sizeof(JsChunkHdr) + size);
+            b = js->blocks;
+        }
+        h = (JsChunkHdr *)(b->mem + b->used);
+        b->used += sizeof(JsChunkHdr) + size;
+        js->gc_total += sizeof(JsChunkHdr) + size;
+        h->size = size;
+    } else if (h->size > size + sizeof(JsChunkHdr) + 32) {
+        /* split the leftover of an oversized reused chunk back onto the free
+         * list: the new `rest` header keeps the block's chunk chain walking
+         * to the same next-chunk position as before */
+        JsChunkHdr *rest = (JsChunkHdr *)((char *)(h + 1) + size);
+        void **restnext = (void **)((char *)(rest + 1));
+        rest->size = h->size - size - sizeof(JsChunkHdr);
+        rest->tag = GC_T_PLAIN;
+        rest->mark = 0;
+        rest->magic = GC_CHUNK_MAGIC;
+        *restnext = js->gc_free;
+        js->gc_free = (void *)rest;
+        h->size = size;
     }
-    {
-        void *p = b->mem + b->used;
-        b->used += size;
-        memset(p, 0, size);
-        return p;
-    }
+    /* no split: the reused chunk KEEPS its full free size. Shrinking it here
+     * would move the chain walk into the middle of the formerly merged run
+     * (stale interior headers), breaking the chunk sequence for every later
+     * GC. The unused tail is dead space *inside* this chunk instead. */
+    h->tag = (uint16_t)tag;
+    h->mark = 0;
+    h->magic = GC_CHUNK_MAGIC;
+    memset(h + 1, 0, size);
+    return (void *)(h + 1);
 }
 
 /**
@@ -601,6 +666,9 @@ int js_obj_delete(HpeJs *js, JsObj *obj, const char *key)
         return 1;
     for (i = 0; i < obj->prop_count; i++) {
         if (!strcmp(obj->props[i].key, key)) {
+            /* sealed / frozen objects keep their own properties non-configurable */
+            if ((int)obj->num_val & 1)
+                return 0;
             memmove(&obj->props[i], &obj->props[i + 1],
                     (size_t)(obj->prop_count - i - 1) * sizeof(JsProp));
             obj->prop_count--;
@@ -1137,10 +1205,17 @@ static char *js_error_to_string(HpeJs *js, JsObj *o)
  *
  * @note 类名为 `Object` 或 `Module` 时统一输出 `[object Object]` / `Object` and `Module` both render as `[object Object]`
  */
+static int try_to_primitive_hook(HpeJs *js, JsValue v, const char *hint, JsValue *out);
+
 static char *js_obj_to_string(HpeJs *js, JsObj *o)
 {
     char buf[64];
     const char *cn = obj_class_name(o);
+    /* Symbol.toStringTag overrides the built-in class tag (spec §19.1.3.6);
+       read via js_get_prop so getter (accessor) forms work too */
+    JsValue tagv = js_get_prop(js, NULL, js_objval(o), "Symbol.toStringTag", 0);
+    if (tagv.t == JS_STR && tagv.str && tagv.str[0])
+        cn = tagv.str;
     if (!strcmp(cn, "Object") || !strcmp(cn, "Module"))
         return hpe_js_strdup(js, "[object Object]");
     snprintf(buf, sizeof(buf), "[object %s]", cn);
@@ -1207,8 +1282,13 @@ char *js_to_string(HpeJs *js, JsValue v)
     }
     case JS_STR:
         return v.str ? v.str : hpe_js_strdup(js, "");
-    case JS_OBJ:
+    case JS_OBJ: {
+        /* ToString(ToPrimitive(v, "string")) — the exotic hook goes first */
+        JsValue hooked;
+        if (try_to_primitive_hook(js, v, "string", &hooked))
+            return js_to_string(js, hooked);
         return js_object_value_to_string(js, v);
+    }
     default:
         return hpe_js_strdup(js, "undefined");
     }
@@ -1336,6 +1416,35 @@ static int parse_number_prefix(const char *s, double *out, const char **end)
 }
 
 /**
+ * @brief `ToPrimitive` 的异质钩子：调用 `obj[Symbol.toPrimitive](hint)` / The exotic `ToPrimitive` hook: call `obj[Symbol.toPrimitive](hint)`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     v 待转换的值 / Value to convert
+ * @param[in]     hint 提示串（`"default"` / `"number"` / `"string"`）/ Hint string (`"default"` / `"number"` / `"string"`)
+ * @param[out]    out 钩子返回的原始值 / Receives the primitive returned by the hook
+ *
+ * @return 钩子存在且返回了原始值时为 1 / 1 when the hook exists and returned a primitive
+ *
+ * @note 知名符号以自然名 `"Symbol.toPrimitive"` 作属性键 / A well-known symbol keys the property under its natural name `"Symbol.toPrimitive"`
+ */
+static int try_to_primitive_hook(HpeJs *js, JsValue v, const char *hint, JsValue *out)
+{
+    JsProp *p;
+    JsValue hv, r;
+    if (v.t != JS_OBJ || !v.obj)
+        return 0;
+    p = js_obj_find_prop(v.obj, "Symbol.toPrimitive");
+    if (!p || !js_is_callable(p->val))
+        return 0;
+    hv = js_string(js, hint);
+    r = js_invoke(js, p->val, v, &hv, 1, 0);
+    if (r.t == JS_OBJ)
+        return 0; /* spec raises TypeError; the engine stays permissive */
+    *out = r;
+    return 1;
+}
+
+/**
  * @brief 语义上的 `ToNumber` 抽象操作 / The abstract `ToNumber` operation
  *
  * @details `undefined`→NaN、`null`→0、布尔→0/1、数值原样；字符串解析前缀，空串为 0、含非法尾随为 NaN；对象先 `ToPrimitive` 再递归。
@@ -1377,13 +1486,16 @@ double js_to_number(HpeJs *js, JsValue v)
         return d;
     }
     case JS_OBJ: {
-        /* ToPrimitive("number") : valueOf/toString override the class form */
-        JsValue p = js_primitive_of(js, v);
-        if (p.t == JS_OBJ)
-            return NAN;
-        if (p.t == JS_STR)
+        /* ToPrimitive("number"): the exotic hook wins, then valueOf/toString */
+        JsValue hooked;
+        if (try_to_primitive_hook(js, v, "number", &hooked))
+            return js_to_number(js, hooked);
+        {
+            JsValue p = js_primitive_of(js, v);
+            if (p.t == JS_OBJ)
+                return NAN;
             return js_to_number(js, p);
-        return js_to_number(js, p);
+        }
     }
     default:
         return NAN;
@@ -1540,8 +1652,13 @@ int js_is_callable(JsValue v)
  */
 int js_primitive_of_checked(HpeJs *js, JsValue v, JsValue *out)
 {
+    JsValue hooked;
     if (v.t != JS_OBJ || !v.obj) {
         *out = v;
+        return 1;
+    }
+    if (try_to_primitive_hook(js, v, "default", &hooked)) {
+        *out = hooked;
         return 1;
     }
     if (v.obj->kind == JS_OBJ_ARRAY || v.obj->kind == JS_OBJ_PROMISE) {

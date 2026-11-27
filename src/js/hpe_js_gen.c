@@ -28,6 +28,41 @@
 #define GEN_STACK_BYTES (256u * 1024u)
 
 /**
+ * @brief 把一个协程的异常上下文换入/换出 / Swap a coroutine's exception context in and out
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] ctx 协程的上下文块 / The coroutine's context block
+ *
+ * @see HpeJsFiberCtx
+ */
+void hpe_js_fiber_enter(HpeJs *js, HpeJsFiberCtx *ctx)
+{
+    ctx->resumer_try_top = js->try_top;
+    memcpy(ctx->resumer_jmp, js->jmp, sizeof(jmp_buf));
+    ctx->resumer_depth = js->call_depth;
+    js->try_top = ctx->coro_try_top;
+    memcpy(js->jmp, ctx->coro_jmp, sizeof(jmp_buf));
+    js->call_depth = 0; /* the coroutine stack starts its own depth budget */
+}
+
+/**
+ * @brief 切出协程时保存协程侧上下文并还原调用方侧 / Save the coroutine context and restore the resumer's on the way out
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] ctx 协程的上下文块 / The coroutine's context block
+ *
+ * @see hpe_js_fiber_enter
+ */
+void hpe_js_fiber_leave(HpeJs *js, HpeJsFiberCtx *ctx)
+{
+    ctx->coro_try_top = js->try_top;
+    memcpy(ctx->coro_jmp, js->jmp, sizeof(jmp_buf));
+    js->try_top = ctx->resumer_try_top;
+    memcpy(js->jmp, ctx->resumer_jmp, sizeof(jmp_buf));
+    js->call_depth = ctx->resumer_depth;
+}
+
+/**
  * @brief 一个生成器的挂起状态 / The suspended state of one generator
  *
  * @note 生命期由 arena 管理；协程栈由平台层负责释放 / Lifetime is arena-managed; the coroutine
@@ -60,15 +95,8 @@ typedef struct HpeJsGen {
     JsValue pending_return;
     /* the value a `yield*` delegate returned, handed back to the delegating body */
     JsValue delegate_ret;
-    /* Per-fiber exception context. `js->try_top` and `js->jmp` are single shared
-     * slots, but a generator body runs on its own stack: while it is parked the
-     * resumer installs its own try frames and its own landing pad. Swap both in
-     * and out on every switch so each side only ever jumps to frames that live
-     * on its own stack — a `longjmp` across a stack switch is fatal. */
-    JsTryFrame *coro_try_top;   /* the coroutine side's try chain / 协程侧的 try 链 */
-    jmp_buf coro_jmp;           /* the coroutine side's landing pad / 协程侧的兜底着陆点 */
-    JsTryFrame *resumer_try_top;/* the resumer side's try chain, saved while inside / 进入协程时暂存的调用方 try 链 */
-    jmp_buf resumer_jmp;        /* the resumer side's landing pad, saved while inside / 进入协程时暂存的调用方着陆点 */
+    /* per-fiber exception context: see `HpeJsFiberCtx` for why this is needed */
+    HpeJsFiberCtx fib;
 } HpeJsGen;
 
 static void gen_body(void *ud);
@@ -146,19 +174,17 @@ static void gen_body(void *ud)
  *
  * @return 仍在运行返回 1，已结束返回 0 / 1 when still live, 0 when finished
  *
- * @note 这里做三件事，都是为了让「一个生成器 = 一个独立栈」这件事对上层透明：
+ * @note 这里做两件事，都是为了让「一个生成器 = 一个独立栈」这件事对上层透明：
  *       1. `gen_active` 在此设置并还原，使 `yield*` 的嵌套按栈式语义工作（内层挂起时
  *          `gen_active` 指向内层，内层 yield 回外层后还原成外层）。
- *       2. `try_top` 与 `jmp` 在此**交换**：协程侧的暂存进 `coro_*`，调用方侧的暂存进
- *          `resumer_*`。这两个槽在 `HpeJs` 上是全局单例，不交换的话协程里的
+ *       2. `try_top` 与 `jmp` 在此**交换**：协程侧的暂存进 `fib.coro_*`，调用方侧的暂存进
+ *          `fib.resumer_*`。这两个槽在 `HpeJs` 上是全局单例，不交换的话协程里的
  *          `longjmp` 会落到另一个栈上的帧，Windows 会直接以 `0xC0000028` 终止进程。
- *       3. 交换在**每次**切换前后都做，因为协程可能在任意深的 `try` 里挂起。
- *       Three things happen here so "one generator = one stack" stays invisible above:
+ *       交换在**每次**切换前后都做，因为协程可能在任意深的 `try` 里挂起。
+ *       Two things happen here so "one generator = one stack" stays invisible above:
  *       1. `gen_active` is set/restored so `yield*` nests stack-wise.
- *       2. `try_top` and `jmp` are swapped between the coroutine and the resumer. Both are
- *          singletons on `HpeJs`; without the swap a `longjmp` inside the coroutine would target
- *          a frame on the other stack, which Windows kills with `0xC0000028`.
- *       3. The swap happens on *every* switch, since a coroutine can park inside any depth of `try`.
+ *       2. The exception context is swapped via `hpe_js_fiber_enter` / `hpe_js_fiber_leave`,
+ *          since `js->try_top` and `js->jmp` are singletons on `HpeJs`.
  */
 static int gen_resume(HpeJsGen *g)
 {
@@ -169,48 +195,33 @@ static int gen_resume(HpeJsGen *g)
     if (!g->coro)
         return 0;
     prev = js->gen_active;
-    g->resumer_try_top = js->try_top;
-    memcpy(g->resumer_jmp, js->jmp, sizeof(jmp_buf));
-    js->try_top = g->coro_try_top;
-    memcpy(js->jmp, g->coro_jmp, sizeof(jmp_buf));
+    hpe_js_fiber_enter(js, &g->fib);
     js->gen_active = g;
     g->state = 1;
     r = hpe_coro_resume(g->coro);
-    g->coro_try_top = js->try_top;
-    memcpy(g->coro_jmp, js->jmp, sizeof(jmp_buf));
-    js->try_top = g->resumer_try_top;
-    memcpy(js->jmp, g->resumer_jmp, sizeof(jmp_buf));
+    hpe_js_fiber_leave(js, &g->fib);
     js->gen_active = prev;
     return r;
 }
 
 /**
- * @brief `next(v)` / `return(v)` 的共用实现 / Shared implementation of `next(v)` and `return(v)`
+ * @brief 恢复生成器函数体直到下一个 `yield` 或结束 / Resume the body until the next `yield` or completion
  *
  * @param[in,out] js JS 运行时上下文 / JS runtime context
  * @param[in]     g 生成器状态 / The generator state
  * @param[in]     sent 传入生成器的值 / The value handed to the body
- * @param[in]     force_return 非 0 表示这是 `return(v)`，不再继续执行 / Non-zero for `return(v)`, which stops the body
  *
  * @return `{ value, done }` 结果 / The `{ value, done }` result
  *
  * @note 已结束的生成器再被 `next` 只返回 `{ undefined, true }` / Calling `next` on a finished generator yields `{ undefined, true }`
  */
-static JsValue gen_step(HpeJs *js, HpeJsGen *g, JsValue sent, int force_return)
+static JsValue gen_step(HpeJs *js, HpeJsGen *g, JsValue sent)
 {
     JsValue out;
 
     if (!g || g->state == 2)
-        return gen_result(js, force_return ? sent : js_undef(), 1);
+        return gen_result(js, js_undef(), 1);
     g->sent = sent;
-    if (force_return) {
-        /* the body is abandoned where it stands; JS semantics allow that */
-        if (g->coro)
-            hpe_coro_destroy(g->coro);
-        g->coro = NULL;
-        g->state = 2;
-        return gen_result(js, sent, 1);
-    }
     if (!g->started) {
         g->started = 1;
         g->yielded = js_undef();
@@ -241,7 +252,7 @@ static JsValue gen_step(HpeJs *js, HpeJsGen *g, JsValue sent, int force_return)
 static JsValue gen_next(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *ud)
 {
     HPE_UNUSED(thisv);
-    return gen_step(js, gen_of(ud), argc > 0 ? args[0] : js_undef(), 0);
+    return gen_step(js, gen_of(ud), argc > 0 ? args[0] : js_undef());
 }
 
 /**
@@ -276,7 +287,7 @@ static JsValue gen_return(HpeJs *js, JsValue thisv, JsValue *args, int argc, voi
      * to catch and `exec_try_finally` runs around. */
     g->pending_return = v;
     g->has_pending_return = 1;
-    return gen_step(js, g, js_undef(), 0);
+    return gen_step(js, g, js_undef());
 }
 
 /**
@@ -316,7 +327,7 @@ static JsValue gen_throw(HpeJs *js, JsValue thisv, JsValue *args, int argc, void
      * coroutine stack, so only a raise from *there* can reach them. */
     g->pending_throw = v;
     g->has_pending_throw = 1;
-    return gen_step(js, g, js_undef(), 0);
+    return gen_step(js, g, js_undef());
 }
 
 /**
@@ -356,9 +367,12 @@ static JsValue gen_self(HpeJs *js, JsValue thisv, JsValue *args, int argc, void 
 JsValue hpe_js_gen_create(HpeJs *js, JsObj *fn, JsEnv *closure, JsValue this_v, JsValue *args,
                           int argc)
 {
-    HpeJsGen *g = (HpeJsGen *)hpe_js_alloc(js, sizeof(*g));
+    HpeJsGen *g = (HpeJsGen *)hpe_js_alloc_typed(js, sizeof(*g), GC_T_GEN);
     JsObj *o = js_object_raw(js);
     int i;
+
+    if (!js->gc_scan_gen)
+        js->gc_scan_gen = hpe_js_gen_gc_scan;
 
     g->js = js;
     g->fn = fn;
@@ -420,7 +434,7 @@ int hpe_js_gen_pull(HpeJs *js, JsObj *obj, JsValue *out)
     HpeJsGen *g = hpe_js_gen_of(obj);
     if (!g)
         return 0;
-    *out = gen_step(js, g, js_undef(), 0);
+    *out = gen_step(js, g, js_undef());
     return g->state != 2;
 }
 
@@ -543,4 +557,20 @@ void *hpe_js_gen_coro(HpeJs *js, HpeJsGen *g)
 {
     HPE_UNUSED(js);
     return g ? g->coro : NULL;
+}
+
+/**
+ * @brief 供 GC 扫描一个挂起生成器的协程栈 / GC hook: scan a suspended generator's coroutine stack
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] state 生成器状态块指针（GC_T_GEN 块的载荷）/ The generator state pointer (payload of a GC_T_GEN chunk)
+ *
+ * @see hpe_js_gc_collect
+ */
+void hpe_js_gen_gc_scan(HpeJs *js, void *state)
+{
+    HpeJsGen *g = (HpeJsGen *)state;
+    void *lo, *hi;
+    if (g && g->coro && hpe_coro_stack_range(g->coro, &lo, &hi))
+        hpe_js_gc_scan_range(js, lo, hi);
 }

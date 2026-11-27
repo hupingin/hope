@@ -11,6 +11,8 @@ typedef struct HpePixmap {
     uint32_t *pixels;
     /* damage-rect support: all raster ops clip to [clip_x0,clip_x1)x[clip_y0,clip_y1) */
     int clip_x0, clip_y0, clip_x1, clip_y1;
+    /* offscreen composition: blend writes accumulated alpha instead of 255 */
+    int alpha_record;
 } HpePixmap;
 
 /**

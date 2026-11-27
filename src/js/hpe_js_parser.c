@@ -903,7 +903,48 @@ typedef struct {
     Tok *t;
     int pos;
     int ntok;
+    int strict; /* "use strict" of the enclosing program / function body */
+    int depth;  /* expression nesting guard / 表达式嵌套深度护栏 */
 } P;
+
+/**
+ * @brief 从词法单元下标 start 扫描指令序言是否含 "use strict" / Scan the directive prologue from token index `start` for "use strict"
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ * @param[in]     start 起始词法单元下标 / Starting token index
+ *
+ * @return 含 "use strict" 指令返回 1，否则 0 / 1 when a "use strict" directive is present, otherwise 0
+ *
+ * @note 指令序言由前导的纯字符串字面量语句组成（可选分号结尾），首个非字符串语句终止扫描 / The directive prologue is the leading run of bare string-literal statements (optionally semicolon-terminated); scanning stops at the first non-string statement
+ */
+static int p_directive_strict(P *p, int start)
+{
+    int i = start;
+    while (i < p->ntok && p->t[i].type == T_STR) {
+        if (p->t[i].text && !strcmp(p->t[i].text, "use strict"))
+            return 1;
+        if (i + 1 < p->ntok && p->t[i + 1].type == T_PUNCT &&
+            !strcmp(p->t[i + 1].text, ";"))
+            i += 2;
+        else
+            i += 1;
+    }
+    return 0;
+}
+
+/**
+ * @brief 严格模式下名字是否为禁用的 `eval` / `arguments` / Whether `name` is the strict-mode-reserved `eval` or `arguments`
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ * @param[in]     name 待检查的名字 / Name to test
+ *
+ * @return 是返回 1，否则 0 / 1 when reserved, otherwise 0
+ */
+static int p_strict_reserved_name(P *p, const char *name)
+{
+    return p->strict && name &&
+           (!strcmp(name, "eval") || !strcmp(name, "arguments"));
+}
 
 /**
  * @brief 取当前词法单元 / Return the current token
@@ -1252,6 +1293,10 @@ static JsNode *p_binding_target(P *p)
         /* reserved words are accepted here as names too: JS engines allow many
          * of them (`let`, `static`, `get`, `set`, `async`, `of`, `as`, `from`)
          * in non-strict positions, so we do not reject them */
+        if (p_strict_reserved_name(p, t->text))
+            js_error(p->js, p_line(p),
+                     "'%s' may not be used as a binding name in strict mode",
+                     t->text);
         JsNode *id = p_node(p, JS_N_IDENT);
         id->str = t->text;
         p_advance(p);
@@ -1502,31 +1547,53 @@ static JsNode *parse_sub_expression(HpeJs *js, const char *src, size_t len)
 }
 
 /**
- * @brief 向模板节点的 cooked 块列表追加一块 / Append one cooked chunk to a template node
+ * @brief 向模板块列表追加一个文本块（cooked 与可选 raw）/ Append one text chunk (cooked plus optional raw) to template chunk lists
  *
  * @param[in,out] p 解析器状态 / Parser state
- * @param[in,out] node 模板节点 / The template node
+ * @param[in,out] cooked cooked 块列表 / Cooked-chunk list
+ * @param[in,out] raw raw 块列表，可为 NULL / Raw-chunk list, or `NULL` when unused
  * @param[in]     s 以 NUL 结尾的字符串 / NUL-terminated string
  * @param[in]     start 块起始下标 / Chunk start offset
  * @param[in]     end 块结束下标 / Chunk end offset
  *
- * @note 偏移相对 `s`；解码转义后作为 `JS_N_STR` 加入 `node->kids[0]` / Offsets are relative to `s`; the decoded text is added as a `JS_N_STR` into `node->kids[0]`
+ * @note 偏移相对 `s`；行终止符先归一化为 LF，cooked 解码转义后作为 `JS_N_STR` 加入 `cooked`，raw 保留转义原样加入 `raw` / Offsets are relative to `s`; line terminators are normalised to LF first, cooked escapes are decoded into `cooked`, and raw keeps the escapes verbatim into `raw`
  *
- * @see decode_chunk
+ * @see decode_chunk, p_scan_chunks
  */
-static void p_template_add_chunk(P *p, JsNode *node, const char *s, size_t start, size_t end)
+static void p_template_add_chunk(P *p, JsNode *cooked, JsNode *raw, const char *s, size_t start,
+                                 size_t end)
 {
-    char *cooked = (char *)malloc(end - start + 8);
-    size_t cn;
-    JsNode *str;
+    char *norm = (char *)malloc(end - start + 1);
+    char *buf;
+    size_t n = end - start;
+    size_t i, no = 0, cn;
+    JsNode *str, *rstr;
 
-    if (!cooked)
+    if (!norm)
         js_error(p->js, p_line(p), "out of memory");
-    cn = decode_chunk(p->js, s + start, end - start, cooked, end - start + 4);
+    for (i = 0; i < n; i++) { /* normalise CRLF / lone CR to LF */
+        if (s[start + i] == '\r') {
+            norm[no++] = '\n';
+            if (i + 1 < n && s[start + i + 1] == '\n')
+                i++;
+        } else {
+            norm[no++] = s[start + i];
+        }
+    }
+    buf = (char *)malloc(no + 8);
+    if (!buf)
+        js_error(p->js, p_line(p), "out of memory");
+    cn = decode_chunk(p->js, norm, no, buf, no + 4);
     str = p_node(p, JS_N_STR);
-    str->str = hpe_js_strndup(p->js, cooked, cn);
-    js_node_add(p->js, node->kids[0], str);
-    free(cooked);
+    str->str = hpe_js_strndup(p->js, buf, cn);
+    js_node_add(p->js, cooked, str);
+    free(buf);
+    if (raw) {
+        rstr = p_node(p, JS_N_STR);
+        rstr->str = hpe_js_strndup(p->js, norm, no);
+        js_node_add(p->js, raw, rstr);
+    }
+    free(norm);
 }
 
 /**
@@ -1576,6 +1643,44 @@ static size_t p_template_scan_sub(HpeJs *js, const char *s, size_t len, size_t e
 }
 
 /**
+ * @brief 扫描模板词法单元，产出文本块与替换表达式 / Scan a template token producing chunks and substitutions
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ * @param[in]     s 模板词法单元全文（含首尾反引号）/ Full template token text (with both backticks)
+ * @param[in,out] cooked cooked 块列表 / Cooked-chunk list
+ * @param[in,out] raw raw 块列表，可为 NULL / Raw-chunk list, or `NULL` when unused
+ * @param[in,out] subs 接收替换表达式的节点 / Node receiving the substitution expressions
+ *
+ * @note `${…}` 中的子表达式以独立源码片段重新解析 / Sub-expressions inside `${…}` are re-parsed as standalone source snippets
+ *
+ * @see p_template, p_tagged_template, p_template_scan_sub, parse_sub_expression
+ */
+static void p_scan_chunks(P *p, const char *s, JsNode *cooked, JsNode *raw, JsNode *subs)
+{
+    size_t len = strlen(s);
+    size_t i = 1; /* past the opening backtick */
+
+    while (i < len) {
+        size_t start = i;
+        while (i < len && s[i] != '`' && !(s[i] == '$' && i + 1 < len && s[i + 1] == '{')) {
+            if (s[i] == '\\' && i + 1 < len)
+                i += 2;
+            else
+                i++;
+        }
+        p_template_add_chunk(p, cooked, raw, s, start, i);
+        if (i >= len || s[i] == '`')
+            break;
+        {
+            size_t es = i + 2; /* past ${ */
+            size_t j = p_template_scan_sub(p->js, s, len, es);
+            js_node_add(p->js, subs, parse_sub_expression(p->js, s + es, j - 1 - es));
+            i = j;
+        }
+    }
+}
+
+/**
  * @brief 把 `T_TEMPLATE` 词法单元展开为模板节点 / Expand a `T_TEMPLATE` token into a template node
  *
  * @param[in,out] p 解析器状态 / Parser state
@@ -1584,39 +1689,80 @@ static size_t p_template_scan_sub(HpeJs *js, const char *s, size_t len, size_t e
  *
  * @note kids[0] 为 cooked 块列表，其后为每个 `${}` 的表达式 / `kids[0]` is the cooked-chunk list, followed by one expression per `${}`
  *
- * @see p_template_add_chunk, p_template_scan_sub, parse_sub_expression
+ * @see p_scan_chunks
  */
 static JsNode *p_template(P *p)
 {
     const char *s = p_cur(p)->text ? p_cur(p)->text : "";
-    size_t len = strlen(s);
-    size_t i = 1; /* past the opening backtick */
     JsNode *node = p_node(p, JS_N_TEMPLATE);
+
     js_node_add(p->js, node, p_node(p, JS_N_BLOCK)); /* kids[0]: cooked chunks */
+    p_scan_chunks(p, s, node->kids[0], NULL, node);
+    p_advance(p);
+    return node;
+}
 
-    while (i < len) {
-        size_t start = i;
+/**
+ * @brief 解析带标签的模板 `` tag`…` `` / Parse a tagged template `` tag`…` ``
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ * @param[in]     tag 已解析的标签表达式 / The already parsed tag expression
+ *
+ * @return `JS_N_TAGGED` 节点 / A `JS_N_TAGGED` node
+ *
+ * @note kids[0] 标签、kids[1] cooked 块、kids[2] raw 块、kids[3..] 替换表达式 / `kids[0]` tag, `kids[1]` cooked chunks, `kids[2]` raw chunks, `kids[3..]` substitutions
+ *
+ * @see p_scan_chunks
+ */
+static JsNode *p_tagged_template(P *p, JsNode *tag)
+{
+    const char *s = p_cur(p)->text ? p_cur(p)->text : "";
+    JsNode *node = p_node(p, JS_N_TAGGED);
 
-        while (i < len && s[i] != '`' && !(s[i] == '$' && i + 1 < len && s[i + 1] == '{')) {
-            if (s[i] == '\\' && i + 1 < len)
-                i += 2;
-            else
-                i++;
-        }
-        p_template_add_chunk(p, node, s, start, i);
-        if (i >= len || s[i] == '`')
-            break;
-        {
-            size_t es = i + 2; /* past ${ */
-            size_t j = p_template_scan_sub(p->js, s, len, es);
-            js_node_add(p->js, node, parse_sub_expression(p->js, s + es, j - 1 - es));
-            i = j;
-        }
-    }
+    js_node_add(p->js, node, tag);                   /* kids[0]: tag */
+    js_node_add(p->js, node, p_node(p, JS_N_BLOCK)); /* kids[1]: cooked chunks */
+    js_node_add(p->js, node, p_node(p, JS_N_BLOCK)); /* kids[2]: raw chunks */
+    p_scan_chunks(p, s, node->kids[1], node->kids[2], node);
     p_advance(p);
     return node;
 }
 /* ---------------- declarations / functions ---------------- */
+
+/**
+ * @brief 严格模式下检查参数表是否含重名简单参数 / Check for duplicate simple parameters in strict mode
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ * @param[in,out] params 参数表节点 / Parameter-list node
+ *
+ * @note 只要出现解构模式即跳过检查（本引擎对模式重名不做校验）/ The check is skipped entirely once a destructuring pattern is present (pattern duplicates are not validated by this engine)
+ */
+static void p_check_dup_params(P *p, JsNode *params)
+{
+    const char *names[64];
+    int n = 0;
+    int i, j;
+
+    for (i = 0; i < params->kid_count; i++) {
+        JsNode *el = params->kids[i];
+        JsNode *tgt;
+        if (!el)
+            continue;
+        if (n >= 64)
+            return;
+        if (el->kind == JS_N_PAT_REST || el->kind == JS_N_PAT_DEFAULT)
+            tgt = el->kids[0];
+        else
+            tgt = el;
+        if (!tgt || tgt->kind != JS_N_IDENT)
+            return; /* destructuring present: skip the duplicate check */
+        for (j = 0; j < n; j++)
+            if (!strcmp(names[j], tgt->str))
+                js_error(p->js, p_line(p),
+                         "duplicate parameter name '%s' not allowed in strict mode",
+                         tgt->str);
+        names[n++] = tgt->str;
+    }
+}
 
 /**
  * @brief 解析 `function [name](params) { body }` / Parse `function [name](params) { body }`
@@ -1628,7 +1774,7 @@ static JsNode *p_template(P *p)
  *
  * @return `JS_N_FUNC` 节点（op 为 `FN_*` 标志，kids[0] 参数、kids[1] 函数体）/ A `JS_N_FUNC` node (op holds `FN_*` flags; kids[0] params, kids[1] body)
  *
- * @note 调用时当前词法单元须为 `function` / The current token must be `function`
+ * @note 调用时当前词法单元须为 `function`；词法处于严格代码或函数体指令序言含 "use strict" 时打上 `FN_STRICT`，并对函数体做严格模式语法检查 / The current token must be `function`; `FN_STRICT` is set when the lexical context is strict or the body's directive prologue contains "use strict", and strict-mode syntax checks apply to the body
  *
  * @see p_arrow_from_params
  */
@@ -1636,7 +1782,12 @@ static JsNode *p_function(P *p, int need_name, int is_async, int is_gen)
 {
     JsNode *fn = p_node(p, JS_N_FUNC);
     JsNode *params = p_node(p, JS_N_BLOCK);
+    int saved_strict = p->strict;
+    int body_strict = 0;
+
     fn->op = (is_async ? FN_ASYNC : 0) | (is_gen ? FN_GEN : 0);
+    if (p->strict)
+        fn->op |= FN_STRICT;
 
     p_advance(p); /* function */
     if (is_gen && p_is(p, "*"))
@@ -1660,10 +1811,22 @@ static JsNode *p_function(P *p, int need_name, int is_async, int is_gen)
     }
     p_expect(p, ")");
     js_node_add(p->js, fn, params);
-    if (p_is(p, "{"))
+    if (p_is(p, "{")) {
+        body_strict = p_directive_strict(p, p->pos + 1);
+        if (body_strict)
+            p->strict = 1;
         js_node_add(p->js, fn, p_block(p));
-    else
+        p->strict = saved_strict;
+    } else {
         js_error(p->js, p_line(p), "function body expected");
+    }
+    if (p->strict || body_strict) {
+        fn->op |= FN_STRICT;
+        p_check_dup_params(p, params);
+        if (fn->str && p_strict_reserved_name(p, fn->str))
+            js_error(p->js, p_line(p),
+                     "function name '%s' is not allowed in strict mode", fn->str);
+    }
     return fn;
 }
 
@@ -1683,11 +1846,18 @@ static JsNode *p_function(P *p, int need_name, int is_async, int is_gen)
 static JsNode *p_arrow_from_params(P *p, JsNode *params, int is_async)
 {
     JsNode *fn = p_node(p, JS_N_FUNC);
+    int saved_strict = p->strict;
+
     fn->op = FN_ARROW | (is_async ? FN_ASYNC : 0);
+    if (p->strict)
+        fn->op |= FN_STRICT;
     js_node_add(p->js, fn, params);
     p_advance(p); /* => */
     if (p_is(p, "{")) {
+        if (p_directive_strict(p, p->pos + 1))
+            p->strict = 1;
         js_node_add(p->js, fn, p_block(p));
+        p->strict = saved_strict;
     } else {
         JsNode *blk = p_node(p, JS_N_BLOCK);
         JsNode *ret = p_node(p, JS_N_RETURN);
@@ -2185,6 +2355,8 @@ static void p_class_method(P *p, JsNode *members, char *key, JsNode *computed,
 
     fn->op = (f->is_async ? FN_ASYNC : 0) | (f->is_gen ? FN_GEN : 0) | FN_CLASS |
              (ctor ? FN_CTOR : 0);
+    if (p->strict)
+        fn->op |= FN_STRICT; /* class methods are always strict */
     fn->str = key;
     p_advance(p); /* ( */
     while (!p_is(p, ")")) {
@@ -2304,7 +2476,12 @@ static JsNode *p_class(P *p)
     } else {
         js_node_add(p->js, cls, NULL);
     }
-    p_class_body(p, cls);
+    {
+        int saved_strict = p->strict;
+        p->strict = 1; /* class bodies are always strict (spec §15.6) */
+        p_class_body(p, cls);
+        p->strict = saved_strict;
+    }
     return cls;
 }
 /* ---------------- expressions ---------------- */
@@ -2434,9 +2611,9 @@ static JsNode *p_member_optional(P *p, JsNode *base, int allow_call)
  *
  * @return 链接完成后的表达式节点 / The fully chained expression node
  *
- * @note `new` 以 allow_call=0 解析被调者，使 `new Date(0).getTime()` 绑定为 `(new Date(0)).getTime()` / `new` parses its callee with calls disabled so `new Date(0).getTime()` binds as `(new Date(0)).getTime()`
+ * @note `new` 以 allow_call=0 解析被调者，使 `new Date(0).getTime()` 绑定为 `(new Date(0)).getTime()`；成员表达式后紧跟模板字面量构成带标签模板 / `new` parses its callee with calls disabled so `new Date(0).getTime()` binds as `(new Date(0)).getTime()`; a template literal right after a member expression forms a tagged template
  *
- * @see p_member_dot, p_member_index, p_member_optional
+ * @see p_member_dot, p_member_index, p_member_optional, p_tagged_template
  */
 static JsNode *p_member_tail(P *p, JsNode *base, int allow_call)
 {
@@ -2454,6 +2631,9 @@ static JsNode *p_member_tail(P *p, JsNode *base, int allow_call)
             js_node_add(p->js, call, base);
             p_call_args(p, call);
             base = call;
+        } else if (p_cur(p)->type == T_TEMPLATE) {
+            /* MemberExpression TemplateLiteral forms a tagged template */
+            base = p_tagged_template(p, base);
         } else {
             /* a bare `super` may only be followed by `.`, `[` or `(` */
             break;
@@ -2574,13 +2754,35 @@ static JsNode *p_single_arrow(P *p, char *name, int is_async)
 }
 
 /**
+ * @brief 解析动态导入 `import(spec)` / Parse a dynamic `import(spec)`
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ *
+ * @return `JS_N_DYN_IMPORT` 节点（kids[0] 为说明符表达式）/ A `JS_N_DYN_IMPORT` node whose `kids[0]` is the specifier expression
+ *
+ * @note 调用时当前词法单元须为 `import` 且后跟 `(`；`import.meta` 由 `p_ident_primary` 先行分流 / The current token must be `import` followed by `(`; `import.meta` is dispatched earlier in `p_ident_primary`
+ *
+ * @see p_ident_primary
+ */
+static JsNode *p_dyn_import(P *p)
+{
+    JsNode *n = p_node(p, JS_N_DYN_IMPORT);
+
+    p_advance(p); /* import */
+    p_advance(p); /* ( */
+    js_node_add(p->js, n, p_assignment(p));
+    p_expect(p, ")");
+    return n;
+}
+
+/**
  * @brief 解析由关键字引导的初级表达式 / Resolve keyword-led primary expressions
  *
  * @param[in,out] p 解析器状态 / Parser state
  *
  * @return 字面量、super、function/class、箭头等节点；普通标识符返回 `NULL` / A literal, `super`, function/class or arrow node; `NULL` means a plain identifier
  *
- * @note 覆盖 `true`/`false`/`null`/`this`/`super`/`function`/`async`/`class`/`new`/`import.meta` 与单参箭头 / Covers `true`/`false`/`null`/`this`/`super`/`function`/`async`/`class`/`new`/`import.meta` and single-parameter arrows
+ * @note 覆盖 `true`/`false`/`null`/`this`/`super`/`function`/`async`/`class`/`new`/`import.meta`/动态 `import()` 与单参箭头 / Covers `true`/`false`/`null`/`this`/`super`/`function`/`async`/`class`/`new`/`import.meta`/dynamic `import()` and single-parameter arrows
  *
  * @see p_primary
  */
@@ -2619,6 +2821,9 @@ static JsNode *p_ident_primary(P *p)
     if (!strcmp(t->text, "import") && p_at(p, 1)->type == T_PUNCT &&
         !strcmp(p_at(p, 1)->text, "."))
         return p_import_meta(p);
+    if (!strcmp(t->text, "import") && p_at(p, 1)->type == T_PUNCT &&
+        !strcmp(p_at(p, 1)->text, "("))
+        return p_dyn_import(p);
     if (p_at(p, 1)->type == T_PUNCT && !strcmp(p_at(p, 1)->text, "=>"))
         return p_single_arrow(p, t->text, 0);
     return NULL;
@@ -2832,9 +3037,9 @@ static JsNode *p_yield(P *p)
  *
  * @param[in,out] p 解析器状态 / Parser state
  *
- * @return `JS_N_NEW` 或更外层的成员/调用节点 / A `JS_N_NEW` node, possibly wrapped by further member/call nodes
+ * @return `JS_N_NEW`、`JS_N_NEW_TARGET` 或更外层的成员/调用节点 / A `JS_N_NEW`, `JS_N_NEW_TARGET` or further member/call node
  *
- * @note 以 allow_call=0 解析被调者，使后续 `(...)` 归属于 `new` / The callee is parsed with calls disabled so a following `(...)` belongs to `new`
+ * @note `new.target` 单独成节点；其余以 allow_call=0 解析被调者，使后续 `(...)` 归属于 `new` / `new.target` becomes its own node; otherwise the callee is parsed with calls disabled so a following `(...)` belongs to `new`
  *
  * @see p_member_tail
  */
@@ -2844,8 +3049,14 @@ static JsNode *p_new_expr(P *p)
     JsNode *callee;
 
     p_advance(p);
-    if (p_is(p, "."))
-        p_advance(p); /* new.target */
+    if (p_is(p, ".")) {
+        Tok *nx = p_at(p, 1);
+        if (nx->type != T_IDENT || strcmp(nx->text, "target"))
+            js_error(p->js, p_line(p), "'target' expected after 'new.'");
+        p_advance(p); /* . */
+        p_advance(p); /* target */
+        return p_member_tail(p, p_node(p, JS_N_NEW_TARGET), 1);
+    }
     /* The callee is a MemberExpression with calls suppressed, so the `(...)` that
      * follows belongs to `new` itself; any further `.`/`()` chain binds to the
      * constructed value: new Date(0).getTime() === (new Date(0)).getTime() */
@@ -2885,8 +3096,16 @@ static JsNode *p_unary(P *p)
         return p_unwrap_prefix(p, JS_N_UN, JS_OP_TYPEOF);
     if (p_is_ident(p, "void"))
         return p_unwrap_prefix(p, JS_N_UN, JS_OP_VOID);
-    if (p_is_ident(p, "delete"))
+    if (p_is_ident(p, "delete")) {
+        /* strict mode: `delete ident` (not a member access) is a SyntaxError;
+         * `delete x.y` / `delete x[y]` are fine, so peek past the base name */
+        if (p->strict && p_at(p, 1)->type == T_IDENT &&
+            !(p_at(p, 2)->type == T_PUNCT &&
+              (!strcmp(p_at(p, 2)->text, ".") || !strcmp(p_at(p, 2)->text, "["))))
+            js_error(p->js, p_line(p),
+                     "delete of an unqualified identifier in strict mode");
         return p_unwrap_prefix(p, JS_N_UN, JS_OP_DELETE);
+    }
     if (p_is_ident(p, "await"))
         return p_unwrap_prefix(p, JS_N_AWAIT, 0);
     if (p_is_ident(p, "yield"))
@@ -3232,6 +3451,9 @@ static JsNode *p_assignment(P *p)
                                       : JS_OP_NULLASSIGN;
         JsNode *n = p_node(p, JS_N_ASSIGN);
         n->op = code;
+        if (target->kind == JS_N_IDENT && p_strict_reserved_name(p, target->str))
+            js_error(p->js, p_line(p),
+                     "'%s' may not be assigned in strict mode", target->str);
         js_node_add(p->js, n, target);
         p_advance(p);
         js_node_add(p->js, n, p_assignment(p));
@@ -3251,7 +3473,14 @@ static JsNode *p_assignment(P *p)
  */
 static JsNode *p_expr(P *p)
 {
-    JsNode *first = p_assignment(p);
+    JsNode *first;
+    /* nesting guard: one nesting level costs roughly 10-20 C frames through
+     * p_expr -> p_assignment -> ... -> p_unary, so cap it far above any
+     * reasonable source before the C stack is at risk */
+    if (++p->depth > 400)
+        js_error(p->js, p_line(p), "expression nesting too deep");
+    first = p_assignment(p);
+    p->depth--;
     if (p_is(p, ",")) {
         JsNode *seq = p_node(p, JS_N_SEQ);
         js_node_add(p->js, seq, first);
@@ -3987,13 +4216,36 @@ static JsNode *p_function_stmt(P *p, int is_async)
 }
 
 /**
+ * @brief 解析 `with (expr) stmt` / Parse `with (expr) stmt`
+ *
+ * @param[in,out] p 解析器状态 / Parser state
+ *
+ * @return `JS_N_WITH` 节点（kids[0] 对象表达式、kids[1] 体语句）/ A `JS_N_WITH` node (`kids[0]` object expression, `kids[1]` body statement)
+ *
+ * @see p_keyword_stmt
+ */
+static JsNode *p_with_stmt(P *p)
+{
+    JsNode *n = p_node(p, JS_N_WITH);
+
+    if (p->strict)
+        js_error(p->js, p_line(p), "'with' is not allowed in strict mode");
+    p_advance(p);
+    p_expect(p, "(");
+    js_node_add(p->js, n, p_expr(p));
+    p_expect(p, ")");
+    js_node_add(p->js, n, p_statement(p));
+    return n;
+}
+
+/**
  * @brief 解析由关键字开头的语句 / Resolve statements that begin with a keyword
  *
  * @param[in,out] p 解析器状态 / Parser state
  *
  * @return 对应的语句节点；普通表达式开头时返回 `NULL` / The matching statement node, or `NULL` when the token is an ordinary expression start
  *
- * @note 分派到 var/function/class/if/while/do/for/switch/try/throw/return/break/debugger/export/import / Dispatches to var/function/class/if/while/do/for/switch/try/throw/return/break/debugger/export/import
+ * @note 分派到 var/function/class/if/while/do/for/switch/try/throw/return/break/debugger/with/export/import / Dispatches to var/function/class/if/while/do/for/switch/try/throw/return/break/debugger/with/export/import
  *
  * @see p_statement
  */
@@ -4001,6 +4253,8 @@ static JsNode *p_keyword_stmt(P *p)
 {
     Tok *t = p_cur(p);
 
+    if (!strcmp(t->text, "with"))
+        return p_with_stmt(p);
     if (!strcmp(t->text, "var") || !strcmp(t->text, "let") || !strcmp(t->text, "const"))
         return p_var_stmt(p);
     if (!strcmp(t->text, "function"))
@@ -4114,6 +4368,8 @@ static JsNode *parse_common(HpeJs *js, const char *source, int module)
     p.ntok = lx.ntok;
 
     prog->op = module ? 1 : 0;
+    p.strict = module ? 1 : p_directive_strict(&p, 0);
+    prog->strict = p.strict;
     while (p_cur(&p)->type != T_EOF)
         js_node_add(js, prog, p_statement(&p));
     return prog;

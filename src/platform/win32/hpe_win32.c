@@ -312,6 +312,43 @@ static void hope_blit(HpeWindow *win)
 }
 
 /**
+ * @brief 把平台光标 ID 映射为系统光标句柄 / Map a platform cursor id onto a system cursor handle
+ *
+ * @param[in]     cursor `HPE_PLAT_CURSOR_*` ID / One of the `HPE_PLAT_CURSOR_*` ids
+ *
+ * @return 共享系统光标句柄 / A shared system cursor handle
+ *
+ * @note 未知 ID 回退为箭头 / Unknown ids fall back to the arrow
+ *
+ * @see hope_wnd_dispatch
+ */
+static HCURSOR hope_cursor_handle(int cursor)
+{
+    switch (cursor) {
+    case HPE_PLAT_CURSOR_HAND:
+        return LoadCursorW(NULL, (LPCWSTR)IDC_HAND);
+    case HPE_PLAT_CURSOR_IBEAM:
+        return LoadCursorW(NULL, (LPCWSTR)IDC_IBEAM);
+    case HPE_PLAT_CURSOR_MOVE:
+        return LoadCursorW(NULL, (LPCWSTR)IDC_SIZEALL);
+    case HPE_PLAT_CURSOR_WAIT:
+        return LoadCursorW(NULL, (LPCWSTR)IDC_WAIT);
+    case HPE_PLAT_CURSOR_HELP:
+        return LoadCursorW(NULL, (LPCWSTR)IDC_HELP);
+    case HPE_PLAT_CURSOR_CROSS:
+        return LoadCursorW(NULL, (LPCWSTR)IDC_CROSS);
+    case HPE_PLAT_CURSOR_NO:
+        return LoadCursorW(NULL, (LPCWSTR)IDC_NO);
+    case HPE_PLAT_CURSOR_SIZEWE:
+        return LoadCursorW(NULL, (LPCWSTR)IDC_SIZEWE);
+    case HPE_PLAT_CURSOR_SIZENS:
+        return LoadCursorW(NULL, (LPCWSTR)IDC_SIZENS);
+    default:
+        return LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+    }
+}
+
+/**
  * @brief 处理鼠标消息并派发 `on_mouse` / Handle a mouse message and dispatch `on_mouse`
  *
  * @param[in,out] win 窗口对象 / Window object
@@ -353,6 +390,31 @@ static LRESULT hope_on_char(HpeWindow *win, WPARAM wparam)
     if (win->cb.on_char && ch >= 32 && (ch < 0xD800 || ch > 0xDFFF))
         win->cb.on_char(win->user, (int)ch);
     return 0;
+}
+
+/**
+ * @brief 处理 `WM_SETCURSOR` 消息 / Handle a `WM_SETCURSOR` message
+ *
+ * @param[in,out] win 窗口对象 / Window object
+ * @param[in]     hwnd 窗口句柄 / Window handle
+ * @param[in]     msg 窗口消息编号 / Window message identifier
+ * @param[in]     wparam 消息主参数 / Message WParam
+ * @param[in]     lparam 消息附加参数，低字为命中测试结果 / Message LParam whose low word is the hit-test result
+ *
+ * @return 客户区内已设置光标返回 `TRUE`，否则交给 `DefWindowProcW` / `TRUE` once the cursor is set inside the client area, otherwise `DefWindowProcW`
+ *
+ * @note 只有客户区归我们管：经 `query_cursor` 回调解析引擎的 CSS 光标并设置；窗口边框区域交回系统处理 / Only the client area is ours: the `query_cursor` callback resolves the engine's CSS cursor and it is applied; the frame area falls back to the system
+ *
+ * @see hope_cursor_handle hope_wnd_dispatch
+ */
+static LRESULT hope_on_set_cursor(HpeWindow *win, HWND hwnd, UINT msg, WPARAM wparam,
+                                  LPARAM lparam)
+{
+    if (LOWORD(lparam) == HTCLIENT && win->cb.query_cursor) {
+        SetCursor(hope_cursor_handle(win->cb.query_cursor(win->user)));
+        return TRUE;
+    }
+    return DefWindowProcW(hwnd, msg, wparam, lparam);
 }
 
 /**
@@ -409,6 +471,8 @@ static LRESULT hope_wnd_dispatch(HpeWindow *win, HWND hwnd, UINT msg, WPARAM wpa
     case WM_MOUSEMOVE:
         /* button = -1 signals a pointer move (no button state change) */
         return hope_on_mouse(win, hwnd, lparam, -1, 0);
+    case WM_SETCURSOR:
+        return hope_on_set_cursor(win, hwnd, msg, wparam, lparam);
     case WM_TIMER:
         if (wparam == 1 && win->cb.on_tick)
             win->cb.on_tick(win->user);
@@ -635,6 +699,8 @@ struct HpeCoro {
     void *user;
     int finished;
     int started;
+    void *stack_lo;   /* fiber stack bounds, captured on first yield / 首次 yield 时捕获的协程栈边界 */
+    void *stack_hi;
 };
 
 /**
@@ -650,6 +716,28 @@ static void CALLBACK coro_trampoline(void *ud)
     c->entry(c->user);
     c->finished = 1;
     SwitchToFiber(c->caller);
+}
+
+/**
+ * @brief 读取当前运行中的 fiber 句柄 / Read the handle of the currently running fiber
+ *
+ * @return 当前 fiber 句柄 / The current fiber handle
+ *
+ * @note 等价于 `GetCurrentFiber`（TEB + 0x20 的 FiberData），但用内联汇编直读
+ *       TEB，避免 mingw SDK 的 `__readgsqword` 内联实现触发 -Warray-bounds 噪声
+ *       / Same as `GetCurrentFiber` (FiberData at TEB + 0x20), but reads the TEB
+ *       with inline assembly so the mingw SDK's `__readgsqword` inlining cannot
+ *       emit -Warray-bounds noise
+ */
+static void *coro_self(void)
+{
+    void **teb;
+#if defined(_WIN64)
+    __asm__ volatile("movq %%gs:0x30, %0" : "=r"(teb));
+#else
+    __asm__ volatile("movl %%fs:0x18, %0" : "=r"(teb));
+#endif
+    return teb[4]; /* TEB.FiberData (8-byte pointers: +0x20 = index 4) */
 }
 
 /**
@@ -695,7 +783,7 @@ int hpe_coro_resume(HpeCoro *coro)
 {
     if (!coro || coro->finished)
         return 0;
-    coro->caller = GetCurrentFiber();
+    coro->caller = coro_self();
     coro->started = 1;
     SwitchToFiber(coro->fiber);
     return !coro->finished;
@@ -708,8 +796,42 @@ int hpe_coro_resume(HpeCoro *coro)
  */
 void hpe_coro_yield(HpeCoro *coro)
 {
-    if (coro && coro->caller)
+    if (coro && coro->caller) {
+        /* capture the fiber's stack bounds once, while running on it, so the
+         * GC can conservatively scan suspended coroutine stacks later. The
+         * TEB pointer is read through the gs/fs segment register (offset
+         * 0x30 on x64, 0x18 on x86); the TIB's StackBase and StackLimit then
+         * sit at +8 and +16 bytes in both pointer widths. */
+        if (!coro->stack_hi) {
+            void **teb;
+#if defined(_WIN64)
+            __asm__ volatile("movq %%gs:0x30, %0" : "=r"(teb));
+#else
+            __asm__ volatile("movl %%fs:0x18, %0" : "=r"(teb));
+#endif
+            coro->stack_hi = teb[1]; /* NtTib.StackBase */
+            coro->stack_lo = teb[2]; /* NtTib.StackLimit */
+        }
         SwitchToFiber(coro->caller);
+    }
+}
+
+/**
+ * @brief 查询协程栈的边界（供 GC 保守扫描挂起协程）/ Query a coroutine's stack bounds (for GC scanning of suspended coroutines)
+ *
+ * @param[in]  coro 协程句柄 / Coroutine handle
+ * @param[out] lo 栈低端地址（含）/ Low address of the stack (inclusive)
+ * @param[out] hi 栈高端地址（不含）/ High address of the stack (exclusive)
+ *
+ * @return 边界可用返回 1；协程为空或从未挂起过返回 0（此时栈上没有活动帧）/ 1 when bounds are known; 0 when the coroutine is NULL or has never yielded (its stack holds no live frames yet)
+ */
+int hpe_coro_stack_range(HpeCoro *coro, void **lo, void **hi)
+{
+    if (!coro || !coro->stack_hi)
+        return 0;
+    *lo = coro->stack_lo;
+    *hi = coro->stack_hi;
+    return 1;
 }
 
 /**
@@ -727,7 +849,7 @@ void hpe_coro_destroy(HpeCoro *coro)
 {
     if (!coro)
         return;
-    if (coro->fiber && coro->fiber != GetCurrentFiber())
+    if (coro->fiber && coro->fiber != coro_self())
         DeleteFiber(coro->fiber);
     free(coro);
 }
@@ -1218,6 +1340,7 @@ static int mask_empty(HpeTextMask *out)
  * @param[in,out] font 字体对象 / Font object
  * @param[in]     wbuf 待渲染的宽字符 / Wide characters to render
  * @param[in]     wlen 宽字符个数 / Number of wide characters
+ * @param[in]     dx 水平亚像素相位（0..1），经世界变换实现 / Horizontal sub-pixel phase (0..1), applied via the world transform
  * @param[in]     w 位图宽度（像素）/ Bitmap width in pixels
  * @param[in]     h 位图高度（像素）/ Bitmap height in pixels
  * @param[out]    out_bm 接收位图句柄，供调用方删除 / Receives the bitmap handle for the caller to delete
@@ -1226,7 +1349,7 @@ static int mask_empty(HpeTextMask *out)
  *
  * @note 白字透明背景绘制，自顶向下；调用方负责 `DeleteObject` 位图句柄 / Draws white text on a transparent background, top-down; the caller owns deleting the bitmap handle
  */
-static void *mask_render(HpePlatFont *font, const wchar_t *wbuf, int wlen, int w, int h,
+static void *mask_render(HpePlatFont *font, const wchar_t *wbuf, int wlen, float dx, int w, int h,
                          HBITMAP *out_bm)
 {
     BITMAPINFO bmi;
@@ -1259,6 +1382,19 @@ static void *mask_render(HpePlatFont *font, const wchar_t *wbuf, int wlen, int w
     SetBkMode(memdc, TRANSPARENT);
     SetTextColor(memdc, RGB(255, 255, 255));
     SetTextAlign(memdc, TA_LEFT | TA_TOP);
+    if (dx > 0.0f && dx < 1.0f) {
+        /* sub-pixel phase: GDI honours the world transform when rendering
+         * text, so a fractional translate shifts the antialiased glyphs */
+        XFORM xf;
+        xf.eM11 = 1.0f;
+        xf.eM12 = 0.0f;
+        xf.eM21 = 0.0f;
+        xf.eM22 = 1.0f;
+        xf.eDx = dx;
+        xf.eDy = 0.0f;
+        SetGraphicsMode(memdc, GM_ADVANCED);
+        SetWorldTransform(memdc, &xf);
+    }
     TextOutW(memdc, 1, 1, wbuf, wlen);
     SelectObject(memdc, old_font);
     SelectObject(memdc, old_bm);
@@ -1297,6 +1433,7 @@ static unsigned char *mask_coverage(const void *bits, int count)
  * @param[in,out] font 字体对象 / Font object
  * @param[in]     utf8 待渲染的 UTF-8 文本 / UTF-8 text to render
  * @param[in]     len 文本字节数 / Number of bytes
+ * @param[in]     dx 水平亚像素相位（0..1）/ Horizontal sub-pixel phase (0..1)
  * @param[out]    out 接收掩码的结构 / Struct that receives the mask
  *
  * @return 成功返回 1，失败返回 0 / 1 on success, 0 on failure
@@ -1307,7 +1444,7 @@ static unsigned char *mask_coverage(const void *bits, int count)
  *
  * @see hpe_text_mask_free
  */
-int hpe_plat_font_mask(HpePlatFont *font, const char *utf8, int len, HpeTextMask *out)
+int hpe_plat_font_mask(HpePlatFont *font, const char *utf8, int len, float dx, HpeTextMask *out)
 {
     wchar_t wbuf[8192];
     int wlen, w, h;
@@ -1328,14 +1465,14 @@ int hpe_plat_font_mask(HpePlatFont *font, const char *utf8, int len, HpeTextMask
     if (!GetTextExtentPoint32W(font->hdc, wbuf, wlen, &sz))
         return 0;
 
-    w = sz.cx + 2;
+    w = sz.cx + 2 + (dx > 0.0f ? 3 : 0);
     h = font->ascent + font->descent + 2;
     if (w < 1)
         w = 1;
     if (h < 1)
         h = 1;
 
-    bits = mask_render(font, wbuf, wlen, w, h, &hbm);
+    bits = mask_render(font, wbuf, wlen, dx, w, h, &hbm);
     if (!bits)
         return 0;
 

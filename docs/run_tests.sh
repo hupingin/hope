@@ -33,7 +33,7 @@ fail=0
 # `--dump` is headless and chrome-less, so identical geometry gives identical bytes.
 # A non-zero exit is a hard failure: the engine must tear down cleanly even on
 # pages that register timers (a bad free() there once corrupted the heap at exit).
-for f in boxes css css-cascade css-props dom-api dom-mutation event flex globals hello hover html-parse image js-arrow js-features js js-builtins grid layout scroll svg-shapes table timers; do
+for f in boxes css css-cascade css-props dom-api dom-mutation event flex globals hello hover html-parse image inline-fx cursor js-arrow js-features js js-builtins grid layout scroll svg-shapes svg-text svg-fx stack table timers bfc js-gc; do
   html="examples/$f.html"
   [ -f "$html" ] || continue
   bmp="$OUT/$f.bmp"
@@ -71,7 +71,8 @@ done
 # globals    : performance/history/localStorage/sessionStorage/console extensions
 # html-parse : parser fault-tolerance (auto-closing, table/select/template)
 # eventloop  : task/microtask order + 4 ms nesting clamp (needs wall time: page:wait)
-for spec in js-modern js-builtins dom-api dom-mutation globals html-parse eventloop:1.2; do
+# js-gc      : conservative GC (__gc/__gcStats, garbage cycles, survivors, gen/promise)
+for spec in js-modern js-builtins dom-api dom-mutation globals html-parse eventloop:1.2 js-gc:0.5; do
   f="${spec%%:*}"
   wait_s=""
   [ "$f" != "$spec" ] && wait_s="${spec#*:}"
@@ -136,6 +137,11 @@ console.log("reexport-renamed", barrel.circleArea(1).toFixed(2));
 console.log("nested", DEEP);
 console.log("meta", util.META.indexOf("util.js") >= 0);
 console.log("entry-meta", import.meta.url.indexOf("main.js") >= 0);
+import("./sub/deep.js").then(function (ns) { console.log("dyn", ns.DEEP); });
+import("./missing.js").then(function () { console.log("dyn-bad", "resolved"); },
+                            function (e) { console.log("dyn-bad", "rejected"); });
+import(42).then(function () { console.log("dyn-num", "resolved"); },
+                function (e) { console.log("dyn-num", "rejected"); });
 EOF
 modout="$("$BIN" --module "$OUT/mod/main.js" 2>&1 | tr -d '\r')"
 modwant='hi hope 6.28 3.14
@@ -145,7 +151,10 @@ star util 3.14
 reexport-renamed 3.14
 nested deep
 meta true
-entry-meta true'
+entry-meta true
+dyn deep
+dyn-bad rejected
+dyn-num rejected'
 if [ "$modout" = "$modwant" ]; then
   echo "  es-modules   OK"
 else

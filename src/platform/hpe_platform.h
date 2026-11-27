@@ -12,6 +12,19 @@ typedef struct HpeWindow HpeWindow;
 #define HPE_MOD_SHIFT 2
 #define HPE_MOD_ALT 4
 
+/* cursor ids the query_cursor callback may return; the backend maps each one
+ * onto its own system cursor imagery */
+#define HPE_PLAT_CURSOR_DEFAULT 0
+#define HPE_PLAT_CURSOR_HAND 1
+#define HPE_PLAT_CURSOR_IBEAM 2
+#define HPE_PLAT_CURSOR_MOVE 3
+#define HPE_PLAT_CURSOR_WAIT 4
+#define HPE_PLAT_CURSOR_HELP 5
+#define HPE_PLAT_CURSOR_CROSS 6
+#define HPE_PLAT_CURSOR_NO 7
+#define HPE_PLAT_CURSOR_SIZEWE 8
+#define HPE_PLAT_CURSOR_SIZENS 9
+
 typedef struct HpeWindowCallbacks {
     void (*on_paint)(void *user);
     void (*on_resize)(void *user, int width, int height);
@@ -34,6 +47,10 @@ typedef struct HpeWindowCallbacks {
     void (*on_mouse)(void *user, int x, int y, int button, int down, int mods);
     /* periodic tick (~15 ms) used to drain script timers / rAF callbacks */
     void (*on_tick)(void *user);
+    /* resolve the system cursor for the client area: return one of the
+     * HPE_PLAT_CURSOR_* ids above. Called on WM_SETCURSOR while the pointer is
+     * over the client area; may be NULL for the backend's default arrow. */
+    int (*query_cursor)(void *user);
 } HpeWindowCallbacks;
 
 /**
@@ -209,6 +226,17 @@ void hpe_coro_yield(HpeCoro *coro);
 void hpe_coro_destroy(HpeCoro *coro);
 
 /**
+ * @brief 查询协程栈的边界（供 GC 保守扫描挂起协程）/ Query a coroutine's stack bounds (for GC scanning of suspended coroutines)
+ *
+ * @param[in]  coro 协程句柄 / Coroutine handle
+ * @param[out] lo 栈低端地址（含）/ Low address of the stack (inclusive)
+ * @param[out] hi 栈高端地址（不含）/ High address of the stack (exclusive)
+ *
+ * @return 边界可用返回 1；协程为空或从未挂起过返回 0 / 1 when bounds are known; 0 when the coroutine is NULL or has never yielded
+ */
+int hpe_coro_stack_range(HpeCoro *coro, void **lo, void **hi);
+
+/**
  * @brief 读取整个文件到新分配的缓冲 / Read a whole file into a freshly allocated buffer
  *
  * @param[in]     path 文件路径 / File path
@@ -362,6 +390,7 @@ typedef struct HpeTextMask {
  * @param[in,out] font 字体对象 / Font object
  * @param[in]     utf8 待渲染的 UTF-8 文本 / UTF-8 text to render
  * @param[in]     len 文本字节数 / Number of bytes
+ * @param[in]     dx 水平亚像素相位（0..1），非整数平移参与抗锯齿 / Horizontal sub-pixel phase (0..1); the fractional shift participates in antialiasing
  * @param[out]    out 接收掩码的结构 / Struct that receives the mask
  *
  * @return 成功返回 1，失败返回 0 / 1 on success, 0 on failure
@@ -370,7 +399,7 @@ typedef struct HpeTextMask {
  *
  * @see hpe_text_mask_free
  */
-int hpe_plat_font_mask(HpePlatFont *font, const char *utf8, int len, HpeTextMask *out);
+int hpe_plat_font_mask(HpePlatFont *font, const char *utf8, int len, float dx, HpeTextMask *out);
 
 /**
  * @brief 释放文本掩码 / Free a text mask

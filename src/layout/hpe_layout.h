@@ -34,7 +34,21 @@ typedef struct HpeLine {
     float height;
     float baseline;
     float y;
+    /* per-line fragments of the inline boxes that contribute content: one
+     * entry per still-open inline box when the line ends or closes */
+    struct HpeInlineFrag *frags;
+    int frag_count;
+    size_t frag_cap;
 } HpeLine;
+
+/* one line's horizontal slice of an inline box (content-box coords) */
+typedef struct HpeInlineFrag {
+    struct HpeBox *box;
+    float x0, x1;          /* content extent on this line */
+    float ascent, descent; /* the inline box's own font metrics */
+    int flags;             /* 1 = box starts here (paint left pad/border),
+                              2 = box ends here (paint right pad/border) */
+} HpeInlineFrag;
 
 /* one floated box inside a block container's float band */
 typedef struct HpeFloatBox {

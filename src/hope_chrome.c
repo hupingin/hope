@@ -35,6 +35,10 @@
 #define FIELD_RADIUS 8.0f
 #define ADDR_FONT_PX 13.0f
 #define SEL_RADIUS 2.0f
+/* nav button metrics: a square hit box left of the address field */
+#define NAV_BTN_W 28.0f
+#define NAV_BTN_GAP 4.0f
+#define NAV_BTN_COUNT 3
 /* two presses within this window and this distance count as a multiple click */
 #define CLICK_SECONDS 0.45
 #define CLICK_SLOP 4.0f
@@ -46,20 +50,39 @@ static const char PLACEHOLDER[] = "\xE8\xBE\x93\xE5\x85\xA5\xE6\x9C\xAC\xE5\x9C\
                                   "\xEF\xBC\x8C\xE5\x9B\x9E\xE8\xBD\xA6\xE6\x89\x93\xE5\xBC\x80";
 
 /**
+ * @brief 计算第 `i` 个导航按钮的矩形 / Compute the rectangle of nav button `i`
+ *
+ * @param[in]     engine 引擎实例，提供窗口宽度 / Engine instance, supplies the window width
+ * @param[in]     i 按钮下标：0 后退、1 前进、2 刷新 / Button index: 0 back, 1 forward, 2 reload
+ *
+ * @return 按钮矩形（设备坐标，正方形，纵向与输入框对齐）/ The button rectangle in device coordinates (square, vertically aligned with the field)
+ *
+ * @note 按钮排在输入框左侧，与输入框同高同基线 / The buttons sit left of the field, sharing its height and vertical centre
+ *
+ * @see nav_field_x field_rect
+ */
+static HpeRect nav_btn_rect(const HpeEngine *engine, int i)
+{
+    float x = CHROME_PAD + (float)i * (NAV_BTN_W + NAV_BTN_GAP);
+    return hpe_rect(x, 8.0f + (FIELD_H - 24.0f) * 0.5f, NAV_BTN_W, 24.0f);
+}
+
+/**
  * @brief 计算地址栏输入框的矩形 / Compute the address-field rectangle
  *
  * @param[in]     engine 引擎实例，提供窗口宽度 / Engine instance, supplies the window width
  *
  * @return 输入框在设备坐标下的矩形 / The field rectangle in device coordinates
  *
- * @note 横向居中留边，纵向固定为窗口顶部条带内 / Padded horizontally and placed in the fixed strip at the top
+ * @note 横向居中留边，纵向固定为窗口顶部条带内；左侧让出 `NAV_BTN_COUNT` 个按钮的位置 / Padded horizontally and placed in the fixed strip at the top; the left side yields room for the `NAV_BTN_COUNT` nav buttons
  *
- * @see addr_layout
+ * @see nav_btn_rect addr_layout
  */
 
 static HpeRect field_rect(const HpeEngine *engine)
 {
-    return hpe_rect(CHROME_PAD, 8.0f, (float)engine->width - CHROME_PAD * 2.0f, FIELD_H);
+    float left = CHROME_PAD + (float)NAV_BTN_COUNT * (NAV_BTN_W + NAV_BTN_GAP);
+    return hpe_rect(left, 8.0f, (float)engine->width - left - CHROME_PAD, FIELD_H);
 }
 
 /* everything the painter and the hit testing need, resolved once */
@@ -679,6 +702,91 @@ static void draw_run(HpePixmap *pm, HpeFont *font, const char *text, int len, fl
 }
 
 /**
+ * @brief 画一个三角形箭头（导航图标）/ Paint one filled triangle arrow (a nav glyph)
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     cx 箭头中心的 X / Arrow centre X
+ * @param[in]     cy 箭头中心的 Y / Arrow centre Y
+ * @param[in]     dir 朝向：-1 向左、1 向右 / Direction: -1 points left, 1 points right
+ * @param[in]     hw 半宽（顶点到底边的水平跨度的一半）/ Half width (apex to base, halved)
+ * @param[in]     hh 半高 / Half height
+ * @param[in]     color 填充色 / Fill colour
+ *
+ * @note 逐行填充 1 像素高条带：斜边按行高线性插值，得到顶点在左/右、底边为竖边的实心三角；条带边界取 `floor`/`ceil`，因此边缘有轻微抗锯齿 / Fills one-pixel-tall bands row by row, interpolating the hypotenuse per row so the apex sits left/right with a vertical base; band edges are rounded with `floor`/`ceil`, which gives light anti-aliasing
+ *
+ * @see nav_paint_button
+ */
+static void nav_paint_arrow(HpePixmap *pm, float cx, float cy, int dir, float hw, float hh,
+                            HpeColor color)
+{
+    int row, rows = (int)(hh * 2.0f);
+
+    for (row = 0; row < rows; row++) {
+        /* |dy| = 0 on the middle row and 1 at the two tips, so the filled span
+         * is widest in the middle and closes to a point at either tip */
+        float dyf = fabsf((float)row + 0.5f - hh) / hh;
+        float span = hw * (1.0f - dyf);
+        /* the vertical base edge sits opposite the apex */
+        float x0 = dir < 0 ? cx + hw * 0.5f - span : cx - hw * 0.5f;
+        hpe_fill_rect_i(pm, (int)floorf(x0), (int)(cy - hh) + row,
+                        (int)ceilf(span) + 1, 1, color);
+    }
+}
+
+/**
+ * @brief 画一个导航按钮（图标 + 悬停/禁用态）/ Paint one nav button (glyph plus hover/disabled state)
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     i 按钮下标：0 后退、1 前进、2 刷新 / Button index: 0 back, 1 forward, 2 reload
+ *
+ * @note 不可用时图标为浅灰（后退无上一项、前进无下一项）；命中框内铺半透明圆角底表示悬停 / The glyph fades to light grey when the action is unavailable (no previous/next entry); a translucent rounded plate marks the hovered button
+ *
+ * @see nav_btn_rect nav_paint_arrow hpe_chrome_hover_button
+ */
+static void nav_paint_button(HpeEngine *engine, HpePixmap *pm, int i)
+{
+    HpeRect r = nav_btn_rect(engine, i);
+    float cx = r.x + r.w * 0.5f, cy = r.y + r.h * 0.5f;
+    int enabled = 1;
+    HpeColor glyph = hpe_rgb(60, 64, 72);
+
+    if (i == 0 && engine->nav_pos <= 0)
+        enabled = 0;
+    if (i == 1 && engine->nav_pos + 1 >= engine->nav_count)
+        enabled = 0;
+    if (!enabled)
+        glyph = hpe_rgb(178, 184, 192);
+    if (engine->chrome_hover_btn == i)
+        hpe_fill_round_rect(pm, r, 6.0f, hpe_rgb(212, 217, 224));
+
+    if (i == 2) {
+        /* reload: a circular arrow, approximated with an open ring plus a head */
+        hpe_stroke_round_rect(pm, hpe_rect(cx - 5.5f, cy - 5.5f, 11.0f, 11.0f), 5.5f, 1.6f, glyph);
+        nav_paint_arrow(pm, cx + 5.0f, cy - 5.0f, 1, 4.0f, 3.0f, glyph);
+    } else {
+        nav_paint_arrow(pm, cx, cy, i == 0 ? -1 : 1, 9.0f, 6.0f, glyph);
+    }
+}
+
+/**
+ * @brief 绘制左侧三个导航按钮 / Paint the three nav buttons on the left of the strip
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ *
+ * @note 依次画后退、前进、刷新 / Paints back, forward and reload in that order
+ *
+ * @see nav_paint_button
+ */
+static void nav_paint_all(HpeEngine *engine, HpePixmap *pm)
+{
+    int i;
+    for (i = 0; i < NAV_BTN_COUNT; i++)
+        nav_paint_button(engine, pm, i);
+}
+
+/**
  * @brief 绘制输入框文本（占位提示或选区加文本）/ Paint the field's text, either the hint or the selection plus runs
  *
  * @param[in,out] engine 引擎实例 / Engine instance
@@ -749,7 +857,10 @@ static void chrome_paint_caret(HpeEngine *engine, HpePixmap *pm, const AddrLayou
                                HpeColor color)
 {
     float cx;
-    if (!engine->addr_focus || addr_sel_end(engine) != addr_sel_start(engine))
+    /* `caret_on` already encodes "focused, selection collapsed, blink phase on";
+     * the collapsed-selection test is kept so a stale phase never paints over
+     * a fresh selection before the next tick */
+    if (!engine->caret_on || addr_sel_end(engine) != addr_sel_start(engine))
         return;
     cx = L->inner_x - engine->addr_scroll +
          addr_width_to(L->font, engine->addr, engine->addr_len, engine->addr_caret);
@@ -783,6 +894,10 @@ void hpe_chrome_paint(HpeEngine *engine)
 
     if (!engine || engine->chrome_h <= 0 || !engine->pm.pixels)
         return;
+    /* keep the caret phase fresh on every bar repaint: the window path also
+     * advances it from the 15 ms tick, but the headless path has no tick, and
+     * a freshly focused field must show the caret on its very first frame */
+    hpe_engine_caret_advance(engine);
     pm = &engine->pm;
     hpe_pixmap_reset_clip(pm);
 
@@ -793,6 +908,9 @@ void hpe_chrome_paint(HpeEngine *engine)
 
     if (!addr_layout(engine, &L))
         return;
+
+    /* nav buttons live left of the field and share its vertical centre */
+    nav_paint_all(engine, pm);
 
     /* rounded field with a focus ring (Chrome: 2px accent outline) */
     hpe_fill_round_rect(pm, L.field, FIELD_RADIUS, field_bg);
@@ -882,13 +1000,70 @@ static void addr_press(HpeEngine *engine, const AddrLayout *L, float x, int mods
  *
  * @see addr_press hpe_chrome_mouse_move
  */
+/**
+ * @brief 判断某点命中哪个导航按钮 / Find which nav button a point hits
+ *
+ * @param[in]     engine 引擎实例 / Engine instance
+ * @param[in]     x X 坐标（设备坐标）/ X position in device coordinates
+ * @param[in]     y Y 坐标（设备坐标）/ Y position in device coordinates
+ *
+ * @return 按钮下标 0/1/2，未命中返回 -1 / Button index 0/1/2, or -1 when nothing is hit
+ *
+ * @note 每个按钮的命中框就是它自己画出来的矩形 / Each button's hit box is exactly the rectangle it paints
+ *
+ * @see nav_btn_rect hpe_chrome_mouse
+ */
+static int nav_btn_at(const HpeEngine *engine, float x, float y)
+{
+    int i;
+    for (i = 0; i < NAV_BTN_COUNT; i++) {
+        HpeRect r = nav_btn_rect(engine, i);
+        if (x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h)
+            return i;
+    }
+    return -1;
+}
+
+/**
+ * @brief 触发一个导航按钮的动作 / Fire one nav button's action
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     i 按钮下标：0 后退、1 前进、2 刷新 / Button index: 0 back, 1 forward, 2 reload
+ *
+ * @return 动作产生了变化返回 1，否则 0 / 1 when the action changed something, otherwise 0
+ *
+ * @note 后退/前进在无对应历史项时不动；刷新重新加载当前文档 / Back and forward do nothing without the matching history entry; reload reloads the current document
+ *
+ * @see hpe_engine_back hpe_engine_forward hpe_engine_reload
+ */
+static int nav_activate(HpeEngine *engine, int i)
+{
+    int ok = 0;
+    if (i == 0)
+        ok = hpe_engine_back(engine);
+    else if (i == 1)
+        ok = hpe_engine_forward(engine);
+    else if (i == 2)
+        ok = hpe_engine_reload(engine);
+    if (ok)
+        engine->dirty = HPE_DIRTY_FULL;
+    return ok;
+}
+
 int hpe_chrome_mouse(HpeEngine *engine, int x, int y, int down, int mods)
 {
     AddrLayout L;
-    int inside;
+    int inside, btn;
 
     if (!engine || engine->chrome_h <= 0 || y >= engine->chrome_h)
         return 0;
+    btn = nav_btn_at(engine, (float)x, (float)y);
+    if (btn >= 0) {
+        /* a nav button is a full press/release cycle of its own */
+        if (down)
+            return 1;
+        return nav_activate(engine, btn);
+    }
     if (!addr_layout(engine, &L)) {
         if (down) {
             engine->addr_focus = 1;
@@ -936,10 +1111,20 @@ int hpe_chrome_mouse(HpeEngine *engine, int x, int y, int down, int mods)
 int hpe_chrome_mouse_move(HpeEngine *engine, int x, int y)
 {
     AddrLayout L;
+    int btn;
 
-    HPE_UNUSED(y);
-    if (!engine || engine->chrome_h <= 0 || !engine->addr_drag)
+    if (!engine || engine->chrome_h <= 0)
         return 0;
+    /* track the nav-button hover state even without a drag: the plate repaint
+     * uses the chrome-only dirty path */
+    btn = y < engine->chrome_h ? nav_btn_at(engine, (float)x, (float)y) : -1;
+    if (btn != engine->chrome_hover_btn) {
+        engine->chrome_hover_btn = btn;
+        if (engine->dirty == HPE_DIRTY_NONE)
+            engine->dirty = HPE_DIRTY_CHROME;
+    }
+    if (!engine->addr_drag)
+        return btn >= 0;
     if (!addr_layout(engine, &L))
         return 1;
     if (!engine->addr_drag_live && fabsf((float)x - engine->addr_press_x) >= DRAG_SLOP) {
@@ -954,6 +1139,33 @@ int hpe_chrome_mouse_move(HpeEngine *engine, int x, int y)
         return 1;
     }
     return 0;
+}
+
+/**
+ * @brief 查询条带内某点的光标语义 / Query the cursor semantics for a point inside the chrome strip
+ *
+ * @param[in]     engine 引擎实例 / Engine instance
+ * @param[in]     x X 坐标（设备坐标）/ X coordinate in device coordinates
+ * @param[in]     y Y 坐标（设备坐标）/ Y coordinate in device coordinates
+ *
+ * @return `HpeCursor` 值；点在条带之外返回 -1 / An `HpeCursor` value; -1 when the point is outside the strip
+ *
+ * @note 输入框命中为 I-beam（文本可编辑），条带其余处为箭头；与地址栏命中测试共用 `field_rect` / A hit inside the field yields the I-beam (the text is editable) and the arrow everywhere else in the strip; shares `field_rect` with the address-bar hit testing
+ *
+ * @see hpe_chrome_mouse
+ */
+int hpe_chrome_cursor_at(HpeEngine *engine, int x, int y)
+{
+    HpeRect field;
+    if (!engine || engine->chrome_h <= 0 || y >= engine->chrome_h || y < 0)
+        return -1;
+    /* nav buttons are clickable: the hand cursor tells the user so */
+    if (nav_btn_at(engine, (float)x, (float)y) >= 0)
+        return HPE_CURSOR_POINTER;
+    field = field_rect(engine);
+    if (x >= field.x && x < field.x + field.w && y >= field.y && y < field.y + field.h)
+        return HPE_CURSOR_TEXT;
+    return HPE_CURSOR_DEFAULT;
 }
 
 /* ---------------- input ---------------- */
@@ -1284,6 +1496,68 @@ int hpe_engine_address_focused(HpeEngine *engine)
 int hpe_engine_address_caret(HpeEngine *engine)
 {
     return engine ? engine->addr_caret : 0;
+}
+
+/**
+ * @brief 取客户端区当前应显示的光标 / Get the cursor currently indicated for the client area
+ *
+ * @param[in]     engine 引擎实例 / Engine instance
+ *
+ * @return `HpeCursor` 枚举值，`engine` 为 NULL 时返回 `HPE_CURSOR_DEFAULT` / An `HpeCursor` value, `HPE_CURSOR_DEFAULT` when `engine` is NULL
+ *
+ * @note 由指针移动事件更新的缓存值；平台层经由 `query_cursor` 回调读取并映射为系统光标 / The cached value updated by pointer-move events; the platform layer reads it from the `query_cursor` callback and maps it to a system cursor
+ *
+ * @see hpe_engine_page_cursor
+ */
+int hpe_engine_page_cursor(HpeEngine *engine)
+{
+    return engine ? engine->page_cursor : HPE_CURSOR_DEFAULT;
+}
+
+/**
+ * @brief 查询地址栏插入符此刻是否可见 / Query whether the address-bar caret is visible right now
+ *
+ * @param[in]     engine 引擎实例 / Engine instance
+ *
+ * @return 插入符可见返回 1，否则 0 / 1 when the caret is visible, otherwise 0
+ *
+ * @note 读由 `hpe_engine_caret_advance` 维护的闪烁相位 / Reads the blink phase maintained by `hpe_engine_caret_advance`
+ *
+ * @see hpe_engine_caret_advance
+ */
+int hpe_engine_caret_visible(HpeEngine *engine)
+{
+    return engine ? engine->caret_on : 0;
+}
+
+/**
+ * @brief 取导航历史项数 / Get the number of navigation history entries
+ *
+ * @param[in]     engine 引擎实例 / Engine instance
+ *
+ * @return 历史项数，`engine` 为 NULL 时返回 0 / Entry count, 0 when `engine` is NULL
+ *
+ * @see hpe_engine_nav_pos
+ */
+int hpe_engine_nav_count(HpeEngine *engine)
+{
+    return engine ? engine->nav_count : 0;
+}
+
+/**
+ * @brief 取当前历史项下标 / Get the index of the current history entry
+ *
+ * @param[in]     engine 引擎实例 / Engine instance
+ *
+ * @return 当前下标，无历史或 `engine` 为 NULL 时返回 -1 / Current index, -1 when there is no history or `engine` is NULL
+ *
+ * @see hpe_engine_nav_count
+ */
+int hpe_engine_nav_pos(HpeEngine *engine)
+{
+    if (!engine || engine->nav_count <= 0)
+        return -1;
+    return engine->nav_pos;
 }
 
 /**

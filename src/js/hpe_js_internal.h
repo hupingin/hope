@@ -177,7 +177,43 @@ struct JsJob {
 typedef struct JsTryFrame {
     jmp_buf jmp;
     struct JsTryFrame *prev;
+    int depth; /* call-depth snapshot taken at push, restored on pop (longjmp-safe) / 压入时的调用深度快照，弹出时恢复（对 longjmp 安全） */
 } JsTryFrame;
+
+/**
+ * @brief 一个协程栈的异常上下文 / The exception context belonging to one coroutine stack
+ *
+ * @note 生成器与 async 函数都跑在自己的协程栈上，而 `js->try_top` 与 `js->jmp` 在 `HpeJs`
+ *       上是全局单例。挂起期间调用方会压入自己的 try 帧并改写兜底着陆点；不按 fiber 交换，
+ *       协程里的 `longjmp` 就会落到另一个栈上的帧，Windows 会以 `0xC0000028` 终止进程。
+ *       Generators and async functions both run on their own coroutine stack, while `js->try_top`
+ *       and `js->jmp` are singletons on `HpeJs`. While a coroutine is parked the resumer installs
+ *       its own try frames and landing pad; without a per-fiber swap a `longjmp` inside the
+ *       coroutine would target a frame on the other stack, which Windows kills with `0xC0000028`.
+ */
+typedef struct HpeJsFiberCtx {
+    JsTryFrame *coro_try_top;    /* the coroutine side's try chain / 协程侧的 try 链 */
+    jmp_buf coro_jmp;            /* the coroutine side's landing pad / 协程侧的兜底着陆点 */
+    JsTryFrame *resumer_try_top; /* the resumer side's try chain, stashed while inside / 进入协程时暂存的调用方 try 链 */
+    jmp_buf resumer_jmp;         /* the resumer side's landing pad, stashed while inside / 进入协程时暂存的调用方着陆点 */
+    int resumer_depth;           /* the resumer's call depth, stashed while inside / 进入协程时暂存的调用方调用深度 */
+} HpeJsFiberCtx;
+
+/**
+ * @brief 切进协程前安装协程侧的异常上下文 / Install the coroutine side's exception context before switching in
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] ctx 该协程的上下文块 / That coroutine's context block
+ */
+void hpe_js_fiber_enter(HpeJs *js, HpeJsFiberCtx *ctx);
+
+/**
+ * @brief 切出协程后还原调用方侧的异常上下文 / Restore the resumer's exception context after switching out
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] ctx 该协程的上下文块 / That coroutine's context block
+ */
+void hpe_js_fiber_leave(HpeJs *js, HpeJsFiberCtx *ctx);
 
 /**
  * @brief 从 arena 分配 8 字节对齐的已清零内存 / Allocate 8-byte-aligned zeroed memory from the arena
@@ -191,6 +227,7 @@ typedef struct JsTryFrame {
  */
 
 void *hpe_js_alloc(HpeJs *js, size_t size);
+void *hpe_js_alloc_typed(HpeJs *js, size_t size, int tag);
 
 /**
  * @brief 在 arena 中复制指定长度的字符串 / Copy a string of the given length into the arena
@@ -699,6 +736,9 @@ struct JsEnv {
     JsValue thisv;
     int has_home;  /* this env owns a [[HomeObject]] (method body) */
     struct JsObj *home;
+    struct JsObj *with_obj; /* `with (obj)` object environment, NULL when none */
+    int has_new_target; /* this env owns a `new.target` binding (non-arrow body) */
+    JsValue new_target;
     int strict;
 };
 
@@ -799,6 +839,7 @@ typedef struct JsNode {
     int kid_count;
     size_t kid_cap;
     int line;
+    int strict; /* program root: script is strict (directive prologue / module) */
 } JsNode;
 
 /* statement / expression kinds */
@@ -806,7 +847,7 @@ enum {
     JS_N_BLOCK, JS_N_VAR, JS_N_FUNC, JS_N_IF, JS_N_WHILE, JS_N_DO, JS_N_FOR,
     JS_N_RETURN, JS_N_BREAK, JS_N_CONTINUE, JS_N_EXPR, JS_N_EMPTY,
     JS_N_FOROF, JS_N_FORIN, JS_N_SWITCH, JS_N_TRY, JS_N_THROW, JS_N_LABEL,
-    JS_N_CLASS, JS_N_EXPORT, JS_N_IMPORT,
+    JS_N_CLASS, JS_N_EXPORT, JS_N_IMPORT, JS_N_WITH,
     /* expressions */
     JS_N_NUM, JS_N_STR, JS_N_IDENT, JS_N_TRUE, JS_N_FALSE, JS_N_NULL,
     JS_N_ARRAY, JS_N_OBJECT, JS_N_BIN, JS_N_UN, JS_N_ASSIGN, JS_N_TERNARY,
@@ -814,6 +855,8 @@ enum {
     JS_N_THIS, JS_N_SUPER_CALL, JS_N_SUPER_MEMBER, JS_N_YIELD, JS_N_AWAIT,
     JS_N_SEQ, JS_N_FUNC_EXPR, JS_N_ARROW, JS_N_TEMPLATE, JS_N_TAGGED,
     JS_N_BIGINT /* `num` holds the radix, `str` the digits */,
+    JS_N_NEW_TARGET /* `new.target` expression */,
+    JS_N_DYN_IMPORT /* dynamic `import(spec)` returning a promise */,
     /* patterns (destructuring) */
     JS_N_PAT_ARR, JS_N_PAT_OBJ, JS_N_PAT_DEFAULT, JS_N_PAT_REST,
     JS_N_OPTCHAIN /* placeholder for an optional-chain link */
@@ -908,6 +951,10 @@ struct JsModule {
 
 /* HpeJsModuleLoader is declared in the public header (hpe_js.h) */
 
+/* fiber-stack scan hooks installed by hpe_js_gen.c / hpe_js_async.c: given the
+ * state pointer stored in a tagged chunk, scan its suspended coroutine stack */
+typedef void (*HpeJsFiberScan)(HpeJs *js, void *state);
+
 struct HpeJs {
     JsEnv *global_env;
     JsObj *global_obj;
@@ -921,6 +968,10 @@ struct HpeJs {
     JsValue thrown;
     JsTryFrame *try_top;
     int in_catch;
+    /* recursion guard: JS function calls beyond `depth_limit` raise a
+     * RangeError-style error instead of exhausting the C stack */
+    int call_depth;
+    int depth_limit;
     /* prototypes */
     JsObj *object_proto;
     JsObj *array_proto;
@@ -964,9 +1015,10 @@ struct HpeJs {
      * NOT be catchable by a user `catch`, so it travels as a distinguished
      * object that `exec_try_catch` recognises and passes through. */
     JsObj *gen_ret_sentinel;
+    /* the async call whose coroutine we are currently on, NULL outside one */
+    struct HpeJsAsync *async_active;
     /* microtask queue (Promise jobs and then() reactions) */
-    JsJob *jobs_head;
-    JsJob *jobs_tail;
+    JsJob *jobs_head;    JsJob *jobs_tail;
     int jobs_running;
     /* timer queues (setTimeout / setInterval / requestAnimationFrame) */
     struct JsTimer *timers;
@@ -992,6 +1044,15 @@ struct HpeJs {
     int strict;              /* global "use strict" */
     int array_methods_done;  /* Array.prototype methods installed once */
     void *mutation_state;    /* HpeJsMutationState (see hpe_js_mutation.h) */
+    /* conservative GC state */
+    void *gc_free;           /* free-chunk list (payload of a freed chunk holds next) / 空闲块链表 */
+    size_t gc_total;         /* bytes allocated in the arena / arena 已分配字节数 */
+    size_t gc_last_live;     /* live bytes at the last collection / 上次回收后的存活字节数 */
+    size_t gc_freed;         /* payload bytes reclaimed by the last collection / 上次回收释放的载荷字节 */
+    void *stack_base;        /* main-thread stack high address / 主线程栈高端地址 */
+    void *dom_document;      /* document root for listener scanning / 文档根，用于监听器扫描 */
+    HpeJsFiberScan gc_scan_gen;   /* scans a suspended generator stack / 扫描挂起生成器栈 */
+    HpeJsFiberScan gc_scan_async; /* scans a suspended async stack / 扫描挂起 async 栈 */
 };
 
 struct JsBlock {
@@ -1000,6 +1061,31 @@ struct JsBlock {
     size_t size;
     char *mem;
 };
+
+/* ---------------- conservative GC ---------------- */
+
+/* every arena allocation starts with this header so the GC can walk blocks
+ * chunk by chunk and reclaim unreachable ones into a free list */
+typedef struct JsChunkHdr {
+    size_t size;   /* payload size, 8-aligned / 载荷字节数，8 字节对齐 */
+    uint16_t tag;  /* GC_T_* allocator hint / 分配器提示标签 */
+    uint16_t mark; /* set while the chunk is reachable / 可达时置位 */
+    uint32_t magic;
+} JsChunkHdr;
+
+enum { GC_T_PLAIN = 0, GC_T_GEN = 1, GC_T_ASYNC = 2 };
+#define GC_CHUNK_MAGIC 0x31484347u /* "1HCG" */
+
+/* conservative GC (hpe_js_gc.c) */
+void hpe_js_gc_scan_range(HpeJs *js, void *lo, void *hi);
+size_t hpe_js_gc_collect(HpeJs *js);
+int hpe_js_gc_maybe(HpeJs *js);
+void hpe_js_gc_install(HpeJs *js);
+void hpe_js_timers_gc_scan(HpeJs *js); /* timer table as a GC root (timers.c) */
+void hpe_js_gen_gc_scan(HpeJs *js, void *state);
+void hpe_js_async_gc_scan(HpeJs *js, void *state);
+
+
 
 /**
  * @brief 格式化并抛出一个 SyntaxError / Format and throw a SyntaxError
@@ -1734,5 +1820,83 @@ int hpe_js_gen_take_pending_return(HpeJs *js, HpeJsGen *g, JsValue *out);
  */
 JsValue js_run_generator_body(HpeJs *js, JsObj *fn, JsEnv *closure, JsValue this_v, JsValue *args,
                               int argc);
+
+/**
+ * @brief 在独立栈上运行 async 函数体 / Run an async body on its own stack
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] fn async 函数对象 / The async function object
+ * @param[in,out] closure 捕获的环境 / The captured environment
+ * @param[in]     this_v 调用时的 this 值 / The `this` value of the call
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 实参个数 / Argument count
+ *
+ * @return 函数体的返回值 / The body's return value
+ *
+ * @note 由 `hpe_js_async.c` 的协程入口调用，实现留在解释器里以便访问静态执行器 / Called from the coroutine entry in `hpe_js_async.c`; the implementation lives in the interpreter so it can reach the static executor
+ */
+JsValue js_run_async_body(HpeJs *js, JsObj *fn, JsEnv *closure, JsValue this_v, JsValue *args,
+                          int argc);
+
+/**
+ * @brief 在 Promise 上登记一对 C 函数反应 / Register a pair of C-function reactions on a promise
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] p 目标 Promise / Target promise
+ * @param[in]     on_ok 兑现时调用的 C 函数 / C function called on fulfilment
+ * @param[in]     on_err 拒绝时调用的 C 函数 / C function called on rejection
+ * @param[in,out] ud 传给两者的用户数据 / User data passed to both
+ *
+ * @note 与 `then` 的差别是不产生下游 Promise，仅供 `await` 这类内部消费者使用 / Unlike `then`
+ *       no downstream promise is produced; meant for internal consumers such as `await`
+ */
+void js_promise_on_settle(HpeJs *js, JsObj *p, JsNativeFn on_ok, JsNativeFn on_err, void *ud);
+
+/**
+ * @brief 按 thenable 规则用值兑现 Promise / Fulfil a promise with a value, following thenable rules
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] p 待兑现的 Promise / Promise to fulfil
+ * @param[in]     v 兑现值 / Fulfilment value
+ *
+ * @see js_promise_on_settle
+ */
+void js_resolve_promise(HpeJs *js, JsObj *p, JsValue v);
+
+/**
+ * @brief `await` 的实现入口 / The entry point implementing `await`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in]     v 被 await 的值 / The awaited value
+ *
+ * @return 兑现值 / The fulfilment value
+ *
+ * @note 实现在 `hpe_js_async.c`，这样挂起逻辑与协程管理放在一起 / The implementation lives in
+ *       `hpe_js_async.c` so the parking logic sits next to the coroutine management
+ */
+JsValue hpe_js_await(HpeJs *js, JsValue v);
+
+/**
+ * @brief 创建 async 调用 / Create an async call
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] fn async 函数对象 / The async function object
+ * @param[in,out] closure 捕获的环境 / The captured environment
+ * @param[in]     this_v 调用时的 this 值 / The `this` value of the call
+ * @param[in,out] args 实参数组 / Actual argument array
+ * @param[in]     argc 实参个数 / Argument count
+ *
+ * @return 立即返回的 promise / The promise returned immediately
+ */
+JsValue hpe_js_async_create(HpeJs *js, JsObj *fn, JsEnv *closure, JsValue this_v, JsValue *args,
+                            int argc);
+
+/**
+ * @brief 挂起当前 async 体直到 promise 定局 / Park the current async body until the promise settles
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] p 被 await 的 promise（必须仍为 pending）/ The awaited promise, still pending
+ */
+void hpe_js_async_park(HpeJs *js, JsObj *p);
 
 #endif /* HPE_JS_INTERNAL_H */

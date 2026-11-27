@@ -30,7 +30,7 @@
 <body>
   <div class="page">
     <h1>Modern JavaScript</h1>
-    <p class="subtitle">try/catch &middot; class/extends/super &middot; this + call/apply/bind &middot; destructuring &middot; spread/rest &middot; template literals &middot; labels &middot; optional chaining &middot; getters &middot; regex &middot; Promise/async &middot; generators &middot; Set/Map</p>
+    <p class="subtitle">try/catch &middot; class/extends/super &middot; this + call/apply/bind &middot; destructuring &middot; spread/rest &middot; template literals &amp; tags &middot; labels &middot; optional chaining &middot; getters &middot; regex &middot; Promise/async &middot; generators &middot; Set/Map</p>
     <div class="card"><h2>Results</h2><div id="out"></div></div>
   </div>
 <script>
@@ -282,6 +282,214 @@
     var o = { plain: 1 }; o[Symbol("s")] = 2; return Object.keys(o).length + ":" + JSON.stringify(o);
   })(), '1:{"plain":1}')) passCount++;
   total++; if (check("well-known iterator in use", typeof [][Symbol.iterator], "function")) passCount++;
+
+  // ---- 8j. Generator 惰性求值：迭代协议 + next/return/throw + try 交互 ----
+  function* gnums() { yield 1; yield 2; yield 3; }
+  total++; if (check("generator spread", [...gnums()].join(","), "1,2,3")) passCount++;
+  total++; if (check("generator for-of", (function () { var s = ""; for (var v of gnums()) s += v; return s; })(), "123")) passCount++;
+  total++; if (check("generator destructure", (function () { var pr = gnums(); return pr.next().value + "," + pr.next().value; })(), "1,2")) passCount++;
+  total++; if (check("Array.from(generator)", Array.from(gnums()).join(","), "1,2,3")) passCount++;
+
+  function* ginf() { var i = 0; while (true) yield i++; }
+  var gi = ginf();
+  total++; if (check("infinite generator is lazy", gi.next().value + "," + gi.next().value + "," + gi.next().value, "0,1,2")) passCount++;
+
+  function* gsent() { var v = yield 1; return "got:" + v; }
+  var gs = gsent(); gs.next();
+  total++; if (check("next(v) sends value in", gs.next("A").value, "got:A")) passCount++;
+
+  function* gfin() { yield 1; yield 2; }
+  var gf = gfin(); gf.next();
+  total++; if (check("return() ends generator", gf.return(9).value + " " + gf.next().done, "9 true")) passCount++;
+
+  var gord = [];
+  function* gtryfin() { try { yield 1; yield 2; } finally { gord.push("fin"); } }
+  var gt = gtryfin(); gt.next(); gt.return(7);
+  total++; if (check("finally runs on return()", gord.join(","), "fin")) passCount++;
+
+  function* gcatch() { try { yield 1; } catch (e) { yield "caught:" + e; } }
+  var gc = gcatch(); gc.next();
+  total++; if (check("throw() caught inside body", gc.throw("boom").value, "caught:boom")) passCount++;
+
+  function* gnc() { yield 1; }
+  var gn = gnc(); gn.next();
+  total++; if (check("throw() escapes when uncaught", (function () { try { gn.throw("bad"); return "no"; } catch (e) { return e; } })(), "bad")) passCount++;
+
+  function* gboom() { yield 1; throw new Error("inside"); }
+  var gb = gboom(); gb.next();
+  total++; if (check("body error reaches caller", (function () { try { gb.next(); return "no"; } catch (e) { return e.message; } })(), "inside")) passCount++;
+
+  function* ginner() { yield 1; throw "deep"; }
+  function* gouter() { try { yield* ginner(); } catch (e) { yield "outer:" + e; } }
+  var go = gouter(); go.next();
+  total++; if (check("outer catches delegate throw", go.next().value, "outer:deep")) passCount++;
+
+  function* gi1() { yield "a"; yield "b"; return "R1"; }
+  function* gi2() { return (yield* gi1()) + "+R2"; }
+  function* gi3() { return (yield* gi2()) + "+R3"; }
+  total++; if (check("nested yield* return values", (function () {
+    var it = gi3(), out = [];
+    for (;;) { var nx = it.next(); if (nx.done) { out.push("done:" + nx.value); break; } out.push(nx.value); }
+    return out.join(",");
+  })(), "a,b,done:R1+R2+R3")) passCount++;
+
+  function* gsub() { function* gnested() { yield 10; yield 20; } var acc = 0; for (var w of gnested()) acc += w; yield acc; }
+  total++; if (check("generator nested in generator", [...gsub()].join(","), "30")) passCount++;
+
+  var glog = [];
+  function* geffect() { glog.push("s"); yield 1; glog.push("m"); yield 2; }
+  var ge = geffect();
+  var glazy = glog.length; ge.next(); var glazy1 = glog.length; ge.next();
+  total++; if (check("body runs lazily on pull", glazy + " " + glazy1 + " " + glog.length, "0 1 2")) passCount++;
+
+  // ---- 8k. async/await 真正的挂起：await 不阻塞调用方 ----
+  var atr = [], arelease;
+  var agate = new Promise(function (r) { arelease = r; });
+  async function aparked() { atr.push("b1"); var av = await agate; atr.push("b2:" + av); return "done:" + av; }
+  atr.push("call");
+  var apr = aparked();
+  atr.push("after");
+  total++; if (check("await yields to caller", atr.join(","), "call,b1,after")) passCount++;
+  arelease("R");
+  total++; if (check("body stays parked until drained", atr.join(","), "call,b1,after")) passCount++;
+
+  // 其余 async 结果要等队列排空才有；排空的检查点由后续的 then 触发。
+  var aAsync = [];
+  apr.then(function (v) { aAsync.push("parked:" + v); });
+
+  async function aRej() { throw new Error("boom"); }
+  aRej().catch(function (e) { aAsync.push("rej:" + e.message); });
+
+  async function aCatches() { try { await Promise.reject(new Error("inner")); return "no"; } catch (e) { return "caught:" + e.message; } }
+  aCatches().then(function (v) { aAsync.push(v); });
+
+  async function aSeq() { var x = await Promise.resolve(1); var y = await Promise.resolve(2); return x + y; }
+  aSeq().then(function (v) { aAsync.push("seq:" + v); });
+
+  async function aInner() { return (await Promise.resolve(2)) + 1; }
+  async function aOuter() { return (await aInner()) * 10; }
+  aOuter().then(function (v) { aAsync.push("chain:" + v); });
+
+  async function aLoop() { var s = 0; for (var i = 1; i <= 4; i++) s += await Promise.resolve(i); return s; }
+  aLoop().then(function (v) { aAsync.push("loop:" + v); });
+
+  async function aFinally() { try { throw new Error("x"); } finally { aAsync.push("fin"); } }
+  aFinally().catch(function (e) { aAsync.push("fthrow:" + e.message); });
+
+  async function aCount(n) { return n <= 0 ? "bottom" : await aCount(n - 1); }
+  aCount(10).then(function (v) { aAsync.push("rec:" + v); });
+
+  total++; if (check("async results after drain", aAsync.join("|"),
+    "parked:done:R|rej:boom|caught:inner|seq:3|chain:30|loop:10|fin|fthrow:x|rec:bottom")) passCount++;
+
+  // ---- 8l. 标签模板字符串：cooked/raw 数组、String.raw、方法标签的 this ----
+  function ttag(strings, a, b) {
+    return "n=" + strings.length + "|0=" + strings[0] + "|1=" + strings[1] + "|2=" + strings[2] +
+           "|raw0=" + strings.raw[0] + "|raw1=" + strings.raw[1] + "|a=" + a + "|b=" + b;
+  }
+  total++; if (check("tagged template chunks + raw",
+    ttag`A${1 + 1}B${"x"}C`, "n=3|0=A|1=B|2=C|raw0=A|raw1=B|a=2|b=x")) passCount++;
+  total++; if (check("String.raw keeps escapes", String.raw`a\nb${5}`, "a\\nb5")) passCount++;
+  var tagObj = { name: "K", m: function (strings) { return this.name + "/" + strings[0]; } };
+  total++; if (check("method tag binds this", tagObj.m`hi`, "K/hi")) passCount++;
+  function traw(strings) { return strings.raw[0]; }
+  total++; if (check("raw keeps escapes verbatim", traw`x\ty\nz`, "x\\ty\\nz")) passCount++;
+  function tcook(strings) { return strings[0]; }
+  total++; if (check("cooked decodes escapes", tcook`x\ty\nz`, "x\ty\nz")) passCount++;
+  function tempty(strings, extra) { return strings.length + ":" + (extra === undefined); }
+  total++; if (check("empty template site", tempty``, "1:true")) passCount++;
+
+  // ---- 8m. new.target：构造/普通调用、箭头继承、super 传播 ----
+  function ntFn() { return new.target; }
+  total++; if (check("new.target is ctor under new", new ntFn() === ntFn, true)) passCount++;
+  total++; if (check("new.target undefined on plain call", ntFn() === undefined, true)) passCount++;
+  function ntArrow() { var f = function () { return new.target; }; return f(); }
+  total++; if (check("plain nested fn has no new.target", ntArrow() === undefined, true)) passCount++;
+  class NtBase { constructor() { this.nt = new.target; } }
+  class NtDer extends NtBase { constructor() { super(); } }
+  var ntInst = new NtDer();
+  total++; if (check("super() propagates new.target", ntInst.nt === NtDer, true)) passCount++;
+  class NtSelf { constructor() { this.nt = new.target; } }
+  total++; if (check("class ctor new.target is itself", new NtSelf().nt === NtSelf, true)) passCount++;
+
+  // ---- 8n. with 语句：属性可见、写入回对象、遮蔽外层变量 ----
+  var wobj = { a: 1, b: 2, x: "inner" };
+  var wx = "outer", wr = 0;
+  with (wobj) { wr = a + b; }
+  total++; if (check("with exposes properties", wr, 3)) passCount++;
+  with (wobj) { a = 10; }
+  total++; if (check("with writes back to object", wobj.a, 10)) passCount++;
+  with (wobj) { x = "set"; }
+  total++; if (check("with shadows outer var", wobj.x + "|" + wx, "set|outer")) passCount++;
+  var wproto = { deep: "D" };
+  var wchild = Object.create(wproto), wgot = "";
+  with (wchild) { wgot = deep; }
+  total++; if (check("with walks prototype chain", wgot, "D")) passCount++;
+  var wthrown = 0;
+  try { with (wobj) { wmissing; } } catch (e) { wthrown = 1; }
+  total++; if (check("with keeps ReferenceError for unknown", wthrown, 1)) passCount++;
+
+  // ---- 8o. 知名符号内部槽：toPrimitive / toStringTag / hasInstance / unscopables / isConcatSpreadable ----
+  var wkCount = 0;
+  var wkObj = {
+    [Symbol.toPrimitive](hint) { wkCount++; return hint === "string" ? "S" : (hint === "number" ? 42 : "D"); }
+  };
+  total++; if (check("Symbol.toPrimitive string hint", String(wkObj) + "|" + wkCount, "S|1")) passCount++;
+  total++; if (check("Symbol.toPrimitive number hint", Number(wkObj) + "|" + wkCount, "42|2")) passCount++;
+  total++; if (check("Symbol.toPrimitive default hint", wkObj + "!" + wkCount, "D!3")) passCount++;
+  class WkVec { get [Symbol.toStringTag]() { return "Vec"; } }
+  total++; if (check("Symbol.toStringTag", Object.prototype.toString.call(new WkVec()), "[object Vec]")) passCount++;
+  class WkEven { static [Symbol.hasInstance](n) { return typeof n === "number" && n % 2 === 0; } }
+  total++; if (check("Symbol.hasInstance", (4 instanceof WkEven) + "!" + !(3 instanceof WkEven), "true!true")) passCount++;
+  var foo = "outer-foo", ubar = "outer-bar";
+  var uobj = { foo: 1, bar: 2 };
+  var u1, u2;
+  with (uobj) { u1 = foo; u2 = bar; }
+  total++; if (check("with sees both props first", u1 + "!" + u2, "1!2")) passCount++;
+  uobj[Symbol.unscopables] = { foo: true };
+  with (uobj) { u1 = foo; u2 = bar; }
+  total++; if (check("Symbol.unscopables exempts foo", u1 + "!" + u2, "outer-foo!2")) passCount++;
+  var ucat = [1, 2].concat([3, 4]), uarr2 = [5, 6];
+  uarr2[Symbol.isConcatSpreadable] = false;
+  total++; if (check("Symbol.isConcatSpreadable", ucat.length + "!" + [1, 2].concat(uarr2).length, "4!3")) passCount++;
+  var wkIt = { [Symbol.iterator]() { var i = 0; return { next() { return i < 3 ? { done: false, value: i++ } : { done: true }; } }; } };
+  var wkSum = 0;
+  for (var wv of wkIt) wkSum += wv;
+  total++; if (check("custom Symbol.iterator in for-of", wkSum + "!" + [...wkIt].join(","), "3!0,1,2")) passCount++;
+
+  // ---- 8p. 严格模式：指令序言 / 未声明赋值 / 冻结写入 / this / delete ----
+  function sUndeclared() {
+    "use strict";
+    try { xstrict9 = 1; return "no-throw"; } catch (e) { return "throws"; }
+  }
+  total++; if (check("strict undeclared assignment throws", sUndeclared(), "throws")) passCount++;
+  var fz = { q: 1 };
+  Object.freeze(fz);
+  function sFrozen() {
+    "use strict";
+    try { fz.q = 2; return "no-throw"; } catch (e) { return e.message.indexOf("frozen") >= 0 ? "throws" : e.message; }
+  }
+  total++; if (check("strict frozen write throws", sFrozen(), "throws")) passCount++;
+  function sFrozenSloppy() { fz.q = 2; return fz.q === 1; }
+  total++; if (check("sloppy frozen write ignored", sFrozenSloppy() ? "ok" : "bad", "ok")) passCount++;
+  var dfz = { k: 1 };
+  Object.freeze(dfz);
+  total++; if (check("sloppy delete frozen = false", (delete dfz.k) + "!" + dfz.k, "false!1")) passCount++;
+  function sThis() { "use strict"; return this === undefined; }
+  total++; if (check("strict plain-call this undefined", sThis() ? "ok" : "bad", "ok")) passCount++;
+  function sThisSloppy() { return typeof this === "object"; }
+  total++; if (check("sloppy plain-call this is object", sThisSloppy() ? "ok" : "bad", "ok")) passCount++;
+  class StCtor { m() { return this === undefined; } }
+  var stMethod = (new StCtor()).m;
+  total++; if (check("class method strict this", stMethod() ? "ok" : "bad", "ok")) passCount++;
+  var sz = { a: 1 };
+  Object.seal(sz);
+  function sSealed() {
+    "use strict";
+    try { sz.b = 2; return "no-throw"; } catch (e) { return "throws"; }
+  }
+  total++; if (check("strict sealed new prop throws", sSealed(), "throws")) passCount++;
+  total++; if (check("sloppy sealed new prop ignored", sz.b === undefined ? "ok" : "bad", "ok")) passCount++;
 
   lines.unshift((passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total + " checks");
   var cls = passCount === total ? "ok" : "fail";

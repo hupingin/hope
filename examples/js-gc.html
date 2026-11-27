@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Hope Engine - conservative GC</title>
+  <style>
+    body {
+      margin: 0;
+      background-color: #f5f6f8;
+      color: #202124;
+      font-size: 15px;
+      line-height: 1.55;
+      font-family: sans-serif;
+    }
+    .page { width: 720px; margin: 24px auto; }
+    h1 { font-size: 26px; margin: 0 0 6px 0; color: #14213d; }
+    .subtitle { color: #5f6368; font-size: 13px; margin: 0 0 18px 0; }
+    .card {
+      background-color: #ffffff;
+      border: 1px solid #dcdfe4;
+      padding: 12px 18px;
+      margin: 0 0 14px 0;
+    }
+    .card h2 { font-size: 16px; margin: 0 0 8px 0; color: #1a73e8; }
+    .row { font-family: monospace; font-size: 13px; white-space: pre; }
+    .fail { color: #d93025; font-weight: bold; }
+    .ok { color: #188038; }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <h1>Conservative GC</h1>
+    <p class="subtitle">__gc &middot; __gcStats &middot; garbage cycles reclaimed &middot; survivors intact &middot; generators &amp; promises after collection</p>
+    <div class="card"><h2>Results</h2><div id="out"></div></div>
+  </div>
+<script>
+  var lines = [];
+  function check(label, got, want) {
+    var pass = String(got) === String(want);
+    lines.push((pass ? "  ok   " : "  FAIL ") + label + " = " + got + (pass ? "" : "   (want " + want + ")"));
+    return pass;
+  }
+  var passCount = 0, total = 0;
+
+  // ---- 1. the builtins exist and report sane numbers ----
+  total++; if (check("typeof __gc", typeof __gc, "function")) passCount++;
+  var s0 = __gcStats();
+  total++; if (check("stats fields", [typeof s0.freed, typeof s0.live, typeof s0.total].join(","), "number,number,number")) passCount++;
+
+  // ---- 2. garbage (incl. cycles) is reclaimed, survivors stay intact ----
+  var survivors = [];
+  for (var i = 0; i < 400; i++) {
+    survivors.push({ i: i, tag: "s" + i, nest: { a: [i, i + 1], b: { deep: "d" + i } } });
+  }
+  for (var j = 0; j < 2000; j++) {
+    var cyc = { n: j, inner: { pad: new Array(8).join("x") } };
+    cyc.self = cyc;           // cycle: only reachable through itself
+    cyc.inner.back = cyc;     // second entry into the same cycle
+    cyc = null;
+  }
+  var st1 = { freed: 0, live: 0 };
+  st1.freed = __gc();
+  st1.live = __gcStats().live;
+  total++; if (check("freed > 0", st1.freed > 0, "true")) passCount++;
+  var sum = 0, okAll = true;
+  for (var k = 0; k < survivors.length; k++) {
+    var sv = survivors[k];
+    if (sv.i !== k || sv.tag !== "s" + k || sv.nest.a[1] !== k + 1 ||
+        sv.nest.b.deep !== "d" + k) okAll = false;
+    sum += sv.i;
+  }
+  total++; if (check("survivors intact", okAll, "true")) passCount++;
+  total++; if (check("survivor sum", sum, "79800")) passCount++;
+  total++; if (check("live > 0 after gc", st1.live > 0, "true")) passCount++;
+
+  // ---- 3. a generator parked across a collection resumes correctly ----
+  function* g3() { var acc = 0; for (var q = 0; q < 3; q++) acc += yield acc; return acc; }
+  var gen = g3();
+  var parked = [gen.next(), gen.next(10)];  // parked: two yields done
+  __gc();
+  var done = gen.next(100);                 // resume after GC
+  total++; if (check("parked gen values",
+        parked[0].value + "," + parked[1].value + "," + done.value,
+        "0,10,110")) passCount++;
+
+  // ---- 4. a promise chain queued before GC settles after it ----
+  // (reactions drain after the script, so the assert runs inside a timer;
+  // rendering also happens there, so #out carries exactly one PASS line)
+  var prGot = "?";
+  var pr = new Promise(function (res) { res(21); })
+    .then(function (v) { return v * 2; })
+    .then(function (v) { prGot = v; });
+  __gc();
+  setTimeout(function () {
+    total++; if (check("promise after gc", prGot, "42")) passCount++;
+    render();
+    document.title = (passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total;
+  }, 1);
+
+  // ---- 5. repeated collections stay stable, no crash, live plateaus ----
+  __gc(); __gc(); __gc();
+  var s5 = __gcStats();
+  total++; if (check("stable after 3 gc", s5.live > 0 && s5.freed >= 0, "true")) passCount++;
+  total++; if (check("live kept survivors", s5.live >= st1.live, "true")) passCount++;
+
+  function render() {
+    lines.unshift((passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total + " checks");
+    var cls = passCount === total ? "ok" : "fail";
+    var el = document.getElementById("out");
+    for (var li = 0; li < lines.length; li++) {
+      var row = document.createElement("div");
+      row.className = "row " + (li === 0 ? cls : "");
+      row.textContent = lines[li];
+      el.appendChild(row);
+    }
+  }
+</script>
+</body>
+</html>

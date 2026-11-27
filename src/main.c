@@ -3,6 +3,7 @@
 #include <string.h>
 
 #include "base/hpe_util.h"
+#include "css/hpe_css.h"
 #include "hope.h"
 #include "js/hpe_js.h"
 #include "platform/hpe_platform.h"
@@ -375,6 +376,46 @@ static void app_tick(void *user)
         hpe_window_invalidate(app->window);
 }
 
+/**
+ * @brief 把引擎光标语义转成平台光标 ID / Translate the engine's cursor semantics into a platform cursor id
+ *
+ * @param[in]     user `App *` 用户数据 / The `App *` user data
+ *
+ * @return `HPE_PLAT_CURSOR_*` ID / One of the `HPE_PLAT_CURSOR_*` ids
+ *
+ * @note 读引擎缓存的 `HpeCursor` 并映射到平台词汇表；grab/grabbing 暂用手形近似 / Reads the engine's cached `HpeCursor` and maps it onto the platform vocabulary; grab/grabbing are approximated with the hand cursor for now
+ *
+ * @see hpe_engine_page_cursor
+ */
+static int app_query_cursor(void *user)
+{
+    App *app = (App *)user;
+    switch (hpe_engine_page_cursor(app->engine)) {
+    case HPE_CURSOR_POINTER:
+    case HPE_CURSOR_GRAB:
+    case HPE_CURSOR_GRABBING:
+        return HPE_PLAT_CURSOR_HAND;
+    case HPE_CURSOR_TEXT:
+        return HPE_PLAT_CURSOR_IBEAM;
+    case HPE_CURSOR_MOVE:
+        return HPE_PLAT_CURSOR_MOVE;
+    case HPE_CURSOR_WAIT:
+        return HPE_PLAT_CURSOR_WAIT;
+    case HPE_CURSOR_HELP:
+        return HPE_PLAT_CURSOR_HELP;
+    case HPE_CURSOR_CROSSHAIR:
+        return HPE_PLAT_CURSOR_CROSS;
+    case HPE_CURSOR_NOT_ALLOWED:
+        return HPE_PLAT_CURSOR_NO;
+    case HPE_CURSOR_EW_RESIZE:
+        return HPE_PLAT_CURSOR_SIZEWE;
+    case HPE_CURSOR_NS_RESIZE:
+        return HPE_PLAT_CURSOR_SIZENS;
+    default:
+        return HPE_PLAT_CURSOR_DEFAULT;
+    }
+}
+
 /* ---------------- command line ---------------- */
 
 typedef struct {
@@ -477,6 +518,9 @@ static void load_start_document(HpeEngine *engine, const Options *o)
 /* ---------------- address-bar test helpers ---------------- */
 
 #define ADDR_TEST_Y 22 /* vertical centre of the address field */
+/* horizontal point inside the field's text viewport (the nav buttons occupy
+ * the left edge, so a click must land past CHROME_PAD + 3*(28+4) = 106) */
+#define ADDR_TEST_X 200
 
 /**
  * @brief 合成一次鼠标点击 / Synthesise one mouse click
@@ -610,7 +654,7 @@ static void hook_test_addr(HpeEngine *engine)
     const char *typed = getenv("HOPE_TEST_ADDR");
     if (!typed || !*typed)
         return;
-    synth_click(engine, 20, ADDR_TEST_Y, 0); /* focus the field */
+    synth_click(engine, ADDR_TEST_X, ADDR_TEST_Y, 0); /* focus the field */
     synth_type(engine, typed);
     if (getenv("HOPE_TEST_ADDR_ENTER"))
         hpe_engine_key(engine, HPE_KEY_RETURN);
@@ -631,7 +675,7 @@ static void hook_test_clipboard(HpeEngine *engine)
     if (seed)
         hpe_clipboard_set_text(seed);
     if (getenv("HOPE_TEST_PASTE")) {
-        synth_click(engine, 20, ADDR_TEST_Y, 0); /* focus the field */
+        synth_click(engine, ADDR_TEST_X, ADDR_TEST_Y, 0); /* focus the field */
         hpe_engine_key(engine, HPE_KEY_PASTE);
         if (getenv("HOPE_TEST_PASTE_ENTER"))
             hpe_engine_key(engine, HPE_KEY_RETURN);
@@ -804,6 +848,31 @@ static void hook_test_scrollbar_drag(HpeEngine *engine)
 }
 
 /**
+ * @brief 测试钩子：在指定点合成一次滚轮并复刻窗口路径 / Test hook: synthesise a wheel at a point, replaying the window path
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @note 读 `HOPE_TEST_WHEEL`，形如 `x,y,lines`；按 `app_scroll` 的顺序派发 `wheel` 事件 → 元素滚动链 → 页面整页滚动 → `scroll` 事件，最后打印滚动偏移（`scroll=<offset>`）供断言 / Reads `HOPE_TEST_WHEEL` as `x,y,lines`; replays the `app_scroll` order — `wheel` event → element scroll chain → page scroll → `scroll` event — then prints the scroll offset (`scroll=<offset>`) for assertions
+ *
+ * @see app_scroll hpe_engine_wheel_scroll
+ */
+static void hook_test_wheel(HpeEngine *engine)
+{
+    const char *spec = getenv("HOPE_TEST_WHEEL");
+    int x = 0, y = 0;
+    float lines = 0.0f;
+    if (!spec || !*spec)
+        return;
+    if (sscanf(spec, "%d,%d,%f", &x, &y, &lines) < 3)
+        return;
+    hpe_engine_wheel_event(engine, x, y, 0, lines, 0);
+    if (!hpe_engine_wheel_scroll(engine, x, y, lines))
+        hpe_engine_scroll_by(engine, lines);
+    hpe_engine_scroll_event(engine, NULL);
+    printf("scroll=%g\n", (double)hpe_engine_scroll_offset(engine));
+}
+
+/**
  * @brief 测试钩子：合成键盘 / 滚轮 / 滚动事件 / Test hook: synthesise keyboard, wheel and scroll events
  *
  * @param[in,out] engine 引擎实例 / Engine instance
@@ -899,6 +968,90 @@ static void report_meta(HpeEngine *engine)
 }
 
 /**
+ * @brief 报告某点的光标语义与插入符相位 / Report the cursor semantics and caret phase at given points
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @note 仅在设置了 `HOPE_TEST_CURSOR` 时输出：把该值当作 `x,y;x,y;...` 逐点派发一次指针移动并打印解析出的 `HpeCursor` 名称；额外设置 `HOPE_TEST_CARET`（值为等待秒数）时先跑该时长的 tick 再打印插入符相位 / Prints only when `HOPE_TEST_CURSOR` is set: the value is treated as `x,y;x,y;...`, each point gets one synthetic pointer move and its resolved `HpeCursor` name is printed; with `HOPE_TEST_CARET` additionally set (its value is the wait in seconds) the caret phase is printed after ticking for that long
+ *
+ * @see hpe_engine_page_cursor hpe_engine_mouse_move hpe_engine_tick
+ */
+static void report_cursor(HpeEngine *engine)
+{
+    static const char *names[] = {"auto",     "default",   "pointer",  "text",
+                                  "move",     "wait",      "help",     "crosshair",
+                                  "not-allowed", "grab",  "grabbing", "ew-resize",
+                                  "ns-resize"};
+    const char *spec = getenv("HOPE_TEST_CURSOR");
+    const char *caret = getenv("HOPE_TEST_CARET");
+    char buf[512];
+    char *tok;
+    if (!spec || !*spec)
+        return;
+    snprintf(buf, sizeof(buf), "%s", spec);
+    for (tok = strtok(buf, ";"); tok; tok = strtok(NULL, ";")) {
+        int cx = 0, cy = 0, cur;
+        if (sscanf(tok, "%d,%d", &cx, &cy) < 2)
+            continue;
+        hpe_engine_mouse_move(engine, cx, cy);
+        cur = hpe_engine_page_cursor(engine);
+        printf("cursor %d,%d %s\n", cx, cy,
+               (cur >= 0 && cur <= HPE_CURSOR_NS_RESIZE) ? names[cur] : "?");
+    }
+    if (caret) {
+        double wait = atof(caret);
+        double t0 = hpe_time_seconds();
+        while (hpe_time_seconds() - t0 < wait)
+            hpe_engine_tick(engine);
+        printf("caret visible=%d\n", hpe_engine_caret_visible(engine));
+    }
+}
+
+/**
+ * @brief 测试钩子：按 `HOPE_TEST_NAV_CLICK` 点击导航按钮 / Test hook: click nav buttons from `HOPE_TEST_NAV_CLICK`
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @note 值为分号分隔的按钮下标（0 后退、1 前进、2 刷新），逐个在按钮中心合成一次点击；配合 `HOPE_TEST_NAV` 观察历史栈变化 / The value is semicolon-separated button indices (0 back, 1 forward, 2 reload); each gets one synthetic click at its centre, so `HOPE_TEST_NAV` can observe the history change
+ *
+ * @see nav_activate synth_click report_nav
+ */
+static void hook_test_nav_click(HpeEngine *engine)
+{
+    const char *spec = getenv("HOPE_TEST_NAV_CLICK");
+    char buf[128];
+    char *tok;
+    if (!spec || !*spec)
+        return;
+    snprintf(buf, sizeof(buf), "%s", spec);
+    for (tok = strtok(buf, ";"); tok; tok = strtok(NULL, ";")) {
+        int i = atoi(tok);
+        /* CHROME_PAD 10 + i * (NAV_BTN_W 28 + NAV_BTN_GAP 4), centre of a 28px box */
+        int x = 10 + i * 32 + 14;
+        if (i >= 0 && i < 3)
+            synth_click(engine, x, ADDR_TEST_Y, 0);
+    }
+}
+
+/**
+ * @brief 报告导航历史栈状态 / Report the navigation history state
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @note 仅在设置了 `HOPE_TEST_NAV` 时输出 `nav=<count>@<pos>` 与地址文本 / Prints `nav=<count>@<pos>` plus the address text only when `HOPE_TEST_NAV` is set
+ *
+ * @see hpe_engine_back hpe_engine_forward hpe_engine_reload
+ */
+static void report_nav(HpeEngine *engine)
+{
+    const char *spec = getenv("HOPE_TEST_NAV");
+    if (!spec || !*spec)
+        return;
+    printf("nav count=%d pos=%d addr=[%s]\n", hpe_engine_nav_count(engine),
+           hpe_engine_nav_pos(engine), hpe_engine_address_text(engine));
+}
+
+/**
  * @brief 无头模式运行并可选导出截图 / Run headlessly and optionally export a screenshot
  *
  * @param[in,out] engine 引擎实例 / Engine instance
@@ -978,6 +1131,7 @@ static int run_window(HpeEngine *engine, int width, int height)
     callbacks.on_char = app_char;
     callbacks.on_mouse = app_mouse;
     callbacks.on_tick = app_tick;
+    callbacks.query_cursor = app_query_cursor;
 
     app.window = hpe_window_create("Hope", width, height, &callbacks, &app);
     if (!app.window) {
@@ -1011,6 +1165,7 @@ int main(int argc, char **argv)
     HpeEngine *engine;
     int rc;
 
+    hpe_js_gc_capture_main_base(); /* outermost frame = GC stack scan bound */
     memset(&o, 0, sizeof(o));
     o.width = 1000;
     o.height = 700;
@@ -1026,9 +1181,13 @@ int main(int argc, char **argv)
     hook_test_addr_editor(engine);
     hook_test_click_at(engine);
     hook_test_scrollbar_drag(engine);
+    hook_test_wheel(engine);
+    hook_test_nav_click(engine);
     hook_test_events(engine);
     report_addr_text(engine);
     report_meta(engine);
+    report_cursor(engine);
+    report_nav(engine);
 
     if (o.dump || o.bench)
         return run_headless(engine, &o);

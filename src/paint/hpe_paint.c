@@ -1264,18 +1264,135 @@ static void paint_box_line_runs(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float
         for (r = 0; r < line->run_count; r++) {
             HpeTextRun *run = &line->runs[r];
             const HpeTextMask *mask;
+            float fx;
             int x, y;
             /* atomic inline-block runs are painted via child recursion, not here */
             if (run->atomic || !run->font)
                 continue;
-            x = (int)floorf(box->content_box.x + ctx->dev_x + run->x);
+            fx = box->content_box.x + ctx->dev_x + run->x;
+            x = (int)floorf(fx);
             y = (int)floorf(baseline);
             if (run->color.a == 0 || x > pm->clip_x1)
                 continue;
-            mask = hpe_font_mask(run->font, run->text, run->len);
+            /* sub-pixel positioning: the quantised fractional phase is baked
+             * into the cached mask, so the glyphs keep their AA gradient */
+            mask = hpe_font_mask_phase(run->font, run->text, run->len, fx - (float)x);
             if (!mask)
                 continue;
             hpe_draw_text_mask(pm, x, y, mask, run->color);
+        }
+    }
+}
+
+/**
+ * @brief 把一个长度解算为像素（行内碎片用） / Resolve a length to pixels for an inline fragment
+ *
+ * @param[in] l 长度 / The length
+ * @param[in] base 百分比基准（宿主内容宽度）/ Percentage basis (host content width)
+ *
+ * @return 像素值；非 px/percent 单位返回 0 / Pixel value; non-px/percent units yield 0
+ *
+ * @note em/rem 等字体相关单位在绘制期不可得，按 0 处理 / Font-relative units are unavailable at paint time and resolve to 0
+ */
+static float frag_len_px(HpeLength l, float base)
+{
+    if (l.unit == HPE_LEN_PX)
+        return l.value;
+    if (l.unit == HPE_LEN_PCT)
+        return l.value * base / 100.0f;
+    return 0.0f;
+}
+
+/**
+ * @brief 求一个盒在盒树中的深度 / Depth of a box in the box tree
+ *
+ * @param[in] box 目标盒 / The box
+ *
+ * @return 根为 0 的祖先层数 / Number of ancestors, the root being 0
+ */
+static int frag_box_depth(HpeBox *box)
+{
+    int d = 0;
+    while (box->parent) {
+        d++;
+        box = box->parent;
+    }
+    return d;
+}
+
+/**
+ * @brief 按盒深度稳定排序一行碎片（祖先先画）/ Stable-sort a line's fragments by box depth (ancestors first)
+ *
+ * @param[in,out] frags 碎片数组，就地排序 / Fragment array, sorted in place
+ * @param[in] n 碎片个数 / Fragment count
+ *
+ * @note 嵌套行内盒按闭标记顺序入列（内层先入），直接绘制会让外层背景盖住内层；
+ *       稳定的插入排序保持同深度碎片按树序 / Nested inline boxes enqueue at close
+ *       time (inner first), which would let the outer background overpaint the
+ *       inner one; the stable insertion sort keeps same-depth fragments in tree order
+ */
+static void paint_frags_sort_by_depth(HpeInlineFrag *frags, int n)
+{
+    int i, j;
+    for (i = 1; i < n; i++) {
+        HpeInlineFrag key = frags[i];
+        int kd = frag_box_depth(key.box);
+        j = i - 1;
+        while (j >= 0 && frag_box_depth(frags[j].box) > kd) {
+            frags[j + 1] = frags[j];
+            j--;
+        }
+        frags[j + 1] = key;
+    }
+}
+
+/* Paint the per-line background and borders of every inline box that
+ * contributed content to this block's lines. */
+static void paint_box_inline_frags(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float own_scroll)
+{
+    int i, r;
+    for (i = 0; i < box->line_count; i++) {
+        HpeLine *line = &box->lines[i];
+        float line_top = snap_y(ctx_dev_y(ctx, line->y, own_scroll));
+        float line_bottom = line_top + line->height;
+
+        if (line_bottom < (float)pm->clip_y0 || line_top > (float)pm->clip_y1)
+            continue;
+
+        paint_frags_sort_by_depth(line->frags, line->frag_count);
+        for (r = 0; r < line->frag_count; r++) {
+            HpeInlineFrag *fr = &line->frags[r];
+            HpeStyle *bs = &fr->box->style;
+            float base = box->content_box.w;
+            float pT = frag_len_px(bs->padding[0], base), pR = frag_len_px(bs->padding[1], base);
+            float pB = frag_len_px(bs->padding[2], base), pL = frag_len_px(bs->padding[3], base);
+            float bT = bs->border_w[0], bR = bs->border_w[1];
+            float bB = bs->border_w[2], bL = bs->border_w[3];
+            int start = (fr->flags & 1) != 0, end = (fr->flags & 2) != 0;
+            float x0 = box->content_box.x + ctx->dev_x + fr->x0 - (start ? pL + bL : 0.0f);
+            float x1 = box->content_box.x + ctx->dev_x + fr->x1 + (end ? pR + bR : 0.0f);
+            float y0 = ctx_dev_y(ctx, line->y + line->baseline - fr->ascent - pT - bT,
+                                 own_scroll);
+            float y1 = ctx_dev_y(ctx, line->y + line->baseline + fr->descent + pB + bB,
+                                 own_scroll);
+            HpeRect bb = hpe_rect(snap_y(x0), snap_y(y0), snap_y(x1) - snap_y(x0),
+                                  snap_y(y1) - snap_y(y0));
+            int any_b = (bT > 0.0f || bR > 0.0f || bB > 0.0f || bL > 0.0f);
+
+            if (!any_b && bs->background.a == 0)
+                continue;
+            if (bs->background.a > 0)
+                hpe_fill_rect(pm, bb, bs->background);
+            if (bT > 0.0f && bs->border_colors[0].a > 0)
+                hpe_fill_rect(pm, hpe_rect(bb.x, bb.y, bb.w, bT), bs->border_colors[0]);
+            if (bB > 0.0f && bs->border_colors[2].a > 0)
+                hpe_fill_rect(pm, hpe_rect(bb.x, bb.y + bb.h - bB, bb.w, bB),
+                              bs->border_colors[2]);
+            if (start && bL > 0.0f && bs->border_colors[3].a > 0)
+                hpe_fill_rect(pm, hpe_rect(bb.x, bb.y, bL, bb.h), bs->border_colors[3]);
+            if (end && bR > 0.0f && bs->border_colors[1].a > 0)
+                hpe_fill_rect(pm, hpe_rect(bb.x + bb.w - bR, bb.y, bR, bb.h),
+                              bs->border_colors[1]);
         }
     }
 }
@@ -1300,64 +1417,115 @@ static void paint_box_own_content(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, flo
     if (bs->text_shadow.valid)
         paint_text_shadow(ctx, pm, box, own_scroll);
 
+    paint_box_inline_frags(ctx, pm, box, own_scroll);
     paint_box_line_runs(ctx, pm, box, own_scroll);
     if (bs->text_decoration != HPE_TD_NONE)
         paint_text_decorations(ctx, pm, box, own_scroll, bs->text_decoration);
 }
 
 /**
- * @brief 按 z-index 升序插入分层盒序列 / Insert a box into the z-order stack by ascending z-index
+ * @brief 判定一个子盒的层叠批次 / Classify a child into its stacking batch
+ *
+ * @param[in] child 子盒 / The child box
+ *
+ * @return 0 = 负 z 定位盒；1 = 流内静态盒；2 = 浮动盒（附录 E 的 float 层）；
+ *         3 = z:auto/0 定位盒或建立层叠上下文的分组盒（opacity < 1 / transform）；
+ *         4 = 正 z 定位盒
+ *         / 0 = negative-z positioned; 1 = in-flow static; 2 = floated box (the
+ *         Appendix E float layer); 3 = z:auto/0 positioned or a grouping box that
+ *         establishes a stacking context (opacity < 1 / transform); 4 = positive-z
+ *         positioned
+ *
+ * @note opacity/transform 盒即使非定位也建立层叠上下文，因此像 z:0 一样参与
+ *       排序而不是留在流内批次；浮动盒画在流内内容之后、定位盒之前 / A grouping
+ *       box establishes a stacking context even when not positioned, so it sorts
+ *       like z:0 instead of staying in-flow; floats paint after in-flow content
+ *       and before positioned boxes
+ */
+static int stack_batch(HpeBox *child)
+{
+    HpeStyle *s = &child->style;
+    int positioned = s->position != HPE_POS_STATIC;
+    int grouped = (s->opacity < 1.0f) || !s->transform.identity;
+    if (positioned && s->z_index < 0)
+        return 0;
+    if (positioned)
+        return s->z_index > 0 ? 4 : 3;
+    if (s->float_side != HPE_FLOAT_NONE)
+        return 2;
+    return grouped ? 3 : 1;
+}
+
+/**
+ * @brief 按（批次，z-index）升序插入分层序列 / Insert into the stacked sequence by (batch, z-index)
  *
  * @param[in,out] stacked 分层盒指针数组 / Stacked box pointer array
+ * @param[in,out] batch 平行的批次号数组 / Parallel batch number array
  * @param[in]     n 数组当前长度 / Current array length
  *
- * @note 对末尾元素做插入排序；长度不足 2 时无操作 / Insertion sort on the last element; no-op when the length is below 2
+ * @note 稳定插入排序：同批次同 z 保持文档序（CSS 附录 E 的简化层序） / Stable
+ *       insertion sort: equal batch and z keep document order (a simplified
+ *       CSS Appendix E layering)
  */
-static void stacked_insert_sorted(HpeBox **stacked, int n)
+static void stacked_insert_sorted(HpeBox **stacked, int *batch, int n)
 {
     HpeBox *key;
-    int j;
+    int keyb, j;
     if (n <= 1)
         return;
     key = stacked[n - 1];
+    keyb = batch[n - 1];
     j = n - 2;
-    while (j >= 0 && stacked[j]->style.z_index > key->style.z_index) {
+    while (j >= 0 && (batch[j] > keyb ||
+                      (batch[j] == keyb && stacked[j]->style.z_index > key->style.z_index))) {
         stacked[j + 1] = stacked[j];
+        batch[j + 1] = batch[j];
         j--;
     }
     stacked[j + 1] = key;
+    batch[j + 1] = keyb;
 }
 
 /**
  * @brief 绘制子盒子树 / Paint the child subtree
  *
- * @param[in]     ctx 绘制上下文 / Paint context
- * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
- * @param[in]     box 父盒 / Parent box
- * @param[in]     scroll 纵向滚动偏移 / Vertical scroll offset
- *
- * @note 静态子盒按顺序绘制，定位子盒按 z-index 升序叠在上层 / Static children paint in order; positioned children paint on top in ascending z-index
+ * @note 层序：负 z 定位盒 → 流内静态盒（文档序）→ 浮动盒 → z:auto/0 定位盒与
+ *       opacity/transform 分组盒（文档序）→ 正 z 定位盒（升序）。
+ *       每个层叠上下文内部独立排序（与规范附录 E 的简化层序一致）
+ *       / Layer order: negative-z positioned, in-flow statics (document order),
+ *       floats, z:auto/0 positioned plus opacity/transform grouping boxes
+ *       (document order), then positive-z positioned (ascending). Each stacking
+ *       context sorts independently (a simplified CSS Appendix E layering)
  */
 static void paint_box_children(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float scroll)
 {
     HpeBox **stacked = NULL;
-    size_t sc = 0, scap = 0;
+    int *batch = NULL;
+    size_t sc = 0, scap_b = 0, scap_i = 0;
     HpeBox *child;
     int r;
 
     for (child = box->first_child; child; child = child->next) {
-        if (child->style.position == HPE_POS_STATIC) {
+        int lv = stack_batch(child);
+        if (lv == 1) {
             paint_box(ctx, pm, child, scroll);
-        } else {
-            stacked = (HpeBox **)hpe_grow(stacked, &scap, sc + 1, sizeof(HpeBox *));
-            stacked[sc++] = child;
-            stacked_insert_sorted(stacked, (int)sc);
+            continue;
         }
+        /* two independent growables: hpe_grow is a no-op once *cap >= need, so
+         * sharing one cap counter would leave the second array NULL */
+        stacked = (HpeBox **)hpe_grow(stacked, &scap_b, sc + 1, sizeof(HpeBox *));
+        batch = (int *)hpe_grow(batch, &scap_i, sc + 1, sizeof(int));
+        stacked[sc] = child;
+        batch[sc] = lv;
+        sc++;
+        stacked_insert_sorted(stacked, batch, (int)sc);
     }
     for (r = 0; r < (int)sc; r++)
         paint_box(ctx, pm, stacked[r], scroll);
     if (stacked)
         hpe_free(stacked);
+    if (batch)
+        hpe_free(batch);
 }
 
 /**

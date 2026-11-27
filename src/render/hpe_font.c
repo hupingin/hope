@@ -365,18 +365,49 @@ static void mask_flush(HpeFont *font)
  */
 const HpeTextMask *hpe_font_mask(HpeFont *font, const char *text, int len)
 {
+    return hpe_font_mask_phase(font, text, len, 0.0f);
+}
+
+/**
+ * @brief 取带水平亚像素相位的覆盖率掩码（带缓存）/ Get a coverage mask with a horizontal sub-pixel phase, cached
+ *
+ * @details 相位量化为 3 档（0、1/3、2/3 px）并入缓存键，因此同一文本最多缓存 3 份
+ *          掩码；稳态帧仍不触碰平台光栅化器。`hpe_font_mask` 等价于相位 0。
+ *          The phase is quantised to 3 steps (0, 1/3, 2/3 px) and folded into the
+ *          cache key, so one text run caches up to three masks; steady-state frames
+ *          still never touch the platform rasterizer. `hpe_font_mask` equals phase 0.
+ *
+ * @param[in,out] font 字体对象 / Font object
+ * @param[in]     text UTF-8 文本 / UTF-8 text
+ * @param[in]     len 文本字节数 / Text length in bytes
+ * @param[in]     frac_x 笔位的小数部分（0..1）/ Fractional part of the pen x (0..1)
+ *
+ * @return 缓存持有的掩码指针（借出，勿释放）；失败返回 `NULL` / A cache-owned mask pointer that must not be freed, or `NULL` on failure
+ *
+ * @see hpe_font_mask
+ */
+const HpeTextMask *hpe_font_mask_phase(HpeFont *font, const char *text, int len, float frac_x)
+{
     HpeMaskEntry *empty, *hit;
     uint64_t key;
+    int phase;
     static HpeTextMask uncached;
 
     if (!font || !font->plat || !text || len <= 0)
         return NULL;
+    phase = (int)(frac_x * 3.0f + 0.5f);
+    if (phase < 0)
+        phase = 0;
+    if (phase > 2)
+        phase = 2;
     if (mask_cache_disabled())
-        return hpe_plat_font_mask(font->plat, text, len, &uncached) ? &uncached : NULL;
+        return hpe_plat_font_mask(font->plat, text, len, (float)phase / 3.0f, &uncached)
+                   ? &uncached
+                   : NULL;
     if (!font->masks)
         font->masks = (HpeMaskEntry *)hpe_calloc(HPE_MASK_CACHE_SIZE, sizeof(HpeMaskEntry));
 
-    key = mask_hash(text, len);
+    key = mask_hash(text, len) ^ ((uint64_t)(phase + 1) << 60);
     mask_slot(font, key, &empty, &hit);
     if (hit)
         return &hit->mask;
@@ -394,7 +425,7 @@ const HpeTextMask *hpe_font_mask(HpeFont *font, const char *text, int len)
             return NULL;
     }
 
-    if (!hpe_plat_font_mask(font->plat, text, len, &empty->mask))
+    if (!hpe_plat_font_mask(font->plat, text, len, (float)phase / 3.0f, &empty->mask))
         return NULL;
     empty->key = key;
     empty->len = len;

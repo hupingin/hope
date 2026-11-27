@@ -202,11 +202,11 @@ int hpe_engine_mouse_move(HpeEngine *engine, int x, int y);
 /**
  * @brief 泵到期定时器与 requestAnimationFrame 队列 / Drain due timers and the requestAnimationFrame queue
  *
- * @param[in,out] engine 引擎实例，无 JS 上下文时返回 0 / Engine instance, returns 0 without a JS context
+ * @param[in,out] engine 引擎实例，NULL 时返回 0 / Engine instance, returns 0 when NULL
  *
- * @return 有回调运行返回 1（页面应重排并重绘），否则 0 / 1 when at least one callback ran (the page should be relaid out and repainted), otherwise 0
+ * @return 有回调运行或地址栏插入符闪烁相位翻转返回 1（页面应重绘），否则 0 / 1 when a callback ran or the address caret's blink phase flipped (the page should be repainted), otherwise 0
  *
- * @note 每轮只处理已到期的回调，期间新增的留待下一轮 / Only callbacks already due are run; ones added during the pass wait for the next round
+ * @note 每轮只处理已到期的回调，期间新增的留待下一轮；插入符时钟独立于 JS 上下文，无脚本时同样闪烁（仅整帧/地址栏脏路径会重绘） / Only callbacks already due are run; ones added during the pass wait for the next round; the caret clock runs independently of the JS context, so blinking works without scripts (repaints ride the full-frame / chrome-only dirty paths)
  *
  * @see hpe_engine_mouse_move
  */
@@ -308,6 +308,58 @@ int hpe_engine_address_selection(HpeEngine *engine, int *start, int *end);
  * @see hpe_engine_address_selection
  */
 int hpe_engine_address_caret(HpeEngine *engine);
+
+/**
+ * @brief 取客户端区当前应显示的光标 / Get the cursor currently indicated for the client area
+ *
+ * @param[in]     engine 引擎实例 / Engine instance
+ *
+ * @return `HpeCursor` 枚举值，`engine` 为 NULL 时返回 `HPE_CURSOR_DEFAULT` / An `HpeCursor` value, `HPE_CURSOR_DEFAULT` when `engine` is NULL
+ *
+ * @note 由指针移动事件更新：地址栏条带内输入框为 I-beam、条带其余处为箭头；页面上取命中盒解析出的 CSS `cursor`（含 UA 默认：链接为 pointer、按钮为 default），文本盒回退为 I-beam；平台层可在窗口回调 `query_cursor` 中读取它映射为系统光标 / Updated by pointer-move events: I-beam inside the address field, the arrow elsewhere in the strip; over the page the hit box's resolved CSS `cursor` is used (with UA defaults: pointer for links, default for buttons), falling back to the I-beam for text boxes; the platform layer may map it to a system cursor from the `query_cursor` window callback
+ *
+ * @see hpe_engine_mouse_move
+ */
+int hpe_engine_page_cursor(HpeEngine *engine);
+
+/**
+ * @brief 查询地址栏插入符此刻是否可见 / Query whether the address-bar caret is visible right now
+ *
+ * @param[in]     engine 引擎实例 / Engine instance
+ *
+ * @return 插入符可见返回 1，否则 0 / 1 when the caret is visible, otherwise 0
+ *
+ * @note 地址栏聚焦、选区折叠且处在 0.5s 可见相位时返回 1；`engine` 为 NULL 时返回 0 / 1 when the bar is focused, the selection is collapsed and the 0.5s visible phase holds; 0 when `engine` is NULL
+ *
+ * @see hpe_engine_tick hpe_engine_address_focused
+ */
+int hpe_engine_caret_visible(HpeEngine *engine);
+
+/* ---------------- navigation history (the chrome's back/forward buttons) ---------------- */
+
+/**
+ * @brief 取导航历史项数 / Get the number of navigation history entries
+ *
+ * @param[in]     engine 引擎实例 / Engine instance
+ *
+ * @return 历史项数，`engine` 为 NULL 时返回 0 / Entry count, 0 when `engine` is NULL
+ *
+ * @note 仅在启用地址栏时记录 / Recorded only while chrome is enabled
+ *
+ * @see hpe_engine_nav_pos
+ */
+int hpe_engine_nav_count(HpeEngine *engine);
+
+/**
+ * @brief 取当前历史项下标 / Get the index of the current history entry
+ *
+ * @param[in]     engine 引擎实例 / Engine instance
+ *
+ * @return 当前下标（0 起），无历史或 `engine` 为 NULL 时返回 -1 / Current index (zero based), -1 when there is no history or `engine` is NULL
+ *
+ * @see hpe_engine_nav_count hpe_engine_back
+ */
+int hpe_engine_nav_pos(HpeEngine *engine);
 
 /**
  * @brief 带修饰键地派发一次鼠标按下 / 抬起 / Deliver a mouse press/release with modifiers
