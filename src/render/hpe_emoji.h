@@ -10,9 +10,12 @@
  * `left`/`baseline` place the box relative to the pen point on the baseline. */
 typedef struct HpeGlyphSprite {
     int w, h;
-    int left;               /* box left offset from the pen x / 盒左缘相对笔位 x 的偏移 */
-    int baseline;           /* rows above the baseline / 基线之上的行数 */
-    const uint32_t *pixels; /* straight-alpha 0xAARRGGBB pixels / 直通 alpha 像素 */
+    int left;          /* box left offset from the pen x / 盒左缘相对笔位 x 的偏移 */
+    int baseline;      /* rows above the baseline / 基线之上的行数 */
+    uint32_t *pixels;  /* straight-alpha 0xAARRGGBB pixels / 直通 alpha 像素
+                        * (cache-owned; freed by sprite_flush, non-const so the
+                        * owner can hpe_free it / 缓存持有，由 sprite_flush 释放，
+                        * 非 const 以便持有方直接释放) */
 } HpeGlyphSprite;
 
 /**

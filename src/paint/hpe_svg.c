@@ -1221,8 +1221,6 @@ static int resolve_gradient(SvgCtx *ctx, HpeDomNode *n, const char *which, SvgGr
 
 /* ---------------- path ---------------- */
 
-#define MAX_FLAT 8192
-
 /**
  * @brief 开启新子路径并落到设备空间起点 / Open a new subpath at a device-space point
  *
