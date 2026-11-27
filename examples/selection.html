@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Hope Engine - text selection</title>
+  <style>
+    body {
+      margin: 0;
+      background-color: #f5f6f8;
+      color: #202124;
+      font-size: 16px;
+      line-height: 1.6;
+      font-family: sans-serif;
+    }
+    .page { width: 720px; margin: 28px auto; }
+    h1 { font-size: 28px; margin: 0 0 8px 0; color: #14213d; }
+    .hint { color: #5f6368; font-size: 14px; margin: 0 0 24px 0; }
+    .card {
+      background-color: #ffffff;
+      border: 1px solid #dcdfe4;
+      padding: 16px 20px;
+      margin: 0 0 16px 0;
+    }
+    .card h2 { font-size: 18px; margin: 0 0 10px 0; color: #1a73e8; }
+    .mixed { font-size: 15px; }
+    .mixed b { color: #14213d; }
+    .mixed .accent { color: #d93025; font-weight: bold; }
+    .tags span {
+      display: inline;
+      background-color: #e8f0fe;
+      color: #1a73e8;
+      padding: 2px 8px;
+      margin: 0 6px 0 0;
+      font-size: 13px;
+    }
+    .cjk { font-size: 15px; }
+    pre {
+      background-color: #f6f8fa;
+      border: 1px solid #dcdfe4;
+      padding: 10px 14px;
+      font-family: monospace;
+      font-size: 13px;
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <h1>Text selection &amp; copy</h1>
+    <p class="hint">Drag across any text to select it, double-click a word, press
+      Ctrl+A to select all, Ctrl+C to copy, Escape to clear. 空白处点击会清除选区。</p>
+
+    <div class="card">
+      <h2>Latin wrapping</h2>
+      <p>Every frame walks the same stages as a browser engine: parse, style,
+        layout, paint, composite. Drag slowly across this paragraph and watch
+        the highlight follow the pointer word by word.</p>
+    </div>
+
+    <div class="card">
+      <h2>CJK 换行与混排</h2>
+      <p class="mixed">引擎对中日韩字符<b>按单字断行</b>，对拉丁文本按单词断行，
+        这样可以避免长单词提前折行导致的排版空隙。<span class="accent">拖选这行中英文混排的文字</span>，
+        复制出来应当保留原始顺序与汉字。</p>
+    </div>
+
+    <div class="card">
+      <h2>Inline spans</h2>
+      <p class="tags">
+        <span>html</span>
+        <span>css</span>
+        <span>layout</span>
+        <span>raster</span>
+      </p>
+      <p>Selecting across the tags must bridge the inter-element whitespace.</p>
+    </div>
+
+    <div class="card">
+      <h2>Preserved whitespace</h2>
+      <pre>drag-select  me   with   odd   spacing
+  and a leading indent, too</pre>
+    </div>
+
+    <div class="card">
+      <h2>Multi-paragraph copy</h2>
+      <p>Copying a selection that spans several cards inserts a newline at
+        every block boundary, just like a real browser.</p>
+      <p>This second paragraph should start on its own line in the clipboard.</p>
+    </div>
+  </div>
+</body>
+</html>

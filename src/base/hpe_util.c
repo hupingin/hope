@@ -6,6 +6,126 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* ---------- allocation statistics (HPE_ALLOC_STATS) ---------- */
+
+/**
+ * @brief 记账链表节点，记录一个存活分配的指针与大小 / Ledger node holding one live allocation's pointer and size
+ *
+ * @note 账本自身用普通 malloc 维护，绝不递归调用 hpe_alloc / The ledger itself uses plain malloc and never calls hpe_alloc recursively
+ */
+typedef struct HpeAllocNode {
+    void *ptr;                   /**< 分配块指针 / Allocated block pointer */
+    size_t size;                 /**< 分配块字节数 / Allocated size in bytes */
+    struct HpeAllocNode *next;   /**< 链表下一节点 / Next node in the ledger */
+} HpeAllocNode;
+
+/** 账本头指针，新分配头插 / Ledger head, newest allocation first */
+static HpeAllocNode *g_alloc_ledger = NULL;
+/** 当前存活分配数 / Currently live allocation count */
+static size_t g_alloc_live = 0;
+/** 累计分配次数 / Total allocation count */
+static size_t g_alloc_total = 0;
+/** 当前存活字节数 / Currently live bytes */
+static size_t g_alloc_live_bytes = 0;
+/** 累计分配字节数 / Total bytes allocated */
+static size_t g_alloc_total_bytes = 0;
+/** 统计开关：-1 未初始化，0 关闭，1 打开 / Stats switch: -1 uninitialised, 0 off, 1 on */
+static int g_alloc_stats = -1;
+
+/**
+ * @brief 进程退出时打印分配统计与泄漏汇总 / Print allocation statistics and a leak summary at process exit
+ *
+ * @details 通过 atexit 注册；存活分配数为 0 时打印无泄漏确认行，
+ *          大于 0 时打印泄漏警告（含存活块数与字节数）。
+ *          Registered via atexit; prints a no-leak confirmation when the live
+ *          count is zero, otherwise a leak warning with live blocks and bytes.
+ */
+static void alloc_stats_report(void)
+{
+    int dump = g_alloc_stats >= 2; /* HPE_ALLOC_STATS=2: also list each block */
+    fprintf(stderr, "[hpe-alloc] total allocations: %zu (%zu bytes)\n",
+            g_alloc_total, g_alloc_total_bytes);
+    if (g_alloc_live > 0) {
+        const HpeAllocNode *n;
+        fprintf(stderr,
+                "[hpe-alloc] LEAK: %zu live allocation(s), %zu byte(s) not freed\n",
+                g_alloc_live, g_alloc_live_bytes);
+        if (dump)
+            for (n = g_alloc_ledger; n; n = n->next)
+                fprintf(stderr, "[hpe-alloc]   live block %p: %zu bytes\n", n->ptr, n->size);
+    } else {
+        fprintf(stderr, "[hpe-alloc] no leaks: 0 live allocation(s)\n");
+    }
+}
+
+/**
+ * @brief 惰性读取环境变量并初始化统计开关 / Lazily read the environment variable and initialise the stats switch
+ *
+ * @details 首次调用时检查 `HPE_ALLOC_STATS`，仅在值为 `1` 时启用，
+ *          并注册退出报告；之后每次调用只做一次静态判断，零额外开销。
+ *          Checks `HPE_ALLOC_STATS` on the first call, enables only when the
+ *          value is `1` and registers the exit report; later calls are a single static branch.
+ *
+ * @return 统计开启返回 1，否则 0 / 1 when statistics are enabled, 0 otherwise
+ */
+static int alloc_stats_enabled(void)
+{
+    if (g_alloc_stats < 0) {
+        const char *env = getenv("HPE_ALLOC_STATS");
+        g_alloc_stats = (env && env[0] >= '1' && env[0] <= '9') ? env[0] - '0' : 0;
+        if (g_alloc_stats)
+            atexit(alloc_stats_report);
+    }
+    return g_alloc_stats;
+}
+
+/**
+ * @brief 把一次新分配登记进账本并累加统计 / Record a new allocation in the ledger and update counters
+ *
+ * @param[in] ptr 分配块指针，非 NULL / Allocated block pointer, not NULL
+ * @param[in] size 分配字节数 / Allocated size in bytes
+ *
+ * @note 账本节点分配失败时静默跳过，不影响主分配流程 / Silently skips when the ledger node cannot be allocated, never affecting the main path
+ */
+static void alloc_track(void *ptr, size_t size)
+{
+    HpeAllocNode *node = (HpeAllocNode *)malloc(sizeof(*node));
+    if (!node)
+        return;
+    node->ptr = ptr;
+    node->size = size;
+    node->next = g_alloc_ledger;
+    g_alloc_ledger = node;
+    g_alloc_live++;
+    g_alloc_total++;
+    g_alloc_live_bytes += size;
+    g_alloc_total_bytes += size;
+}
+
+/**
+ * @brief 从账本摘除一个分配并返回其大小 / Unlink an allocation from the ledger and return its size
+ *
+ * @param[in]  ptr 待摘除的分配块指针 / Block pointer to unlink
+ * @param[out] size_out 写入该块登记的字节数 / Receives the recorded size of the block
+ *
+ * @return 找到并摘除返回 1，未登记返回 0 / 1 when found and unlinked, 0 when never tracked
+ */
+static int alloc_untrack(const void *ptr, size_t *size_out)
+{
+    HpeAllocNode **pp = &g_alloc_ledger;
+    while (*pp) {
+        HpeAllocNode *dead = *pp;
+        if (dead->ptr == ptr) {
+            *pp = dead->next;
+            *size_out = dead->size;
+            free(dead);
+            return 1;
+        }
+        pp = &dead->next;
+    }
+    return 0;
+}
+
 /**
  * @brief 分配一块堆内存 / Allocate a block of heap memory
  *
@@ -24,6 +144,8 @@ void *hpe_alloc(size_t size)
         fprintf(stderr, "hope: out of memory (%zu bytes)\n", size);
         abort();
     }
+    if (alloc_stats_enabled())
+        alloc_track(p, size ? size : 1);
     return p;
 }
 
@@ -44,6 +166,8 @@ void *hpe_calloc(size_t count, size_t size)
         fprintf(stderr, "hope: out of memory (%zu x %zu bytes)\n", count, size);
         abort();
     }
+    if (alloc_stats_enabled())
+        alloc_track(p, (count ? count : 1) * (size ? size : 1));
     return p;
 }
 
@@ -63,6 +187,14 @@ void *hpe_realloc(void *ptr, size_t size)
     if (!p) {
         fprintf(stderr, "hope: out of memory (%zu bytes)\n", size);
         abort();
+    }
+    if (alloc_stats_enabled()) {
+        size_t old = 0;
+        if (ptr && alloc_untrack(ptr, &old)) {
+            g_alloc_live--;
+            g_alloc_live_bytes -= old;
+        }
+        alloc_track(p, size ? size : 1);
     }
     return p;
 }
@@ -107,6 +239,13 @@ char *hpe_strndup(const char *s, size_t n)
  */
 void hpe_free(void *ptr)
 {
+    if (ptr && g_alloc_stats > 0) {
+        size_t old = 0;
+        if (alloc_untrack(ptr, &old)) {
+            g_alloc_live--;
+            g_alloc_live_bytes -= old;
+        }
+    }
     free(ptr);
 }
 

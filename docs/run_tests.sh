@@ -33,7 +33,7 @@ fail=0
 # `--dump` is headless and chrome-less, so identical geometry gives identical bytes.
 # A non-zero exit is a hard failure: the engine must tear down cleanly even on
 # pages that register timers (a bad free() there once corrupted the heap at exit).
-for f in boxes css css-cascade css-props dom-api dom-mutation event flex globals hello hover html-parse image inline-fx cursor js-arrow js-features js js-builtins grid layout scroll svg-shapes svg-text svg-fx stack table timers bfc js-gc; do
+for f in boxes css css-cascade css-props dom-api dom-mutation event flex globals hello hover html-parse image inline-fx cursor js-arrow js-features js js-builtins grid layout scroll svg-shapes svg-text svg-fx stack table timers bfc js-gc vertical emoji; do
   html="examples/$f.html"
   [ -f "$html" ] || continue
   bmp="$OUT/$f.bmp"
@@ -70,9 +70,10 @@ done
 # dom-mutation: DOM mutation APIs + MutationObserver (needs live JS, so it is a script check)
 # globals    : performance/history/localStorage/sessionStorage/console extensions
 # html-parse : parser fault-tolerance (auto-closing, table/select/template)
+# css-layout-matrix: layout property matrix (box model / flow / flex / grid / table)
 # eventloop  : task/microtask order + 4 ms nesting clamp (needs wall time: page:wait)
 # js-gc      : conservative GC (__gc/__gcStats, garbage cycles, survivors, gen/promise)
-for spec in js-modern js-builtins dom-api dom-mutation globals html-parse eventloop:1.2 js-gc:0.5; do
+for spec in js-modern js-builtins dom-api dom-mutation globals html-parse css-layout-matrix eventloop:1.2 js-gc:0.5; do
   f="${spec%%:*}"
   wait_s=""
   [ "$f" != "$spec" ] && wait_s="${spec#*:}"
@@ -161,6 +162,42 @@ else
   echo "  es-modules   FAIL"
   printf '%s\n' "$modout"
   fail=1
+fi
+
+# ---------------- 3b. page text selection (drag + copy) ----------------
+# A synthetic drag over hello.html's h1 must copy exactly "pe — 希"; the
+# sentinel seed keeps a stale system clipboard from faking a pass.
+selout="$(HOPE_TEST_CLIPBOARD="@@SENTINEL@@" HOPE_TEST_SEL_DRAG="40,100;200,100" \
+          HOPE_TEST_SEL=COPY "$BIN" examples/hello.html \
+          --width 500 --height 400 --dump "$OUT/sel.bmp" 2>&1)"
+if [ $? = 0 ] && printf '%s' "$selout" | grep -q 'SEL-COPY: pe — 希'; then
+  echo "  sel-drag     OK"
+else
+  echo "  sel-drag     FAIL"
+  printf '%s\n' "$selout" | grep -E 'SEL-COPY|not consumed' | head -5
+  fail=1
+fi
+
+# ---------------- 3c. browser tabs (new / switch / close) ----------------
+# Ctrl+T opens a blank second tab; switch:0 must return to the document tab and
+# show its path in the address bar again (proves per-tab identity).
+tabout="$(HOPE_TEST_TAB="CTRL_T;switch:0" "$BIN" examples/hello.html \
+          --width 760 --height 500 --chrome --dump "$OUT/tabs.bmp" 2>&1)"
+tabline="$(printf '%s\n' "$tabout" | grep '^tabs ' | head -1)"
+if [ $? = 0 ] && printf '%s' "$tabline" | grep -q 'count=2 active=0' \
+   && printf '%s' "$tabline" | grep -q 'hello.html'; then
+  echo "  tabs         OK"
+else
+  echo "  tabs         FAIL ($tabline)"
+  fail=1
+fi
+
+# ---------------- 4. C unit tests ----------------
+# hope_tests covers base (utf8/string) + css parsing + html parsing + encoding.
+TESTS_BIN="build/bin/hope_tests.exe"
+if [ -x "$TESTS_BIN" ]; then
+  "$TESTS_BIN" | tail -1 | grep -q "cases passed" || { echo "  hope_tests   FAIL"; fail=1; }
+  printf '  %-12s %s\n' "hope_tests" "$("$TESTS_BIN" 2>/dev/null | grep -o '[0-9]*/[0-9]* cases passed' | tail -1)"
 fi
 
 echo

@@ -333,6 +333,40 @@ static void app_char(void *user, int codepoint)
 }
 
 /**
+ * @brief 把输入法组合串交给引擎 / Forward an IME composition string to the engine
+ *
+ * @param[in,out] user `App *` 用户数据 / The `App *` user data
+ * @param[in]     utf8 组合中的字符串（"" 表示清除）/ The in-progress string ("" to clear)
+ *
+ * @note 组合串只改内联显示，不编辑地址；有变化才请求重绘 / A composition only changes the inline display, never the address; repaints only on a change
+ *
+ * @see hpe_engine_ime_compose
+ */
+static void app_ime_compose(void *user, const char *utf8)
+{
+    App *app = (App *)user;
+    hpe_engine_ime_compose(app->engine, utf8);
+    hpe_window_invalidate(app->window);
+}
+
+/**
+ * @brief 把输入法提交串交给引擎 / Forward a committed IME string to the engine
+ *
+ * @param[in,out] user `App *` 用户数据 / The `App *` user data
+ * @param[in]     utf8 最终字符串 / The final string
+ *
+ * @note 提交会真正插入插入符处；有变化才请求重绘 / A commit really inserts at the caret; repaints only on a change
+ *
+ * @see hpe_engine_ime_commit
+ */
+static void app_ime_commit(void *user, const char *utf8)
+{
+    App *app = (App *)user;
+    if (hpe_engine_ime_commit(app->engine, utf8))
+        hpe_window_invalidate(app->window);
+}
+
+/**
  * @brief 把鼠标事件交给引擎 / Forward a mouse event to the engine
  *
  * @param[in,out] user `App *` 用户数据 / The `App *` user data
@@ -517,7 +551,7 @@ static void load_start_document(HpeEngine *engine, const Options *o)
 
 /* ---------------- address-bar test helpers ---------------- */
 
-#define ADDR_TEST_Y 22 /* vertical centre of the address field */
+#define ADDR_TEST_Y 50 /* vertical centre of the address field (below the tab strip) */
 /* horizontal point inside the field's text viewport (the nav buttons occupy
  * the left edge, so a click must land past CHROME_PAD + 3*(28+4) = 106) */
 #define ADDR_TEST_X 200
@@ -605,6 +639,10 @@ static int key_named(const char *name, int *key, int *mods)
         {"CTRL_X", HPE_KEY_CUT, HPE_MOD_CTRL},
         {"CTRL_V", HPE_KEY_PASTE, HPE_MOD_CTRL},
         {"PASTE", HPE_KEY_PASTE, 0},
+        {"CTRL_T", HPE_KEY_TAB_NEW, HPE_MOD_CTRL},
+        {"CTRL_W", HPE_KEY_TAB_CLOSE, HPE_MOD_CTRL},
+        {"CTRL_TAB", HPE_KEY_TAB_NEXT, HPE_MOD_CTRL},
+        {"CTRL_SHIFT_TAB", HPE_KEY_TAB_PREV, HPE_MOD_CTRL | HPE_MOD_SHIFT},
     };
     size_t i;
     for (i = 0; i < sizeof(table) / sizeof(table[0]); i++) {
@@ -1034,6 +1072,112 @@ static void hook_test_nav_click(HpeEngine *engine)
 }
 
 /**
+ * @brief 测试钩子：驱动页面文本选区（全选/复制） / Test hook: drive the page text selection (select-all / copy)
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @return 无 / void
+ *
+ * @note `HOPE_TEST_SEL` 含 "ALL" 时按 Ctrl+A 全选、含 "COPY" 时按 Ctrl+C 复制并打印剪贴板内容（`SEL-COPY: ...`），供无头验证选区与复制 / When `HOPE_TEST_SEL` contains "ALL" Ctrl+A is pressed, and "COPY" presses Ctrl+C then prints the clipboard (`SEL-COPY: ...`), letting headless runs verify selection and copy
+ *
+ * @see hpe_engine_key hpe_clipboard_get_text
+ */
+static void hook_test_page_sel(HpeEngine *engine)
+{
+    const char *spec = getenv("HOPE_TEST_SEL");
+    const char *drag = getenv("HOPE_TEST_SEL_DRAG");
+    if (drag && *drag) {
+        /* "x0,y0;x1,y1(;x2,y2...)": press, move through each point, release */
+        char buf[256];
+        char *tok;
+        int first = 1;
+        snprintf(buf, sizeof(buf), "%s", drag);
+        for (tok = strtok(buf, ";"); tok; tok = strtok(NULL, ";")) {
+            int x = 0, y = 0;
+            if (sscanf(tok, "%d,%d", &x, &y) >= 2) {
+                if (first) {
+                    hpe_engine_mouse_event(engine, x, y, 0, 1);
+                    first = 0;
+                } else {
+                    hpe_engine_mouse_move(engine, x, y);
+                }
+            }
+        }
+        hpe_engine_mouse_event(engine, 0, 0, 0, 0); /* release ends the drag */
+    }
+    if (!spec || !*spec)
+        return;
+    if (strstr(spec, "ALL")) {
+        if (!hpe_engine_key(engine, HPE_KEY_SELECT_ALL))
+            fprintf(stderr, "hope: page select-all was not consumed\n");
+    }
+    if (strstr(spec, "COPY")) {
+        char *text;
+        if (!hpe_engine_key(engine, HPE_KEY_COPY))
+            fprintf(stderr, "hope: page copy was not consumed\n");
+        text = hpe_clipboard_get_text();
+        printf("SEL-COPY: %s\n", text ? text : "(clipboard empty)");
+        if (text)
+            hpe_free(text);
+    }
+}
+
+/**
+ * @brief 测试钩子：驱动标签管理（新建/关闭/切换） / Test hook: drive tab management (new/close/switch)
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @return 无 / void
+ *
+ * @note 读 `HOPE_TEST_TAB`（分号分隔的 `CTRL_T`/`CTRL_W`/`CTRL_TAB`/`CTRL_SHIFT_TAB`/`switch:N`），逐项执行后打印 `tabs count=N active=M addr=[...]` / Reads `HOPE_TEST_TAB` (semicolon-separated CTRL_T/CTRL_W/CTRL_TAB/CTRL_SHIFT_TAB/switch:N), runs each, then prints `tabs count=N active=M addr=[...]`
+ *
+ * @see key_named hpe_engine_key_mods
+ */
+static void hook_test_tab(HpeEngine *engine)
+{
+    const char *spec = getenv("HOPE_TEST_TAB");
+    char buf[128];
+    char *tok;
+    if (!spec || !*spec)
+        return;
+    snprintf(buf, sizeof(buf), "%s", spec);
+    for (tok = strtok(buf, ";"); tok; tok = strtok(NULL, ";")) {
+        int key, mods, index;
+        if (sscanf(tok, "switch:%d", &index) == 1) {
+            if (!hpe_engine_tab_switch(engine, index))
+                fprintf(stderr, "hope: tab switch to %d was rejected\n", index);
+            continue;
+        }
+        if (key_named(tok, &key, &mods) && !hpe_engine_key_mods(engine, key, mods))
+            fprintf(stderr, "hope: tab key %s was not consumed\n", tok);
+    }
+    printf("tabs count=%d active=%d addr=[%s]\n", hpe_engine_tab_count(engine),
+           hpe_engine_tab_active(engine), hpe_engine_address_text(engine));
+}
+
+/**
+ * @brief 测试钩子：模拟一次输入法组合与提交 / Test hook: simulate one IME composition and commit
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @return 无 / void
+ *
+ * @note 读 `HOPE_TEST_IME` 作为提交文本：聚焦地址栏 → `compose` 两次（假拼音 → 目标文本）→ `commit`，配合 `HOPE_TEST_ADDR_TEXT` 检查结果 / Reads `HOPE_TEST_IME` as the committed text: focuses the field, composes twice (fake pinyin, then the target), commits, and reports through `HOPE_TEST_ADDR_TEXT`
+ *
+ * @see hpe_engine_ime_compose hpe_engine_ime_commit
+ */
+static void hook_test_ime(HpeEngine *engine)
+{
+    const char *text = getenv("HOPE_TEST_IME");
+    if (!text || !*text)
+        return;
+    synth_click(engine, ADDR_TEST_X, ADDR_TEST_Y, 0); /* focus the field */
+    hpe_engine_ime_compose(engine, "nihao");
+    hpe_engine_ime_compose(engine, text);
+    hpe_engine_ime_commit(engine, text);
+}
+
+/**
  * @brief 报告导航历史栈状态 / Report the navigation history state
  *
  * @param[in,out] engine 引擎实例 / Engine instance
@@ -1129,6 +1273,8 @@ static int run_window(HpeEngine *engine, int width, int height)
     callbacks.on_key = app_key;
     callbacks.on_key_up = app_key_up;
     callbacks.on_char = app_char;
+    callbacks.on_ime_compose = app_ime_compose;
+    callbacks.on_ime_commit = app_ime_commit;
     callbacks.on_mouse = app_mouse;
     callbacks.on_tick = app_tick;
     callbacks.query_cursor = app_query_cursor;
@@ -1183,6 +1329,9 @@ int main(int argc, char **argv)
     hook_test_scrollbar_drag(engine);
     hook_test_wheel(engine);
     hook_test_nav_click(engine);
+    hook_test_page_sel(engine);
+    hook_test_tab(engine);
+    hook_test_ime(engine);
     hook_test_events(engine);
     report_addr_text(engine);
     report_meta(engine);

@@ -136,6 +136,28 @@ const HpeTextMask *hpe_font_mask(HpeFont *font, const char *text, int len);
 const HpeTextMask *hpe_font_mask_phase(HpeFont *font, const char *text, int len, float frac_x);
 
 /**
+ * @brief 解析某码点真正使用的字体（含回退链）/ Resolve the font that actually serves a code point (fallback chain included)
+ *
+ * @details 主字体覆盖该码点时返回主字体本身；否则按字体族的硬编码回退链
+ *          （Segoe UI Symbol → Segoe UI Emoji → SimSun）逐个验证覆盖并返回第一个
+ *          覆盖的后备字体。结果按码点缓存在主字体上。
+ *          When the primary font covers the code point the primary itself is
+ *          returned; otherwise the family's hardcoded fallback chain
+ *          (Segoe UI Symbol → Segoe UI Emoji → SimSun) is probed and the first
+ *          covering fallback is returned. Results are cached per code point.
+ *
+ * @param[in,out] font 主字体对象 / Primary font object
+ * @param[in]     codepoint Unicode 码点 / Unicode code point
+ *
+ * @return 服务该码点的字体；`font` 为 `NULL` 返回 `NULL` / The font serving the code point, or `NULL` when `font` is `NULL`
+ *
+ * @note 彩色 emoji 序列的步进也经此解析到 emoji 字体 / The advance of color emoji sequences also resolves here to the emoji font
+ *
+ * @see hpe_font_advance
+ */
+HpeFont *hpe_font_resolve(HpeFont *font, uint32_t codepoint);
+
+/**
  * @brief 销毁全部缓存字体并释放其资源 / Destroy every cached font and release its resources
  *
  * @details 逐个释放掩码缓存、字宽缓存、平台字体与字体对象，并把缓存计数归零。

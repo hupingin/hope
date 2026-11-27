@@ -7,6 +7,7 @@
 
 #include "paint/hpe_svg.h"
 #include "base/hpe_util.h"
+#include "render/hpe_emoji.h"
 #include "render/hpe_image.h"
 #include "render/hpe_raster.h"
 
@@ -38,6 +39,138 @@ typedef struct PaintCtx {
 } PaintCtx;
 
 #define MAX_OPACITY_DEPTH 3
+
+/* selection highlight colour (Chrome-like light blue) / 选区高亮色（类 Chrome 浅蓝） */
+#define HPE_SEL_COLOR hpe_rgba(181, 213, 255, 255)
+
+/* The engine installs the current selection before every repaint; paint reads
+ * it while drawing text runs. Paint is single-threaded, so a module static
+ * avoids threading the descriptor through every paint_* signature. */
+static const HpePaintSel *g_sel = NULL;
+
+/**
+ * @brief 设置绘制阶段的选区描述（下一帧起生效）/ Set the paint-time selection descriptor (effective from the next frame)
+ *
+ * @param[in]     sel 选区描述，NULL 清除 / The selection descriptor, NULL to clear
+ *
+ * @note 指针由调用方持有且须在绘制期间保持有效 / The pointer is caller-owned and must stay valid during painting
+ */
+void hpe_paint_set_selection(const HpePaintSel *sel)
+{
+    g_sel = sel;
+}
+
+/**
+ * @brief 求 run 前 n 字节的排版宽度 / The laid-out width of a run's first n bytes
+ *
+ * @param[in]     run 文本 run（须有字体）/ The text run (must carry a font)
+ * @param[in]     n 字节长度 / Byte length
+ *
+ * @return n 字节的宽度（像素）/ Width of the first n bytes in pixels
+ *
+ * @note 逐码点用 hpe_font_advance 累加，与文本绘制的步进一致 / Accumulates hpe_font_advance per code point, matching how the text is drawn
+ */
+static float sel_run_x_to(const HpeTextRun *run, int n)
+{
+    const char *p = run->text;
+    const char *end = run->text + n;
+    float w = 0.0f;
+    while (p < end) {
+        uint32_t cp;
+        int k = hpe_utf8_next(p, &cp);
+        if (k <= 0)
+            break;
+        w += hpe_font_advance(run->font, cp);
+        p += k;
+    }
+    return w;
+}
+
+/**
+ * @brief 查一个 run 所属文本盒的选区区间 / Look up the selected range of the text box a run belongs to
+ *
+ * @param[in]     run 文本 run / The text run
+ *
+ * @return 命中的区间条目，无选区或未命中返回 NULL / The matching entry, NULL without a selection or on a miss
+ *
+ * @note 行与 run 挂在块盒上，run->text 才指向文本盒文本，因此用「run 文本落在哪个条目的盒文本内」判定；区间表通常很短，线性扫描足够 / Lines and runs live on block boxes while run->text points into a text box's text, so membership is decided by which entry's box text contains the run; entries are few, so a linear scan suffices
+ */
+static const HpePaintSelEntry *sel_entry_of_run(const HpeTextRun *run)
+{
+    int i;
+    if (!g_sel || !run->text)
+        return NULL;
+    for (i = 0; i < g_sel->count; i++) {
+        const HpePaintSelEntry *e = &g_sel->entries[i];
+        if (run->text >= e->box->text && run->text + run->len <= e->box->text + e->box->text_len)
+            return e;
+    }
+    return NULL;
+}
+
+/**
+ * @brief 判断是否为布局合成的字面空格 run / Test whether a run is the layout's synthetic literal space
+ *
+ * @param[in]     run 文本 run / The text run
+ *
+ * @return 是字面空格返回 1，否则 0 / 1 for a literal space run, otherwise 0
+ *
+ * @note 折叠空格输出的 run 文本是字面量 " "，不指向任何文本盒，因此选区匹配要特殊处理 / Collapsed spaces are emitted as literal " " runs pointing into no text box, so selection matching must treat them specially
+ */
+static int sel_is_space_run(const HpeTextRun *run)
+{
+    return run->len == 1 && run->text && run->text[0] == ' ';
+}
+
+/**
+ * @brief 判断一行的所有文本 run 是否被整体选中 / Test whether every text run of a line is fully selected
+ *
+ * @param[in]     line 行 / The line
+ *
+ * @return 整行被选中返回 1，否则 0 / 1 when the whole line is selected, otherwise 0
+ *
+ * @note 「整体选中」要求每个非原子、非字面空格的文本 run 都命中一个覆盖其文本盒全文的条目；供整行边到边高亮 / "Fully selected" means every non-atomic, non-literal-space text run hits an entry covering its whole text box; used for edge-to-edge line highlights
+ */
+static int sel_line_fully_selected(const HpeLine *line)
+{
+    int r;
+    for (r = 0; r < line->run_count; r++) {
+        const HpeTextRun *run = &line->runs[r];
+        const HpePaintSelEntry *e;
+        if (run->atomic || !run->font || !run->text || run->len <= 0 || sel_is_space_run(run))
+            continue;
+        e = sel_entry_of_run(run);
+        if (!e || e->start > 0 || e->end < e->box->text_len)
+            return 0;
+    }
+    return 1;
+}
+
+/**
+ * @brief 绘制一个 run 内被选中的部分 / Paint the selected part of one run
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     e run 所属文本盒的选区区间 / The selected range of the run's text box
+ * @param[in]     run 文本 run / The text run
+ * @param[in]     fx run 起点设备 x / Device x of the run's start
+ * @param[in]     line_top 行顶设备 y / Device y of the line's top
+ * @param[in]     line_h 行高 / Line height
+ *
+ * @note 高亮矩形先于字形绘制，因此文字压在高亮之上；区间边界按码点对齐 / The highlight rect is painted before the glyphs so the text sits on top; range edges snap to code-point boundaries
+ */
+static void paint_sel_run(HpePixmap *pm, const HpePaintSelEntry *e, const HpeTextRun *run,
+                          float fx, float line_top, float line_h)
+{
+    int rb = (int)(run->text - e->box->text);
+    int lo = e->start > rb ? e->start : rb;
+    int hi = e->end < rb + run->len ? e->end : rb + run->len;
+    float x0, x1;
+    if (lo >= hi || !run->font)
+        return;
+    x0 = fx + sel_run_x_to(run, lo - rb);
+    x1 = fx + sel_run_x_to(run, hi - rb);
+    hpe_fill_rect(pm, hpe_rect(x0, line_top, x1 - x0, line_h), HPE_SEL_COLOR);
+}
 
 /**
  * @brief 把文档 y 映射为设备 y / Map a document y to device y
@@ -1248,19 +1381,260 @@ static void paint_trace_box(HpeBox *box, HpeStyle *bs, HpeRect bb)
             box->line_count);
 }
 
+/**
+ * @brief 在文本 run 上叠加彩色 emoji 精灵 / Overlay the color emoji sprites of a text run
+ *
+ * @details 合成掩码给 emoji 序列留了空洞；这里从 run 起点按步进累计笔位，把每个
+ *          序列的精灵画到对应位置。
+ *          The composed mask leaves blank holes at emoji sequences; this walks the
+ *          run from its start accumulating pen x and paints each sequence's sprite
+ *          at the matching position.
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     run 文本 run / The text run
+ * @param[in]     pen_x run 起点的设备 x / Device x of the run start
+ * @param[in]     pen_y 设备基线 y / Device baseline y
+ *
+ * @note 精灵位置按 `hpe_font_advance` 累计，与掩码合成用的步进一致 / Sprite positions accumulate `hpe_font_advance`, the same advance the mask composition uses
+ */
+static void paint_run_emoji(HpePixmap *pm, HpeTextRun *run, float pen_x, float pen_y)
+{
+    const char *p = run->text, *end = run->text + run->len;
+    float x = pen_x;
+    int iy = (int)floorf(pen_y);
+    while (p < end) {
+        int el = hpe_emoji_seq_len(p, (int)(end - p));
+        HpeGlyphSprite sp;
+        if (el > 0 && hpe_emoji_sprite(hpe_font_size(run->font), p, el, run->color, &sp)) {
+            hpe_emoji_blit(pm, &sp, (int)floorf(x) + sp.left, iy - sp.baseline);
+            {
+                const char *q = p + el;
+                while (p < q) {
+                    uint32_t cp;
+                    int n = hpe_utf8_next(p, &cp);
+                    if (n <= 0)
+                        break;
+                    x += hpe_font_advance(run->font, cp);
+                    p += n;
+                }
+            }
+            continue;
+        }
+        {
+            uint32_t cp;
+            int n = hpe_utf8_next(p, &cp);
+            if (n <= 0)
+                break;
+            x += hpe_font_advance(run->font, cp);
+            p += n;
+        }
+    }
+}
+
+/**
+ * @brief 判断码点在竖排中是否直立（与 layout 模块的判定一致）/ Test whether a code point stays upright in vertical writing (same rule as the layout module)
+ *
+ * @param[in] cp Unicode 码点 / Unicode code point
+ *
+ * @return 直立返回 1 / 1 when upright
+ */
+static int vert_upright(uint32_t cp)
+{
+    if (cp >= 0x2E80u && cp <= 0x9FFFu)
+        return 1;
+    if (cp >= 0xF900u && cp <= 0xFAFFu)
+        return 1;
+    if (cp >= 0xFF00u && cp <= 0xFF60u)
+        return 1;
+    switch (cp) {
+    case 0x2018u:
+    case 0x2019u:
+    case 0x201Cu:
+    case 0x201Du:
+    case 0x2026u:
+    case 0x3001u:
+    case 0x3002u:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/**
+ * @brief 把覆盖率掩码顺时针旋转 90° / Rotate a coverage mask 90° clockwise
+ *
+ * @param[in] src 源掩码 / Source mask
+ *
+ * @return 新分配的旋转掩码，调用方先 `hpe_text_mask_free` 释放覆盖率、再 `hpe_free` 释放结构 / A freshly allocated rotated mask; free the coverage via `hpe_text_mask_free`, then the struct via `hpe_free`
+ *
+ * @note 旋转后基线行为 0（顶部对齐），绘制时以盒顶定位；失败返回 NULL / The rotated baseline row is 0 (top aligned) so painting positions by the box top; NULL on failure
+ */
+static HpeTextMask *mask_rotate90(const HpeTextMask *src)
+{
+    HpeTextMask *out = (HpeTextMask *)hpe_alloc(sizeof(HpeTextMask));
+    int dx, dy;
+    if (!out)
+        return NULL;
+    out->width = src->height;
+    out->height = src->width;
+    out->baseline = 0;
+    out->coverage = (unsigned char *)hpe_alloc((size_t)out->width * out->height);
+    if (!out->coverage) {
+        hpe_free(out);
+        return NULL;
+    }
+    for (dy = 0; dy < out->height; dy++) {
+        for (dx = 0; dx < out->width; dx++) {
+            int sx = out->width - 1 - dx; /* source column / 源列 */
+            int sy = dy;                  /* source row / 源行 */
+            out->coverage[(size_t)dy * out->width + dx] =
+                src->coverage[(size_t)sy * src->width + sx];
+        }
+    }
+    return out;
+}
+
+/**
+ * @brief 在竖排列中绘制一个字形 / Paint one glyph inside a vertical column
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     font 字体 / Font
+ * @param[in]     ch 码点的 UTF-8 字节 / The code point's UTF-8 bytes
+ * @param[in]     n 字节长度 / Byte length
+ * @param[in]     upright 直立为 1，旋转为 0 / 1 upright, 0 rotated clockwise
+ * @param[in]     col_x 列左缘设备 x / Device x of the column's left edge
+ * @param[in]     col_w 列宽 / Column width
+ * @param[in]     pen_y 字形盒顶的设备 y / Device y of the glyph box top
+ * @param[in]     color 颜色 / Colour
+ */
+static void paint_vert_glyph(HpePixmap *pm, HpeFont *font, const char *ch, int n, int upright,
+                             float col_x, float col_w, float pen_y, HpeColor color)
+{
+    const HpeTextMask *m = hpe_font_mask(font, ch, n);
+    if (!m)
+        return;
+    if (upright) {
+        int x = (int)floorf(col_x + (col_w - (float)m->width) * 0.5f);
+        int y = (int)floorf(pen_y + (float)m->baseline);
+        hpe_draw_text_mask(pm, x, y, m, color);
+    } else {
+        HpeTextMask *rot = mask_rotate90(m);
+        if (rot) {
+            int x = (int)floorf(col_x + (col_w - (float)rot->width) * 0.5f);
+            hpe_draw_text_mask(pm, x, (int)floorf(pen_y), rot, color);
+            hpe_text_mask_free(rot);
+            hpe_free(rot); /* the rotated mask is heap-allocated as a whole / 旋转掩码整体堆分配，需连同结构一起释放 */
+        }
+    }
+}
+
+/**
+ * @brief 以竖排模式绘制盒的全部文本列 / Paint every text column of a vertical box
+ *
+ * @param[in]     ctx 绘制上下文 / Paint context
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     box 盒 / Box
+ * @param[in]     own_scroll 本盒的滚动偏移 / The box's own scroll offset
+ *
+ * @note 每条线是一列：`col_x` 是列左缘、`width` 是列宽、run 的 `x` 是竖直起点；
+ *       CJK 直立、拉丁顺时针旋转 90°，逐字形沿列向下推进 / Each line is a column:
+ *       `col_x` is the column's left edge, `width` its width, and each run's `x`
+ *       the vertical start; CJK stays upright, Latin rotates 90° clockwise, and
+ *       glyphs advance downward column by column
+ */
+static void paint_box_line_runs_vertical(PaintCtx *ctx, HpePixmap *pm, HpeBox *box,
+                                         float own_scroll)
+{
+    int i, r;
+    for (i = 0; i < box->line_count; i++) {
+        HpeLine *line = &box->lines[i];
+        float col_x = box->content_box.x + ctx->dev_x + line->col_x;
+        float col_top = ctx_dev_y(ctx, box->content_box.y, own_scroll);
+        if (col_x + line->width < (float)pm->clip_x0 || col_x > (float)pm->clip_x1)
+            continue;
+        for (r = 0; r < line->run_count; r++) {
+            HpeTextRun *run = &line->runs[r];
+            const char *p, *end;
+            float pen_y;
+            /* atomic inline-blocks are painted via their own boxes, not here */
+            if (run->atomic || !run->font || run->color.a == 0 || !run->text)
+                continue;
+            pen_y = col_top + run->x;
+            p = run->text;
+            end = run->text + run->len;
+            while (p < end) {
+                uint32_t cp;
+                int n = hpe_utf8_next(p, &cp);
+                if (n <= 0)
+                    break;
+                paint_vert_glyph(pm, run->font, p, n, vert_upright(cp), col_x, line->width,
+                                 pen_y, run->color);
+                pen_y += hpe_font_advance(run->font, cp);
+                p += n;
+            }
+        }
+    }
+}
+
+/**
+ * @brief 绘制单个 run 的选区高亮并返回新的顺延标志 / Paint one run's selection highlight and return the new carry flag
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     run 文本 run / The text run
+ * @param[in]     fx run 起点设备 x / Device x of the run's start
+ * @param[in]     line_top 行顶设备 y / Device y of the line's top
+ * @param[in]     line_h 行高 / Line height
+ * @param[in]     full 整行已被边到边高亮为 1 / 1 when the line is already highlighted edge to edge
+ * @param[in]     carry 进入本 run 前的顺延标志 / The carry flag on entry
+ *
+ * @return 离开本 run 时的顺延标志 / The carry flag on exit
+ *
+ * @note 顺延标志表示「选中越过了本 run 末尾」，供下一个字面空格 run 继承 / The carry flag means the selection ran past this run's end, inherited by the next literal space run
+ */
+static int paint_line_run_sel(HpePixmap *pm, const HpeTextRun *run, float fx, float line_top,
+                              float line_h, int full, int carry)
+{
+    const HpePaintSelEntry *se;
+    if (full)
+        return carry;
+    se = sel_entry_of_run(run);
+    if (sel_is_space_run(run)) {
+        /* a synthetic space inherits the carry from the word before it, so
+         * inter-word gaps read as selected */
+        if (carry)
+            hpe_fill_rect(pm, hpe_rect(fx, line_top, run->width, line_h), HPE_SEL_COLOR);
+        return 0;
+    }
+    if (!se)
+        return 0;
+    paint_sel_run(pm, se, run, fx, line_top, line_h);
+    return se->end > (int)(run->text - se->box->text) + run->len;
+}
+
 /* Blit the glyph runs of every line whose band intersects the clip. */
 static void paint_box_line_runs(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float own_scroll)
 {
     int i, r;
+    /* vertical writing modes paint per-glyph columns / 竖排按列逐字形绘制 */
+    if (box->style.writing_mode != 0) {
+        paint_box_line_runs_vertical(ctx, pm, box, own_scroll);
+        return;
+    }
     for (i = 0; i < box->line_count; i++) {
         HpeLine *line = &box->lines[i];
         float baseline = snap_y(ctx_dev_y(ctx, line->y + line->baseline, own_scroll));
         float line_top = snap_y(ctx_dev_y(ctx, line->y, own_scroll));
         float line_bottom = line_top + line->height;
+        int full, carry = 0;
 
         if (line_bottom < (float)pm->clip_y0 || line_top > (float)pm->clip_y1)
             continue;
 
+        full = g_sel ? sel_line_fully_selected(line) : 0;
+        /* a fully selected line highlights edge to edge, Chrome-style */
+        if (full)
+            hpe_fill_rect(pm, hpe_rect(box->content_box.x + ctx->dev_x, line_top,
+                                       box->content_box.w, line->height), HPE_SEL_COLOR);
         for (r = 0; r < line->run_count; r++) {
             HpeTextRun *run = &line->runs[r];
             const HpeTextMask *mask;
@@ -1274,12 +1648,14 @@ static void paint_box_line_runs(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float
             y = (int)floorf(baseline);
             if (run->color.a == 0 || x > pm->clip_x1)
                 continue;
+            carry = paint_line_run_sel(pm, run, fx, line_top, line->height, full, carry);
             /* sub-pixel positioning: the quantised fractional phase is baked
              * into the cached mask, so the glyphs keep their AA gradient */
             mask = hpe_font_mask_phase(run->font, run->text, run->len, fx - (float)x);
-            if (!mask)
-                continue;
-            hpe_draw_text_mask(pm, x, y, mask, run->color);
+            if (mask)
+                hpe_draw_text_mask(pm, x, y, mask, run->color);
+            /* color emoji live in holes the composed mask left blank */
+            paint_run_emoji(pm, run, fx, baseline);
         }
     }
 }

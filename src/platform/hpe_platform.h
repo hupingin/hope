@@ -39,6 +39,12 @@ typedef struct HpeWindowCallbacks {
      * by the Win32 backend). Used by the address bar for path entry and by
      * pages as the source of `keypress`. */
     void (*on_char)(void *user, int codepoint);
+    /* IME composition updated: `utf8` is the in-progress string ("" when the
+     * composition was cleared or ended without a result). May be NULL. */
+    void (*on_ime_compose)(void *user, const char *utf8);
+    /* IME composition committed: `utf8` is the final string to insert. May be
+     * NULL. */
+    void (*on_ime_commit)(void *user, const char *utf8);
     /* mouse: x,y are viewport (client) coords; button 0 = left; down: 1 = pressed, 0 = released;
      * button -1 = pointer move (no button state change). `mods` is a mask of
      * HPE_MOD_* captured with the event (Shift+click extends a text selection).
@@ -400,6 +406,88 @@ typedef struct HpeTextMask {
  * @see hpe_text_mask_free
  */
 int hpe_plat_font_mask(HpePlatFont *font, const char *utf8, int len, float dx, HpeTextMask *out);
+
+/**
+ * @brief 判断字体是否覆盖某个码点 / Test whether the font covers a code point
+ *
+ * @details 对每个码点做一次字形索引查询并标记不存在的字形；结果由调用方缓存。
+ *          Each query maps the code point to a glyph index marking non-existing
+ *          glyphs; the caller is expected to cache the result.
+ *
+ * @param[in,out] font 字体对象 / Font object
+ * @param[in]     codepoint Unicode 码点 / Unicode code point
+ *
+ * @return 覆盖返回 1，未覆盖或字体为空返回 0 / 1 when covered, 0 when missing or the font is NULL
+ *
+ * @see hpe_plat_font_create
+ */
+int hpe_plat_font_covers(HpePlatFont *font, uint32_t codepoint);
+
+/**
+ * @brief 用显式字体名创建平台字体对象 / Create a platform font object with an explicit face name
+ *
+ * @param[in]     pixel_size 字号（像素）/ Font size in pixels
+ * @param[in]     weight 字重 / Font weight
+ * @param[in]     face_utf8 字体名（UTF-8），NULL 时按字体族映射 / Typeface name in UTF-8, NULL maps by family
+ *
+ * @return 新字体对象，失败返回 NULL / The new font object, NULL on failure
+ *
+ * @note 供字形回退链按具体字体名创建后备字体 / Lets the glyph fallback chain create a fallback font by name
+ *
+ * @see hpe_plat_font_create hpe_plat_font_destroy
+ */
+HpePlatFont *hpe_plat_font_create_face(float pixel_size, int weight, const char *face_utf8);
+
+/* ---------- color emoji glyph service (COLRv0 layers via GDI outlines) ---------- */
+typedef struct HpePlatEmojiFont HpePlatEmojiFont;
+
+/* one glyph's antialiased coverage extracted by glyph index. `coverage` is
+ * w*h bytes (0..255) owned by the caller (hpe_free); `left`/`baseline` place
+ * the box relative to the pen point on the baseline. */
+typedef struct HpeGlyphOutline {
+    unsigned char *coverage;
+    int w, h;
+    int left;      /* box left offset from the pen x / 盒左缘相对笔位 x 的偏移 */
+    int baseline;  /* row index of the baseline inside the box / 盒内基线所在行 */
+    float advance; /* cell increment x / 水平步进宽度 */
+} HpeGlyphOutline;
+
+/**
+ * @brief 打开彩色 emoji 字体（按字号）/ Open the color emoji font at a pixel size
+ *
+ * @param[in]     pixel_size 字号（像素）/ Font size in pixels
+ *
+ * @return 新对象，系统无彩色 emoji 字体时返回 NULL / The new object, NULL when the system has no color emoji font
+ *
+ * @note Win32 后端使用 `Segoe UI Emoji`；对象只承载 DC 与字体句柄 / The Win32 backend uses `Segoe UI Emoji`; the object only owns a DC and a font handle
+ *
+ * @see hpe_plat_emoji_font_destroy
+ */
+HpePlatEmojiFont *hpe_plat_emoji_font_create(float pixel_size);
+
+/**
+ * @brief 按字形索引取抗锯齿覆盖率轮廓 / Fetch an antialiased coverage outline by glyph index
+ *
+ * @param[in,out] font emoji 字体对象 / Emoji font object
+ * @param[in]     glyph_id 字形索引 / Glyph index
+ * @param[out]    out 接收轮廓的结构，coverage 由调用方 `hpe_free` / Receives the outline, the coverage is freed by the caller via `hpe_free`
+ *
+ * @return 成功返回 1，空字形或失败返回 0 / 1 on success, 0 for a blank glyph or failure
+ *
+ * @note 内部使用 `GetGlyphOutlineW` 的 `GGO_GLYPH_INDEX|GGO_GRAY8_BITMAP` 形式 / Implemented via `GetGlyphOutlineW` with `GGO_GLYPH_INDEX|GGO_GRAY8_BITMAP`
+ *
+ * @see hpe_plat_emoji_font_create
+ */
+int hpe_plat_emoji_glyph(HpePlatEmojiFont *font, uint32_t glyph_id, HpeGlyphOutline *out);
+
+/**
+ * @brief 关闭彩色 emoji 字体并释放资源 / Close the color emoji font and release its resources
+ *
+ * @param[in,out] font emoji 字体对象，NULL 时无操作 / Emoji font object, NULL is a no-op
+ *
+ * @see hpe_plat_emoji_font_create
+ */
+void hpe_plat_emoji_font_destroy(HpePlatEmojiFont *font);
 
 /**
  * @brief 释放文本掩码 / Free a text mask

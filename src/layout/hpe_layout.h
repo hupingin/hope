@@ -34,6 +34,11 @@ typedef struct HpeLine {
     float height;
     float baseline;
     float y;
+    /* vertical writing mode reinterprets this line as a text column:
+     * `col_x` is the column's left offset relative to the content box,
+     * `width` is the column width, and each run's `x`/`width` become the
+     * vertical start offset and vertical length. */
+    float col_x;
     /* per-line fragments of the inline boxes that contribute content: one
      * entry per still-open inline box when the line ends or closes */
     struct HpeInlineFrag *frags;

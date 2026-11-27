@@ -1426,6 +1426,379 @@ static void flush_paragraph(LayoutCtx *ctx, HpeBox *block, HpeParagraph *para, f
     para->count = 0;
 }
 
+/* ---------------- vertical writing mode ----------------
+ * `writing-mode: vertical-rl / vertical-lr` re-runs the block flow with the
+ * inline axis pointing down and the block axis pointing across: text becomes
+ * columns of upright CJK glyphs and clockwise-rotated Latin glyphs, and the
+ * columns (plus any block-level children) stack right-to-left (`vertical-rl`)
+ * or left-to-right (`vertical-lr`). Column geometry lives in HpeLine.col_x /
+ * HpeLine.width with each run's x/width reinterpreted as the vertical start
+ * offset and vertical length; paint has the matching reader. */
+
+/* One in-flow block child measured during the first vertical pass. */
+typedef struct {
+    HpeBox *child;
+    float prefix; /* block-axis offset where the child's margin box starts / 子盒外边距盒的块轴起点 */
+    float extent; /* margin-box width along the block axis / 块轴方向的外边距盒宽度 */
+} VertChild;
+
+/* block-layout helpers defined further below / 下方块布局一节定义的辅助函数 */
+static float solve_content_width(const LayoutCtx *ctx, HpeStyle *st, float cb_width,
+                                 float avail_width, const float p[4], const float b[4]);
+static void block_resolve_edges(LayoutCtx *ctx, HpeStyle *st, float avail_width, float m[4],
+                                float p[4], float b[4], int *no_top_sep, int *no_bottom_sep);
+static void block_auto_margins(LayoutCtx *ctx, HpeStyle *st, float avail_width, float m[4],
+                               const float p[4], const float b[4]);
+static void block_apply_relative_offset(LayoutCtx *ctx, HpeBox *box, float avail_width);
+static void block_position_abspos_children(LayoutCtx *ctx, HpeBox *box);
+static void block_box_rects(HpeBox *box, float inner_w, float inner_h, const float p[4],
+                            const float b[4]);
+
+/* Paragraph walker state for one vertical flush (columns are not shared
+ * across flushes: every contiguous inline run starts a fresh column). */
+typedef struct {
+    LayoutCtx *ctx;
+    HpeBox *block;
+    float inner_h;
+    float col_w;
+    float used;          /* block-axis extent consumed so far / 已消耗的块轴长度 */
+    float pen_y;         /* vertical pen inside the current column / 当前列内的竖直笔位 */
+    int col_idx;         /* current column line index, -1 = none / 当前列行下标，-1 表示无 */
+    int pending_space;   /* collapsed space waiting for the next chunk / 待输出的折叠空格 */
+} VertState;
+
+/**
+ * @brief 求竖排的列宽（行高充当列宽）/ Resolve the column width (the line height acts as the column width)
+ *
+ * @param[in] st 计算样式 / Computed style
+ *
+ * @return 非负列宽（像素）/ Non-negative column width in pixels
+ */
+static float vert_col_width(const HpeStyle *st)
+{
+    float lh = style_line_height(st, font_for(st));
+    return lh > 1.0f ? lh : 1.0f;
+}
+
+/**
+ * @brief 求竖排盒的竖直内容高度 / Resolve the vertical extent (content height) of a vertical box
+ *
+ * @details 显式 `height` 优先；`auto` 时填满包含块的可用高度（扣除本盒的
+ *          外边距/边框/内边距），与横排下块盒自动填满宽度同理。
+ *          A declared `height` wins; `auto` fills the containing block's
+ *          available height minus this box's own margins, border and padding,
+ *          mirroring how a horizontal block fills its width.
+ *
+ * @param[in]     ctx 布局上下文 / Layout context
+ * @param[in]     st 计算样式 / Computed style
+ * @param[in]     avail_height 可用高度基准 / Available height basis
+ * @param[in]     m 四边外边距 / Four margin sides
+ * @param[in]     p 四边内边距 / Four padding sides
+ * @param[in]     b 四边边框宽度 / Four border widths
+ *
+ * @return 非负内容高度 / Non-negative content height
+ */
+static float vert_inner_height(LayoutCtx *ctx, const HpeStyle *st, float avail_height,
+                               const float m[4], const float p[4], const float b[4])
+{
+    float h;
+    if (st->height.unit != HPE_LEN_AUTO)
+        h = resolve_len(ctx, st, st->height, avail_height);
+    else
+        h = avail_height - m[0] - m[2] - b[0] - b[2] - p[0] - p[2];
+    return h > 0.0f ? h : 0.0f;
+}
+
+/**
+ * @brief 开启一个新列（必要时）/ Open a new column when none is open
+ *
+ * @param[in,out] vs 竖排状态 / Vertical state
+ *
+ * @return 当前列的行下标 / Index of the current column's line
+ *
+ * @note 行的 `col_x` 先暂存列的块轴前缀，最终位置在 finalize 统一换算 / The line's `col_x` temporarily holds the column's block-axis prefix, converted once at finalisation
+ */
+static int vert_col_open(VertState *vs)
+{
+    HpeLine *ln;
+    int idx;
+    if (vs->col_idx >= 0)
+        return vs->col_idx;
+    idx = line_begin(vs->block);
+    ln = &vs->block->lines[idx];
+    ln->col_x = vs->used; /* provisional: block-axis prefix / 暂存块轴前缀 */
+    ln->width = vs->col_w;
+    vs->used += vs->col_w;
+    vs->pen_y = 0.0f;
+    vs->col_idx = idx;
+    return idx;
+}
+
+/**
+ * @brief 结束当前列 / Close the current column
+ *
+ * @param[in,out] vs 竖排状态 / Vertical state
+ */
+static void vert_col_close(VertState *vs)
+{
+    vs->col_idx = -1;
+    vs->pending_space = 0;
+}
+
+/**
+ * @brief 放置一个原子行内盒（竖排）/ Place one atomic inline box vertically
+ *
+ * @param[in,out] vs 竖排状态 / Vertical state
+ * @param[in]     ab 原子行内块盒 / Atomic inline-block box
+ *
+ * @note 原子盒在列内水平居中，最终定位在 finalize 阶段统一回填 / Atomics are centred horizontally inside the column and finally positioned at finalisation
+ */
+static void vert_place_atomic(VertState *vs, HpeBox *ab)
+{
+    float e = ab->border_box.h;
+    int idx, rc;
+    if (vs->col_idx >= 0 && vs->pen_y + e > vs->inner_h + 0.5f)
+        vert_col_close(vs);
+    idx = vert_col_open(vs);
+    line_add_run(vs->block, idx, NULL, 0, &ab->style, NULL, vs->pen_y, e, e, 0.0f, vs->col_w);
+    rc = vs->block->lines[idx].run_count - 1;
+    vs->block->lines[idx].runs[rc].atomic = ab;
+    vs->pen_y += e;
+}
+
+/**
+ * @brief 把一段文本放入竖排列（按簇折列）/ Place one text segment into vertical columns, wrapping per cluster
+ *
+ * @param[in,out] vs 竖排状态 / Vertical state
+ * @param[in]     seg 文本片段 / Text segment
+ *
+ * @note 簇沿用横排的 text_measure_cluster（CJK 单字、拉丁整词）；空格折叠为
+ *       列内竖直间距 / Clusters reuse the horizontal text_measure_cluster (one CJK
+ *       char or one Latin word); spaces collapse into vertical gaps
+ */
+static void vert_place_text(VertState *vs, const HpeSegment *seg)
+{
+    HpeFont *font = font_for(seg->style);
+    const char *p = seg->text, *end = seg->text + seg->len;
+    float letter = resolve_len(vs->ctx, seg->style, seg->style->letter_spacing, 0.0f);
+    float space_adv = font ? hpe_font_advance(font, ' ') + letter : 0.0f;
+    if (!font || !seg->text)
+        return;
+    while (p < end) {
+        uint32_t cp;
+        const char *q;
+        float w = 0.0f;
+        int n = hpe_utf8_next(p, &cp);
+        if (n <= 0)
+            break;
+        if (cp == ' ' || cp == '\n' || cp == '\r' || cp == '\t' || cp == 0x00A0u) {
+            vs->pending_space = 1;
+            p += n;
+            continue;
+        }
+        q = text_measure_cluster(font, p, end, letter, &w);
+        if (vs->col_idx >= 0 && vs->pen_y + w > vs->inner_h + 0.5f)
+            vert_col_close(vs);
+        if (vs->pending_space && vs->pen_y > 0.0f)
+            vs->pen_y += space_adv;
+        vs->pending_space = 0;
+        line_add_run(vs->block, vert_col_open(vs), p, (int)(q - p), seg->style, font, vs->pen_y,
+                     w, 0.0f, 0.0f, vs->col_w);
+        vs->pen_y += w;
+        p = q;
+    }
+}
+
+/**
+ * @brief 把段落排进竖排列 / Flush a paragraph into vertical columns
+ *
+ * @param[in]     ctx 布局上下文 / Layout context
+ * @param[in,out] block 所属块盒 / Owning block box
+ * @param[in,out] para 段落，排完后清空 / Paragraph, emptied afterwards
+ * @param[in]     inner_h 竖直内容高度 / Vertical content height
+ * @param[in]     col_w 列宽 / Column width
+ * @param[in,out] used 块轴游标，按列宽推进 / Block-axis cursor, advanced by column widths
+ *
+ * @note 行内盒开/闭标记被跳过（竖排暂不绘制行内背景边框） / Inline open/close markers are skipped (vertical text paints no inline backgrounds yet)
+ */
+static void vert_flush(LayoutCtx *ctx, HpeBox *block, HpeParagraph *para, float inner_h,
+                       float col_w, float *used)
+{
+    VertState vs;
+    int i;
+    if (para->count == 0)
+        return;
+    memset(&vs, 0, sizeof(vs));
+    vs.ctx = ctx;
+    vs.block = block;
+    vs.inner_h = inner_h;
+    vs.col_w = col_w;
+    vs.used = *used;
+    vs.col_idx = -1;
+    for (i = 0; i < para->count; i++) {
+        HpeSegment *seg = &para->items[i];
+        if (seg->atomic_box)
+            vert_place_atomic(&vs, seg->atomic_box);
+        else if (seg->inline_box)
+            continue; /* inline backgrounds unsupported in vertical text */
+        else if (seg->hard_break)
+            vert_col_close(&vs);
+        else
+            vert_place_text(&vs, seg);
+    }
+    *used = vs.used;
+    para->count = 0;
+}
+
+/**
+ * @brief 度量一个块级子盒在块轴上的占位 / Measure one block child's block-axis extent
+ *
+ * @param[in,out] ctx 布局上下文 / Layout context
+ * @param[in]     child 块级子盒 / Block child
+ * @param[in]     inner_w 宽度基准 / Width basis
+ * @param[in]     inner_h 竖直高度基准 / Vertical height basis
+ * @param[in,out] used 块轴游标 / Block-axis cursor
+ * @param[in,out] kids 子盒记录数组 / Child record array
+ * @param[in,out] count 记录个数 / Record count
+ * @param[in,out] cap 数组容量 / Array capacity
+ *
+ * @note 先在临时原点跑一遍布局量出宽度，最终位置在第二趟统一排布 / One scratch pass measures the width; the second pass places every child at its final position
+ */
+static void vert_child_measure(LayoutCtx *ctx, HpeBox *child, float inner_w, float inner_h,
+                               float *used, VertChild **kids, int *count, size_t *cap)
+{
+    VertChild *arr;
+    float mL = margin_px(ctx, &child->style, child->style.margin[3], inner_w);
+    float mR = margin_px(ctx, &child->style, child->style.margin[1], inner_w);
+    layout_block(ctx, child, 0.0f, 0.0f, inner_w, inner_h);
+    arr = (VertChild *)hpe_grow(*kids, cap, (size_t)*count + 1, sizeof(VertChild));
+    if (!arr)
+        return;
+    *kids = arr;
+    (*kids)[*count].child = child;
+    (*kids)[*count].prefix = *used;
+    (*kids)[*count].extent = mL + child->border_box.w + mR;
+    (*count)++;
+    *used += mL + child->border_box.w + mR;
+}
+
+/**
+ * @brief 把列与块级子盒换算到最终位置 / Convert columns and block children to their final positions
+ *
+ * @param[in,out] box 竖排块盒 / Vertical block box
+ * @param[in]     base 块轴总长（声明宽度或内容累计）/ Block-axis total (declared width or accumulated content)
+ * @param[in]     rl 从右向左为 1 / 1 for right-to-left column progression
+ */
+static void vert_columns_finalize(HpeBox *box, float base, int rl)
+{
+    int i, r;
+    for (i = 0; i < box->line_count; i++) {
+        HpeLine *ln = &box->lines[i];
+        ln->col_x = rl ? base - ln->col_x - ln->width : ln->col_x;
+        for (r = 0; r < ln->run_count; r++) {
+            HpeTextRun *run = &ln->runs[r];
+            HpeBox *ab;
+            float bx, by;
+            if (!run->atomic)
+                continue;
+            ab = run->atomic;
+            bx = box->content_box.x + ln->col_x + (ln->width - ab->border_box.w) * 0.5f;
+            by = box->content_box.y + run->x;
+            box_shift(ab, bx - ab->border_box.x, by - ab->border_box.y);
+        }
+    }
+}
+
+/**
+ * @brief 把块级子盒放到最终位置（第二趟）/ Place block children at their final positions (second pass)
+ *
+ * @param[in,out] ctx 布局上下文 / Layout context
+ * @param[in,out] box 竖排块盒 / Vertical block box
+ * @param[in,out] kids 子盒记录数组 / Child record array
+ * @param[in]     count 记录个数 / Record count
+ * @param[in]     base 块轴总长 / Block-axis total
+ * @param[in]     inner_w 宽度基准 / Width basis
+ * @param[in]     inner_h 竖直高度基准 / Vertical height basis
+ * @param[in]     rl 从右向左为 1 / 1 for right-to-left progression
+ */
+static void vert_children_place(LayoutCtx *ctx, HpeBox *box, VertChild *kids, int count,
+                                float base, float inner_w, float inner_h, int rl)
+{
+    int i;
+    for (i = 0; i < count; i++) {
+        float left = rl ? base - kids[i].prefix - kids[i].extent : kids[i].prefix;
+        layout_block(ctx, kids[i].child, box->content_box.x + left, box->content_box.y, inner_w,
+                     inner_h);
+    }
+    hpe_free(kids);
+}
+
+/**
+ * @brief 以竖排模式排版一个块盒 / Lay out one block box in vertical writing mode
+ *
+ * @param[in,out] ctx 布局上下文 / Layout context
+ * @param[in,out] box 目标块盒 / The block box
+ * @param[in]     x 外边距盒左缘 / Margin-box left edge
+ * @param[in]     y 外边距盒上缘 / Margin-box top edge
+ * @param[in]     avail_width 可用宽度（百分比基准）/ Available width, the percentage basis
+ * @param[in]     avail_height 可用高度（竖直基准）/ Available height, the vertical basis
+ *
+ * @return 外边距盒总高度 / The margin-box height
+ *
+ * @note 行内内容按列折行（CJK 直立、拉丁顺时针旋转 90°），块级子盒沿块轴
+ *       （水平方向）排布；`vertical-rl` 首列在最右。竖排暂不支持浮动、
+ *       行内背景边框与滚动容器 / Inline content wraps into columns (upright CJK,
+ *       clockwise-rotated Latin) while block children flow along the horizontal
+ *       block axis; `vertical-rl` starts at the rightmost column. Floats, inline
+ *       backgrounds and scroll containers are unsupported in vertical text
+ */
+static float layout_vertical_block(LayoutCtx *ctx, HpeBox *box, float x, float y,
+                                   float avail_width, float avail_height)
+{
+    HpeStyle *st = &box->style;
+    float m[4], p[4], b[4], inner_w, inner_h, col_w, base, used = 0.0f;
+    int no_top_sep, no_bottom_sep, kid_count = 0, rl;
+    size_t kid_cap = 0;
+    VertChild *kids = NULL;
+    HpeParagraph para;
+    HpeBox *child;
+
+    block_resolve_edges(ctx, st, avail_width, m, p, b, &no_top_sep, &no_bottom_sep);
+    block_auto_margins(ctx, st, avail_width, m, p, b);
+    inner_w = solve_content_width(ctx, st, avail_width, avail_width - m[3] - m[1], p, b);
+    inner_h = vert_inner_height(ctx, st, avail_height, m, p, b);
+    col_w = vert_col_width(st);
+    rl = (st->writing_mode == 1);
+    box->content_box.x = x + m[3] + b[3] + p[3];
+    box->content_box.y = y + m[0] + b[0] + p[0];
+    box->content_box.w = inner_w;
+    box->content_box.h = inner_h;
+    memset(&para, 0, sizeof(para));
+    for (child = box->first_child; child; child = child->next) {
+        if (child->style.float_side != HPE_FLOAT_NONE || child->style.position == HPE_POS_ABSOLUTE ||
+            child->style.position == HPE_POS_FIXED)
+            continue;
+        if (child->kind == HPE_BOX_BLOCK) {
+            vert_flush(ctx, box, &para, inner_h, col_w, &used);
+            vert_child_measure(ctx, child, inner_w, inner_h, &used, &kids, &kid_count, &kid_cap);
+        } else {
+            collect_inline(ctx, child, inner_w, &para);
+        }
+    }
+    vert_flush(ctx, box, &para, inner_h, col_w, &used);
+    if (para.items)
+        hpe_free(para.items);
+    base = (st->width.unit != HPE_LEN_AUTO) ? inner_w : used;
+    vert_columns_finalize(box, base, rl);
+    vert_children_place(ctx, box, kids, kid_count, base, inner_w, inner_h, rl);
+    box->content_box.w = base;
+    box->scroll_content_h = inner_h;
+    block_box_rects(box, base, inner_h, p, b);
+    block_apply_relative_offset(ctx, box, avail_width);
+    block_position_abspos_children(ctx, box);
+    return m[0] + box->border_box.h + m[2];
+}
+
 /* ---------------- block layout ---------------- */
 
 /**
@@ -4229,6 +4602,23 @@ static void block_scroll_container(LayoutCtx *ctx, HpeBox *box, float avail_widt
         box->scroll_y = 0.0f;
 }
 
+/**
+ * @brief 记录块盒的自然内容高度（滚动容器的可达范围）/ Record a block box's natural content height (a scroll container's reachable extent)
+ *
+ * @param[in,out] box 块盒 / Block box
+ * @param[in]     cur_y 内容底边的文档 y / Document y of the content bottom
+ *
+ * @note 自然内容范围是滚动容器需要能够到达的长度，`block_content_height` 之后可能
+ *       会把它夹紧到显式高度 / The natural extent is what a scroll container must be able to reach; `block_content_height` may then clamp it to the explicit height
+ */
+static void block_set_scroll_content_h(HpeBox *box, float cur_y)
+{
+    float natural = cur_y - box->content_box.y;
+    if (natural < 0.0f)
+        natural = 0.0f;
+    box->scroll_content_h = natural;
+}
+
 static float layout_block(LayoutCtx *ctx, HpeBox *box, float x, float y, float avail_width,
                           float avail_height)
 {
@@ -4239,6 +4629,9 @@ static float layout_block(LayoutCtx *ctx, HpeBox *box, float x, float y, float a
     int had_block = 0;
     float prev_bottom = 0.0f;
 
+    /* vertical writing modes run their own block flow / 竖排书写模式走独立的块流 */
+    if (st->writing_mode != 0)
+        return layout_vertical_block(ctx, box, x, y, avail_width, avail_height);
     block_reset_lines(box);
     /* a replaced element solves its used content size from the intrinsic size
      * and the author's declaration before the ordinary width path runs */
@@ -4258,14 +4651,7 @@ static float layout_block(LayoutCtx *ctx, HpeBox *box, float x, float y, float a
 
     cur_y = block_flow_children(ctx, box, inner_w, avail_height, m, b, no_top_sep, &had_block,
                                 &prev_bottom);
-    /* the natural content extent is what a scroll container has to be able to
-     * reach; `block_content_height` may then clamp it to the explicit height. */
-    {
-        float natural = cur_y - box->content_box.y;
-        if (natural < 0.0f)
-            natural = 0.0f;
-        box->scroll_content_h = natural;
-    }
+    block_set_scroll_content_h(box, cur_y);
     inner_h = block_content_height(ctx, box, cur_y - box->content_box.y, cur_y, prev_bottom,
                                    had_block, no_bottom_sep, avail_width, avail_height, m, p, b);
     box->content_box.h = inner_h;

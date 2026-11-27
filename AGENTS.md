@@ -210,6 +210,26 @@ HTML 解析 → CSS 层叠 → 块/行内布局 → 软件光栅 → 上屏。
   **Ctrl+V 粘贴**（平台剪贴板 `hpe_clipboard_get_text`：优先 `CF_UNICODETEXT`，否则 `CF_HDROP` 取首个文件
   路径；粘贴文本去掉换行/控制符并按地址容量截断，替换当前选区）；编辑全程以 UTF-8 码点为最小单位，
   不会切碎中文；加载失败保留输入并在状态行显示 `ERR:`；滚动时外壳固定不动。
+- **浏览器能力批次（v0.21）**：
+  - **页面文本选中与复制**：选区端点按 DOM 文本节点存储（`HpeSelPos{node,off}`，盒树重建后存活）；
+    命中→光标映射两级（DFS 命中带行盒 → `sel_caret_at` 逐 run 半字形对齐 → `sel_run_owner` 反查
+    文本盒）；拖选/Shift 扩展/双击选词（0.4s·4px 多击检测）；`hpe_sel_prepare` 生成文档序选区表，
+    paint 逐 run 高亮（折叠空格字面量 run 以 `carry` 继承、整行选中边到边）；`hpe_sel_copy` 按
+    块级祖先插 `\n` 写剪贴板；Ctrl+A/C/Escape。核心在 `src/hope_sel.c`，钩子 `HOPE_TEST_SEL`/
+    `SEL_DRAG`、trace `HPE_TRACE_SEL=1`。
+  - **多标签页**：`src/hope_chrome.c` 28px 标签条（标签体/×/＋）；每标签仅存身份
+    （路径/`nav[32]` 历史环/滚动），切换 memcpy 进出 + `nav_suppress` 重载；
+    Ctrl+T/W/Tab/Shift+Tab；API `hpe_engine_tab_count/active/switch`。
+  - **IME 组合输入**：Win32 `WM_IME_*` → `ImmGetCompositionStringW` → 回调
+    `on_ime_compose/on_ime_commit`；组合串在地址栏插入符处内联显示（下划线），提交即插入。
+  - **竖排文本**：`writing-mode: vertical-rl/lr`（CJK 直立下排、拉丁旋转 90°，
+    `mask_rotate90` 顶对齐掩码）；基线 `examples/vertical.html`。
+  - **彩色 emoji**：COLRv0/CPAL 逐层合成精灵（`g_sprites` 缓存含前景色键），ZWJ/VS16/修饰符/
+    地区旗序列；回退链 `fb[]` 分段合成段落掩码；基线 `examples/emoji.html`。
+  - **测试与质量**：C 单测框架 `hope_tests`（42 用例/223 断言，CTest 接入）；CSS 布局矩阵
+    `css-layout-matrix.html`（56 过 + 12 XFAIL）；基准入库 `tools/bench_run.py` +
+    `bench_compare.py`；内存账本 `HPE_ALLOC_STATS=1|2`（借其修复 emoji 精灵/竖排掩码/
+    PNG 解压缓冲/图片缓存键四类泄漏）。
 
 ## JS 引擎（v0.7）
 纯 C 手写，无第三方依赖。执行时机：DOM 解析 + 样式收集完成后、首次布局之前（等价于 defer 脚本）。
@@ -304,31 +324,35 @@ HTML 解析 → CSS 层叠 → 块/行内布局 → 软件光栅 → 上屏。
    **v0.8 内置库**：`Date`、Map/Set 迭代、`new` 成员访问优先级修复、Array/String/Number/Math/Object 全量方法、
    **v0.12 DOM**：`cloneNode`/`insertBefore`/`replaceChild`/`DocumentFragment`/`MutationObserver`、
    节点包装器 `tagName` 大写、`document.head`、`removeAttribute`/`hasAttribute`）
-2. 布局：grid、table；flex 的 wrap/shrink/order/stretch；元素级滚动容器（`overflow:auto` 不产生内部滚动条，内容撑高页面）；
-   absolute 的百分比 inset 与 z-index 自动堆叠上下文（仅按 z-index 排序定位盒）。
-3. 绘制：`<img>`/图片解码（PNG/JPEG/GIF）、滚动条 UI、文本选中与复制、`background-position`/`background-size` 完整应用
-   （渐变当前铺满盒）、`transition`/`animation` 插值时钟（当前仅解析存储为标志）、子像素文字定位、彩色 emoji。
-   （v0.11 已解决 SVG：`transform`（translate/scale/rotate/skewX/skewY/matrix）、`linearGradient`/
-   `radialGradient`（填充+描边）、`polygon`/`polyline`/`ellipse`/`line`、`defs`/`use`、
-   `path` 的 `S/Q/T/A`、`path`/多边形/椭圆/线段命中测试、`textLength`/`dominant-baseline`。
-   剩余 SVG 缺口：`mask`/`clipPath`/`marker`/`filter`/`gradientTransform`/`tspan`。）
-4. 样式：结构伪类（`:first-child`/`:nth-child` 等未实现）、伪元素（`::before`/`::after`）、状态伪类（`:focus`/`:active`）、
-   `transform` 的 `skew`/`matrix`/3D、`cursor` 与平台光标联动、`transition`/`animation` 插值时钟。
-   （v0.9 已解决：`em/rem/vh/vw/ch` 精确解析、`box-sizing`、`min/max-*`、`overflow` 裁剪、`opacity`、
-   `visibility`、`text-decoration`、线性渐变、盒/文字阴影、2D `transform`、letter/word-spacing、
-   `text-indent`、`vertical-align`、负 margin、`list-style-*`、四边独立 `border-color`、
-   `rgba()/hsl()/transparent`/完整具名色表。
-   **v0.10 已解决：`!important` 参与层叠、`@media` 条件求值、继承属性集合补全、
-   `visibility: hidden` 子树内 `visible` 重现。**）
-5. 基础设施：无 JS GC（整页重载才回收）、无跨平台后端（仅 Win32）。（已解决：字体掩码缓存 `HPE_NO_MASK_CACHE=1` 旁路；脏矩形滚动 `HPE_NO_DIRTY=1` 旁路；裸后代选择器 `a b` 解析 bug；fixed 盒滚动偏移；main.c 新增 `--bench N`、`--scroll-lines N`；
-   裁剪矩形跨上/左边缘时高度被错误放大（`hpe_fill_rect_i` 用 `+=` 而非 `-=`）；
-   亚像素滚动与近整数边缘取整导致脏路径与全量差 1 行——滚动量对齐整像素 + 设备 y 量化 1/64px；
+2. 布局：见 `docs/design.md` §10.10（flex `baseline` 细节；grid `gap`/auto track/`span` 组合与
+   table separate 模式的 12 条 XFAIL 边界；`flow-root`、跨容器 `clear`）。
+   （已解决：grid/table 布局、flex wrap/shrink/order/stretch、元素级滚动容器、
+   absolute 百分比 inset 精确解算、完整层叠上下文（v0.14–v0.18））
+3. 绘制：`transition`/`animation` 插值时钟（仍仅解析存储为标志）、渐变多层/多色标高级语法。
+   （已解决：`<img>` 四格式解码、滚动条 UI、`background-position/size`、子像素文字定位、
+   彩色 emoji/字形回退链、**页面内文本选中与复制**、竖排文本 `writing-mode`；SVG 的
+   `mask`/`clipPath`/`marker`/`filter`/`gradientTransform` 也已落地——见 `svg-fx.html` 基线）
+4. 样式：渐变多层/多色标高级语法、`transform` 的 3D、`transition`/`animation` 插值时钟。
+   （已解决：结构伪类、伪元素、状态伪类、`skew`/`matrix`、`cursor` 与平台光标联动（v0.20））
+5. 基础设施：无跨平台后端（仅 Win32，**显式豁免项**）、真实系统时钟之外的单调时钟
+   `hpe_time_monotonic`（**显式豁免项**）。
+   （已解决：JS GC（`hpe_js_gc_*`，`js-gc.html` 断言 10/10）、C 单测框架 `hope_tests`
+   （42 用例/223 断言）、性能基准入库 `tools/bench_run.py`+`bench_compare.py`、
+   内存泄漏检测账本 `HPE_ALLOC_STATS=1|2` + `docs/memory-debug.md`；
+   **v0.21 借账本修复四类泄漏**：emoji 精灵释放错字段（14 块/52KB）、竖排旋转掩码结构未释放
+   （每字形 24B）、PNG 成功路径不解压缓冲、图片缓存键存嗅探后格式致永不命中反复解码；
+   字体掩码缓存 `HPE_NO_MASK_CACHE=1` 旁路、脏矩形滚动 `HPE_NO_DIRTY=1` 旁路、
+   `--bench N`/`--scroll-lines N`；
    **v0.12 DOM/CSS 增量更新**：变更分类（`NONE/PAINT/LAYOUT`）+ 脏标记惰性重排 + 局部子树增量布局
    （`hpe_layout_rebuild`，与全量逐字节一致）+ 脚本增改移除 `<style>` 即时生效；调试开关
    `HOPE_TRACE_REFLOW=1`、`HPE_FORCE_EAGER=1`、`HPE_NO_PARTIAL=1`）
-6. 浏览器外壳：地址栏已是完整文本编辑器（选区/双击选词/三击全选/Shift 扩展/Ctrl+A/C/X/V/
-   方向键与 Home/End/Ctrl+词移动/粘贴），但**无输入法组合输入**、插入符不闪烁、无 I 形光标、
-   无前进后退与刷新按钮，滚轮在条带内仍滚动页面；页面内文本仍不能选中复制（选区模型只在地址栏）。
+6. 浏览器外壳：标签页无拖拽排序/会话持久化/中键关闭；IME 无组合窗定位（ImmSetCompositionWindow）；
+   页面正文无插入符编辑（无 contenteditable）。
+   （已解决：插入符闪烁与 I 形光标、前进/后退/刷新按钮、滚轮条带穿透、
+   **v0.21**：多标签页（每标签历史/滚动 + Ctrl+T/W/Tab）、IME 组合输入
+   （`WM_IME_COMPOSITION` → `on_ime_compose/commit` 回调，内联下划线组合串）、
+   页面文本选中与复制（`HpeSelPos{node,off}` DOM 端点选区、拖选/双击选词/整行高亮/
+   跨块复制写剪贴板；回归 `runtests.py` §3b sel-drag + §3c tabs））
 7. HTML 解析：非完整 HTML5 状态机——未实现 `<frameset>`、`<form>` 隐式闭合细节、`<svg>`/`<math>`
    命名空间切换、`<textarea>`/`<title>` 的 RCDATA 规则、属性重复剔除、`<template>` 内容惰性解析；
    编码仅 UTF-8/UTF-16/Latin-1(cp1252)，无 GBK/Big5/Shift-JIS；`<link>` 资源提示只记录不加载。

@@ -31,11 +31,15 @@
 11. ✅ SVG 绘制子集扩展：仿射 transform、新图元、`defs`/`use`、线性/径向渐变、`path` 全命令与命中测试（v0.11）
 12. ✅ DOM 模型补全：脏标记驱动的惰性重排、局部子树增量布局、`MutationObserver`、`DocumentFragment`/`cloneNode`/`insertBefore`/`replaceChild`、CSS 增量样式刷新（v0.12）
 13. ✅ HTML 解析补全：容错自动闭合、`<table>`/`<select>`/`<template>` 专用规则、字符编码探测、`<base href>` 与 `<link>` 资源提示（v0.13）
-14. 🔲 布局补全（二）：grid、table、flex wrap/shrink/order、元素级滚动容器
-15. 🔲 绘制补全（二）：`<img>`、滚动条、页面内文本选中、radial 渐变、`background-position/size`
-16. 🔲 样式补全（三）：结构伪类、伪元素、状态伪类、`skew`/`matrix`、`transition` 时钟
-17. 🔲 JS 补全：`Proxy`/`Reflect`、`Intl`、`WeakMap`、TypedArray、真正的事件循环与 GC
-18. 🔲 基础设施：JS GC、跨平台后端
+14. ✅ 布局补全（二）：grid、table、flex wrap/shrink/order、元素级滚动容器（v0.14–v0.18）
+15. ✅ 绘制补全（二）：`<img>`、滚动条、页面内文本选中、radial 渐变、`background-position/size`、彩色 emoji、竖排文本（v0.14–v0.21）
+16. ✅ 样式补全（三）：结构伪类、伪元素、状态伪类、`skew`/`matrix`、`cursor` 联动（`transition` 时钟仍为缺口）
+17. ✅ JS 补全：真正的事件循环与 GC（`Proxy`/`Reflect`/`Intl`/`WeakMap` 仍为缺口）
+18. ✅ 基础设施：JS GC、C 单测框架、性能基准入库、内存泄漏检测账本（跨平台后端为显式豁免项）
+19. ✅ 浏览器能力批次：页面内文本选中与复制（DOM 端点选区/拖选/双击选词/整行高亮/跨块复制）、
+    多标签页（每标签历史/滚动 + Ctrl+T/W/Tab）、IME 组合输入（内联下划线组合串）、C 单测框架
+    （42 用例/223 断言）、CSS 布局矩阵（56 过 + 12 XFAIL）、基准入库对比、`HPE_ALLOC_STATS`
+    分配账本并借其修复四类泄漏（v0.21）
 
 > 注：早期规划中的「float / flex 属绘制补全」已在 v0.4 / v0.6 提前落地，本列表据实回填。
 
@@ -556,9 +560,9 @@ typedef struct HpeBox {
 
 ### 10.10 已知布局缺口
 
-grid、table 布局；flex 的 `flex-wrap` / `row-reverse` / `order` / `flex-basis` / `flex-shrink` /
-`stretch` 拉伸与 `baseline`；元素级滚动（`overflow` 只裁剪不产生可滚动条）；`content`/`vertical-align`
-的完整基线对齐（仅支持原子行内盒的 top/middle/bottom 等）；完整层叠上下文。
+flex `baseline` 对齐与部分对齐细节；grid 的 `gap`/`auto` track/`span` 组合与 table separate
+模式的若干边界（`css-layout-matrix.html` 中以 12 条 XFAIL 记录，不判失败）；
+`display:flow-root`、跨容器 `clear`、BFC 边界阻断 margin 塌陷。
 
 ### 10.11 尺寸求解与间距（v0.9 新增）
 
@@ -1138,53 +1142,25 @@ cmake --build build
 
 ## 17. 已知缺口与路线图（待补）
 
-0. **HTML 解析**（v0.13 已补齐四大类：容错自动闭合、`<table>`/`<select>`/`<template>` 专用规则、
-   字符编码探测、`<base href>` 与 `<link>` 资源提示，见 §6）：
-   仍**不是**完整 HTML5 状态机——未实现 `<frameset>`、`<form>` 的隐式闭合细节、`<math>`/`<svg>` 的
-   外来内容命名空间切换、`<textarea>`/`<title>` 的 RCDATA 转义规则、`<select>` 内 `<option>` 的 `label`
-   裁剪、`<colgroup>`/`<caption>` 的更细粒度插入模式、属性重复剔除、`<template>` 的模板内容惰性解析；
-   编码方面仅支持 UTF-8 / UTF-16 / Latin-1(cp1252)，未覆盖 GBK/Big5/Shift-JIS 等亚洲编码；
-   资源提示只记录 `rel`/`href`，不做实际加载（`icon`/`preload` 不参与绘制）。
-1. **JS**（v0.7 已补齐绝大多数语言特性：原型链/`class`/`extends`/`instanceof`、`try/catch/finally`、
-   `this` 与 `call/apply/bind`、解构/展开/默认与剩余参数/模板字符串、`for-in`·`for-of`/`switch`/标签循环、
-   位运算/`?.`/`??`、getter·setter、正则、`Promise`/`async await`、生成器、ES 模块；
-   v0.8 补齐内置库：`Date`、`Map`/`Set` 迭代协议、Array/String/Number/Math/Object 全量方法；
-   v0.12 补齐 DOM 变更 API 与 `MutationObserver`）：
-   仍缺 `getBoundingClientRect`；节点 host 包装器每次读取都新建，`===` 同一性比较不可靠（见 §13.1）；
-   生成器为**急切物化**（不支持 `yield` 中途暂停与无限生成器）；`await` 为同步 settle（无真正的事件循环挂起）；
-   无 `Proxy`/`Reflect`/`Intl`/`WeakMap`·`WeakSet`/`Symbol.iterator` 之外的知名符号；
-   `Date` 仅支持固定偏移而无历史时区库/夏令时规则，`Intl` 相关格式化未实现。
-2. **布局**：grid、table；flex 的 wrap/shrink/order/stretch；元素级滚动容器
-   （`overflow:auto` 目前不产生内部滚动条，内容把页面撑高）；
-   完整层叠上下文（`z-index:auto` 嵌套、opacity/transform 触发）。
-3. **绘制**：`<img>`/图片解码（PNG/JPEG/GIF）、滚动条 UI（页面级 + 元素级）、页面内文本选中与复制、
-   插入符闪烁 / I 形光标、`background-position`/`background-size` 的完整应用
-   （当前渐变铺满整个盒）、`transition`/`animation` 的插值时钟（当前仅解析存储为标志）、
-   子像素文字定位、彩色 emoji / 字形回退链。
-   （**v0.11 已补齐 SVG**：`transform`（translate/scale/rotate/skewX/skewY/matrix）、
-   `linearGradient`/`radialGradient`（填充与描边、objectBoundingBox 与 userSpaceOnUse）、
-   `<polygon>`/`<polyline>`/`<ellipse>`/`<line>`、`<defs>`/`<use>`、`path` 的 `S/Q/T/A`、
-   `path`/`polygon`/`polyline`/`ellipse`/`line` 的命中测试、`textLength`/`dominant-baseline`。
-   剩余 SVG 缺口：`mask`/`clipPath`/`<marker>`/`filter`/`gradientTransform`/`<tspan>`。）
-4. **样式**：`:first-child`/`:nth-child` 等结构伪类、伪元素（`::before`/`::after`）、
-   `:focus`/`:active` 等状态伪类、渐变的多层/多色标高级语法、`transform` 的 `skew`/`matrix`/3D、
-   `cursor` 与平台光标的联动、`transition`/`animation` 插值时钟。
-   （v0.9 已补齐：`em/rem/vh/vw/ch` 精确解析、`box-sizing`、`min/max-*`、`overflow` 裁剪、
-   `opacity`、`visibility`、`text-decoration`、线性渐变、盒/文字阴影、2D `transform`、
-   letter/word-spacing、`text-indent`、`vertical-align`、负 margin、`list-style-*`、
-   四边独立 `border-color`、`rgba()/hsl()/transparent`/完整具名色表。
-   **v0.10 已补齐：`!important` 参与层叠（两趟：normal 后 important）、`@media` 条件求值
-   （媒体类型/`and`/`not`/`only`/逗号或列表/区间特性/嵌套，按视口求值）、继承属性集合
-   （`visibility`/`cursor`/`list-style-*`/`letter-spacing`/`word-spacing`/`text-indent`）、
-   `visibility: hidden` 子树内 `visible` 重现。**）
-5. **基础设施**：JS GC、跨平台后端、真正的事件循环。
-   （**v0.12 已补齐 DOM/CSS 增量更新**：变更分类 + 脏标记惰性重排 + 局部子树增量布局 +
-   微任务批量 `MutationObserver` + 脚本新增/修改/移除 `<style>` 即时生效；
-   字体掩码缓存、脏矩形滚动重绘已于 v0.4 完成。）
-6. **浏览器外壳**（v0.6 后剩余）：地址栏已是完整文本编辑器（选区/双击选词/三击全选/Shift 扩展/
-   `Ctrl+A/C/X/V`/方向键·Home·End·Ctrl+词移动/粘贴文件路径），仍缺**输入法组合输入**、
-   插入符闪烁、鼠标 I 形光标、前进/后退历史与刷新按钮；滚轮在条带内仍会滚动页面
-   （滚轮事件不带坐标）；**页面内文本仍不能选中复制**——选区模型目前只存在于地址栏。
+> v0.14–v0.21 批次已消化本清单的绝大部分：布局补全（grid/table/元素级滚动/绝对定位百分比
+> inset/完整层叠上下文）、绘制补全（`<img>` 四格式解码、滚动条 UI、`background-position/size`、
+> 子像素文字定位、彩色 emoji 与字形回退链、**页面内文本选中与复制**）、样式补全（结构伪类、
+> 伪元素、状态伪类、`cursor` 与平台光标联动）、基础设施（JS GC、单测框架、基准入库、分配账本）、
+> 外壳（插入符闪烁、I 形光标、前进/后退/刷新、**多标签页**、**IME 组合输入**）、
+> **竖排文本**（`writing-mode: vertical-rl/lr`）。以下为**当前**仍存在的缺口：
+
+0. **HTML 解析**：仍不是完整 HTML5 状态机——未实现 `<frameset>`、`<form>` 的隐式闭合细节、
+   `<math>`/`<svg>` 外来内容命名空间切换、RCDATA 转义细节、属性重复剔除、模板内容惰性解析；
+   编码仅 UTF-8 / UTF-16 / Latin-1(cp1252)，未覆盖 GBK/Big5/Shift-JIS；资源提示不参与加载。
+1. **JS**：仍缺 `getBoundingClientRect`；节点 host 包装器每次读取新建（`===` 同一性不可靠）；
+   生成器为急切物化（无 `yield` 暂停/无限生成器）；`await` 同步 settle；无 `Proxy`/`Reflect`/
+   `Intl`/`WeakMap`·`WeakSet`；`Date` 无历史时区库/夏令时规则。事件暂无 `mouseover`。
+2. **布局**：见 §10.10（flex baseline 细节、grid/table 若干 XFAIL 边界、flow-root 等）。
+3. **绘制**：`transition`/`animation` 插值时钟（仍仅解析存储为标志）；渐变多层/多色标高级语法。
+4. **基础设施**：非 Windows 平台后端（macOS/Linux 目前为空）、真实系统时钟之外的单调时钟
+   （`hpe_time_monotonic`）——两项为显式豁免项。
+5. **内存**：DOM 游离节点（JS 侧创建后脱离文档树）与 SVG 派生上下文 `cov_scratch`
+   指针复制模式存在各 ≤4KB 的既有小泄漏，可用 `HPE_ALLOC_STATS=1` 复现。
 
 ---
 

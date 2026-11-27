@@ -17,6 +17,7 @@
 #include "layout/hpe_layout.h"
 #include "paint/hpe_paint.h"
 #include "platform/hpe_platform.h"
+#include "render/hpe_emoji.h"
 #include "render/hpe_image.h"
 
 #define HPE_MAX_SCRIPTS 64
@@ -988,6 +989,8 @@ HpeEngine *hpe_engine_create(int width, int height)
     engine->page_cursor = HPE_CURSOR_DEFAULT;
     engine->caret_key = -1;
     engine->chrome_hover_btn = -1;
+    engine->tab_count = 1; /* the start document lives in tab 0 */
+    engine->tabs[0].used = 1;
     hpe_pixmap_init(&engine->pm, engine->width, engine->height);
     snprintf(engine->status, sizeof(engine->status), "hope: ready");
     return engine;
@@ -1021,6 +1024,8 @@ void hpe_engine_destroy(HpeEngine *engine)
         hpe_free(engine->path);
     hpe_image_shutdown();
     hpe_font_shutdown();
+    hpe_emoji_shutdown();
+    hpe_sel_shutdown(engine);
     hpe_free(engine);
 }
 
@@ -1054,6 +1059,8 @@ static void reset_document(HpeEngine *engine, const char *path)
     }
     hpe_css_free(&engine->sheet);
     hpe_css_init(&engine->sheet); /* user agent styles */
+    /* the old DOM is about to be freed: drop the selection that references it */
+    hpe_sel_reset(engine);
 }
 
 /**
@@ -1310,6 +1317,7 @@ int hpe_engine_load_blank(HpeEngine *engine)
     if (engine->chrome_h > 0) {
         hpe_chrome_set_text(engine, "");
         engine->addr_focus = 0;
+        engine->ime_comp_len = 0;
         nav_push(engine, NULL);
     }
     return 1;
@@ -1390,6 +1398,132 @@ int hpe_engine_forward(HpeEngine *engine)
     if (!engine || engine->nav_pos + 1 >= engine->nav_count)
         return 0;
     return nav_replay(engine, engine->nav_pos + 1);
+}
+
+/* ---------------- tabs ---------------- */
+
+/**
+ * @brief 取当前打开的标签数 / Get the number of open tabs
+ *
+ * @param[in]     engine 引擎实例 / Engine instance
+ *
+ * @return 标签数，`engine` 为 NULL 时返回 0 / Tab count, 0 when `engine` is NULL
+ */
+int hpe_engine_tab_count(HpeEngine *engine)
+{
+    return engine ? engine->tab_count : 0;
+}
+
+/**
+ * @brief 取当前活动标签下标 / Get the active tab's index
+ *
+ * @param[in]     engine 引擎实例 / Engine instance
+ *
+ * @return 活动标签下标，`engine` 为 NULL 时返回 -1 / Active tab index, -1 when `engine` is NULL
+ */
+int hpe_engine_tab_active(HpeEngine *engine)
+{
+    return engine ? engine->tab_active : -1;
+}
+
+/**
+ * @brief 把活动标签的实时状态写回标签槽 / Write the active tab's live state back into its slot
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @note 实时导航环就是活动标签的历史；切换前保存路径/历史/滚动 / The live navigation ring IS the active tab's history; path, history and scroll are saved before a switch
+ */
+static void tab_save_active(HpeEngine *engine)
+{
+    HpeTab *t = &engine->tabs[engine->tab_active];
+    t->used = 1;
+    snprintf(t->path, sizeof(t->path), "%s", engine->path ? engine->path : "");
+    memcpy(t->nav, engine->nav, sizeof(t->nav));
+    t->nav_count = engine->nav_count;
+    t->nav_pos = engine->nav_pos;
+    t->scroll_y = engine->scroll_y;
+}
+
+/**
+ * @brief 从标签槽恢复实时导航状态并重载文档 / Restore the live navigation state from a tab slot and reload its document
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     t 目标标签槽 / The target tab slot
+ *
+ * @return 加载成功返回 1，否则 0 / 1 when the document loaded, otherwise 0
+ *
+ * @note 以 `nav_suppress` 重载（切换不是导航），随后恢复该标签的滚动偏移 / Reloads with `nav_suppress` (a switch is not a navigation), then restores the tab's scroll offset
+ */
+static int tab_restore(HpeEngine *engine, const HpeTab *t)
+{
+    int ok;
+    memcpy(engine->nav, t->nav, sizeof(engine->nav));
+    engine->nav_count = t->nav_count;
+    engine->nav_pos = t->nav_pos;
+    engine->nav_suppress = 1;
+    if (t->path[0])
+        ok = hpe_engine_load_file(engine, t->path);
+    else
+        ok = hpe_engine_load_blank(engine);
+    engine->nav_suppress = 0;
+    engine->scroll_y = t->scroll_y;
+    clamp_scroll(engine);
+    hpe_sel_reset(engine);
+    engine->dirty = HPE_DIRTY_FULL;
+    return ok;
+}
+
+int hpe_engine_tab_new(HpeEngine *engine)
+{
+    HpeTab *t;
+    if (!engine || engine->tab_count >= HPE_TAB_MAX)
+        return 0;
+    tab_save_active(engine);
+    engine->tab_active = engine->tab_count++;
+    t = &engine->tabs[engine->tab_active];
+    memset(t, 0, sizeof(*t));
+    t->used = 1;
+    engine->nav_count = 0;
+    engine->nav_pos = 0;
+    hpe_engine_load_blank(engine); /* pushes the blank entry into the fresh ring */
+    engine->dirty = HPE_DIRTY_FULL;
+    return 1;
+}
+
+int hpe_engine_tab_close(HpeEngine *engine, int index)
+{
+    HpeTab *t;
+    int i;
+    if (!engine || index < 0 || index >= engine->tab_count)
+        return 0;
+    if (engine->tab_count == 1) {
+        /* the last tab resets to a fresh blank page instead of closing */
+        engine->nav_count = 0;
+        engine->nav_pos = 0;
+        hpe_engine_load_blank(engine);
+        engine->dirty = HPE_DIRTY_FULL;
+        return 1;
+    }
+    tab_save_active(engine);
+    for (i = index; i < engine->tab_count - 1; i++)
+        engine->tabs[i] = engine->tabs[i + 1];
+    engine->tab_count--;
+    if (engine->tab_active > index)
+        engine->tab_active--;
+    else if (engine->tab_active >= engine->tab_count)
+        engine->tab_active = engine->tab_count - 1;
+    t = &engine->tabs[engine->tab_active];
+    tab_restore(engine, t);
+    return 1;
+}
+
+int hpe_engine_tab_switch(HpeEngine *engine, int index)
+{
+    if (!engine || index < 0 || index >= engine->tab_count || index == engine->tab_active)
+        return 0;
+    tab_save_active(engine);
+    engine->tab_active = index;
+    return tab_restore(engine, &engine->tabs[index]);
 }
 
 /**
@@ -1993,6 +2127,8 @@ void hpe_engine_render(HpeEngine *engine)
         return;
     }
     t0 = hpe_time_seconds();
+    /* refresh the paint-time selection map (box pointers may have changed) */
+    hpe_sel_prepare(engine);
     if (engine->dirty == HPE_DIRTY_CHROME && engine->painted)
         hpe_chrome_paint(engine);
     else if (engine->dirty == HPE_DIRTY_SCROLL && engine->root && !dirty_disabled())
@@ -2448,6 +2584,10 @@ int hpe_engine_mouse_move(HpeEngine *engine, int x, int y)
      * once the pointer leaves the strip */
     if (hpe_chrome_mouse_move(engine, x, y))
         return 1;
+    /* an in-progress page selection drag extends with the pointer */
+    if (engine->sel_drag && hpe_sel_mouse_move(engine, x, y) &&
+        engine->dirty == HPE_DIRTY_NONE)
+        engine->dirty = HPE_DIRTY_FULL;
     node = node_from_hit(engine, x, y); /* NULL inside the chrome strip */
 
     hover_changed = node != engine->hover_node;
@@ -2615,11 +2755,41 @@ static int mouse_dispatch_events(HpeEngine *engine, HpeDomNode *node, int x, int
     return fired;
 }
 
+/**
+ * @brief 把一次页面按压/抬起喂给选区模块 / Feed one page press/release into the selection module
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     x X 坐标（窗口坐标）/ X coordinate in window space
+ * @param[in]     y Y 坐标（窗口坐标）/ Y coordinate in window space
+ * @param[in]     down 按下为 1、抬起为 0 / 1 when pressed, 0 when released
+ * @param[in]     mods 修饰键掩码 / Modifier mask
+ *
+ * @return 选区状态发生变化返回 1，否则 0 / 1 when the selection changed, otherwise 0
+ *
+ * @note 按下开始/折叠/扩展选区，抬起只结束拖拽；变化处标记整帧重绘 / A press starts, collapses or extends the selection, a release only ends the drag; changes mark a full repaint
+ *
+ * @see hpe_sel_mouse_down hpe_sel_mouse_up
+ */
+static int sel_mouse_feed(HpeEngine *engine, int x, int y, int down, int mods)
+{
+    if (down) {
+        if (hpe_sel_mouse_down(engine, x, y, mods)) {
+            if (engine->dirty == HPE_DIRTY_NONE)
+                engine->dirty = HPE_DIRTY_FULL;
+            return 1;
+        }
+        return 0;
+    }
+    hpe_sel_mouse_up(engine);
+    return 0;
+}
+
 int hpe_engine_mouse_event_mods(HpeEngine *engine, int x, int y, int button, int down, int mods)
 {
     HpeDomNode *node;
     int fired = 0;
     int blurred = 0;
+    int sel_changed = 0;
     int active_changed = 0;
     int py;
 
@@ -2637,12 +2807,16 @@ int hpe_engine_mouse_event_mods(HpeEngine *engine, int x, int y, int button, int
         return hpe_chrome_mouse(engine, x, y, down, mods);
     if (engine->chrome_h > 0 && engine->addr_focus) {
         engine->addr_focus = 0; /* clicking the page leaves the address bar */
+        engine->ime_comp_len = 0;
         if (engine->dirty == HPE_DIRTY_NONE)
             engine->dirty = HPE_DIRTY_CHROME;
         blurred = 1;
     }
+    /* page text selection: a press starts or collapses it, a release ends the
+     * drag; Shift+click extends an existing selection */
+    sel_changed = sel_mouse_feed(engine, x, y, down, mods);
     if (!engine->js)
-        return blurred;
+        return blurred || sel_changed;
 
     node = node_from_hit(engine, x, y);
     if (!node)

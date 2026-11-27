@@ -3128,6 +3128,30 @@ static void apply_direction(HpeStyle *d, const char *value)
     d->set2 |= HPE_PROP2_DIRECTION;
 }
 
+/**
+ * @brief 把 `writing-mode` 声明写入样式 / Write a `writing-mode` declaration into the style
+ *
+ * @details 识别 `horizontal-tb`（0）、`vertical-rl`（1）与 `vertical-lr`（2）；
+ *          未识别的值按 `horizontal-tb` 处理。
+ *          Recognises `horizontal-tb` (0), `vertical-rl` (1) and `vertical-lr` (2);
+ *          an unknown value falls back to `horizontal-tb`.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @note 竖排布局在 layout 模块实现，这里只做取值解析 / Vertical layout lives in the layout module; this only parses the value
+ */
+static void apply_writing_mode(HpeStyle *d, const char *value)
+{
+    if (hpe_str_ieq(value, "vertical-rl"))
+        d->writing_mode = 1;
+    else if (hpe_str_ieq(value, "vertical-lr"))
+        d->writing_mode = 2;
+    else
+        d->writing_mode = 0;
+    d->set2 |= HPE_PROP2_WRITING_MODE;
+}
+
 /* name -> applier registry; the single source of truth for the property surface */
 typedef void (*PropApplier)(HpeStyle *d, const char *value);
 typedef struct {
@@ -3240,6 +3264,7 @@ static const PropEntry k_prop_table[] = {
     {"table-layout", apply_table_layout},
     {"border-spacing", apply_border_spacing},
     {"direction", apply_direction},
+    {"writing-mode", apply_writing_mode},
     {"scrollbar-width", apply_scrollbar_width},
 };
 
@@ -5778,6 +5803,7 @@ static const ScalarCopy k_scalars_word2[] = {
     SCALAR_COPY(HPE_PROP2_BORDER_SPACING, border_spacing_h),
     SCALAR_COPY(HPE_PROP2_BORDER_SPACING, border_spacing_v),
     SCALAR_COPY(HPE_PROP2_DIRECTION, direction_rtl),
+    SCALAR_COPY(HPE_PROP2_WRITING_MODE, writing_mode),
     SCALAR_COPY(HPE_PROP2_SCROLLBAR_WIDTH, scrollbar_width),
 };
 
@@ -5984,6 +6010,7 @@ static void inherit_parent_style(HpeStyle *style, const HpeStyle *parent)
     style->letter_spacing = parent->letter_spacing;
     style->word_spacing = parent->word_spacing;
     style->text_indent = parent->text_indent;
+    style->writing_mode = parent->writing_mode;
 }
 
 /**

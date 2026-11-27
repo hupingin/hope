@@ -332,6 +332,7 @@ typedef enum HpeCombinator {
 #define HPE_PROP2_BACKGROUND_REPEAT   (1ull << 47)
 #define HPE_PROP2_OBJECT_FIT          (1ull << 48)
 #define HPE_PROP2_OBJECT_POSITION     (1ull << 49)
+#define HPE_PROP2_WRITING_MODE        (1ull << 50)
 /* per-side border color uses one bit plus the shared HpeStyle.border_colors[4] */
 
 /* `scrollbar-width` initial value is `auto`, i.e. a classic 12px scrollbar. The
@@ -436,6 +437,9 @@ typedef struct HpeStyle {
     HpeObjectFit object_fit;
     HpeBgPos object_pos; /* `object-position`, shares HpeBgPos' px / % form */
     HpeBgRepeat bg_repeat;
+    /* vertical text (CSS Writing Modes): 0 = horizontal-tb, 1 = vertical-rl,
+     * 2 = vertical-lr / 竖排文本：0 横排，1 从右向左竖排，2 从左向右竖排 */
+    int writing_mode;
 } HpeStyle;
 
 typedef struct HpeAttrSel {

@@ -26,6 +26,8 @@
 /* <link> resource hints we record (stylesheet excluded -- it is consumed) */
 #define HPE_MAX_LINKS 32
 #define HPE_MAX_PATH 1024
+/* maximum number of simultaneously open browser tabs */
+#define HPE_TAB_MAX 8
 
 /* dirty flags: what the next render() has to do */
 #define HPE_DIRTY_NONE 0
@@ -38,6 +40,26 @@
 #define HPE_REFLOW_NONE 0   /* nothing changed: skip layout and repaint */
 #define HPE_REFLOW_PAINT 1  /* paint-only change (colour, opacity, shadow): restyle, no geometry */
 #define HPE_REFLOW_LAYOUT 2 /* geometry may have changed: rebuild the box tree */
+
+/* page text selection endpoint: a byte offset inside a DOM text node. Keyed by
+ * node (not box) so the selection survives relayouts, which rebuild the box
+ * tree but keep DOM nodes alive. */
+typedef struct HpeSelPos {
+    HpeDomNode *node; /* 所属文本节点 / Owning DOM text node */
+    int off;          /* 节点文本内的字节偏移 / Byte offset within the node's text */
+} HpeSelPos;
+
+/* one browser tab. Only the identity survives a background period (path,
+ * per-tab history, scroll offset); switching tabs reloads the document from
+ * disk, which keeps memory flat and the engine single-document. */
+typedef struct HpeTab {
+    int used;                                 /* 槽位在用 / Slot in use */
+    char path[HPE_MAX_PATH];                  /* 当前文档路径（""=空白页）/ Current document path (""=blank) */
+    char nav[HPE_NAV_MAX][HPE_MAX_PATH];      /* 每标签历史环 / Per-tab history ring */
+    int nav_count;                            /* 历史项数 / History entry count */
+    int nav_pos;                              /* 当前历史下标 / Current history index */
+    float scroll_y;                           /* 切走时的滚动偏移 / Scroll offset when last left */
+} HpeTab;
 
 struct HpeEngine {
     HpePixmap pm;
@@ -132,6 +154,33 @@ struct HpeEngine {
     int caret_on;
     double tick_last;
     int caret_key;
+
+    /* IME composition display: `ime_comp` is the in-progress string shown
+     * inline at the caret (underlined); cleared on commit, cancel or blur */
+    char ime_comp[HPE_ADDR_MAX];
+    int ime_comp_len;
+
+    /* page text selection (anchor = where the drag started, focus = where it
+     * currently extends to); `sel_drag` is set between press and release.
+     * `sel_map` is the per-box highlight table rebuilt before every repaint
+     * and handed to the paint module via hpe_paint_set_selection. */
+    HpeSelPos sel_anchor;
+    HpeSelPos sel_focus;
+    int sel_drag;
+    double sel_click_t;   /* last press time/position, for multi-click counting */
+    int sel_click_x;
+    int sel_click_y;
+    int sel_click_count;
+    HpePaintSelEntry *sel_map;
+    int sel_map_count;
+    size_t sel_map_cap;
+    HpePaintSel sel_ps; /* descriptor handed to the paint module (self-owned) */
+
+    /* browser tabs: `tabs[tab_active]` mirrors the live navigation state (the
+     * engine's nav[] ring IS the active tab's ring; switch copies in/out). */
+    HpeTab tabs[HPE_TAB_MAX];
+    int tab_count;
+    int tab_active;
 };
 
 /**
@@ -194,6 +243,158 @@ int hpe_engine_caret_advance(HpeEngine *engine);
  * @note 实现位于 `hope.c` / Implemented in `hope.c`
  */
 int hpe_engine_view_height(HpeEngine *engine);
+
+/* ---------------- hope_sel.c ---------------- */
+
+/**
+ * @brief 查询是否存在非折叠的页面选区 / Test whether a non-collapsed page selection exists
+ *
+ * @param[in]     engine 引擎实例 / Engine instance
+ *
+ * @return 有选区返回 1，否则 0 / 1 when a selection exists, otherwise 0
+ */
+int hpe_sel_has(const HpeEngine *engine);
+
+/**
+ * @brief 处理页面上的指针按下（开始/扩展/双击选词） / Handle a pointer press on the page (start/extend/double-click word select)
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     x X 坐标（窗口坐标）/ X coordinate in window space
+ * @param[in]     y Y 坐标（窗口坐标）/ Y coordinate in window space
+ * @param[in]     mods 修饰键掩码，`HPE_MOD_SHIFT` 扩展既有选区 / Modifier mask; `HPE_MOD_SHIFT` extends an existing selection
+ *
+ * @return 选区状态发生变化返回 1，否则 0 / 1 when the selection changed, otherwise 0
+ *
+ * @note 命中非文本区域时折叠既有选区；双击选中光标处的词 / A press on a non-text area collapses the selection; a double click selects the word under the pointer
+ */
+int hpe_sel_mouse_down(HpeEngine *engine, int x, int y, int mods);
+
+/**
+ * @brief 拖选进行中处理指针移动（扩展焦点端点） / Handle a pointer move while dragging (extends the focus endpoint)
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     x X 坐标（窗口坐标）/ X coordinate in window space
+ * @param[in]     y Y 坐标（窗口坐标）/ Y coordinate in window space
+ *
+ * @return 选区变化返回 1，否则 0 / 1 when the selection changed, otherwise 0
+ */
+int hpe_sel_mouse_move(HpeEngine *engine, int x, int y);
+
+/**
+ * @brief 结束拖选 / End a selection drag
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ */
+void hpe_sel_mouse_up(HpeEngine *engine);
+
+/**
+ * @brief 把选区文本写入剪贴板 / Copy the selected text to the clipboard
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @return 写入成功返回 1，无选区或文本为空返回 0 / 1 when written, 0 without a selection or when the text is empty
+ *
+ * @note 区块盒之间补换行符，与浏览器复制行为一致 / Newlines are inserted between block boxes, matching browser copy behaviour
+ */
+int hpe_sel_copy(HpeEngine *engine);
+
+/**
+ * @brief 全选文档文本 / Select all document text
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @return 文档含文本且选区变化返回 1，否则 0 / 1 when the document has text and the selection changed, otherwise 0
+ */
+int hpe_sel_select_all(HpeEngine *engine);
+
+/**
+ * @brief 清除页面选区 / Clear the page selection
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @return 原有选区被清除返回 1，本无选区返回 0 / 1 when an existing selection was cleared, 0 when there was none
+ */
+int hpe_sel_clear(HpeEngine *engine);
+
+/**
+ * @brief 重建逐盒选区区间表并交给绘制模块 / Rebuild the per-box selection table and hand it to the paint module
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @note 每次重绘页面前调用；选区失效（节点被移除）时自然产生空表 / Called before every page repaint; a stale selection (removed nodes) naturally yields an empty table
+ */
+void hpe_sel_prepare(HpeEngine *engine);
+
+/**
+ * @brief 无条件丢弃选区状态（换页时调用，不触发重绘） / Drop the selection state unconditionally (on page load, no repaint)
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @note 旧文档的 DOM 节点即将销毁，端点引用必须清空；释放区间表缓冲由 hpe_sel_shutdown 负责 / The old document's DOM nodes are about to be freed, so the endpoints must be cleared; freeing the table buffer is hpe_sel_shutdown's job
+ *
+ * @see hpe_sel_shutdown
+ */
+void hpe_sel_reset(HpeEngine *engine);
+
+/**
+ * @brief 释放选区模块的缓冲 / Free the selection module's buffers
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ */
+void hpe_sel_shutdown(HpeEngine *engine);
+
+/* ---------------- hope.c: tabs ---------------- */
+
+/**
+ * @brief 新建一个空白标签并切换过去 / Open a new blank tab and switch to it
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @return 成功返回 1，已达上限返回 0 / 1 on success, 0 when the tab limit is reached
+ */
+int hpe_engine_tab_new(HpeEngine *engine);
+
+/**
+ * @brief 关闭指定下标的标签 / Close the tab at the given index
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     index 待关闭的标签下标 / Index of the tab to close
+ *
+ * @return 成功返回 1，下标非法返回 0 / 1 on success, 0 for an invalid index
+ *
+ * @note 关闭最后一个标签会重置为空白页而不是关闭 / Closing the last tab resets it to the blank page instead
+ */
+int hpe_engine_tab_close(HpeEngine *engine, int index);
+
+/**
+ * @brief 切换到指定下标的标签 / Switch to the tab at the given index
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     index 目标标签下标 / Index of the target tab
+ *
+ * @return 成功返回 1，下标非法或已是当前标签返回 0 / 1 on success, 0 for an invalid index or the already-active tab
+ *
+ * @note 切换会保存当前标签的路径/历史/滚动，重载目标标签的文档并恢复其滚动 / Switching saves the current tab's path/history/scroll, reloads the target document and restores its scroll
+ */
+int hpe_engine_tab_switch(HpeEngine *engine, int index);
+
+/**
+ * @brief 取当前打开的标签数 / Get the number of open tabs
+ *
+ * @param[in]     engine 引擎实例 / Engine instance
+ *
+ * @return 标签数，`engine` 为 NULL 时返回 0 / Tab count, 0 when `engine` is NULL
+ */
+int hpe_engine_tab_count(HpeEngine *engine);
+
+/**
+ * @brief 取当前活动标签下标 / Get the active tab's index
+ *
+ * @param[in]     engine 引擎实例 / Engine instance
+ *
+ * @return 活动标签下标，`engine` 为 NULL 时返回 -1 / Active tab index, -1 when `engine` is NULL
+ */
+int hpe_engine_tab_active(HpeEngine *engine);
 
 /* ---------------- hope_chrome.c ---------------- */
 

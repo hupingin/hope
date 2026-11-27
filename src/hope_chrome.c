@@ -29,6 +29,16 @@
 #include "render/hpe_raster.h"
 
 #define HPE_CHROME_H 44
+/* the tab strip is a row above the address row; the total chrome height is
+ * HPE_TAB_H + HPE_CHROME_H (see hpe_engine_enable_chrome) */
+#define HPE_TAB_H 28
+#define HPE_TAB_X0 4.0f
+#define HPE_TAB_W 160.0f
+#define HPE_TAB_STEP (HPE_TAB_W + 2.0f)
+#define HPE_TAB_CLOSE_W 16.0f /* right-zone width inside a tab that closes it */
+#define HPE_TAB_PLUS_W 22.0f
+#define TAB_TITLE_MAX 64
+#define TAB_BLANK_LABEL "\xE6\x96\xB0\xE6\xA0\x87\xE7\xAD\xBE\xE9\xA1\xB5" /* 新标签页 */
 #define CHROME_PAD 10.0f
 #define FIELD_PAD 8.0f
 #define FIELD_H 28.0f
@@ -64,7 +74,7 @@ static const char PLACEHOLDER[] = "\xE8\xBE\x93\xE5\x85\xA5\xE6\x9C\xAC\xE5\x9C\
 static HpeRect nav_btn_rect(const HpeEngine *engine, int i)
 {
     float x = CHROME_PAD + (float)i * (NAV_BTN_W + NAV_BTN_GAP);
-    return hpe_rect(x, 8.0f + (FIELD_H - 24.0f) * 0.5f, NAV_BTN_W, 24.0f);
+    return hpe_rect(x, (float)HPE_TAB_H + 8.0f + (FIELD_H - 24.0f) * 0.5f, NAV_BTN_W, 24.0f);
 }
 
 /**
@@ -82,7 +92,8 @@ static HpeRect nav_btn_rect(const HpeEngine *engine, int i)
 static HpeRect field_rect(const HpeEngine *engine)
 {
     float left = CHROME_PAD + (float)NAV_BTN_COUNT * (NAV_BTN_W + NAV_BTN_GAP);
-    return hpe_rect(left, 8.0f, (float)engine->width - left - CHROME_PAD, FIELD_H);
+    return hpe_rect(left, (float)HPE_TAB_H + 8.0f, (float)engine->width - left - CHROME_PAD,
+                    FIELD_H);
 }
 
 /* everything the painter and the hit testing need, resolved once */
@@ -786,6 +797,117 @@ static void nav_paint_all(HpeEngine *engine, HpePixmap *pm)
         nav_paint_button(engine, pm, i);
 }
 
+/* ---------------- tab strip ---------------- */
+
+/**
+ * @brief 求标签条中第 `i` 个标签的矩形 / Compute the rectangle of tab `i` in the strip
+ *
+ * @param[in]     i 标签下标 / Tab index
+ *
+ * @return 标签矩形（设备坐标）/ The tab rectangle in device coordinates
+ */
+static HpeRect tab_rect(int i)
+{
+    return hpe_rect(HPE_TAB_X0 + (float)i * HPE_TAB_STEP, 2.0f, HPE_TAB_W,
+                    (float)HPE_TAB_H - 4.0f);
+}
+
+/**
+ * @brief 求「新建标签」按钮的矩形 / Compute the new-tab (+) button rectangle
+ *
+ * @param[in]     engine 引擎实例，提供标签数 / Engine instance, supplies the tab count
+ *
+ * @return 按钮矩形（设备坐标，排在最后一个标签之后）/ The button rectangle in device coordinates, right of the last tab
+ */
+static HpeRect tab_plus_rect(const HpeEngine *engine)
+{
+    return hpe_rect(HPE_TAB_X0 + (float)engine->tab_count * HPE_TAB_STEP + 2.0f, 4.0f,
+                    HPE_TAB_PLUS_W, (float)HPE_TAB_H - 8.0f);
+}
+
+/**
+ * @brief 求标签标题文本（路径基名或空白页标签） / Resolve a tab's title (path basename or the blank label)
+ *
+ * @param[in]     t 标签槽 / The tab slot
+ * @param[out]    buf 接收标题 / Receives the title
+ * @param[in]     n 缓冲大小 / Buffer size
+ *
+ * @note 取最后一个 `/` 或 `\` 之后的部分 / Takes the part after the last `/` or `\`
+ */
+static void tab_title_of(const HpeTab *t, char *buf, size_t n)
+{
+    const char *p;
+    if (!t->path[0]) {
+        snprintf(buf, n, "%s", TAB_BLANK_LABEL);
+        return;
+    }
+    p = t->path + strlen(t->path);
+    while (p > t->path && p[-1] != '/' && p[-1] != '\\')
+        p--;
+    snprintf(buf, n, "%s", p);
+}
+
+/**
+ * @brief 把标题截断到可用宽度（按码点边界） / Truncate a title to the available width (on code-point boundaries)
+ *
+ * @param[in]     font 标签字体 / The tab font
+ * @param[in,out] buf 标题缓冲，就地截断 / Title buffer, truncated in place
+ * @param[in]     max_w 可用宽度 / Available width
+ */
+static void tab_title_fit(HpeFont *font, char *buf, float max_w)
+{
+    int len = (int)strlen(buf);
+    while (len > 0 && hpe_font_measure(font, buf, len) > max_w) {
+        uint32_t cp;
+        int k = hpe_utf8_next(buf + len - 1, &cp); /* step back one code point */
+        len -= k > 0 ? k : 1;
+        while (len > 0 && ((unsigned char)buf[len - 1]) >= 0x80 &&
+               ((unsigned char)buf[len - 1]) < 0xC0)
+            len--; /* drop continuation bytes */
+        buf[len] = '\0';
+    }
+}
+
+/**
+ * @brief 绘制整个标签条 / Paint the whole tab strip
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ *
+ * @note 活动标签白底，非活动标签深一档；标题取路径基名，右侧画 `×` 关闭区，末尾画 `+` 新建按钮 / The active tab is white, inactive ones one shade darker; the title is the path's basename, each tab carries an `×` close zone and a `+` new-tab button ends the row
+ */
+static void tab_paint_all(HpeEngine *engine, HpePixmap *pm)
+{
+    HpeFont *font = hpe_font_get(ADDR_FONT_PX, 400, HPE_FONT_SANS);
+    HpeColor active_bg = hpe_rgb(255, 255, 255);
+    HpeColor idle_bg = hpe_rgb(218, 222, 228);
+    HpeColor text_color = hpe_rgb(60, 64, 67);
+    HpeColor close_color = hpe_rgb(120, 126, 134);
+    int i;
+    if (!font)
+        return;
+    for (i = 0; i < engine->tab_count; i++) {
+        HpeRect r = tab_rect(i);
+        char title[TAB_TITLE_MAX];
+        float asc = hpe_font_ascent(font), desc = hpe_font_descent(font);
+        float baseline = r.y + (r.h + asc - desc) * 0.5f;
+        float text_x = r.x + 8.0f;
+        float close_x;
+        hpe_fill_rect(pm, r, i == engine->tab_active ? active_bg : idle_bg);
+        tab_title_of(&engine->tabs[i], title, sizeof(title));
+        close_x = r.x + r.w - HPE_TAB_CLOSE_W;
+        tab_title_fit(font, title, close_x - text_x - 4.0f);
+        draw_run(pm, font, title, (int)strlen(title), text_x, baseline, text_color);
+        draw_run(pm, font, "\xC3\x97", 2, close_x + 2.0f, baseline, close_color);
+    }
+    if (engine->tab_count < HPE_TAB_MAX) {
+        HpeRect pr = tab_plus_rect(engine);
+        float asc = hpe_font_ascent(font), desc = hpe_font_descent(font);
+        draw_run(pm, font, "+", 1, pr.x + 7.0f,
+                 pr.y + (pr.h + asc - desc) * 0.5f, hpe_rgb(96, 102, 110));
+    }
+}
+
 /**
  * @brief 绘制输入框文本（占位提示或选区加文本）/ Paint the field's text, either the hint or the selection plus runs
  *
@@ -809,9 +931,25 @@ static void chrome_paint_field_text(HpeEngine *engine, HpePixmap *pm, const Addr
     int sel_a = addr_sel_start(engine);
     int sel_b = addr_sel_end(engine);
 
-    if (engine->addr_len == 0) {
+    if (engine->addr_len == 0 && engine->ime_comp_len == 0) {
         draw_run(pm, L->font, PLACEHOLDER, (int)strlen(PLACEHOLDER), L->inner_x, L->baseline,
                  hint_color);
+        return;
+    }
+    if (engine->ime_comp_len > 0 && engine->addr_focus) {
+        /* inline IME composition: caret-left text, the underlined composition
+         * string, then the caret-right text; the caret itself is hidden */
+        float xc = L->inner_x - scroll +
+                   addr_width_to(L->font, engine->addr, engine->addr_len, engine->addr_caret);
+        float comp_w = hpe_font_measure(L->font, engine->ime_comp, engine->ime_comp_len);
+        HpeColor comp_color = hpe_rgb(26, 115, 232);
+        draw_run(pm, L->font, engine->addr, engine->addr_caret, L->inner_x - scroll,
+                 L->baseline, text_color);
+        draw_run(pm, L->font, engine->ime_comp, engine->ime_comp_len, xc, L->baseline,
+                 comp_color);
+        draw_run(pm, L->font, engine->addr + engine->addr_caret,
+                 engine->addr_len - engine->addr_caret, xc + comp_w, L->baseline, text_color);
+        hpe_fill_rect(pm, hpe_rect(xc, L->baseline + 2.0f, comp_w, 1.5f), comp_color);
         return;
     }
     if (sel_b > sel_a && engine->addr_focus) {
@@ -906,6 +1044,9 @@ void hpe_chrome_paint(HpeEngine *engine)
     hpe_fill_rect(pm, hpe_rect(0.0f, (float)engine->chrome_h - 1.0f, (float)engine->width, 1.0f),
                   bar_line);
 
+    /* the tab strip is the row above the address row */
+    tab_paint_all(engine, pm);
+
     if (!addr_layout(engine, &L))
         return;
 
@@ -920,7 +1061,9 @@ void hpe_chrome_paint(HpeEngine *engine)
     addr_clamp_scroll(engine, &L);
     hpe_pixmap_set_clip(pm, hpe_rect(L.inner_x, L.field.y + 2.0f, L.inner_w, L.field.h - 4.0f));
     chrome_paint_field_text(engine, pm, &L, text_color, hint_color, sel_bg, sel_fg);
-    chrome_paint_caret(engine, pm, &L, text_color);
+    /* an in-progress composition replaces the caret with the underlined string */
+    if (engine->ime_comp_len == 0)
+        chrome_paint_caret(engine, pm, &L, text_color);
     hpe_pixmap_reset_clip(pm);
 }
 
@@ -1050,6 +1193,69 @@ static int nav_activate(HpeEngine *engine, int i)
     return ok;
 }
 
+/**
+ * @brief 命中测试标签条 / Hit-test the tab strip
+ *
+ * @param[in]     engine 引擎实例 / Engine instance
+ * @param[in]     x X 坐标（设备坐标）/ X coordinate in device coordinates
+ * @param[in]     y Y 坐标（设备坐标）/ Y coordinate in device coordinates
+ * @param[out]    close 命中关闭区时置 1 / Set to 1 when the close zone was hit
+ *
+ * @return 标签下标、`TAB_HIT_PLUS`（新建按钮）或 `TAB_HIT_NONE` / A tab index, `TAB_HIT_PLUS` (the new-tab button) or `TAB_HIT_NONE`
+ */
+#define TAB_HIT_NONE (-1)
+#define TAB_HIT_PLUS (-2)
+static int tab_hit(const HpeEngine *engine, float x, float y, int *close)
+{
+    int i;
+    *close = 0;
+    if (y < 0.0f || y >= (float)HPE_TAB_H)
+        return TAB_HIT_NONE;
+    for (i = 0; i < engine->tab_count; i++) {
+        HpeRect r = tab_rect(i);
+        if (x >= r.x && x <= r.x + r.w) {
+            if (x >= r.x + r.w - HPE_TAB_CLOSE_W)
+                *close = 1;
+            return i;
+        }
+    }
+    if (engine->tab_count < HPE_TAB_MAX) {
+        HpeRect pr = tab_plus_rect(engine);
+        if (x >= pr.x && x <= pr.x + pr.w)
+            return TAB_HIT_PLUS;
+    }
+    return TAB_HIT_NONE;
+}
+
+/**
+ * @brief 处理标签条内的一次按下/抬起 / Handle one press/release inside the tab strip
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     x X 坐标（设备坐标）/ X coordinate in device coordinates
+ * @param[in]     y Y 坐标（设备坐标）/ Y coordinate in device coordinates
+ * @param[in]     down 按下为 1、抬起为 0 / 1 when pressed, 0 when released
+ *
+ * @return 事件被标签条消费返回 1，否则 0 / 1 when the strip consumed the event, otherwise 0
+ *
+ * @note 标签体切换、`×` 区关闭、`+` 新建；动作发生在按下时（与浏览器一致）/ A tab body switches, the `×` zone closes, `+` opens; actions fire on press, like a browser
+ */
+static int tab_mouse(HpeEngine *engine, int x, int y, int down)
+{
+    int close = 0;
+    int hit = tab_hit(engine, (float)x, (float)y, &close);
+    if (!down)
+        return 1;
+    if (hit >= 0) {
+        if (close)
+            hpe_engine_tab_close(engine, hit);
+        else
+            hpe_engine_tab_switch(engine, hit);
+    } else if (hit == TAB_HIT_PLUS) {
+        hpe_engine_tab_new(engine);
+    }
+    return 1;
+}
+
 int hpe_chrome_mouse(HpeEngine *engine, int x, int y, int down, int mods)
 {
     AddrLayout L;
@@ -1057,6 +1263,9 @@ int hpe_chrome_mouse(HpeEngine *engine, int x, int y, int down, int mods)
 
     if (!engine || engine->chrome_h <= 0 || y >= engine->chrome_h)
         return 0;
+    /* the tab strip row handles its own presses */
+    if ((float)y < (float)HPE_TAB_H)
+        return tab_mouse(engine, x, y, down);
     btn = nav_btn_at(engine, (float)x, (float)y);
     if (btn >= 0) {
         /* a nav button is a full press/release cycle of its own */
@@ -1078,6 +1287,7 @@ int hpe_chrome_mouse(HpeEngine *engine, int x, int y, int down, int mods)
         if (!inside) {
             /* clicking the strip outside the field drops focus, like Chrome */
             engine->addr_focus = 0;
+            engine->ime_comp_len = 0;
             engine->addr_drag = 0;
             engine->addr_drag_live = 0;
             engine->dirty = HPE_DIRTY_CHROME;
@@ -1242,6 +1452,64 @@ int hpe_chrome_navigate(HpeEngine *engine)
 }
 
 /**
+ * @brief 更新输入法组合串的内联显示 / Update the inline display of the IME composition string
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     utf8 组合中的字符串（"" 表示清除）/ The in-progress string ("" to clear)
+ *
+ * @note 组合串画在插入符处并带下划线，不改动地址文本；超长按输入框容量截断；空串清除显示并恢复插入符 / The composition renders at the caret with an underline and never edits the address text; overlong input truncates to the field capacity; an empty string clears the display and restores the caret
+ */
+void hpe_engine_ime_compose(HpeEngine *engine, const char *utf8)
+{
+    if (!engine)
+        return;
+    engine->ime_comp_len = 0;
+    engine->ime_comp[0] = '\0';
+    if (utf8 && *utf8) {
+        size_t n = strlen(utf8);
+        if (n > sizeof(engine->ime_comp) - 1)
+            n = sizeof(engine->ime_comp) - 1;
+        /* never split a UTF-8 sequence when clamping */
+        while (n > 0 && ((unsigned char)utf8[n] & 0xC0) == 0x80)
+            n--;
+        memcpy(engine->ime_comp, utf8, n);
+        engine->ime_comp[n] = '\0';
+        engine->ime_comp_len = (int)n;
+    }
+    if (engine->dirty == HPE_DIRTY_NONE)
+        engine->dirty = HPE_DIRTY_CHROME;
+}
+
+/**
+ * @brief 提交输入法组合串（插入插入符处）/ Commit the IME composition string (inserted at the caret)
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     utf8 最终字符串 / The final string
+ *
+ * @return 插入成功返回 1，否则 0 / 1 when inserted, otherwise 0
+ *
+ * @note 等价于在插入符处插入文本并清除组合显示；未聚焦或空串时忽略 / Equivalent to inserting the text at the caret and clearing the composition; ignored while the bar is not focused or the string is empty
+ */
+int hpe_engine_ime_commit(HpeEngine *engine, const char *utf8)
+{
+    int len, changed;
+    if (!engine || !engine->addr_focus)
+        return 0;
+    len = utf8 ? (int)strlen(utf8) : 0;
+    if (len <= 0) {
+        engine->ime_comp_len = 0;
+        engine->ime_comp[0] = '\0';
+        return 0;
+    }
+    changed = addr_insert_at_caret(engine, utf8, len);
+    engine->ime_comp_len = 0;
+    engine->ime_comp[0] = '\0';
+    if (changed && engine->dirty == HPE_DIRTY_NONE)
+        engine->dirty = HPE_DIRTY_CHROME;
+    return changed;
+}
+
+/**
  * @brief 发送一个无修饰键的按键 / Send one key stroke with no modifier
  *
  * @param[in,out] engine 引擎实例 / Engine instance
@@ -1392,39 +1660,109 @@ static int addr_key_edit(HpeEngine *engine, int key, int ctrl, int shift)
  *
  * @see addr_key_edit hpe_chrome_navigate
  */
+/**
+ * @brief 页面级快捷键：复制/全选/清除页面选区 / Page-level shortcuts: copy/select/clear the page selection
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     key 按键码（`HPE_KEY_*`）/ Key code (`HPE_KEY_*`)
+ *
+ * @return 按键被消费返回 1，否则 0 / 1 when the key was consumed, otherwise 0
+ *
+ * @note 地址栏未聚焦时才走到这里；变化处标记整帧重绘 / Reached only when the address bar is not focused; changes mark a full repaint
+ */
+static int page_key_edit(HpeEngine *engine, int key)
+{
+    switch (key) {
+    case HPE_KEY_COPY:
+        return hpe_sel_copy(engine);
+    case HPE_KEY_SELECT_ALL:
+        if (hpe_sel_select_all(engine)) {
+            engine->dirty = HPE_DIRTY_FULL;
+            return 1;
+        }
+        return 0;
+    case HPE_KEY_ESCAPE:
+        if (hpe_sel_clear(engine)) {
+            engine->dirty = HPE_DIRTY_FULL;
+            return 1;
+        }
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+/**
+ * @brief 处理全局标签管理快捷键 / Handle the global tab-management shortcuts
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     key 按键码（`HPE_KEY_*`）/ Key code (`HPE_KEY_*`)
+ *
+ * @return 按键被消费返回 1，否则 0 / 1 when the key was consumed, otherwise 0
+ *
+ * @note Chrome 风格：即使地址栏聚焦也生效；仅一个标签时前进/后退键不消费 / Chrome-style: effective even with the address bar focused; with a single tab the cycle keys are not consumed
+ */
+static int tab_key(HpeEngine *engine, int key)
+{
+    if (key == HPE_KEY_TAB_NEW)
+        return hpe_engine_tab_new(engine);
+    if (key == HPE_KEY_TAB_CLOSE)
+        return hpe_engine_tab_close(engine, engine->tab_active);
+    if (key == HPE_KEY_TAB_NEXT || key == HPE_KEY_TAB_PREV) {
+        int n = engine->tab_count;
+        if (n < 2)
+            return 0;
+        return hpe_engine_tab_switch(engine, (engine->tab_active +
+                                              (key == HPE_KEY_TAB_NEXT ? 1 : n - 1)) % n);
+    }
+    return 0;
+}
+
 int hpe_engine_key_mods(HpeEngine *engine, int key, int mods)
 {
     int shift = (mods & HPE_MOD_SHIFT) != 0;
     int ctrl = (mods & HPE_MOD_CTRL) != 0;
     int changed;
 
-    if (!engine || engine->chrome_h <= 0 || !engine->addr_focus)
+    if (!engine)
         return 0;
 
-    if (key == HPE_KEY_RETURN) {
-        int ok = hpe_chrome_navigate(engine);
-        engine->addr_focus = 1;
-        engine->dirty = ok ? HPE_DIRTY_FULL : HPE_DIRTY_CHROME;
+    /* tab management shortcuts work globally, Chrome-style (even while the
+     * address bar has focus) */
+    if (tab_key(engine, key))
         return 1;
-    }
-    if (key == HPE_KEY_ESCAPE) {
-        /* Chrome: Escape puts back the address the field was showing when it got
-         * focus (the last committed page), then leaves the field */
-        if (strcmp(engine->addr, engine->addr_committed) != 0)
-            hpe_chrome_set_text(engine, engine->addr_committed);
-        engine->addr_focus = 0;
+
+    /* the address bar consumes keys only while it has focus */
+    if (engine->chrome_h > 0 && engine->addr_focus) {
+        if (key == HPE_KEY_RETURN) {
+            int ok = hpe_chrome_navigate(engine);
+            engine->addr_focus = 1;
+            engine->dirty = ok ? HPE_DIRTY_FULL : HPE_DIRTY_CHROME;
+            return 1;
+        }
+        if (key == HPE_KEY_ESCAPE) {
+            /* Chrome: Escape puts back the address the field was showing when it got
+             * focus (the last committed page), then leaves the field */
+            if (strcmp(engine->addr, engine->addr_committed) != 0)
+                hpe_chrome_set_text(engine, engine->addr_committed);
+            engine->addr_focus = 0;
+            engine->ime_comp_len = 0;
+            engine->dirty = HPE_DIRTY_CHROME;
+            return 1;
+        }
+
+        changed = addr_key_edit(engine, key, ctrl, shift);
+
+        engine->addr_drag = 0;
+        engine->addr_drag_live = 0;
+        if (!changed)
+            return 0;
         engine->dirty = HPE_DIRTY_CHROME;
         return 1;
     }
 
-    changed = addr_key_edit(engine, key, ctrl, shift);
-
-    engine->addr_drag = 0;
-    engine->addr_drag_live = 0;
-    if (!changed)
-        return 0;
-    engine->dirty = HPE_DIRTY_CHROME;
-    return 1;
+    /* page-level shortcuts: copy/select/clear the page text selection */
+    return page_key_edit(engine, key);
 }
 
 /**
@@ -1441,7 +1779,7 @@ void hpe_engine_enable_chrome(HpeEngine *engine)
 {
     if (!engine || engine->chrome_h > 0)
         return;
-    engine->chrome_h = HPE_CHROME_H;
+    engine->chrome_h = HPE_TAB_H + HPE_CHROME_H;
     if (engine->root)
         hpe_engine_relayout(engine); /* narrower viewport: re-clamp the scroll */
     else

@@ -1791,6 +1791,7 @@ static int decode_png(ByteReader *br, HpeImage *out)
         goto fail;
     }
 
+    hpe_free(inflated.data); /* raw scanlines are no longer needed / 解压行数据已摆放完毕，释放 */
     hpe_free(pi.idat.data);
     hpe_free(pi.alpha);
     out->width = (int)pi.width;
@@ -3020,6 +3021,8 @@ int hpe_image_load_file(const char *path, HpeImageFormat hint, HpeImage *out)
     buf = hpe_read_file(path, &size);
     if (!buf)
         return 0;
+    if (getenv("HPE_TRACE_IMAGE"))
+        fprintf(stderr, "image decode: %s (%zu bytes)\n", path, size);
     if (hint == HPE_IMG_UNKNOWN)
         hint = hpe_image_format_from_path(path);
     ok = decode_any((const uint8_t *)buf, size, hint, out);
@@ -3075,15 +3078,26 @@ const HpeImage *hpe_image_cache_get(HpeImageCache *cache, const char *path, HpeI
 {
     ImageCacheEntry *e;
     HpeImage decoded;
+    HpeImageFormat stored;
     if (!cache || !path)
         return NULL;
 
     for (e = cache->head; e; e = e->next) {
         if (e->want_w == want_w && e->want_h == want_h && e->hint == hint &&
-            strcmp(e->path, path) == 0)
+            strcmp(e->path, path) == 0) {
+            if (getenv("HPE_TRACE_IMAGE"))
+                fprintf(stderr, "cache hit: %s (count=%d)\n", path, cache->count);
             return &e->image;
+        }
     }
+    if (getenv("HPE_TRACE_IMAGE"))
+        fprintf(stderr, "cache miss: %s (count=%d)\n", path, cache->count);
 
+    /* the key keeps the caller's hint verbatim: lookups always come in with the
+     * same argument, so storing the sniffed format would make every later
+     * lookup with HPE_IMG_UNKNOWN miss forever / 缓存键保存调用方的原始 hint：
+     * 查找参数恒定，若存嗅探出的格式则后续 UNKNOWN 查找永不命中 */
+    stored = hint;
     if (hint == HPE_IMG_UNKNOWN)
         hint = hpe_image_format_from_path(path);
     memset(&decoded, 0, sizeof(decoded));
@@ -3105,7 +3119,7 @@ const HpeImage *hpe_image_cache_get(HpeImageCache *cache, const char *path, HpeI
         return NULL;
     }
     e->path = hpe_strdup(path);
-    e->hint = hint;
+    e->hint = stored;
     e->want_w = want_w;
     e->want_h = want_h;
     e->image = decoded;

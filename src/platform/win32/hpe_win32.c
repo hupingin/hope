@@ -1,6 +1,7 @@
 #include "platform/hpe_platform.h"
 
 #include <windows.h>
+#include <imm.h>
 #include <shellapi.h>
 #include <stdio.h>
 #include <string.h>
@@ -63,6 +64,7 @@ static void utf8_to_wide(const char *s, wchar_t *out, int out_count)
 /* ---------------- window ---------------- */
 
 static LRESULT CALLBACK hope_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam);
+static int cp_to_wchars(uint32_t cp, wchar_t out[2]); /* defined in the font section / 定义见字体一节 */
 
 /**
  * @brief 注册共享窗口类（每进程一次）/ Register the shared window class once per process
@@ -393,6 +395,78 @@ static LRESULT hope_on_char(HpeWindow *win, WPARAM wparam)
 }
 
 /**
+ * @brief 从输入法上下文取一个 UTF-16 组合串并转为 UTF-8 / Read one UTF-16 IME string and convert it to UTF-8
+ *
+ * @param[in]     imc 输入法上下文 / The input method context
+ * @param[in]     index 串类型（GCS_COMPSTR 或 GCS_RESULTSTR）/ String kind (GCS_COMPSTR or GCS_RESULTSTR)
+ * @param[out]    utf8 接收 UTF-8 结果 / Receives the UTF-8 string
+ * @param[in]     n 缓冲字节数 / Buffer size in bytes
+ *
+ * @return 成功返回 1，空串或失败返回 0 / 1 on success, 0 when empty or on failure
+ *
+ * @note 两步查询（先大小后内容）；UTF-16 按 MultiByteToWideChar 转换 / Two-step query (size then contents); UTF-16 is converted with MultiByteToWideChar
+ */
+static int ime_get_string_w(HIMC imc, DWORD index, char *utf8, size_t n)
+{
+    LONG wlen = ImmGetCompositionStringW(imc, index, NULL, 0);
+    wchar_t *w;
+    int ok = 0;
+    if (wlen <= 0)
+        return 0;
+    w = (wchar_t *)hpe_alloc((size_t)wlen + sizeof(wchar_t));
+    if (!w)
+        return 0;
+    if (ImmGetCompositionStringW(imc, index, w, wlen) >= 0) {
+        int cch = wlen / (LONG)sizeof(wchar_t);
+        int bytes = WideCharToMultiByte(CP_UTF8, 0, w, cch, NULL, 0, NULL, NULL);
+        if (bytes > 0 && (size_t)bytes < n) {
+            char *tmp = (char *)hpe_alloc((size_t)bytes + 1);
+            if (tmp) {
+                if (WideCharToMultiByte(CP_UTF8, 0, w, cch, tmp, bytes, NULL, NULL) > 0) {
+                    tmp[bytes] = '\0';
+                    snprintf(utf8, n, "%s", tmp);
+                    ok = 1;
+                }
+                hpe_free(tmp);
+            }
+        }
+    }
+    hpe_free(w);
+    return ok;
+}
+
+/**
+ * @brief 处理输入法组合消息 / Handle the IME composition message
+ *
+ * @param[in,out] win 目标窗口 / Target window
+ * @param[in]     hwnd 窗口句柄 / Window handle
+ * @param[in]     lparam 消息附加参数（GCS_* 位掩码）/ Message lparam (GCS_* bit mask)
+ *
+ * @return 消息处理结果，恒为 0 / The message result, always 0
+ *
+ * @note GCS_COMPSTR 更新内联组合显示，GCS_RESULTSTR 提交最终串；返回 0 吃掉默认路径，避免 IME 再发 WM_CHAR 造成重复插入 / GCS_COMPSTR updates the inline composition display and GCS_RESULTSTR commits the final string; returning 0 eats the default path so the IME does not also emit WM_CHAR (which would insert twice)
+ */
+static LRESULT hope_on_ime_composition(HpeWindow *win, HWND hwnd, LPARAM lparam)
+{
+    HIMC imc = ImmGetContext(hwnd);
+    char utf8[1024];
+    if (!imc)
+        return 0;
+    if ((lparam & GCS_COMPSTR) && win->cb.on_ime_compose) {
+        if (ime_get_string_w(imc, GCS_COMPSTR, utf8, sizeof(utf8)))
+            win->cb.on_ime_compose(win->user, utf8);
+        else
+            win->cb.on_ime_compose(win->user, "");
+    }
+    if ((lparam & GCS_RESULTSTR) && win->cb.on_ime_commit) {
+        if (ime_get_string_w(imc, GCS_RESULTSTR, utf8, sizeof(utf8)))
+            win->cb.on_ime_commit(win->user, utf8);
+    }
+    ImmReleaseContext(hwnd, imc);
+    return 0;
+}
+
+/**
  * @brief 处理 `WM_SETCURSOR` 消息 / Handle a `WM_SETCURSOR` message
  *
  * @param[in,out] win 窗口对象 / Window object
@@ -415,6 +489,82 @@ static LRESULT hope_on_set_cursor(HpeWindow *win, HWND hwnd, UINT msg, WPARAM wp
         return TRUE;
     }
     return DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+
+/**
+ * @brief 处理输入法生命周期消息 / Handle the IME lifecycle messages
+ *
+ * @param[in,out] win 窗口对象 / Window object
+ * @param[in]     hwnd 窗口句柄 / Window handle
+ * @param[in]     msg 窗口消息编号（START/COMPOSITION/END）/ Message id (START/COMPOSITION/END)
+ * @param[in]     lparam 消息附加参数，`WM_IME_COMPOSITION` 时为 GCS_* 位掩码 / Message lparam, the GCS_* mask for `WM_IME_COMPOSITION`
+ *
+ * @return 恒为 0（吃掉默认路径，避免 IME 再发 WM_CHAR 造成重复插入）/ Always 0 (the default path is eaten so the IME does not also emit WM_CHAR, which would insert twice)
+ *
+ * @note START/END 清空组合显示，COMPOSITION 分别更新组合串与提交最终串 / START/END clear the composition display; COMPOSITION updates the in-progress string and commits the final one
+ *
+ * @see hope_on_ime_composition hope_wnd_dispatch
+ */
+static LRESULT hope_wnd_ime(HpeWindow *win, HWND hwnd, UINT msg, LPARAM lparam)
+{
+    switch (msg) {
+    case WM_IME_STARTCOMPOSITION:
+        if (win->cb.on_ime_compose)
+            win->cb.on_ime_compose(win->user, "");
+        return 0;
+    case WM_IME_COMPOSITION:
+        return hope_on_ime_composition(win, hwnd, lparam);
+    default: /* WM_IME_ENDCOMPOSITION: a cancel or an end the result already reported */
+        if (win->cb.on_ime_compose)
+            win->cb.on_ime_compose(win->user, "");
+        return 0;
+    }
+}
+
+/**
+ * @brief 把输入类消息映射到回调 / Map input messages onto engine callbacks
+ *
+ * @param[in,out] win 窗口对象 / Window object
+ * @param[in]     hwnd 窗口句柄 / Window handle
+ * @param[in]     msg 窗口消息编号 / Window message identifier
+ * @param[in]     wparam 消息主参数 / Message WParam
+ * @param[in]     lparam 消息附加参数 / Message LParam
+ *
+ * @return 处理结果 / The message result
+ *
+ * @note 覆盖按键、字符、输入法、鼠标与光标消息 / Covers key, char, IME, mouse and cursor messages
+ *
+ * @see hope_wnd_dispatch
+ */
+static LRESULT hope_wnd_input(HpeWindow *win, HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam)
+{
+    switch (msg) {
+    case WM_KEYDOWN:
+        if (win->cb.on_key)
+            win->cb.on_key(win->user, (int)wparam, hope_mods());
+        return 0;
+    case WM_KEYUP:
+        if (win->cb.on_key_up)
+            win->cb.on_key_up(win->user, (int)wparam, hope_mods());
+        return 0;
+    case WM_CHAR:
+        return hope_on_char(win, wparam);
+    case WM_IME_STARTCOMPOSITION:
+    case WM_IME_COMPOSITION:
+    case WM_IME_ENDCOMPOSITION:
+        return hope_wnd_ime(win, hwnd, msg, lparam);
+    case WM_LBUTTONDOWN:
+        return hope_on_mouse(win, hwnd, lparam, 0, 1);
+    case WM_LBUTTONUP:
+        return hope_on_mouse(win, hwnd, lparam, 0, 0);
+    case WM_MOUSEMOVE:
+        /* button = -1 signals a pointer move (no button state change) */
+        return hope_on_mouse(win, hwnd, lparam, -1, 0);
+    case WM_SETCURSOR:
+        return hope_on_set_cursor(win, hwnd, msg, wparam, lparam);
+    default:
+        return -1; /* not an input message */
+    }
 }
 
 /**
@@ -454,25 +604,6 @@ static LRESULT hope_wnd_dispatch(HpeWindow *win, HWND hwnd, UINT msg, WPARAM wpa
             win->cb.on_scroll(win->user, -(float)GET_WHEEL_DELTA_WPARAM(wparam) /
                                            (float)WHEEL_DELTA * 3.0f);
         return 0;
-    case WM_KEYDOWN:
-        if (win->cb.on_key)
-            win->cb.on_key(win->user, (int)wparam, hope_mods());
-        return 0;
-    case WM_KEYUP:
-        if (win->cb.on_key_up)
-            win->cb.on_key_up(win->user, (int)wparam, hope_mods());
-        return 0;
-    case WM_CHAR:
-        return hope_on_char(win, wparam);
-    case WM_LBUTTONDOWN:
-        return hope_on_mouse(win, hwnd, lparam, 0, 1);
-    case WM_LBUTTONUP:
-        return hope_on_mouse(win, hwnd, lparam, 0, 0);
-    case WM_MOUSEMOVE:
-        /* button = -1 signals a pointer move (no button state change) */
-        return hope_on_mouse(win, hwnd, lparam, -1, 0);
-    case WM_SETCURSOR:
-        return hope_on_set_cursor(win, hwnd, msg, wparam, lparam);
     case WM_TIMER:
         if (wparam == 1 && win->cb.on_tick)
             win->cb.on_tick(win->user);
@@ -480,8 +611,12 @@ static LRESULT hope_wnd_dispatch(HpeWindow *win, HWND hwnd, UINT msg, WPARAM wpa
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
-    default:
+    default: {
+        LRESULT r = hope_wnd_input(win, hwnd, msg, wparam, lparam);
+        if (r >= 0)
+            return r;
         return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
     }
 }
 
@@ -1154,11 +1289,31 @@ struct HpePlatFont {
 };
 
 /**
+ * @brief 把字体族映射为具体字体名 / Map a font family onto a concrete typeface name
+ *
+ * @param[in]     family 字体族 / Font family
+ *
+ * @return 字体名的宽字符形式 / The typeface name as a wide string
+ *
+ * @note mono 取 Consolas、serif 取 Times New Roman，其余取 Microsoft YaHei / Mono uses Consolas, serif uses Times New Roman, everything else Microsoft YaHei
+ *
+ * @see hpe_plat_font_create
+ */
+static const wchar_t *face_for_family(HpeFontFamily family)
+{
+    if (family == HPE_FONT_MONO)
+        return L"Consolas";
+    if (family == HPE_FONT_SERIF)
+        return L"Times New Roman";
+    return L"Microsoft YaHei";
+}
+
+/**
  * @brief 创建 GDI 字体句柄 / Create a GDI font handle
  *
  * @param[in]     pixel_size 字号（像素），取整并夹在 6..240 / Font size in pixels, rounded and clamped to 6..240
  * @param[in]     weight 字重，`>= 700` 用粗体 / Font weight, uses bold when `>= 700`
- * @param[in]     family 字体族，决定实际字体名 / Font family, selects the actual typeface
+ * @param[in]     face 字体名（宽字符） / Typeface name (wide)
  *
  * @return 新字体对象，失败返回 NULL / The new font object, NULL on failure
  *
@@ -1166,24 +1321,16 @@ struct HpePlatFont {
  *
  * @see hpe_plat_font_destroy
  */
-HpePlatFont *hpe_plat_font_create(float pixel_size, int weight, HpeFontFamily family)
+static HpePlatFont *plat_font_create_named(float pixel_size, int weight, const wchar_t *face)
 {
     HpePlatFont *font;
     TEXTMETRICW tm;
     int px = (int)(pixel_size + 0.5f);
-    const wchar_t *face;
 
     if (px < 6)
         px = 6;
     if (px > 240)
         px = 240;
-
-    if (family == HPE_FONT_MONO)
-        face = L"Consolas";
-    else if (family == HPE_FONT_SERIF)
-        face = L"Times New Roman";
-    else
-        face = L"Microsoft YaHei";
 
     font = (HpePlatFont *)hpe_calloc(1, sizeof(HpePlatFont));
     font->hdc = CreateCompatibleDC(NULL);
@@ -1212,6 +1359,71 @@ HpePlatFont *hpe_plat_font_create(float pixel_size, int weight, HpeFontFamily fa
     font->descent = tm.tmDescent;
     font->line_height = tm.tmHeight + tm.tmExternalLeading;
     return font;
+}
+
+/**
+ * @brief 创建平台字体对象 / Create a platform font object
+ *
+ * @param[in]     pixel_size 字号（像素）/ Font size in pixels
+ * @param[in]     weight 字重 / Font weight
+ * @param[in]     family 字体族 / Font family
+ *
+ * @return 新字体对象，失败返回 NULL / The new font object, NULL on failure
+ *
+ * @note 由 `hpe_plat_font_create_face` 按字体族映射出的字体名创建 / Created through `hpe_plat_font_create_face` with the family-mapped name
+ *
+ * @see hpe_plat_font_destroy
+ */
+HpePlatFont *hpe_plat_font_create(float pixel_size, int weight, HpeFontFamily family)
+{
+    return plat_font_create_named(pixel_size, weight, face_for_family(family));
+}
+
+/**
+ * @brief 用显式字体名创建平台字体对象 / Create a platform font object with an explicit face name
+ *
+ * @param[in]     pixel_size 字号（像素）/ Font size in pixels
+ * @param[in]     weight 字重 / Font weight
+ * @param[in]     face_utf8 字体名（UTF-8），NULL 时按字体族映射 / Typeface name in UTF-8, NULL maps by family
+ *
+ * @return 新字体对象，失败返回 NULL / The new font object, NULL on failure
+ *
+ * @note 字体不存在时 GDI 会静默替换，调用方需用 `hpe_plat_font_covers` 验证覆盖 / GDI silently substitutes a missing face, so callers should verify coverage with `hpe_plat_font_covers`
+ *
+ * @see hpe_plat_font_destroy
+ */
+HpePlatFont *hpe_plat_font_create_face(float pixel_size, int weight, const char *face_utf8)
+{
+    wchar_t wface[64];
+    if (!face_utf8 || !face_utf8[0])
+        return plat_font_create_named(pixel_size, weight, face_for_family(HPE_FONT_SANS));
+    utf8_to_wide(face_utf8, wface, 64);
+    return plat_font_create_named(pixel_size, weight, wface);
+}
+
+/**
+ * @brief 判断字体是否覆盖某个码点 / Test whether the font covers a code point
+ *
+ * @param[in,out] font 字体对象 / Font object
+ * @param[in]     codepoint Unicode 码点 / Unicode code point
+ *
+ * @return 覆盖返回 1，未覆盖或字体为空返回 0 / 1 when covered, 0 when missing or the font is NULL
+ *
+ * @note 用 `GetGlyphIndicesW` 并带 `GGI_MARK_NONEXISTING_GLYPHS` 标记缺字 / Uses `GetGlyphIndicesW` with `GGI_MARK_NONEXISTING_GLYPHS`
+ *
+ * @see hpe_plat_font_create
+ */
+int hpe_plat_font_covers(HpePlatFont *font, uint32_t codepoint)
+{
+    wchar_t buf[2];
+    WORD glyph = 0xFFFF;
+    int n;
+    if (!font)
+        return 0;
+    n = cp_to_wchars(codepoint, buf);
+    if (GetGlyphIndicesW(font->hdc, buf, n, &glyph, GGI_MARK_NONEXISTING_GLYPHS) == GDI_ERROR)
+        return 0;
+    return glyph != 0xFFFF;
 }
 
 /**
@@ -1498,4 +1710,136 @@ void hpe_text_mask_free(HpeTextMask *mask)
     if (mask->coverage)
         hpe_free(mask->coverage);
     memset(mask, 0, sizeof(*mask));
+}
+
+/* ---------------- color emoji (COLRv0 layer outlines) ---------------- */
+
+struct HpePlatEmojiFont {
+    HFONT hfont;
+    HDC hdc;
+    HGDIOBJ old_font;
+    int px;
+};
+
+/**
+ * @brief 打开彩色 emoji 字体（按字号）/ Open the color emoji font at a pixel size
+ *
+ * @param[in]     pixel_size 字号（像素）/ Font size in pixels
+ *
+ * @return 新对象，系统无彩色 emoji 字体时返回 NULL / The new object, NULL when the system has no color emoji font
+ *
+ * @note 选入 `Segoe UI Emoji` 后用 `GetTextFaceW` 验证 GDI 没有替换掉它 / Selects `Segoe UI Emoji` and verifies with `GetTextFaceW` that GDI did not substitute it
+ *
+ * @see hpe_plat_emoji_font_destroy
+ */
+HpePlatEmojiFont *hpe_plat_emoji_font_create(float pixel_size)
+{
+    HpePlatEmojiFont *ef;
+    WCHAR face[64];
+    int px = (int)(pixel_size + 0.5f);
+    if (px < 6)
+        px = 6;
+    if (px > 240)
+        px = 240;
+    ef = (HpePlatEmojiFont *)hpe_calloc(1, sizeof(HpePlatEmojiFont));
+    ef->px = px;
+    ef->hdc = CreateCompatibleDC(NULL);
+    if (!ef->hdc) {
+        hpe_free(ef);
+        return NULL;
+    }
+    ef->hfont = CreateFontW(-px, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                            OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
+                            DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI Emoji");
+    if (!ef->hfont) {
+        DeleteDC(ef->hdc);
+        hpe_free(ef);
+        return NULL;
+    }
+    ef->old_font = SelectObject(ef->hdc, ef->hfont);
+    SetMapMode(ef->hdc, MM_TEXT);
+    /* a missing face is silently substituted; verify it really is the emoji font */
+    if (GetTextFaceW(ef->hdc, 64, face) == 0 || lstrcmpiW(face, L"Segoe UI Emoji") != 0) {
+        hpe_plat_emoji_font_destroy(ef);
+        return NULL;
+    }
+    return ef;
+}
+
+/**
+ * @brief 按字形索引取抗锯齿覆盖率轮廓 / Fetch an antialiased coverage outline by glyph index
+ *
+ * @param[in,out] font emoji 字体对象 / Emoji font object
+ * @param[in]     glyph_id 字形索引 / Glyph index
+ * @param[out]    out 接收轮廓的结构，coverage 由调用方 `hpe_free` / Receives the outline, the coverage is freed by the caller via `hpe_free`
+ *
+ * @return 成功返回 1，空字形或失败返回 0 / 1 on success, 0 for a blank glyph or failure
+ *
+ * @note `GGO_GRAY8_BITMAP` 输出 0..64 共 65 级灰度，这里归一到 0..255 / `GGO_GRAY8_BITMAP` yields 65 grey levels in 0..64, normalised here to 0..255
+ *
+ * @see hpe_plat_emoji_font_create
+ */
+int hpe_plat_emoji_glyph(HpePlatEmojiFont *font, uint32_t glyph_id, HpeGlyphOutline *out)
+{
+    GLYPHMETRICS gm;
+    /* identity MAT2: each FIXED is {fract, value} / 单位 MAT2：FIXED 为 {小数, 整数} */
+    MAT2 mat = {{0, 1}, {0, 0}, {0, 0}, {0, 1}};
+    DWORD size;
+    unsigned char *buf, *cov;
+
+    if (!out)
+        return 0;
+    memset(out, 0, sizeof(*out));
+    if (!font)
+        return 0;
+    size = GetGlyphOutlineW(font->hdc, (UINT)glyph_id, GGO_GLYPH_INDEX | GGO_GRAY8_BITMAP, &gm,
+                            0, NULL, &mat);
+    if (getenv("HPE_TRACE_EMOJI"))
+        fprintf(stderr, "glyph: id=%u size=%lu bb=%u err=%lu\n", glyph_id,
+                (unsigned long)size, gm.gmBlackBoxX, GetLastError());
+    if (size == GDI_ERROR || gm.gmBlackBoxX == 0 || gm.gmBlackBoxY == 0)
+        return 0;
+    buf = (unsigned char *)hpe_alloc(size);
+    if (GetGlyphOutlineW(font->hdc, (UINT)glyph_id, GGO_GLYPH_INDEX | GGO_GRAY8_BITMAP, &gm,
+                         size, buf, &mat) == GDI_ERROR) {
+        hpe_free(buf);
+        return 0;
+    }
+    cov = (unsigned char *)hpe_alloc((size_t)gm.gmBlackBoxX * gm.gmBlackBoxY);
+    {
+        /* rows are DWORD-aligned in the GGO buffer / GGO 缓冲每行按 DWORD 对齐 */
+        DWORD stride = (gm.gmBlackBoxX + 3u) & ~3u;
+        DWORD y, x;
+        for (y = 0; y < gm.gmBlackBoxY; y++)
+            for (x = 0; x < gm.gmBlackBoxX; x++)
+                cov[y * gm.gmBlackBoxX + x] = (unsigned char)(buf[y * stride + x] * 255 / 64);
+    }
+    hpe_free(buf);
+    out->coverage = cov;
+    out->w = gm.gmBlackBoxX;
+    out->h = gm.gmBlackBoxY;
+    out->left = gm.gmptGlyphOrigin.x;
+    out->baseline = gm.gmptGlyphOrigin.y; /* rows above the baseline / 基线之上的行数 */
+    out->advance = (float)gm.gmCellIncX;
+    return 1;
+}
+
+/**
+ * @brief 关闭彩色 emoji 字体并释放资源 / Close the color emoji font and release its resources
+ *
+ * @param[in,out] font emoji 字体对象，NULL 时无操作 / Emoji font object, NULL is a no-op
+ *
+ * @see hpe_plat_emoji_font_create
+ */
+void hpe_plat_emoji_font_destroy(HpePlatEmojiFont *font)
+{
+    if (!font)
+        return;
+    if (font->hdc) {
+        SelectObject(font->hdc, font->old_font);
+        DeleteDC(font->hdc);
+    }
+    if (font->hfont)
+        DeleteObject(font->hfont);
+    hpe_free(font);
 }

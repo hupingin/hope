@@ -240,6 +240,32 @@ void hpe_engine_render(HpeEngine *engine);
 #define HPE_KEY_RIGHT 0x110006
 #define HPE_KEY_HOME 0x110007
 #define HPE_KEY_END 0x110008
+#define HPE_KEY_TAB_NEW 0x110009    /* Ctrl+T: open a new blank tab */
+#define HPE_KEY_TAB_CLOSE 0x11000a  /* Ctrl+W: close the active tab */
+#define HPE_KEY_TAB_NEXT 0x11000b   /* Ctrl+Tab: switch to the next tab */
+#define HPE_KEY_TAB_PREV 0x11000c   /* Ctrl+Shift+Tab: switch to the previous tab */
+
+/**
+ * @brief 更新输入法组合串的内联显示 / Update the inline display of the IME composition string
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     utf8 组合中的字符串（"" 表示清除）/ The in-progress string ("" to clear)
+ *
+ * @note 组合串画在插入符处并带下划线，不改动地址文本；空串清除显示并恢复插入符 / The composition renders at the caret with an underline and never edits the address text; an empty string clears the display and restores the caret
+ */
+void hpe_engine_ime_compose(HpeEngine *engine, const char *utf8);
+
+/**
+ * @brief 提交输入法组合串（插入插入符处）/ Commit the IME composition string (inserted at the caret)
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     utf8 最终字符串 / The final string
+ *
+ * @return 插入成功返回 1，否则 0 / 1 when inserted, otherwise 0
+ *
+ * @note 等价于在插入符处插入文本并清除组合显示；未聚焦或空串时忽略 / Equivalent to inserting the text at the caret and clearing the composition; ignored while the bar is not focused or the string is empty
+ */
+int hpe_engine_ime_commit(HpeEngine *engine, const char *utf8);
 
 /**
  * @brief 为引擎启用自绘地址栏 / Enable the engine's self-drawn address bar
@@ -251,6 +277,36 @@ void hpe_engine_render(HpeEngine *engine);
  * @see hpe_engine_chrome_height
  */
 void hpe_engine_enable_chrome(HpeEngine *engine);
+
+/**
+ * @brief 取当前打开的标签数 / Get the number of open tabs
+ *
+ * @param[in]     engine 引擎实例 / Engine instance
+ *
+ * @return 标签数，`engine` 为 NULL 时返回 0 / Tab count, 0 when `engine` is NULL
+ */
+int hpe_engine_tab_count(HpeEngine *engine);
+
+/**
+ * @brief 取当前活动标签下标 / Get the active tab's index
+ *
+ * @param[in]     engine 引擎实例 / Engine instance
+ *
+ * @return 活动标签下标，`engine` 为 NULL 时返回 -1 / Active tab index, -1 when `engine` is NULL
+ */
+int hpe_engine_tab_active(HpeEngine *engine);
+
+/**
+ * @brief 切换到指定下标的标签 / Switch to the tab at the given index
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     index 目标标签下标 / Index of the target tab
+ *
+ * @return 成功返回 1，下标非法或已是当前标签返回 0 / 1 on success, 0 for an invalid index or the already-active tab
+ *
+ * @note 切换会保存当前标签的路径/历史/滚动，重载目标标签的文档并恢复其滚动 / Switching saves the current tab's path/history/scroll, reloads the target document and restores its scroll
+ */
+int hpe_engine_tab_switch(HpeEngine *engine, int index);
 
 /**
  * @brief 取地址栏高度 / Get the address-bar height

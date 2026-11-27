@@ -5,6 +5,33 @@
 #include "layout/hpe_layout.h"
 #include "render/hpe_pixmap.h"
 
+/* ---------- text selection highlight ---------- */
+
+/**
+ * @brief 一个文本盒的选中字节区间 / Selected byte range of one text box
+ */
+typedef struct HpePaintSelEntry {
+    const struct HpeBox *box; /* 选区命中的文本盒 / The selected text box */
+    int start, end;           /* box->text 内的选中字节区间 [start, end) / Byte range within box->text */
+} HpePaintSelEntry;
+
+/**
+ * @brief 本帧选区描述：文档序排列的逐盒区间表 / This frame's selection: per-box ranges in document order
+ */
+typedef struct HpePaintSel {
+    const HpePaintSelEntry *entries; /* 区间表，可为 NULL / Range table, may be NULL */
+    int count;                       /* 区间个数 / Number of entries */
+} HpePaintSel;
+
+/**
+ * @brief 设置绘制阶段的选区描述（下一帧起生效）/ Set the paint-time selection descriptor (effective from the next frame)
+ *
+ * @param[in]     sel 选区描述，NULL 清除 / The selection descriptor, NULL to clear
+ *
+ * @note 指针由调用方持有且须在绘制期间保持有效；引擎在每次重绘前重建并传入 / The pointer is caller-owned and must stay valid during painting; the engine rebuilds and passes it before every repaint
+ */
+void hpe_paint_set_selection(const HpePaintSel *sel);
+
 /**
  * @brief 绘制整个文档 / Paint the whole document
  *
