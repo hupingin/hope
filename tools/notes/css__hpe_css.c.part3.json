@@ -1,0 +1,348 @@
+{
+  "skip_ws_comments": {
+    "brief": "跳过空白与 `/* */` 注释 / Skip whitespace and `/* */` comments",
+    "details": "循环跳过空白；遇到 `/*` 则一路跳到配对的 `*/` 之后继续，注释未闭合时直接跳到输入末尾。| Whitespace is skipped in a loop; on `/*` the scan runs to the matching `*/` and continues, and an unterminated comment sends the cursor to the end of the input.",
+    "params": {
+      "pp": "inout:解析游标指针 / Parse cursor pointer",
+      "end": "输入缓冲区末尾 / End of the input buffer"
+    },
+    "see": "css_parse_into"
+  },
+  "find_block_end": {
+    "brief": "找到与起始 `{` 配对的 `}` / Find the `}` matching a block's opening `{`",
+    "details": "从 `block` 开始按大括号计数扫描，每遇到 `}` 深度减一，深度归零即返回该位置；块未闭合时返回 `end`。| The scan counts braces from `block`, decrementing on each `}` and returning that position when the depth reaches zero; an unterminated block returns `end`.",
+    "params": {
+      "block": "块体起始指针（`{` 之后）/ Pointer to the block body, just past `{`",
+      "end": "输入缓冲区末尾 / End of the input buffer"
+    },
+    "return": "配对的 `}` 位置，或未闭合时的 `end` / The matching `}` position, or `end` when unterminated",
+    "see": "parse_at_rule"
+  },
+  "sheet_add_rule": {
+    "brief": "把一条已解析的规则连同其 @media 链追加到样式表 / Append a fully-parsed rule with its @media chain to a stylesheet",
+    "details": "`mq_depth` 大于 0 时把外层 `@media` 的媒体查询栈整段复制进规则的 `mq` 并记录深度，随后扩容规则数组并以值拷贝追加该规则。| When `mq_depth` is above 0 the enclosing `@media` query stack is copied wholesale into the rule's `mq` array with its depth recorded, after which the rule array is grown and the rule appended by value.",
+    "params": {
+      "sheet": "inout:目标样式表 / Target stylesheet",
+      "rule": "inout:待追加的规则（其声明数组所有权移交样式表）/ Rule being appended, whose declaration array ownership transfers to the sheet",
+      "mq_stack": "外层 `@media` 的媒体查询栈 / Media query stack of enclosing `@media` blocks",
+      "mq_depth": "嵌套深度 / Nesting depth"
+    },
+    "see": "parse_style_rule rule_media_ok"
+  },
+  "parse_at_rule": {
+    "brief": "解析一个 at-rule 的体 / Parse the body of an at-rule",
+    "details": "以 `;` 结尾的语句型 at-rule 直接跳过；否则找到块体匹配的 `}`，若是 `@media` 且未超过嵌套上限则解析其条件并压栈，再以更深的栈递归 `css_parse_into`；其它 at-rule 整体跳过，避免未知块破坏后续规则流。| A statement at-rule ending in `;` is skipped; otherwise the matching `}` of its body is found, and for an `@media` within the nesting limit its conditions are parsed and pushed before recursing into `css_parse_into` with a deeper stack; any other at-rule is skipped wholesale so an unknown block never corrupts the surrounding rule stream.",
+    "params": {
+      "sheet": "inout:目标样式表 / Target stylesheet",
+      "pp": "inout:解析游标指针 / Parse cursor pointer",
+      "q": "at-rule 头部结束处（`;` 或 `{`）/ End of the at-rule prelude (`;` or `{`)",
+      "end": "输入缓冲区末尾 / End of the input buffer",
+      "mq_stack": "媒体查询栈 / Media query stack",
+      "mq_depth": "当前嵌套深度 / Current nesting depth"
+    },
+    "see": "parse_media_query css_parse_into find_block_end"
+  },
+  "find_decl_block_end": {
+    "brief": "前进到声明块结束，识别字符串中的 `}` / Advance to the end of a declaration block, honouring quoted strings",
+    "details": "扫描到 `}` 为止，但遇到引号时先跳到配对的引号之后，因此字符串值里的 `}` 不会提前结束块。| The scan runs to `}` but on a quote it jumps past the matching quote first, so a `}` inside a string value does not terminate the block early.",
+    "params": {
+      "p": "块体起始指针 / Pointer to the start of the block body",
+      "end": "输入缓冲区末尾 / End of the input buffer"
+    },
+    "return": "块结束的 `}` 位置，或未闭合时的 `end` / The terminating `}` position, or `end` when unterminated",
+    "see": "parse_style_rule"
+  },
+  "parse_style_rule": {
+    "brief": "解析一条 `选择器 { 声明 }` 规则 / Parse one `selector { declarations }` rule",
+    "details": "先定位 `{` 得到选择器与声明区间，解析选择器列表后解析声明块；仅当选择器非空且声明确实设置了属性时，才把该规则连同递增的源码顺序号追加到样式表。| The `{` is located to delimit the selector and declaration spans, the selector list and declaration block are then parsed, and only when selectors are present and the declarations actually set a property is the rule appended to the sheet with an incremented source-order number.",
+    "params": {
+      "sheet": "inout:目标样式表 / Target stylesheet",
+      "pp": "inout:解析游标指针 / Parse cursor pointer",
+      "end": "输入缓冲区末尾 / End of the input buffer",
+      "mq_stack": "外层 `@media` 的媒体查询栈 / Media query stack of enclosing `@media` blocks",
+      "mq_depth": "嵌套深度 / Nesting depth"
+    },
+    "note": "找不到 `{` 或声明为空时游标推进到末尾且不产生规则 / When no `{` is found or the declarations are empty the cursor moves to the end and no rule is produced",
+    "see": "parse_selector_list hpe_css_parse_declarations sheet_add_rule"
+  },
+  "css_parse_into": {
+    "brief": "递归解析样式表文本并追加规则 / Recursively parse stylesheet text and append rules",
+    "details": "跳过空白与注释后，`@` 开头的交给 `parse_at_rule`（`@media` 会以更深的栈递归回本函数），其余交给 `parse_style_rule`；规则的 `mq_stack` 保存外层 `@media` 条件（最外层在前），层叠时须整条链都匹配视口才生效。| After whitespace and comments are skipped, `@`-prefixed input goes to `parse_at_rule` (whose `@media` re-enters this function with a deeper stack) and anything else to `parse_style_rule`; a rule's `mq_stack` holds the enclosing `@media` conditions outermost first and only matches at cascade time when the whole chain matches the viewport.",
+    "params": {
+      "sheet": "inout:目标样式表 / Target stylesheet",
+      "css": "待解析的 CSS 文本 / CSS text to parse",
+      "length": "`css` 的字节长度 / Byte length of `css`",
+      "mq_stack": "媒体查询栈 / Media query stack",
+      "mq_depth": "当前嵌套深度 / Current nesting depth"
+    },
+    "note": "`sheet` 或 `css` 为 `NULL` 时直接返回 / It returns immediately when `sheet` or `css` is `NULL`",
+    "see": "parse_at_rule parse_style_rule hpe_css_parse"
+  },
+  "hpe_css_parse": {
+    "brief": "解析一段 CSS 文本并追加到样式表 / Parse CSS text and append it to a stylesheet",
+    "details": "在栈上分配媒体查询栈后从第 0 层开始调用 `css_parse_into`，规则按出现顺序追加且不会清空已有规则。| A media-query stack is allocated on the stack and `css_parse_into` is entered at depth 0; rules are appended in source order and existing rules are kept.",
+    "params": {
+      "sheet": "inout:目标样式表 / Target stylesheet",
+      "css": "待解析的 CSS 文本 / CSS text to parse",
+      "length": "`css` 的字节长度 / Byte length of `css`"
+    },
+    "see": "css_parse_into hpe_css_init"
+  },
+  "hpe_css_init": {
+    "brief": "初始化样式表并载入内置 UA 样式 / Initialise a stylesheet and load the built-in UA stylesheet",
+    "details": "先把整个结构清零、把视口默认设为 800x600，再解析 `hpe_ua_stylesheet()` 的文本，因此新样式表一开始就带有浏览器默认样式。| The struct is zeroed, the viewport defaults to 800x600 and the text from `hpe_ua_stylesheet()` is parsed, so a fresh sheet already carries the user-agent defaults.",
+    "params": {
+      "sheet": "inout:目标样式表 / Target stylesheet"
+    },
+    "note": "传 `NULL` 时直接返回 / Returns immediately when `NULL` is passed",
+    "see": "hpe_css_free hpe_css_parse hpe_ua_stylesheet"
+  },
+  "hpe_css_free": {
+    "brief": "释放样式表持有的全部规则 / Release every rule held by a stylesheet",
+    "details": "逐条调用 `rule_free` 后释放规则数组并把整个结构清零，可安全重复调用。| Every rule is released through `rule_free`, the rule array is freed and the struct zeroed, so repeated calls are safe.",
+    "params": {
+      "sheet": "inout:目标样式表 / Target stylesheet"
+    },
+    "note": "传 `NULL` 时直接返回 / Returns immediately when `NULL` is passed",
+    "see": "hpe_css_init rule_free"
+  },
+  "apply_box_edges": {
+    "brief": "按掩码拷贝四边的 margin/padding/边框宽/inset / Copy the four-sided margin, padding, border-width and inset longhands selected by a mask",
+    "details": "逐边检查 `HPE_PROP_MARGIN_TOP`/`PADDING_TOP`/`BORDER_TOP`/`INSET_TOP` 及其 `+i` 位，命中即拷贝该边长属性；掩码含对应的“四边”位时再统一拷贝四条边框宽度。| Each edge is checked for the `HPE_PROP_MARGIN_TOP`/`PADDING_TOP`/`BORDER_TOP`/`INSET_TOP` bit and its `+i` variants, copying that longhand on a hit; when the shorthand border-width bit is present all four border widths are copied.",
+    "params": {
+      "dst": "inout:接收拷贝的目标样式 / Target style that receives the copies",
+      "src": "源样式 / Source style",
+      "s": "本次生效的属性位掩码 / Property bit mask that is in effect"
+    },
+    "see": "apply_decl_masked"
+  },
+  "apply_scalar_table": {
+    "brief": "按掩码表逐项把源样式的标量成员拷到目标 / Copy the scalar members selected by a mask table from source to destination",
+    "details": "遍历拷贝表，凡其位在 `mask` 中的项即用表中记录的偏移与大小整体拷贝成员字节，因此新增属性只需在表中加一行。| The table is walked and every entry whose bit is set in `mask` has its member bytes copied wholesale using the recorded offset and size, so adding a property means adding one row.",
+    "params": {
+      "dst": "inout:接收拷贝的目标样式 / Target style that receives the copies",
+      "src": "源样式 / Source style",
+      "mask": "生效的属性位掩码 / Property bit mask in effect",
+      "tbl": "长属性拷贝表 / Scalar longhand copy table",
+      "count": "表中的条目数 / Number of entries in the table"
+    },
+    "see": "apply_first_word_scalars apply_second_word_scalars"
+  },
+  "apply_first_word_scalars": {
+    "brief": "拷贝第一属性字中的标量长属性 / Copy the scalar longhands carried in the first property word",
+    "details": "以第一属性字掩码调用 `apply_scalar_table`。| It calls `apply_scalar_table` with the first-word mask.",
+    "params": {
+      "dst": "inout:接收拷贝的目标样式 / Target style that receives the copies",
+      "src": "源样式 / Source style",
+      "s": "第一属性字的位掩码 / Bit mask of the first property word"
+    },
+    "see": "apply_scalar_table apply_second_word_scalars"
+  },
+  "apply_second_word_scalars": {
+    "brief": "拷贝第二属性字中的标量长属性 / Copy the scalar longhands carried in the second property word",
+    "details": "以第二属性字掩码调用 `apply_scalar_table`。| It calls `apply_scalar_table` with the second-word mask.",
+    "params": {
+      "dst": "inout:接收拷贝的目标样式 / Target style that receives the copies",
+      "src": "源样式 / Source style",
+      "s2": "第二属性字的位掩码 / Bit mask of the second property word"
+    },
+    "see": "apply_scalar_table apply_first_word_scalars"
+  },
+  "apply_border_color_resolved": {
+    "brief": "解析并拷贝四边边框颜色 / Resolve and copy the per-side border colours",
+    "details": "逐边优先取该侧颜色位对应的值；若该侧未声明但简写颜色位存在，则用简写颜色兜底，使 `border-color` 仍能画出四边。| Each edge prefers the value of its own colour bit and falls back to the shorthand colour when that edge was not declared but the shorthand bit is set, so a `border-color` still paints all four sides.",
+    "params": {
+      "dst": "inout:接收颜色拷贝的目标样式 / Target style that receives the copies",
+      "src": "源样式 / Source style",
+      "s": "第一属性字的位掩码 / Bit mask of the first property word",
+      "s2": "第二属性字的位掩码 / Bit mask of the second property word"
+    },
+    "see": "apply_decl_masked"
+  },
+  "apply_decl_masked": {
+    "brief": "按掩码把一条声明应用到样式 / Apply one declaration onto a style, restricted to the given masks",
+    "details": "先取出 `src->set & mask` 与 `src->set2 & mask2` 并把它们并入目标的“已声明”位（供后续阶段区分显式值与继承值），再依次拷贝四边、第一属性字标量、第二属性字标量、四边边框颜色；若没有任何单边颜色位而简写颜色位在掩码内，则四边统一用简写颜色。| It first takes `src->set & mask` and `src->set2 & mask2` and folds them into the destination's \"declared\" bits (so later stages can tell explicit from inherited values), then copies the box edges, the first-word scalars, the second-word scalars and the per-side border colours; when no per-side colour bit is present but the shorthand colour bit is inside the mask, all four edges take the shorthand colour.",
+    "params": {
+      "dst": "inout:目标样式 / Target style",
+      "src": "源声明 / Source declaration",
+      "mask": "第一属性字的生效掩码 / Mask applied to the first property word",
+      "mask2": "第二属性字的生效掩码 / Mask applied to the second property word"
+    },
+    "see": "apply_decl apply_decl_important"
+  },
+  "apply_decl": {
+    "brief": "把一条声明的全部属性应用到样式 / Apply every property of one declaration onto a style",
+    "details": "以全 1 掩码调用 `apply_decl_masked`，即不加筛选地应用所有已声明属性。| It calls `apply_decl_masked` with all-ones masks, applying every declared property without filtering.",
+    "params": {
+      "dst": "inout:目标样式 / Target style",
+      "src": "源声明 / Source declaration"
+    },
+    "see": "apply_decl_masked apply_decl_important"
+  },
+  "apply_decl_important": {
+    "brief": "只应用一条声明中被标为 `!important` 的属性 / Apply only the `!important` properties of one declaration",
+    "details": "以该声明的 `imp`/`imp2` 掩码调用 `apply_decl_masked`。| It calls `apply_decl_masked` with the declaration's `imp`/`imp2` masks.",
+    "params": {
+      "dst": "inout:目标样式 / Target style",
+      "src": "源声明 / Source declaration"
+    },
+    "see": "apply_decl_masked apply_important_pass"
+  },
+  "inherit_parent_style": {
+    "brief": "从父样式拷贝可继承属性 / Copy the inheritable properties from the parent style",
+    "details": "把颜色、字号、字重、文本对齐、行高、空白处理、字体族、可见性、光标、列表类型与位置以及字/词间距、文本缩进等可继承属性从 `parent` 复制到当前样式，作为层叠的起点。| Inheritable properties such as colour, font size, font weight, text alignment, line height, white-space, family, visibility, cursor, list type and position, letter/word spacing and text indent are copied from `parent` to seed the cascade.",
+    "params": {
+      "style": "inout:目标样式 / Target style",
+      "parent": "父元素样式 / Parent style"
+    },
+    "see": "hpe_css_compute"
+  },
+  "rule_media_ok": {
+    "brief": "判断规则的全部外层 `@media` 条件是否都命中视口 / Test whether every enclosing `@media` condition of a rule matches the viewport",
+    "details": "沿规则保存的媒体查询链逐层用视口宽高求值，任一层不匹配即返回 0；无条件的规则（深度 0）直接返回 1。| The rule's stored query chain is evaluated layer by layer against the viewport size and any failing layer returns 0; an unconditional rule (depth 0) returns 1 immediately.",
+    "params": {
+      "rule": "CSS 规则 / CSS rule",
+      "sheet": "提供视口尺寸的样式表 / Stylesheet that supplies the viewport size"
+    },
+    "return": "全部命中返回 1，否则返回 0 / 1 when all match, 0 otherwise",
+    "see": "media_alt_matches collect_matches"
+  },
+  "rule_best_specificity": {
+    "brief": "返回规则中匹配该节点的最高特异性 / Return the highest specificity among a rule's selectors that match the node",
+    "details": "遍历规则的选择器，仅统计匹配节点者，取其特异性最大值；无任何选择器匹配时返回 -1。| It walks the rule's selectors, considering only those matching the node, and takes the maximum specificity; -1 is returned when none matches.",
+    "params": {
+      "rule": "CSS 规则 / CSS rule",
+      "node": "待测试的 DOM 节点 / DOM node to test"
+    },
+    "return": "最高特异性，或无匹配时的 -1 / The highest specificity, or -1 when none matches",
+    "see": "selector_matches collect_matches"
+  },
+  "collect_matches": {
+    "brief": "收集所有匹配节点的样式表规则 / Collect every stylesheet rule matching a node",
+    "details": "遍历样式表规则，跳过媒体条件未命中的规则，对命中的记录其最高特异性、源码顺序与声明指针；匹配数组按需扩容。| The sheet's rules are walked, media conditions that fail are skipped, and each hit records its best specificity, source order and declaration pointer; the match array grows on demand.",
+    "params": {
+      "sheet": "样式表 / Stylesheet",
+      "node": "待计算样式的 DOM 节点 / DOM node being styled",
+      "matches": "inout:匹配结果数组 / Match result array",
+      "count": "inout:已收集的匹配个数 / Number of matches collected so far",
+      "cap": "inout:匹配数组当前容量 / Current capacity of the match array"
+    },
+    "see": "rule_media_ok rule_best_specificity hpe_css_compute"
+  },
+  "sort_matches": {
+    "brief": "按（特异性, 源码顺序）稳定排序匹配项 / Stable sort the matches by (specificity, source order)",
+    "details": "用插入排序按键升序排列，特异性相同时按源码顺序，稳定排序保证同键项的相对顺序不变，从而使后写的规则覆盖先写的。| An insertion sort orders the entries ascending by key with source order breaking ties; being stable it keeps equal-key entries in their original relative order, so later rules override earlier ones.",
+    "params": {
+      "m": "inout:待排序的匹配数组 / Match array to sort",
+      "n": "数组元素个数 / Number of entries in the array"
+    },
+    "see": "apply_normal_declarations"
+  },
+  "sort_imps": {
+    "brief": "按（特异性, 源码顺序）稳定排序 important 匹配项 / Stable sort the important matches by (specificity, source order)",
+    "details": "与 `sort_matches` 相同的键与稳定插入排序，作用于 `HpeImpMatch` 数组。| It uses the same key and stable insertion sort as `sort_matches`, applied to the `HpeImpMatch` array.",
+    "params": {
+      "m": "inout:待排序的 important 匹配数组 / Important match array to sort",
+      "n": "数组元素个数 / Number of entries in the array"
+    },
+    "see": "apply_important_pass"
+  },
+  "parse_inline_style": {
+    "brief": "解析元素的内联 `style` 属性 / Parse the element's inline `style` attribute",
+    "details": "非元素节点或无 `style` 属性时返回 0；否则把属性文本交给 `hpe_css_parse_declarations` 解析进 `out` 并返回 1。| A non-element node or a missing `style` attribute returns 0; otherwise the attribute text is parsed into `out` by `hpe_css_parse_declarations` and 1 is returned.",
+    "params": {
+      "node": "目标 DOM 节点 / Target DOM node",
+      "out": "out:接收解析出的样式 / Receives the parsed style"
+    },
+    "return": "存在非空 `style` 属性返回 1，否则返回 0 / 1 when a non-empty `style` attribute exists, 0 otherwise",
+    "see": "hpe_css_parse_declarations apply_normal_declarations"
+  },
+  "apply_normal_declarations": {
+    "brief": "应用普通声明：先规则后内联样式 / Apply the normal declarations: matching rules first, then the inline style",
+    "details": "按排序后的顺序逐条应用样式表声明，其后若存在内联 `style` 属性再应用一次，从而内联样式胜过任何普通样式表声明。| The sorted stylesheet declarations are applied in order and the inline `style` attribute, when present, is applied afterwards, so the inline style beats any normal stylesheet declaration.",
+    "params": {
+      "style": "inout:目标样式 / Target style",
+      "matches": "已排序的匹配数组 / The sorted match array",
+      "n": "匹配个数 / Number of matches",
+      "node": "待计算样式的 DOM 节点 / DOM node being styled"
+    },
+    "see": "apply_decl parse_inline_style hpe_css_compute"
+  },
+  "collect_imps": {
+    "brief": "收集待第二趟处理的 `!important` 声明 / Gather the `!important` declarations for the second pass",
+    "details": "逐条检查匹配规则中确实含 important 位的声明并记录其特异性与顺序；若内联 `style` 也含 important 项，则以高于任何选择器的特异性（`1<<20`）与更晚的顺序（`1<<30`）作为单独一项加入，并以 `inline_style` 标记。| Each matching rule whose declaration actually carries important bits is recorded with its specificity and order; when the inline `style` also has important declarations it is added as a separate entry with a specificity above any selector (`1<<20`) and a later order (`1<<30`), flagged through `inline_style`.",
+    "params": {
+      "matches": "匹配数组 / Match array",
+      "n": "匹配个数 / Number of matches",
+      "node": "待计算样式的 DOM 节点 / DOM node being styled",
+      "imps": "inout:important 匹配列表 / `!important` match array",
+      "count": "inout:已收集的 important 个数 / Number of important matches collected so far",
+      "cap": "inout:important 数组当前容量 / Current capacity of the important array"
+    },
+    "see": "apply_important_pass sort_imps"
+  },
+  "apply_important_pass": {
+    "brief": "按排序结果应用 important 声明 / Apply the sorted important declarations",
+    "details": "按顺序逐项处理：内联项重新解析 `style` 属性后只应用其 important 位，规则项直接调用 `apply_decl_important`，因此 important 声明整体覆盖所有普通声明。| The entries are handled in order: an inline entry re-parses the `style` attribute and applies only its important bits while a rule entry goes straight through `apply_decl_important`, so important declarations override every normal one.",
+    "params": {
+      "style": "inout:目标样式 / Target style",
+      "imps": "已排序的 important 匹配数组 / The sorted important match array",
+      "n": "important 个数 / Number of important matches",
+      "node": "待计算样式的 DOM 节点 / DOM node being styled"
+    },
+    "see": "apply_decl_important collect_imps hpe_css_compute"
+  },
+  "hpe_css_compute": {
+    "brief": "计算节点的最终样式（两趟层叠）/ Compute a node's final style with a two-pass cascade",
+    "details": "第一趟从 `hpe_style_default` 出发，按 `parent` 继承可继承属性，收集所有媒体条件通过且选择器匹配的规则，按（特异性, 源码顺序）排序后依次应用，最后叠加内联 `style=\"\"`（胜过普通样式表声明）。| Pass one starts from `hpe_style_default`, inherits the inheritable properties from `parent`, gathers every rule whose media conditions pass and whose selectors match, applies them sorted by (specificity, source order), and finally overlays the inline `style=\"\"`, which beats a normal stylesheet declaration.|第二趟只处理 `!important`：把（含内联的）important 声明按同一种键排序后只应用被标记为 important 的位；在 important 层内内联仍胜过样式表，其余由源码顺序决定。| Pass two handles `!important` only: the important declarations, inline ones included, are sorted by the same key and only the bits flagged important are applied; within the important origin an inline `style=\"\"` still beats a stylesheet and otherwise source order decides.",
+    "params": {
+      "sheet": "样式表；为 `NULL` 时跳过规则匹配 / Stylesheet; rule matching is skipped when `NULL`",
+      "node": "待计算样式的 DOM 节点 / DOM node whose style is computed",
+      "parent": "父节点样式，用于继承；可为 `NULL` / Parent style used for inheritance; may be `NULL`",
+      "out": "out:接收计算后的样式 / Receives the computed style"
+    },
+    "note": "计算得到的样式保留“已声明”位（`set`/`set2`），供绘制阶段区分显式值与继承值 / The computed style keeps the \"declared\" bits (`set`/`set2`) so later stages can tell an explicit value from an inherited one",
+    "see": "collect_matches apply_normal_declarations collect_imps apply_important_pass"
+  },
+  "inline_append": {
+    "brief": "按格式串向输出缓冲追加文本 / Append formatted text to the output buffer",
+    "details": "缓冲已满时直接返回，否则用 `vsnprintf` 追加并累加长度；写入长度会被夹到 `out_size` 以防越界。| It returns immediately when the buffer is full, otherwise appends through `vsnprintf` and accumulates the length, clamping the length to `out_size` to avoid overrun.",
+    "params": {
+      "out": "inout:输出缓冲 / Output buffer",
+      "out_size": "`out` 的容量 / Capacity of `out`",
+      "olen": "inout:已写入长度 / Length written so far",
+      "fmt": "printf 风格格式串 / printf-style format string"
+    },
+    "see": "hpe_css_inline_set"
+  },
+  "hpe_css_inline_set": {
+    "brief": "在元素的内联 `style` 属性中设置一个属性 / Set one property in an element's inline `style` attribute",
+    "details": "扫描现有 `style` 属性，遇到同名属性就替换其值（值为空则删除），其余声明原样保留；没有同名属性时在末尾追加 `prop: value;`，最后整体写回属性。| The existing `style` attribute is scanned; a declaration with the same name has its value replaced (or removed when the new value is empty) while other declarations are kept verbatim, and when no match exists `prop: value;` is appended before the attribute is written back.",
+    "params": {
+      "node": "inout:目标 DOM 元素 / Target DOM element",
+      "prop": "CSS 属性名（小写、带连字符）/ CSS property name, lowercase and dashed",
+      "value": "属性值；空串或 `NULL` 表示删除该属性 / Property value; an empty string or `NULL` removes the property"
+    },
+    "note": "供 JavaScript DOM 桥使用 / Used by the JavaScript DOM bridge",
+    "see": "inline_append hpe_css_inline_get"
+  },
+  "hpe_css_inline_get": {
+    "brief": "读取元素内联 `style` 属性中的一个属性值 / Read one property value from an element's inline `style` attribute",
+    "details": "按 `;` 拆分内联样式，逐个以大小写不敏感的方式比较属性名，命中后把去除首尾空白的值写入 `out` 并返回 1。| The inline style is split on `;` and property names are compared case-insensitively; on a hit the trimmed value is written to `out` and 1 is returned.",
+    "params": {
+      "node": "目标 DOM 元素 / Target DOM element",
+      "prop": "要查询的 CSS 属性名 / CSS property name to look up",
+      "out": "out:接收属性值的缓冲区 / Buffer that receives the property value",
+      "out_size": "接收缓冲区容量（字节）/ Capacity of the output buffer in bytes"
+    },
+    "return": "找到返回 1，否则返回 0 / 1 when found, 0 otherwise",
+    "note": "属性值以去空白后的文本原样返回，不做规范化 / The value is returned as trimmed text without normalisation",
+    "see": "hpe_css_inline_set"
+  },
+  "hpe_ua_stylesheet": {
+    "brief": "返回内置的用户代理默认样式表文本 / Return the built-in user-agent stylesheet text",
+    "details": "这份常量文本为 `html`/`body`、标题、列表、表格、表单控件等元素提供 `display`、`margin`、`font-size` 等浏览器默认值，在 `hpe_css_init` 时被解析进样式表。| This constant text supplies browser-default `display`, `margin`, `font-size` and similar values for `html`/`body`, headings, lists, tables and form controls; it is parsed into the sheet by `hpe_css_init`.",
+    "return": "以 NUL 结尾的 UA 样式表 CSS 文本 / NUL-terminated CSS text of the user-agent stylesheet",
+    "see": "hpe_css_init"
+  }
+}

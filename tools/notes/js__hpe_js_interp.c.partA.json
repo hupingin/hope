@@ -1,0 +1,878 @@
+{
+  "js_node_new": {
+    "brief": "分配并初始化一个 AST 节点 / Allocate and initialise an AST node",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "kind": "节点种类（`JS_N_*`）/ Node kind (`JS_N_*`)",
+      "line": "源码行号（用于报错）/ Source line number used for error reporting"
+    },
+    "return": "指向新节点（已置位 kind 与 line，其余字段清零）的指针 / Pointer to the fresh node, with kind and line set and all other fields zeroed",
+    "note": "节点由运行时分配器管理，随 `HpeJs` 一同释放 / The node is owned by the runtime allocator and freed with the `HpeJs`",
+    "see": "js_node_add"
+  },
+  "js_node_add": {
+    "brief": "把一个子节点追加到父节点的子节点表 / Append a child node to a parent's child list",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "parent": "inout:接收子节点的父节点 / Parent that receives the child",
+      "child": "要追加的子节点 / Child node to append"
+    },
+    "note": "子节点表按倍增策略扩容，旧内容会被拷贝 / The child array grows by doubling and copies the existing entries",
+    "see": "js_node_new"
+  },
+  "flow_none": {
+    "brief": "构造一个表示“继续顺序执行”的 Flow 状态 / Build a Flow state meaning normal sequential execution",
+    "return": "action 为 `FLOW_NONE`、返回值 undefined、标签为 `NULL` 的 Flow / A Flow with action `FLOW_NONE`, an undefined return value and no label"
+  },
+  "bind_native": {
+    "brief": "把一个原生 C 函数包装成可调用的 JS 函数值 / Wrap a native C function into a callable JS function value",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "fn": "原生函数指针 / Native function pointer",
+      "ud": "透传给原生函数的用户数据 / Opaque user data forwarded to the native function"
+    },
+    "return": "装箱后的对象值 / The boxed object value"
+  },
+  "array_get_index": {
+    "brief": "按下标读取数组元素 / Read an array element by index",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "arr": "目标数组对象 / Target array object",
+      "i": "元素下标 / Element index"
+    },
+    "return": "下标对应的值；不存在时为 undefined / The value at the index, or undefined when absent",
+    "note": "下标先转成十进制字符串再走属性查找 / The index is rendered as a decimal string and then looked up as a property"
+  },
+  "array_set_index": {
+    "brief": "按下标写入数组元素并同步 length / Write an array element by index, updating length",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "arr": "目标数组对象 / Target array object",
+      "i": "元素下标 / Element index",
+      "v": "写入的值 / Value to store"
+    },
+    "note": "当写入位置越过当前长度时把 `length` 提升为 `i + 1` / When the index goes past the current end, `length` is bumped to `i + 1`"
+  },
+  "array_push_value": {
+    "brief": "把值推到数组末尾 / Append a value to the end of an array",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "arr": "目标数组对象 / Target array object",
+      "v": "要追加的值 / Value to append"
+    },
+    "note": "等价于 `array_set_index(arr, length, v)` / Equivalent to `array_set_index(arr, length, v)`",
+    "see": "array_set_index"
+  },
+  "array_length": {
+    "brief": "安全地读取数组长度 / Read an array length defensively",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "arr": "目标数组对象 / Target array object"
+    },
+    "return": "数组的整数长度 / The integer length of the array",
+    "retval": {
+      "0": "`length` 为 NaN、负数或超过 1e9 时返回 0 / Returned when `length` is NaN, negative or above 1e9"
+    }
+  },
+  "array_of": {
+    "brief": "用一段 C 数组构造 JS 数组 / Build a JS array from a C array",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "v": "元素值数组 / Array of element values",
+      "n": "元素个数 / Number of elements to copy"
+    },
+    "return": "包含全部元素的新数组值 / A new array value holding all elements"
+  },
+  "is_digits": {
+    "brief": "判断字符串是否全部由十进制数字组成 / Test whether a string consists solely of decimal digits",
+    "params": {
+      "s": "待检查的字符串 / String to inspect"
+    },
+    "return": "全为数字且非空返回 1，否则返回 0 / 1 when non-empty and all digits, otherwise 0",
+    "retval": {
+      "0": "为空指针、空串或含非数字字符 / `NULL`, empty, or containing a non-digit"
+    },
+    "note": "空串视为不通过，与数组下标判定语义配合使用 / An empty string fails, matching how array-index keys are detected"
+  },
+  "utf8_len": {
+    "brief": "按 UTF-8 码点统计字符串长度 / Count a string's length in UTF-8 code points",
+    "params": {
+      "s": "待统计的字符串 / String to measure"
+    },
+    "return": "码点个数 / Number of code points",
+    "note": "空指针按空串处理；非法的续字节按单字节前进 / A `NULL` pointer is treated as empty and an invalid sequence advances one byte"
+  },
+  "utf8_char_at": {
+    "brief": "取字符串第 i 个码点的单字符子串 / Take the single-character substring at code-point index i",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "s": "源字符串 / Source string",
+      "i": "码点下标（从 0 起）/ Code-point index, zero based"
+    },
+    "return": "该位置的单个码点字符串；越界时返回 undefined / The one-code-point string at that position, or undefined when out of range"
+  },
+  "js_job_push": {
+    "brief": "把作业追加到微任务队列尾部 / Append a job to the tail of the microtask queue",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "job": "inout:待入队的作业（其 next 会被清零）/ Job to enqueue, whose next pointer is cleared"
+    },
+    "note": "仅做链表串接，不执行作业 / Only links the list; the job is not executed here",
+    "see": "hpe_js_drain_jobs"
+  },
+  "job_new": {
+    "brief": "分配一个微任务作业 / Allocate a microtask job",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "kind": "作业种类（`JOB_*`）/ Job kind (`JOB_*`)"
+    },
+    "return": "指向新作业的指针，fn/arg/value 均初始化为 undefined / Pointer to the new job whose fn/arg/value start as undefined",
+    "note": "作业由运行时分配器托管 / The job is owned by the runtime allocator"
+  },
+  "hpe_js_queue_microtask": {
+    "brief": "把 fn(arg) 排为微任务 / Queue fn(arg) to run as a microtask",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "fn": "要调用的函数值 / Function value to call",
+      "arg": "传给 fn 的单个实参 / Single argument passed to fn"
+    },
+    "note": "以 `JOB_CALL` 入队，由解释器在当前语句/脚本之后以及 `hpe_js_call()` 中排空 / Enqueued as a `JOB_CALL` and drained after the current statement or script and by `hpe_js_call()`；`js` 为 `NULL` 时直接返回",
+    "see": "hpe_js_drain_jobs"
+  },
+  "reaction_push": {
+    "brief": "为 Promise 注册一对反应回调 / Register a pair of reaction callbacks on a promise",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "p": "目标 Promise 对象 / Target promise object",
+      "on_ok": "兑现回调 / Fulfilment callback",
+      "on_err": "拒绝回调 / Rejection callback",
+      "result": "接收回调结果的后续 Promise（可为 `NULL`）/ Downstream promise receiving the handler result, may be `NULL`"
+    },
+    "note": "Promise 尚未定局时回调挂到链表上；已定局则立即生成 `JOB_REACTION` 入队 / If the promise is still pending the callbacks are linked; if already settled a `JOB_REACTION` job is enqueued at once"
+  },
+  "js_settle_promise": {
+    "brief": "把 Promise 置为已兑现或已拒绝并派发其反应 / Settle a promise and schedule its reactions",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "p": "目标 Promise 对象 / Target promise object",
+      "state": "新状态（1 兑现、2 拒绝）/ New state (1 fulfilled, 2 rejected)",
+      "value": "随状态携带的结果值 / Result value carried with the state"
+    },
+    "note": "只有仍处于 pending 的 Promise 会被改变，重复调用无效；已挂载的回调会被摘链并各生成一个 `JOB_REACTION` / Only a still-pending promise is changed, later calls are no-ops; attached reactions are detached and each becomes a `JOB_REACTION`"
+  },
+  "promise_resolve_with": {
+    "brief": "按 thenable 规则用值 v 兑现 Promise p / Fulfil promise p with v following thenable rules",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "p": "待兑现的 Promise 对象 / Promise object to fulfil",
+      "v": "兑现值 / Fulfilment value"
+    },
+    "note": "v 为 p 自身时报 TypeError（链式循环）；v 为其他 Promise 时链接其状态，pending 时通过 `native_promise_resolver` 回调转发；否则直接兑现 / A TypeError is raised when v is p itself (chaining cycle); another promise is chained, pending ones being forwarded via `native_promise_resolver`; otherwise p fulfils directly"
+  },
+  "native_promise_resolver": {
+    "brief": "Promise 构造器内部使用的 resolve/reject 原生回调 / Native resolve/reject callback used inside the Promise constructor",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "thisv": "忽略（返回 undefined）/ Ignored",
+      "args": "首个元素为传入值 / First element is the incoming value",
+      "argc": "实参个数 / Argument count",
+      "ud": "指向 `PromiseCap` 的捕获块 / Pointer to the `PromiseCap` capture block"
+    },
+    "return": "总是返回 undefined / Always returns undefined",
+    "note": "无实参时按 undefined 处理；`cap->reject` 为真则直接拒绝，否则走 `promise_resolve_with` / A missing argument is treated as undefined; `cap->reject` rejects directly, otherwise `promise_resolve_with` is used"
+  },
+  "run_reaction": {
+    "brief": "执行单个 Promise 反应并把结果接入后续 Promise / Run one promise reaction and feed its result to the downstream promise",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "r": "要执行的反应 / Reaction to run",
+      "state": "触发该反应的状态（1 兑现、2 拒绝）/ State that triggered the reaction (1 fulfilled, 2 rejected)",
+      "value": "传入处理器的值 / Value passed to the handler"
+    },
+    "note": "处理器不可调用时把状态与值原样传递下去；`result` 为 `NULL` 时丢弃处理器返回值 / When the handler is not callable the state and value pass straight through; with `result == NULL` the handler's return value is discarded"
+  },
+  "hpe_js_drain_jobs": {
+    "brief": "排空微任务队列 / Drain the microtask queue",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context"
+    },
+    "note": "重入保护：`jobs_running` 为真时立即返回；本轮期间新入队的作业会一并处理 / Re-entrancy guarded by `jobs_running`; jobs enqueued during the pass are also processed",
+    "see": "js_job_push"
+  },
+  "promise_then": {
+    "brief": "为 Promise 挂上 then 回调并返回新 Promise / Attach then callbacks to a promise and return a new promise",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "p": "源 Promise 对象 / Source promise object",
+      "on_ok": "兑现回调 / Fulfilment callback",
+      "on_err": "拒绝回调 / Rejection callback"
+    },
+    "return": "由回调结果兑现的新 Promise 值 / A new promise value settled from the callback result",
+    "note": "注册后立即调用 `hpe_js_drain_jobs()` / `hpe_js_drain_jobs()` is called right after registration"
+  },
+  "native_iter_next": {
+    "brief": "迭代器对象的 next 方法 / The `next` method of an iterator object",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "thisv": "忽略 / Ignored",
+      "args": "忽略 / Ignored",
+      "argc": "忽略 / Ignored",
+      "ud": "指向迭代器对象自身的指针 / Pointer to the iterator object itself"
+    },
+    "return": "`{ done, value }` 结果对象 / A `{ done, value }` result object",
+    "note": "游标存放在对象的 `_i` 上；越界时返回 `done: true` 且 value 为 undefined / The cursor lives in the object's `_i`; past the end it returns `done: true` with value undefined"
+  },
+  "native_iter_self": {
+    "brief": "返回 this 的 `Symbol.iterator` 方法 / The `Symbol.iterator` method returning `this`",
+    "params": {
+      "js": "忽略 / Ignored",
+      "thisv": "迭代器自身 / The iterator itself",
+      "args": "忽略 / Ignored",
+      "argc": "忽略 / Ignored",
+      "ud": "忽略 / Ignored"
+    },
+    "return": "原样返回 `thisv` / Returns `thisv` unchanged",
+    "note": "使迭代器自身可迭代 / Makes the iterator itself iterable"
+  },
+  "make_iterable": {
+    "brief": "把一个元素数组包装成可迭代的迭代器对象 / Wrap an element array into an iterable iterator object",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "items": "被迭代的元素数组 / Element array being iterated"
+    },
+    "return": "带有 `next` 与 `Symbol.iterator` 的迭代器对象值 / An iterator object value carrying `next` and `Symbol.iterator`",
+    "note": "对象的 `_i` 游标从 0 起，`class_name` 为 `Iterator` / The object's `_i` cursor starts at 0 and its `class_name` is `Iterator`"
+  },
+  "proto_of_string": {
+    "brief": "取字符串原型对象 / Get the string prototype object",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context"
+    },
+    "return": "`String.prototype` 对象 / The `String.prototype` object"
+  },
+  "proto_for": {
+    "brief": "按原始值类型选择对应的原型对象 / Pick the prototype matching a primitive value's type",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "base": "参与属性查找的原始值 / Primitive value whose member is being resolved"
+    },
+    "return": "字符串/数字/布尔值分别返回对应原型，其余返回 `Object.prototype` / The matching prototype for string, number and boolean, otherwise `Object.prototype`"
+  },
+  "proto_lookup": {
+    "brief": "在原型对象上查找属性并处理取值器 / Look up a property on a prototype and invoke its getter",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "proto": "原型对象（可为 `NULL`）/ Prototype object, may be `NULL`",
+      "thisv": "调用取值器时的 this 值 / The `this` value for the getter",
+      "prop": "属性名 / Property name",
+      "line": "出错时报告的行号 / Line number reported on error"
+    },
+    "return": "属性值；属性缺失时返回 undefined / The property value, or undefined when the property is absent",
+    "note": "存在 getter 时以 `thisv` 调用它，否则返回属性槽的值 / When a getter exists it is called with `thisv`; otherwise the property slot value is returned"
+  },
+  "member_get": {
+    "brief": "通用的成员读取，覆盖原始值、宿主对象与对象属性 / General member read covering primitives, host objects and object properties",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境（当前实现未使用）/ Lexical environment, unused by the current implementation",
+      "base": "参与属性查找的值 / Value whose member is being resolved",
+      "prop": "属性名 / Property name",
+      "line": "出错时报告的行号 / Line number reported on error"
+    },
+    "return": "属性值；查不到时返回 undefined / The property value, or undefined when not found",
+    "details": "字符串上 `length` 返回码点数，纯数字键返回对应码点字符，其余走 `String.prototype`。数字与布尔值走各自原型。宿主对象先尝试其虚表的 `get`。模块对象在自身无该属性时回退到命名空间对象。 | On strings `length` yields the code-point count and an all-digit key yields the matching code point, everything else going through `String.prototype`. Numbers and booleans use their own prototypes. Host objects first try their vtable's `get`. A module object falls back to its namespace object when the property is absent.",
+    "note": "对 `null` / `undefined` 报错 `cannot read property` / Raises `cannot read property` for `null` / `undefined`"
+  },
+  "member_set": {
+    "brief": "通用的成员写入，覆盖宿主对象、访问器与数组长度 / General member write covering host objects, accessors and array length",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境（当前实现未使用）/ Lexical environment, unused by the current implementation",
+      "base": "写入目标值 / Value being written to",
+      "prop": "属性名 / Property name",
+      "value": "写入的值 / Value to store",
+      "line": "出错时报告的行号 / Line number reported on error"
+    },
+    "note": "宿主对象的写入交给其虚表 `set`；有 setter 时以 base 为 this 调用；数组的纯数字键会同步 `length`。对原始值写入静默忽略，对 `null` / `undefined` 报错 / Host writes go to the vtable `set`; a setter is called with base as `this`; a digit key on an array updates `length`. Writes to primitives are silently ignored and `null` / `undefined` raise an error"
+  },
+  "js_get_prop": {
+    "brief": "对外暴露的成员读取入口 / Public member-read entry point",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "base": "参与属性查找的值 / Value whose member is being resolved",
+      "prop": "属性名 / Property name",
+      "line": "出错时报告的行号 / Line number reported on error"
+    },
+    "return": "属性值 / The property value",
+    "note": "直接转发给 `member_get` / Forwards straight to `member_get`",
+    "see": "member_get"
+  },
+  "js_set_prop": {
+    "brief": "对外暴露的成员写入入口 / Public member-write entry point",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "base": "写入目标值 / Value being written to",
+      "prop": "属性名 / Property name",
+      "value": "写入的值 / Value to store",
+      "line": "出错时报告的行号 / Line number reported on error"
+    },
+    "note": "直接转发给 `member_set` / Forwards straight to `member_set`",
+    "see": "member_set"
+  },
+  "make_arguments_object": {
+    "brief": "构造函数内部的 arguments 对象 / Build the `arguments` object for a function call",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "args": "实参数组 / Actual argument array",
+      "argc": "实参个数 / Argument count"
+    },
+    "return": "包含全部实参与 `length` 的 `Arguments` 对象值 / An `Arguments` object value holding all arguments plus `length`",
+    "note": "元素以十进制字符串为键存放，原型为 `Object.prototype` / Elements are stored under decimal string keys with `Object.prototype` as prototype"
+  },
+  "run_function_body": {
+    "brief": "在新建的函数环境中执行函数体 / Execute a function body in a fresh function environment",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "fn": "函数对象（其 `code` 给出形参与函数体）/ Function object whose `code` supplies the parameters and body",
+      "closure": "闭包捕获的外层环境 / Outer environment captured by the closure",
+      "this_v": "调用时的 this 值 / The `this` value of the call",
+      "args": "实参数组 / Actual argument array",
+      "argc": "实参个数 / Argument count"
+    },
+    "return": "`return` 流携带的返回值，否则为 undefined / The value carried by a `return` flow, otherwise undefined",
+    "details": "非箭头函数会绑定 `this` 并定义 `arguments`；有 [[HomeObject]] 时一并写入环境。形参按顺序绑定，支持默认值（`undefined` 时求值）与 rest 参数（收集剩余实参为数组）。函数名在环境内未定义时以函数自身回填（便于递归）。 | A non-arrow function binds `this` and defines `arguments`; a [[HomeObject]] is carried into the environment when present. Parameters bind in order, supporting defaults (evaluated for `undefined`) and rest (remaining arguments gathered into an array). The function name is back-filled with the function itself when not already defined, enabling recursion.",
+    "note": "由 `call_value` / `run_generator` / `run_async` 等调用 / Called from `call_value`, `run_generator`, `run_async` and friends"
+  },
+  "run_generator": {
+    "brief": "以急切求值方式运行生成器函数 / Run a generator function by materialising its yields eagerly",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "fn": "生成器函数对象 / Generator function object",
+      "closure": "闭包捕获的外层环境 / Outer environment captured by the closure",
+      "this_v": "调用时的 this 值 / The `this` value of the call",
+      "args": "实参数组 / Actual argument array",
+      "argc": "实参个数 / Argument count"
+    },
+    "return": "包裹已收集产出值的可迭代对象 / An iterable wrapping the collected yielded values",
+    "note": "所有 yield 立即收集到数组（设计文档 §12.7），暂停后恢复的 `yield_sink` 会被还原 / All yields are collected into an array up front (design §12.7); the previous `yield_sink` is restored afterwards"
+  },
+  "apply_class_fields": {
+    "brief": "为实例求值并安装类字段 / Evaluate and install a class's instance fields on an object",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "ctor": "类构造函数（其 `class_def` 给出类节点）/ Class constructor whose `class_def` gives the class node",
+      "instance": "接收字段的实例 / Instance receiving the fields"
+    },
+    "note": "在实例环境中求值各字段初始化器，无初始化器的字段置 undefined；类节点缺失或成员表为空时直接返回 / Initialisers are evaluated in a per-instance environment and a field without initialiser becomes undefined; returns early when the class node is missing or the member list is empty"
+  },
+  "run_async": {
+    "brief": "以返回 Promise 的方式运行异步函数 / Run an async function, returning a promise",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "fn": "异步函数对象 / Async function object",
+      "closure": "闭包捕获的外层环境 / Outer environment captured by the closure",
+      "this_v": "调用时的 this 值 / The `this` value of the call",
+      "args": "实参数组 / Actual argument array",
+      "argc": "实参个数 / Argument count"
+    },
+    "return": "由函数体返回值兑现的 Promise 值 / A promise value fulfilled from the body's return value",
+    "note": "创建 Promise 后运行函数体并用 `promise_resolve_with` 接入结果，随后排空作业队列 / Creates the promise, runs the body and wires the result through `promise_resolve_with`, then drains the job queue"
+  },
+  "call_value": {
+    "brief": "按函数值的种类分派调用 / Dispatch a call according to the kind of function value",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境（当前实现未使用）/ Lexical environment, unused by the current implementation",
+      "callee": "被调用的函数值 / Function value being called",
+      "thisv": "调用时的 this 值 / The `this` value of the call",
+      "args": "实参数组 / Actual argument array",
+      "argc": "实参个数 / Argument count",
+      "line": "出错时报告的行号 / Line number reported on error"
+    },
+    "return": "调用结果值 / The call result value",
+    "details": "不可调用时报错。绑定函数（`FN_BOUND`）会把已绑定实参与本次实参拼接后递归调用目标，`this` 取绑定值（非 undefined 时）。原生函数直接调用其 C 指针；生成器走 `run_generator`，异步函数走 `run_async`，普通函数走 `run_function_body`。 | Errors out when not callable. A bound function (`FN_BOUND`) concatenates its bound arguments with the new ones and recurses into the target, taking `this` from the bound value when it is not undefined. Native functions call their C pointer directly; generators go through `run_generator`, async functions through `run_async` and plain functions through `run_function_body`.",
+    "see": "js_invoke"
+  },
+  "js_invoke": {
+    "brief": "以一个显式 this 调用函数值 / Call a function value with an explicit `this`",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "fn": "被调用的函数值 / Function value to call",
+      "thisv": "调用时的 this 值 / The `this` value of the call",
+      "args": "实参数组 / Actual argument array",
+      "argc": "实参个数 / Argument count",
+      "line": "出错时报告的行号 / Line number reported on error"
+    },
+    "return": "调用结果值 / The call result value",
+    "note": "以 `env` 为 `NULL` 转发给 `call_value` / Forwards to `call_value` with a `NULL` environment",
+    "see": "call_value"
+  },
+  "run_ctor_body": {
+    "brief": "运行构造函数体并按需安装类字段 / Run a constructor body, applying class fields as appropriate",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "ctor": "构造函数对象 / Constructor function object",
+      "this_v": "此构造调用中的 this 值（新建实例或被派生的实例）/ The `this` value of this construction (the new instance or the derived instance)",
+      "args": "实参数组 / Actual argument array",
+      "argc": "实参个数 / Argument count",
+      "derived": "派生类构造函数为 1 / 1 for a derived-class constructor"
+    },
+    "return": "构造函数体返回的值 / The value returned by the constructor body",
+    "note": "基类在函数体之前安装字段，派生类在函数体（即 `super()`）之后安装 / A base class installs fields before the body while a derived class installs them after the body, i.e. after `super()`"
+  },
+  "js_construct": {
+    "brief": "以 new 语义构造对象 / Construct an object with `new` semantics",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "callee": "构造函数值 / Constructor value",
+      "args": "实参数组 / Actual argument array",
+      "argc": "实参个数 / Argument count",
+      "line": "出错时报告的行号 / Line number reported on error"
+    },
+    "return": "新建（或构造函数返回的）对象值 / The newly created object value, or the object returned by the constructor",
+    "details": "不可调用时报错。原生构造函数以其 C 指针调用，`this` 为 undefined。绑定函数拼接实参后递归构造目标。其余情况取构造函数的 `prototype` 作为新实例原型，用类名设置 `class_name` 并运行构造函数体；构造函数体返回对象则采用该对象，否则返回新实例。 | Errors out when not callable. A native constructor is invoked through its C pointer with an undefined `this`. Bound functions concatenate arguments and recurse. Otherwise the constructor's `prototype` becomes the instance prototype, `class_name` is set from the function name and the constructor body runs; an object returned by the body wins, otherwise the fresh instance is returned."
+  },
+  "bind_target": {
+    "brief": "把值绑定或赋值到一个绑定目标 / Bind or assign a value to a single binding target",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "id": "目标标识符节点或解构模式 / Identifier node or destructuring pattern",
+      "v": "被绑定或赋值的值 / Value being bound or assigned",
+      "declare": "声明式绑定为 1，纯赋值为 0 / 1 for a declarative binding, 0 for a plain assignment"
+    },
+    "details": "标识符目标在声明模式下走 `js_env_declare`；赋值模式下写已存在的槽位，槽位不存在时严格模式报 `is not defined`、非严格模式写入全局环境。非标识符目标转交给 `bind_pattern` 或 `assign_pattern`。 | An identifier target uses `js_env_declare` when declaring; when assigning it writes the existing slot, and a missing slot raises `is not defined` in strict mode or defines it on the global environment otherwise. A non-identifier target is handed to `bind_pattern` or `assign_pattern`."
+  },
+  "pattern_bind_decl": {
+    "brief": "声明式解构的叶子操作适配器 / Leaf adapter for declarative destructuring",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "pat": "解构模式节点 / Destructuring pattern node",
+      "value": "被解构的值 / Value being destructured"
+    },
+    "note": "以 `declare = 1` 调用 `bind_pattern`，使解构走声明路径 / Calls `bind_pattern` with `declare = 1` so the walk takes the declaration path",
+    "see": "bind_pattern"
+  },
+  "pattern_bind_plain": {
+    "brief": "赋值式解构的叶子操作适配器 / Leaf adapter for plain destructuring",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "pat": "解构模式节点 / Destructuring pattern node",
+      "value": "被解构的值 / Value being destructured"
+    },
+    "note": "以 `declare = 0` 调用 `bind_pattern`，使解构走赋值路径 / Calls `bind_pattern` with `declare = 0` so the walk takes the assignment path",
+    "see": "bind_pattern"
+  },
+  "pattern_each_array": {
+    "brief": "按数组模式逐项解构可迭代值 / Destructure an iterable element by element against an array pattern",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "pat": "数组模式节点 / Array pattern node",
+      "value": "被解构的可迭代值 / Iterable value being destructured",
+      "apply": "对每个叶子目标执行绑定/赋值的回调 / Callback performing the bind or assign for each leaf target"
+    },
+    "note": "空位（elision）跳过对应下标；遇到 rest 元素时把从该下标起的所有元素收集成数组后交给回调并结束遍历 / Elisions skip their index; a rest element gathers everything from that index into an array, is handed to the callback, and the walk ends"
+  },
+  "pattern_each_object": {
+    "brief": "按对象模式逐键解构对象值 / Destructure an object value key by key against an object pattern",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "pat": "对象模式节点 / Object pattern node",
+      "value": "被解构的对象值 / Object value being destructured",
+      "exclude": "收集已解构键的集合（可为 `NULL`）/ Set collecting already destructured keys, may be `NULL`",
+      "apply": "对每个叶子目标执行绑定/赋值的回调 / Callback performing the bind or assign for each leaf target"
+    },
+    "note": "rest 元素收集除 `exclude` 中键以外的全部自有可枚举键；带默认值的无源属性 `{a = 1}` 在此先播种 undefined，交由 `JS_N_PAT_DEFAULT` 分支替换 / A rest element collects every own key except those in `exclude`; a defaulted property with no source `{a = 1}` is seeded with undefined here and replaced by the `JS_N_PAT_DEFAULT` arm"
+  },
+  "pattern_default_value": {
+    "brief": "在值为 undefined 时求值解构默认值 / Evaluate a destructuring default when the value is undefined",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "pat": "带默认值的模式节点（默认表达式在 `kids[1]`）/ Pattern node carrying the default, whose expression is in `kids[1]`",
+      "value": "待检查的值 / Value being inspected"
+    },
+    "return": "值非 undefined 时原样返回，否则返回默认表达式的求值结果 / The value itself when not undefined, otherwise the evaluated default",
+    "note": "只有 `undefined` 触发默认值，`null` 不触发 / Only `undefined` triggers the default; `null` does not"
+  },
+  "bind_pattern": {
+    "brief": "按声明或赋值语义解构一个模式 / Destructure a pattern in declaration or assignment mode",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "pat": "解构模式节点（可为 `NULL`）/ Destructuring pattern node, may be `NULL`",
+      "value": "被解构的值 / Value being destructured",
+      "declare": "声明式绑定为 1，赋值为 0 / 1 for a declarative binding, 0 for an assignment"
+    },
+    "note": "标识符走 `bind_target`；默认值先经 `pattern_default_value`；数组与对象模式分别走 `pattern_each_array` / `pattern_each_object`（声明模式下经 `pattern_bind_decl` 适配器）；无法识别的模式回退到 `assign_pattern` / Identifiers go to `bind_target`; defaults pass through `pattern_default_value`; array and object patterns go to `pattern_each_array` / `pattern_each_object` (via the `pattern_bind_decl` adapter when declaring); anything else falls back to `assign_pattern`"
+  },
+  "assign_member": {
+    "brief": "向成员表达式目标赋值 / Assign a value to a member-expression target",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "target": "成员目标节点（`a.b` 或 `a[b]`）/ Member target node (`a.b` or `a[b]`)",
+      "value": "写入的值 / Value to store"
+    },
+    "note": "点式取 `target->str`，下标式对键表达式求值后转字符串，最终经 `member_set` 写入 / A dot form uses `target->str`, an index form evaluates and stringifies the key, and the write goes through `member_set`"
+  },
+  "assign_pattern": {
+    "brief": "按赋值语义解构一个模式 / Destructure a pattern in assignment mode",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "pat": "解构模式节点（可为 `NULL`）/ Destructuring pattern node, may be `NULL`",
+      "value": "被解构的值 / Value being destructured"
+    },
+    "note": "标识符经 `bind_target`（`declare = 0`）写入，成员目标经 `assign_member`；数组与对象模式分别走 `pattern_each_array` / `pattern_each_object`（不收集排除键）；其余模式静默忽略 / Identifiers are written through `bind_target` with `declare = 0` and member targets through `assign_member`; array and object patterns use `pattern_each_array` / `pattern_each_object` (without an exclusion set); any other pattern is silently ignored"
+  },
+  "to_i32": {
+    "brief": "按 ToInt32 规则把值转换为 32 位有符号整数 / Convert a value to a signed 32-bit integer per ToInt32",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "v": "待转换的值 / Value to convert"
+    },
+    "return": "转换结果，已对 2^32 取模并解释为有符号数 / The result, reduced modulo 2^32 and interpreted as signed",
+    "retval": {
+      "0": "值为 NaN 或无穷时返回 0 / Returned for NaN or an infinity"
+    }
+  },
+  "to_u32": {
+    "brief": "按 ToUint32 规则把值转换为 32 位无符号整数 / Convert a value to an unsigned 32-bit integer per ToUint32",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "v": "待转换的值 / Value to convert"
+    },
+    "return": "转换结果，已对 2^32 取模到 `[0, 2^32)` / The result, reduced modulo 2^32 into `[0, 2^32)`",
+    "retval": {
+      "0": "值为 NaN 或无穷时返回 0 / Returned for NaN or an infinity"
+    }
+  },
+  "js_instanceof": {
+    "brief": "实现 instanceof 运算符 / Implement the `instanceof` operator",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "obj": "待检查的左操作数 / Left-hand operand being tested",
+      "ctor": "右操作数（构造函数值）/ Right-hand operand, the constructor value",
+      "line": "出错时报告的行号 / Line number reported on error"
+    },
+    "return": "在原型链上找到构造函数原型返回 true，否则返回 false / `true` when the constructor prototype is found on the chain, otherwise `false`",
+    "note": "左操作数非对象返回 false；右操作数不可调用或其 `prototype` 非对象时报错 / A non-object left operand yields `false`; an uncallable right operand or a non-object `prototype` raises an error"
+  },
+  "bin_concat": {
+    "brief": "把两个操作数转成字符串并拼接 / Stringify both operands and concatenate them",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "l": "左操作数 / Left operand",
+      "r": "右操作数 / Right operand"
+    },
+    "return": "拼接得到的新字符串值 / The concatenated string value",
+    "note": "结果长度按两者的 UTF-8 字节数计算 / The result length is the sum of the two UTF-8 byte counts"
+  },
+  "eval_logical": {
+    "brief": "求值逻辑与、逻辑或与空值合并并短路 / Evaluate `&&`, `||` and `??` with short-circuiting",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "n": "二元表达式节点（子表达式在 kids 上）/ Binary expression node whose sub-expressions live in its kids",
+      "op": "运算符（`JS_OP_AND` / `JS_OP_OR` / `JS_OP_NULLISH`）/ Operator (`JS_OP_AND` / `JS_OP_OR` / `JS_OP_NULLISH`)"
+    },
+    "return": "决定结果的原始操作数，而非强制转换后的布尔值 / The deciding operand itself rather than a coerced boolean",
+    "note": "`??` 只在左值为 `null` 或 `undefined` 时才求右值 / `??` evaluates the right side only for `null` or `undefined`"
+  },
+  "eval_relational": {
+    "brief": "求值比较运算符 / Evaluate the relational operators",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "n": "比较表达式节点（决定具体运算符）/ Comparison node determining the operator",
+      "l": "左操作数 / Left operand",
+      "r": "右操作数 / Right operand"
+    },
+    "return": "`<` `>` `<=` `>=` 的布尔结果 / The boolean result of `<`, `>`, `<=` or `>=`",
+    "note": "两侧均为字符串时按字典序 `strcmp` 比较，否则按数值比较；任一操作数为 NaN 时结果为 false / Two strings compare lexicographically via `strcmp`, otherwise numerically; a NaN operand always yields `false`"
+  },
+  "eval_arithmetic": {
+    "brief": "求值算术、位与移位运算符 / Evaluate arithmetic, bitwise and shift operators",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "n": "算式节点（`op` 决定具体运算）/ Expression node whose `op` selects the operation",
+      "l": "左操作数 / Left operand",
+      "r": "右操作数 / Right operand"
+    },
+    "return": "运算结果数値；运算符未覆盖时返回 undefined / The numeric result, or undefined for an unsupported operator",
+    "details": "两侧通过 ToNumber 转数值。取模对除数为 0 返回 NaN（避免 C 的未定义行为），幂用 `pow`。位运算与移位先经 `to_i32` / `to_u32` 规约，移位量对 32 取模（`& 31`）。 | Both sides are converted with ToNumber. Remainder yields NaN for a zero divisor to avoid C undefined behaviour and exponentiation uses `pow`. Bitwise and shift operations normalise through `to_i32` / `to_u32`, with the shift amount taken modulo 32 (`& 31`)."
+  },
+  "eval_in_operator": {
+    "brief": "实现 in 运算符 / Implement the `in` operator",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "n": "运算表达式节点（提供行号）/ Expression node supplying the line number",
+      "l": "左操作数（属性键）/ Left operand, the property key",
+      "r": "右操作数（目标对象）/ Right operand, the target object"
+    },
+    "return": "对象拥有该属性时返回 true / `true` when the object owns the property",
+    "note": "右操作数非对象时报错；整数值键按无小数形式格式化后再查找 / A non-object right operand raises an error; an integral numeric key is formatted without a fractional part before lookup"
+  },
+  "bin_add": {
+    "brief": "实现二元加号 / Implement the binary plus operator",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "l": "左操作数 / Left operand",
+      "r": "右操作数 / Right operand"
+    },
+    "return": "任一操作数为字符串时返回拼接结果，否则返回数值和 / The concatenation when either side is a string, otherwise the numeric sum",
+    "note": "对象先经 ToPrimitive 转换，转换后若任一侧为字符串仍走拼接 / Objects are coerced with ToPrimitive and still concatenate when either coerced side is a string"
+  },
+  "eval_bin": {
+    "brief": "分派并求值二元表达式 / Dispatch and evaluate a binary expression",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "n": "二元表达式节点 / Binary expression node"
+    },
+    "return": "表达式求值结果 / The evaluated expression value",
+    "details": "逻辑与/或/空值合并先交给 `eval_logical`（不求值右操作数）。`instanceof` 先求左值再求右值交给 `js_instanceof`。相等类运算符用 `js_values_equal`（严格与否由运算符决定）。`in` 走 `eval_in_operator`，比较走 `eval_relational`，算术/位/移位走 `eval_arithmetic`，`+` 走 `bin_add`。未识别的运算符报错。 | Logical and/or/nullish go to `eval_logical` first, without evaluating the right operand. `instanceof` evaluates the left then the right and calls `js_instanceof`. Equality operators use `js_values_equal`, strictness determined by the operator. `in` uses `eval_in_operator`, comparisons use `eval_relational`, arithmetic/bitwise/shift use `eval_arithmetic` and `+` uses `bin_add`. An unrecognised operator raises an error."
+  },
+  "read_target": {
+    "brief": "读取一个可作为左值的目标的当前值 / Read the current value of an assignable target",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "target": "目标节点（标识符或成员表达式）/ Target node (identifier or member expression)"
+    },
+    "return": "目标的当前值；标识符未定义或其他目标类型时返回 undefined / The current value, or undefined for an undefined identifier or other target kinds",
+    "note": "成员目标会先对基对象与键表达式求值再走 `member_get` / A member target evaluates its base and key expressions and goes through `member_get`"
+  },
+  "write_target": {
+    "brief": "向一个可作为左值的目标写入值 / Write a value to an assignable target",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "target": "目标节点 / Target node",
+      "value": "写入的值 / Value to store"
+    },
+    "note": "标识符写入已存在的槽位，槽位缺失时严格模式报 `is not defined`、否则定义到全局环境；成员目标经 `member_set` 写入；其余目标转交 `assign_pattern` / An identifier writes its existing slot, raising `is not defined` in strict mode or defining it globally otherwise; member targets write through `member_set`; other targets go to `assign_pattern`"
+  },
+  "eval_compound": {
+    "brief": "求值复合赋值运算符 / Evaluate a compound assignment operator",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "n": "赋值表达式节点（`op` 决定运算符）/ Assignment node whose `op` selects the operator",
+      "old": "左值当前值 / Current value of the target",
+      "rhs": "右操作数 / Right-hand operand"
+    },
+    "return": "运算结果值 / The result value",
+    "note": "`+=` 在任一侧为字符串时拼接，其余运算符与 `eval_bin` 语义一致；未识别的赋值运算符报错 / `+=` concatenates when either side is a string and the rest match the `eval_bin` semantics; an unrecognised assignment operator raises an error"
+  },
+  "eval_shortassign": {
+    "brief": "求值逻辑赋值运算符 / Evaluate the logical assignment operators",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "n": "赋值表达式节点（区分 `&&=` / `||=` / `??=`）/ Assignment node distinguishing `&&=`, `||=` and `??=`",
+      "old": "左值当前值 / Current value of the target"
+    },
+    "return": "未触发赋值时返回原值，否则返回写入的新值 / The untouched value when the assignment is skipped, otherwise the newly written value",
+    "note": "`&&=` 仅在原值为假值时跳过，`||=` 仅在真值时跳过，`??=` 仅在非空值时跳过 / `&&=` skips only for a falsy value, `||=` only for a truthy one and `??=` only for a non-nullish one"
+  },
+  "eval_assign": {
+    "brief": "分派并求值赋值表达式 / Dispatch and evaluate an assignment expression",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "n": "赋值表达式节点 / Assignment expression node"
+    },
+    "return": "赋给目标的值 / The value assigned to the target",
+    "note": "简单赋值（`=`）对标识符/成员目标走 `write_target`，解构目标走 `assign_pattern`；逻辑赋值走 `eval_shortassign`；其余复合赋值先 `read_target` 再 `eval_compound`，最后 `write_target` / A simple `=` uses `write_target` for identifier or member targets and `assign_pattern` for destructuring; logical assignments use `eval_shortassign`; other compound assignments read with `read_target`, combine with `eval_compound` and finally `write_target`"
+  },
+  "make_method": {
+    "brief": "由函数节点创建方法函数值 / Create a method function value from a function node",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "创建该方法时捕获的环境 / Environment captured when the method is created",
+      "fn_node": "函数声明节点 / Function declaration node"
+    },
+    "return": "方法函数值 / The method function value",
+    "note": "函数标志取自节点的 `op`，节点有名称时写入函数的 `name` / Function flags come from the node's `op` and the node's name, when present, is written into the function's `name`"
+  },
+  "make_method_home": {
+    "brief": "创建方法并记录其 [[HomeObject]] / Create a method and record its [[HomeObject]]",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "创建该方法时捕获的环境 / Environment captured when the method is created",
+      "fn_node": "函数声明节点 / Function declaration node",
+      "home": "方法所属对象（供 `super.x` 解析）/ Object the method belongs to, used to resolve `super.x`"
+    },
+    "return": "带 `home` 的方法函数值 / The method function value with `home` set",
+    "note": "在 `make_method` 基础上补充 home 指针 / Adds the home pointer on top of `make_method`",
+    "see": "make_method"
+  },
+  "class_member_kind": {
+    "brief": "判定类成员的种类 / Determine a class member's kind",
+    "params": {
+      "m": "类成员节点 / Class member node"
+    },
+    "return": "`K_*` 成员种类常量 / The `K_*` member-kind constant",
+    "details": "块节点为静态块（`K_STATIC_BLOCK`）。非函数节点按 `op` 是 `JS_MEMBER_STATIC_FIELD` 与否区分静态字段或实例字段。函数节点按 `num` 中保存的 `JS_METHOD_*` 返回构造器、get/set、静态方法/get/set，缺省为普通方法。 | A block node is a static block (`K_STATIC_BLOCK`). A non-function node is a static or instance field depending on whether `op` is `JS_MEMBER_STATIC_FIELD`. A function node returns constructor, getter/setter or static method/getter/setter according to the `JS_METHOD_*` stored in `num`, defaulting to a plain method."
+  },
+  "class_is_static_kind": {
+    "brief": "判断成员种类是否安装到构造函数上 / Test whether a member kind installs on the constructor",
+    "params": {
+      "kind": "`class_member_kind` 返回的成员种类 / Member kind returned by `class_member_kind`"
+    },
+    "return": "静态方法/get/set 或静态字段返回 1，其余返回 0 / 1 for a static method, getter, setter or field, otherwise 0",
+    "note": "静态成员挂到构造函数上，其余挂到原型上 / Static members land on the constructor, everything else on the prototype",
+    "see": "class_member_kind"
+  },
+  "class_install_member": {
+    "brief": "按成员种类把一个类成员安装到原型或构造函数 / Install one class member onto the prototype or the constructor according to its kind",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "m": "类成员节点 / Class member node",
+      "proto": "类原型对象 / Class prototype object",
+      "ctor": "类构造函数对象 / Class constructor object"
+    },
+    "details": "构造器成员自身不在此安装。方法与静态方法以 `make_method_home` 安装；get/set（含静态）通过 `js_obj_set_accessor` 安装；静态字段求值初始化器后写入构造函数；静态块在新建的、`this` 指向构造函数的环境中执行。实例字段在此跳过，留待每实例 `apply_class_fields` 处理。 | The constructor member itself is not installed here. Methods and static methods install via `make_method_home`; getters and setters (including statics) install via `js_obj_set_accessor`; a static field evaluates its initialiser and writes the constructor; a static block runs in a fresh environment whose `this` is the constructor. Instance fields are skipped here and handled per instance by `apply_class_fields`."
+  },
+  "class_find_ctor_node": {
+    "brief": "在类体成员中查找显式构造函数节点 / Find the explicit constructor node among the class body members",
+    "params": {
+      "members": "类体成员节点（可为 `NULL`）/ Class body member node, may be `NULL`"
+    },
+    "return": "构造函数节点指针；没有显式构造函数时返回 `NULL` / Pointer to the constructor node, or `NULL` when the class declares none",
+    "note": "只识别种类为 `K_CTOR` 的函数节点 / Only function nodes whose kind is `K_CTOR` are recognised"
+  },
+  "class_synth_ctor": {
+    "brief": "为没有显式构造函数的类合成一个构造函数 / Synthesise a constructor for a class that declares none",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "n": "类声明节点 / Class declaration node",
+      "proto": "类原型对象 / Class prototype object"
+    },
+    "return": "合成的构造函数对象 / The synthesised constructor object",
+    "note": "合成的函数带 `FN_CLASS | FN_CTOR`、空形参与空函数体，名称取类名（缺省 `constructor`），`home` 指向原型，`class_def` 指向类节点，使 `new` 与 `super()` 仍有可运行对象 / The synthetic function carries `FN_CLASS | FN_CTOR`, empty parameters and body, the class name (defaulting to `constructor`), `home` pointing at the prototype and `class_def` at the class node, so that `new` and `super()` still have something to run"
+  },
+  "class_install_members": {
+    "brief": "安装类体中的全部成员 / Install every member of a class body",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "members": "类体成员节点（可为 `NULL`）/ Class body member node, may be `NULL`",
+      "proto": "类原型对象 / Class prototype object",
+      "ctor": "类构造函数对象 / Class constructor object"
+    },
+    "note": "跳过构造器成员（由 `class_eval` 自行安装）与空槽位，其余交给 `class_install_member` / The constructor member (installed by `class_eval` itself) and empty slots are skipped, the rest go to `class_install_member`",
+    "see": "class_install_member"
+  },
+  "class_eval": {
+    "brief": "求值类声明并构造原型与构造函数 / Evaluate a class declaration, building its prototype and constructor",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "n": "类声明节点 / Class declaration node"
+    },
+    "return": "类构造函数值 / The class constructor value",
+    "details": "有父类表达式时求值并判断派生关系（父类 `prototype` 为对象即为派生）。原型以类名命名，派生时链接到父类原型，否则链接 `Object.prototype`。显式构造函数节点存在时用它建函数，否则合成一个。随后设置构造函数的 `name`、`prototype` 与原型上的 `constructor`，派生类把构造函数的 `proto` 接到父类上以实现静态继承，最后安装全部成员；类名在词法环境中声明。 | A superclass expression, when present, is evaluated and the class counts as derived when the superclass `prototype` is an object. The prototype is named after the class and links either to the superclass prototype or to `Object.prototype`. An explicit constructor node is used when present, otherwise one is synthesised. The constructor's `name`, `prototype` and the prototype's `constructor` are then set, a derived class links its constructor's `proto` to the superclass for static inheritance, all members are installed, and the class name is declared in the lexical environment."
+  },
+  "object_literal": {
+    "brief": "求值对象字面量 / Evaluate an object literal",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "n": "对象字面量节点 / Object literal node"
+    },
+    "return": "新建的对象值 / The newly created object value",
+    "details": "展开属性（`JS_N_SPREAD`）把源对象的全部自有键拷贝过来；`__proto__` 属性设置 `proto`。属性键取自节点的 `str`，取值/方法/访问器由 `op` 区分：get/set 经 `js_obj_set_accessor`，方法经 `make_method`，普通属性求值（带默认值形式取其表达式分支）。 | A spread property (`JS_N_SPREAD`) copies every own key from the source object and a `__proto__` property sets `proto`. The key comes from the node's `str` and `op` selects a value, method or accessor: get/set via `js_obj_set_accessor`, methods via `make_method`, and a plain property is evaluated (a defaulted form takes its expression branch)."
+  },
+  "template_eval": {
+    "brief": "求值模板字面量 / Evaluate a template literal",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "n": "模板字面量节点（`kids[0]` 为字面块表，其后为插值表达式）/ Template literal node whose `kids[0]` holds the literal chunks and whose following kids are the interpolations"
+    },
+    "return": "拼接后的字符串值 / The concatenated string value",
+    "note": "先按字节预估总长并一次分配，再逐块拷贝字面量与其后的插值（插值经 `js_to_string` 转换）/ The total byte length is computed up front and allocated once, then each literal chunk is copied followed by its interpolation stringified with `js_to_string`"
+  },
+  "eval_member": {
+    "brief": "求值成员访问表达式 / Evaluate a member access expression",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "n": "成员访问节点 / Member access node"
+    },
+    "return": "成员值；可选链在基值为 `null`/`undefined` 时返回 undefined / The member value, or undefined when an optional chain meets a `null` / `undefined` base",
+    "note": "点式取 `str`，下标式对键表达式求值后转字符串；`num != 0` 标记可选链短路 / A dot form uses `str`, an index form evaluates and stringifies the key, and `num != 0` marks an optional chain that may short-circuit",
+    "see": "member_get"
+  },
+  "eval_super_member": {
+    "brief": "求值 `super.x` 成员访问 / Evaluate a `super.x` member access",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "n": "super 成员访问节点 / `super` member access node"
+    },
+    "return": "父原型上的成员值；无属性名时返回父原型对象；缺失时返回 undefined / The member value from the superclass prototype, the prototype object itself when no name is given, or undefined when absent",
+    "note": "沿环境链寻找带 [[HomeObject]] 的作用域，取其 `home->proto` 与 `this`；找不到 home 时报 `'super' keyword unexpected here`；取值器以该 `this` 调用 / Walks the environment chain for the scope carrying a [[HomeObject]], using its `home->proto` and `this`; a missing home raises `'super' keyword unexpected here` and a getter is called with that `this`"
+  },
+  "args_init": {
+    "brief": "初始化一个可变实参向量 / Initialise a growable argument vector",
+    "params": {
+      "al": "out:待初始化的实参向量 / Argument vector to initialise",
+      "js": "JS 运行时上下文 / JS runtime context",
+      "cap": "初始容量（小于 1 时按 1 处理）/ Initial capacity, clamped up to 1"
+    },
+    "note": "count 归零，缓冲区由运行时分配器分配 / The count is reset to zero and the buffer comes from the runtime allocator"
+  },
+  "args_push": {
+    "brief": "向实参向量追加一个值 / Append one value to an argument vector",
+    "params": {
+      "al": "inout:目标实参向量 / Target argument vector",
+      "js": "JS 运行时上下文 / JS runtime context",
+      "v": "要追加的值 / Value to append"
+    },
+    "note": "容量不足时按 `+8` 增长并拷贝已有元素 / When full the capacity grows by 8 and existing elements are copied"
+  },
+  "args_build": {
+    "brief": "求值调用/构造节点的实参并展开 spread / Evaluate a call or construct node's arguments, flattening spreads",
+    "params": {
+      "al": "out:接收实参的向量 / Vector receiving the arguments",
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "n": "调用或构造节点 / Call or construct node",
+      "first": "起始子节点下标（跳过被调函数节点）/ Index of the first child to evaluate, skipping the callee node"
+    },
+    "note": "spread 实参通过迭代协议（`js_iter_len` / `js_iter_at`）逐个展开后压入，使调用与构造共用同一条路径 / A spread argument is expanded through the iteration protocol (`js_iter_len` / `js_iter_at`), letting calls and constructs share one code path"
+  },
+  "eval_callee": {
+    "brief": "解析被调函数及其 this 绑定 / Resolve a call's callee together with its `this` binding",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "n": "调用节点（`op == 1` 表示可选调用）/ Call node, where `op == 1` marks an optional call",
+      "callee_node": "被调函数节点 / Callee node",
+      "callee": "out:解析出的被调函数值 / Resolved callee value",
+      "thisv": "out:对应的 this 值 / Matching `this` value"
+    },
+    "return": "0 表示可选调用在 `null`/`undefined` 上短路，1 表示可以继续调用 / 0 when an optional call short-circuits on `null` / `undefined`, 1 when the call may proceed",
+    "note": "方法调用把 `this` 绑到基对象；`super.m()` 把 `this` 绑到类的自身实例（经 `js_env_this_env`）/ A method call binds `this` to the base object；`super.m()` binds `this` to the class's own instance via `js_env_this_env`"
+  },
+  "super_call": {
+    "brief": "在派生构造函数中执行 `super(...)` / Perform a `super(...)` call inside a derived constructor",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "env": "词法环境 / Lexical environment",
+      "n": "super 调用节点 / `super` call node"
+    },
+    "return": "父构造函数返回的对象；未返回对象时返回当前 `this` 实例 / The object returned by the parent constructor, or the current `this` instance when it returns none",
+    "details": "沿环境链查找带 [[HomeObject]] 的作用域以取得 `home` 与 `this`。取 `home->proto` 上的 `constructor` 作为父构造函数，若不可调用则报错。用 `args_build` 求值实参，再以 `derived = 1` 运行父构造函数体（因此父类字段在 `super()` 之后才安装到该实例上）。 | The environment chain is walked for the scope carrying a [[HomeObject]] to obtain `home` and `this`. The `constructor` on `home->proto` is taken as the parent constructor and an error is raised when it is not callable. Arguments are evaluated with `args_build` and the parent body runs with `derived = 1`, so the parent's fields are installed on the instance only after `super()`."
+  }
+}

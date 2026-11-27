@@ -1,5 +1,6 @@
 /* Hope UI Engine - javascript DOM bridge implementation */
 #include "js/hpe_js_dom.h"
+#include "js/hpe_js_canvas.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,6 +10,7 @@
 #include "html/hpe_html.h"
 #include "js/hpe_js_internal.h"
 #include "js/hpe_js_mutation.h"
+#include "js/hpe_js_selection.h"
 #include "layout/hpe_layout.h"
 
 /* ---------------- small malloc string builder ---------------- */
@@ -86,6 +88,10 @@ static void (*g_focus_hook)(void *ud, HpeDomNode *node);
 static void *g_focus_hook_ud;
 static HpeDomNode *g_active_element;
 
+/* the reporting slot a cancelable dispatch shares with its preventDefault
+ * native; nested cancelable dispatches share it (documented in the header) */
+static int *g_prevented_out = NULL;
+
 /* Browsers force a layout before answering geometry queries, so an element a
  * script just built already has a box. The engine owns the layout pass, so the
  * geometry getters ask it to lay out through this hook first. */
@@ -96,6 +102,14 @@ static void *g_layout_hook_ud;
  * size and the current scroll offsets. Same hook idea as the layout one. */
 static void (*g_viewport_hook)(void *ud, float *w, float *h, float *sx, float *sy);
 static void *g_viewport_hook_ud;
+
+/* scroll / document.write hooks (v0.28): JS reports these to the engine */
+static void (*g_scroll_hook)(void *ud, HpeDomNode *node, int kind, float x, float y);
+static void *g_scroll_hook_ud;
+static float (*g_scroll_getter)(void *ud, HpeDomNode *node, int axis);
+static void *g_scroll_getter_ud;
+static void (*g_write_hook)(void *ud, const char *text);
+static void *g_write_hook_ud;
 
 /**
  * @brief 请求引擎立即排版 / Ask the engine to lay out right now
@@ -266,6 +280,10 @@ static JsValue native_noop(HpeJs *js, JsValue thisv, JsValue *args, int argc, vo
 static JsValue native_stop_propagation(HpeJs *js, JsValue thisv, JsValue *args, int argc,
                                        void *ud);
 static int propagation_stopped(HpeJs *js, JsValue ev);
+static JsValue native_prevent_default(HpeJs *js, JsValue thisv, JsValue *args, int argc,
+                                      void *ud);
+/* scroll API, defined below; declared here for the DOM-method table */
+static JsValue dm_scroll_into_view(HpeJs *js, HpeDomNode *node, JsValue *args, int argc);
 
 /**
  * @brief 把 camelCase 的 JS 属性名转成连字符小写的 CSS 名 / Convert a camelCase JS property name to a dashed lowercase CSS name
@@ -334,6 +352,12 @@ static void serialize_node(HpeDomNode *node, SB *sb)
     sb_add(sb, "<", 1);
     sb_add(sb, node->tag, strlen(node->tag));
     for (i = 0; i < node->attr_count; i++) {
+        /* the engine's form reset snapshots are implementation details: they
+         * must not leak into `innerHTML` (nor into `outerHTML` serialisations) */
+        if (!strcmp(node->attrs[i].name, "data-defval") ||
+            !strcmp(node->attrs[i].name, "data-defchk") ||
+            !strcmp(node->attrs[i].name, "data-defsel"))
+            continue;
         sb_add(sb, " ", 1);
         sb_add(sb, node->attrs[i].name, strlen(node->attrs[i].name));
         sb_add(sb, "=\"", 2);
@@ -1233,6 +1257,174 @@ static JsValue dm_blur(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
     return js_undef();
 }
 
+/* ---------------- form controls (v0.23) ---------------- */
+
+/* the engine-side hook running form.submit() / form.reset() semantics */
+static void (*g_form_hook)(void *ud, HpeDomNode *form, int kind);
+static void *g_form_hook_ud;
+
+/* kind codes for the form hook */
+#define HPE_FORM_HOOK_SUBMIT 0 /* `form.submit()`: action navigation, no events */
+#define HPE_FORM_HOOK_RESET 1  /* `form.reset()`: restore the default snapshots */
+
+/**
+ * @brief `form.submit()` 的实现 / Implementation of `form.submit()`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node form 元素 / The form element
+ * @param[in,out] args 实参数组（未使用）/ Actual argument array (unused)
+ * @param[in]     argc 参数个数 / Argument count
+ *
+ * @return 总是返回 `undefined` / Always returns `undefined`
+ *
+ * @note 按规范绕过 `submit` 事件与校验，直接交给引擎钩子（action 为本地文件时跳转）/
+ *       Per spec it bypasses the `submit` event and validation, going straight to the
+ *       engine hook (which navigates when an `action` is set)
+ */
+static JsValue dm_submit(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
+{
+    HPE_UNUSED(args);
+    HPE_UNUSED(argc);
+    if (g_form_hook)
+        g_form_hook(g_form_hook_ud, node, HPE_FORM_HOOK_SUBMIT);
+    return js_undef();
+}
+
+/**
+ * @brief `form.reset()` 的实现 / Implementation of `form.reset()`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node form 元素 / The form element
+ * @param[in,out] args 实参数组（未使用）/ Actual argument array (unused)
+ * @param[in]     argc 参数个数 / Argument count
+ *
+ * @return 总是返回 `undefined` / Always returns `undefined`
+ *
+ * @note 先派发可取消的 `reset` 事件，未取消时经引擎钩子恢复默认值快照 /
+ *       A cancelable `reset` event fires first; when not prevented the engine hook
+ *       restores the default snapshots
+ */
+static JsValue dm_reset(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
+{
+    HpeJsEventInit init;
+    int prevented = 0;
+
+    HPE_UNUSED(args);
+    HPE_UNUSED(argc);
+    memset(&init, 0, sizeof(init));
+    hpe_js_dom_dispatch_cancelable(js, node, "reset", &init, &prevented);
+    if (!prevented && g_form_hook)
+        g_form_hook(g_form_hook_ud, node, HPE_FORM_HOOK_RESET);
+    return js_undef();
+}
+
+/**
+ * @brief `checkValidity()` 的实现 / Implementation of `checkValidity()`
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node 目标控件 / The target control
+ * @param[in,out] args 实参数组（未使用）/ Actual argument array (unused)
+ * @param[in]     argc 参数个数 / Argument count
+ *
+ * @return 满足约束返回 `true` / `true` when the constraints hold
+ *
+ * @note 已实现子集：`required` 且当前值为空串 → 不满足（同时派发 `invalid`）；
+ *       其余约束类型尚未实现 / Implemented subset: `required` with an empty current
+ *       value fails (an `invalid` event fires); other constraint types are not yet
+ *       implemented
+ */
+static JsValue dm_check_validity(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
+{
+    HpeJsEventInit init;
+    int prevented = 0;
+    char val[512];
+    const char *v;
+
+    HPE_UNUSED(args);
+    HPE_UNUSED(argc);
+    if (hpe_dom_attr(node, "required")) {
+        v = hpe_dom_attr(node, "value");
+        snprintf(val, sizeof(val), "%s", v ? v : "");
+        if (!val[0]) {
+            memset(&init, 0, sizeof(init));
+            hpe_js_dom_dispatch_cancelable(js, node, "invalid", &init, &prevented);
+            return js_bool(0);
+        }
+    }
+    return js_bool(1);
+}
+
+/* ---------------- <dialog> (v0.26) ---------------- */
+
+/* the engine-side hook keeps the modal top-layer node in sync */
+static void (*g_dialog_hook)(void *ud, HpeDomNode *dialog, int kind);
+static void *g_dialog_hook_ud;
+
+#define HPE_DIALOG_HOOK_SHOW 0      /* show(): refresh state, non-modal */
+#define HPE_DIALOG_HOOK_SHOWMODAL 1 /* showModal(): refresh state, modal top layer */
+#define HPE_DIALOG_HOOK_CLOSE 2     /* close(): drop modal state, fire close event */
+
+/**
+ * @brief 打开 `<dialog>`（`show()` / `showModal()` 共用）/ Open a `<dialog>` (shared by show/showModal)
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node 目标 `<dialog>` / The target `<dialog>`
+ * @param[in]     modal `showModal()` 为 1，`show()` 为 0 / 1 for showModal, 0 for show
+ *
+ * @return `undefined` / `undefined`
+ *
+ * @note 先置 `open` 属性（触发重排），再经引擎钩子同步模态层 / Sets `open` (triggering reflow), then syncs the modal layer through the engine hook
+ */
+static JsValue dialog_open(HpeJs *js, HpeDomNode *node, int modal)
+{
+    HPE_UNUSED(js);
+    if (!node || (node->tag && strcmp(node->tag, "dialog")))
+        return js_undef();
+    if (!hpe_dom_attr(node, "open"))
+        hpe_dom_set_attr(node, "open", "");
+    if (g_dialog_hook)
+        g_dialog_hook(g_dialog_hook_ud, node, modal ? HPE_DIALOG_HOOK_SHOWMODAL
+                                                    : HPE_DIALOG_HOOK_SHOW);
+    return js_undef();
+}
+
+/**
+ * @brief `dialog.show()` 的实现 / Implementation of `dialog.show()`
+ */
+static JsValue dm_dialog_show(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
+{
+    HPE_UNUSED(args);
+    HPE_UNUSED(argc);
+    return dialog_open(js, node, 0);
+}
+
+/**
+ * @brief `dialog.showModal()` 的实现 / Implementation of `dialog.showModal()`
+ */
+static JsValue dm_dialog_show_modal(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
+{
+    HPE_UNUSED(args);
+    HPE_UNUSED(argc);
+    return dialog_open(js, node, 1);
+}
+
+/**
+ * @brief `dialog.close()` 的实现 / Implementation of `dialog.close()`
+ *
+ * @note 移除 `open` 属性后经引擎钩子派发 `close` 事件 / Removes `open`, then fires `close` through the engine hook
+ */
+static JsValue dm_dialog_close(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
+{
+    HPE_UNUSED(args);
+    HPE_UNUSED(argc);
+    if (!node || (node->tag && strcmp(node->tag, "dialog")))
+        return js_undef();
+    hpe_dom_remove_attr(node, "open");
+    if (g_dialog_hook)
+        g_dialog_hook(g_dialog_hook_ud, node, HPE_DIALOG_HOOK_CLOSE);
+    return js_undef();
+}
+
 /* method-name -> handler registry; the dispatch below is pure table lookup so
  * adding a DOM method is a one-line table edit, not a new branch. */
 static const struct {
@@ -1264,6 +1456,14 @@ static const struct {
     { "dispatchEvent",          dm_dispatch_event },
     { "focus",                  dm_focus },
     { "blur",                   dm_blur },
+    { "submit",                 dm_submit },
+    { "reset",                  dm_reset },
+    { "checkValidity",          dm_check_validity },
+    { "show",                   dm_dialog_show },
+    { "showModal",              dm_dialog_show_modal },
+    { "close",                  dm_dialog_close },
+    { "getContext",             hpe_js_canvas_get_context },
+    { "scrollIntoView",         dm_scroll_into_view },
     { NULL, NULL }
 };
 
@@ -1338,7 +1538,11 @@ static int method_is(const char *prop)
            !strcmp(prop, "querySelectorAll") || !strcmp(prop, "addEventListener") ||
            !strcmp(prop, "removeEventListener") || !strcmp(prop, "click") ||
            !strcmp(prop, "getBoundingClientRect") || !strcmp(prop, "dispatchEvent") ||
-           !strcmp(prop, "focus") || !strcmp(prop, "blur");
+           !strcmp(prop, "focus") || !strcmp(prop, "blur") ||
+           !strcmp(prop, "submit") || !strcmp(prop, "reset") ||
+           !strcmp(prop, "checkValidity") || !strcmp(prop, "show") ||
+           !strcmp(prop, "showModal") || !strcmp(prop, "close") ||
+           !strcmp(prop, "getContext") || !strcmp(prop, "scrollIntoView");
 }
 
 /* ---------------- events ---------------- */
@@ -1357,7 +1561,7 @@ static const char *on_prop_event(const char *prop)
     static const char *evts[] = {
         "click",     "mousedown", "mouseup", "mousemove",  "mouseover", "mouseout",
         "mouseenter", "mouseleave", "keydown", "keyup",     "keypress",  "wheel",
-        "scroll",    NULL
+        "scroll",    "input", "change", "submit", "reset", "invalid", NULL
     };
     int i;
     if (prop[0] != 'o' || prop[1] != 'n')
@@ -1480,6 +1684,62 @@ static JsValue native_noop(HpeJs *js, JsValue thisv, JsValue *args, int argc, vo
     return js_undef();
 }
 
+/* ---- scroll API (v0.28) ---- */
+
+/**
+ * @brief `scrollTo` / `scrollBy` 的实现（kind 由 ud 传入）/ Implementation of scrollTo/scrollBy
+ */
+static JsValue dom_scroll_xy(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *ud)
+{
+    int kind = (int)(intptr_t)ud;
+    float x = argc > 0 ? (float)js_to_number(js, args[0]) : 0.0f;
+    float y = argc > 1 ? (float)js_to_number(js, args[1]) : 0.0f;
+    HPE_UNUSED(thisv);
+    if (g_scroll_hook)
+        g_scroll_hook(g_scroll_hook_ud, NULL, kind, x, y);
+    return js_undef();
+}
+
+/**
+ * @brief 读取文档滚动偏移 / Read the document scroll offset
+ */
+static JsValue dom_scroll_offset(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *ud)
+{
+    int axis = (int)(intptr_t)ud;
+    HPE_UNUSED(js);
+    HPE_UNUSED(thisv);
+    HPE_UNUSED(args);
+    HPE_UNUSED(argc);
+    if (g_scroll_getter)
+        return js_num(g_scroll_getter(g_scroll_getter_ud, NULL, axis));
+    return js_num(0.0);
+}
+
+/**
+ * @brief 读取元素的 scrollTop / scrollLeft / Read an element's scrollTop/scrollLeft
+ */
+static JsValue eg_scroll_offset(HpeJs *js, HpeDomNode *node, const char *prop)
+{
+    int axis = prop[6] == 'T' ? 1 : 0; /* scrollTop vs scrollLeft */
+    HPE_UNUSED(js);
+    if (g_scroll_getter)
+        return js_num(g_scroll_getter(g_scroll_getter_ud, node, axis));
+    return js_num(0.0);
+}
+
+/**
+ * @brief `element.scrollIntoView()` 的实现 / Implementation of element.scrollIntoView()
+ */
+static JsValue dm_scroll_into_view(HpeJs *js, HpeDomNode *node, JsValue *args, int argc)
+{
+    HPE_UNUSED(args);
+    HPE_UNUSED(argc);
+    if (g_scroll_hook)
+        g_scroll_hook(g_scroll_hook_ud, node, 2, 0.0f, 0.0f);
+    HPE_UNUSED(js);
+    return js_undef();
+}
+
 /**
  * @brief 在事件对象上记录停止传播标志 / Record a stop-propagation flag on the event object
  *
@@ -1545,7 +1805,9 @@ static JsValue event_object(HpeJs *js, const char *type, int x, int y, HpeDomNod
     js_obj_set(js, o, "clientX", js_num((double)x));
     js_obj_set(js, o, "clientY", js_num((double)y));
     js_obj_set(js, o, "target", node_value(js, target));
-    js_obj_set(js, o, "preventDefault", js_objval(js_native_new(js, native_noop, NULL)));
+    js_obj_set(js, o, "preventDefault",
+               js_objval(js_native_new(js, g_prevented_out ? native_prevent_default : native_noop,
+                                       NULL)));
     js_obj_set(js, o, "stopPropagation",
                js_objval(js_native_new(js, native_stop_propagation, NULL)));
     js_obj_set(js, o, "stopImmediatePropagation",
@@ -1572,6 +1834,7 @@ static void event_object_init(HpeJs *js, JsObj *o, const char *type, const HpeJs
 {
     int is_key = !strncmp(type, "key", 3);
     int is_wheel = !strcmp(type, "wheel") || !strcmp(type, "mousewheel");
+    int is_toggle = !strcmp(type, "toggle") || !strcmp(type, "beforetoggle");
     if (!init)
         return;
     js_obj_set(js, o, "bubbles", js_bool(init->no_bubble ? 0 : 1));
@@ -1597,6 +1860,8 @@ static void event_object_init(HpeJs *js, JsObj *o, const char *type, const HpeJs
         js_obj_set(js, o, "which", js_num((double)init->key_code));
         js_obj_set(js, o, "repeat", js_bool(init->repeat ? 1 : 0));
     }
+    if (is_toggle)
+        js_obj_set(js, o, "newState", js_string(js, init->new_state ? init->new_state : ""));
 }
 
 /**
@@ -1651,9 +1916,9 @@ static int fire_on_node(HpeJs *js, HpeDomNode *node, const char *type, int mask,
             JsValue h = l->handler;
             *pp = l->next; /* unlink before the call; pp already points at the successor */
             node->listeners = head;
-            hpe_js_call(js, h, js_undef(), args, 1);
+            hpe_js_call(js, h, node_value(js, node), args, 1);
         } else {
-            hpe_js_call(js, l->handler, js_undef(), args, 1);
+            hpe_js_call(js, l->handler, node_value(js, node), args, 1);
             pp = &l->next;
         }
         *fired = 1;
@@ -1738,6 +2003,42 @@ int hpe_js_dom_dispatch_ex(HpeJs *js, HpeDomNode *target, const char *type,
         if (fire_on_node(js, chain[i], type, FIRE_BUBBLE, args[0], &fired))
             return fired;
     return fired;
+}
+
+int hpe_js_dom_dispatch_cancelable(HpeJs *js, HpeDomNode *target, const char *type,
+                                   const HpeJsEventInit *init, int *prevented)
+{
+    HpeJsEventInit full;
+    int saved_prevented = 0;
+    int r;
+
+    if (!js || !target)
+        return 0;
+    memset(&full, 0, sizeof(full));
+    if (init)
+        full = *init;
+    if (prevented)
+        *prevented = 0;
+    g_prevented_out = prevented ? prevented : &saved_prevented;
+    r = hpe_js_dom_dispatch_ex(js, target, type, &full);
+    g_prevented_out = NULL;
+    return r;
+}
+
+/**
+ * @brief 可取消事件的 `preventDefault()` 实现 / The `preventDefault()` native of a cancelable event
+ */
+static JsValue native_prevent_default(HpeJs *js, JsValue thisv, JsValue *args, int argc,
+                                      void *ud)
+{
+    HPE_UNUSED(args);
+    HPE_UNUSED(argc);
+    HPE_UNUSED(ud);
+    if (g_prevented_out)
+        *g_prevented_out = 1;
+    if (thisv.t == JS_OBJ && thisv.obj)
+        js_obj_set(js, thisv.obj, "_prevented", js_bool(1));
+    return js_undef();
 }
 
 /**
@@ -2552,6 +2853,8 @@ static int dataset_vt_set(HpeJs *js, void *target, const char *prop, JsValue val
 
 static const HpeJsHostVt g_dataset_vt = {dataset_vt_get, dataset_vt_set};
 
+static void select_set_value(HpeDomNode *select, const char *value);
+
 /**
  * @brief `dataset` 读取器 / `dataset` getter
  *
@@ -2565,6 +2868,185 @@ static JsValue eg_dataset(HpeJs *js, HpeDomNode *node, const char *prop)
 {
     HPE_UNUSED(prop);
     return js_make_host(js, node, HPE_HOST_DATASET, &g_dataset_vt);
+}
+
+/* ---------------- form control properties (v0.23) ---------------- */
+
+/**
+ * @brief 读 input 的 type 属性（缺省 text）/ Read an input's `type` (defaulting to `text`)
+ */
+static const char *form_input_type(HpeDomNode *node)
+{
+    const char *t = hpe_dom_attr(node, "type");
+    return (t && *t) ? t : "text";
+}
+
+/**
+ * @brief 判断标签是否为表单控件 / Test whether a tag is a form control
+ */
+static int tag_is_form_control(const char *tag)
+{
+    return tag && (!strcmp(tag, "input") || !strcmp(tag, "select") ||
+                   !strcmp(tag, "textarea") || !strcmp(tag, "button") ||
+                   !strcmp(tag, "fieldset") || !strcmp(tag, "output") ||
+                   !strcmp(tag, "progress") || !strcmp(tag, "meter"));
+}
+
+/**
+ * @brief 在子树中收集控件 / Collect the form controls within a subtree
+ */
+static void collect_controls(HpeDomNode *n, JsObj *arr, HpeJs *js, int *count)
+{
+    char key[32];
+    while (n) {
+        if (n->type == HPE_NODE_ELEMENT && tag_is_form_control(n->tag)) {
+            snprintf(key, sizeof(key), "%d", *count);
+            js_obj_set(js, arr, key, node_value(js, n));
+            (*count)++;
+        }
+        if (n->first_child)
+            collect_controls(n->first_child, arr, js, count);
+        n = n->next_sibling;
+    }
+}
+
+/**
+ * @brief 按标签收集子树元素 / Collect subtree elements by tag
+ */
+static void collect_by_tag(HpeDomNode *n, const char *tag, JsObj *arr, HpeJs *js, int *count)
+{
+    char key[32];
+    while (n) {
+        if (n->type == HPE_NODE_ELEMENT && n->tag && !strcmp(n->tag, tag)) {
+            snprintf(key, sizeof(key), "%d", *count);
+            js_obj_set(js, arr, key, node_value(js, n));
+            (*count)++;
+        }
+        if (n->first_child)
+            collect_by_tag(n->first_child, tag, arr, js, count);
+        n = n->next_sibling;
+    }
+}
+
+/**
+ * @brief `value` 读取器 / The `value` getter
+ *
+ * @details input 族读 `value` 属性；select 读选中 option 的 `value`（或其文本）；
+ *          textarea / output / progress / meter 读子树文本。
+ *          The input family reads the `value` attribute; `select` reads the selected
+ *          option's `value` (or its text); `textarea` / `output` / `progress` / `meter`
+ *          read the subtree text.
+ */
+static JsValue eg_value(HpeJs *js, HpeDomNode *node, const char *prop)
+{
+    HpeDomNode *c;
+    const char *v;
+
+    HPE_UNUSED(prop);
+    if (node->tag && !strcmp(node->tag, "select")) {
+        for (c = node->first_child; c; c = c->next_sibling) {
+            if (c->type != HPE_NODE_ELEMENT || !c->tag || strcmp(c->tag, "option"))
+                continue;
+            if (hpe_dom_attr(c, "selected")) {
+                v = hpe_dom_attr(c, "value");
+                if (v)
+                    return js_string(js, v);
+                return element_get_text(js, c);
+            }
+        }
+        return js_string(js, "");
+    }
+    if (node->tag && (!strcmp(node->tag, "textarea") || !strcmp(node->tag, "output") ||
+                      !strcmp(node->tag, "progress") || !strcmp(node->tag, "meter")))
+        return element_get_text(js, node);
+    v = hpe_dom_attr(node, "value");
+    return js_string(js, v ? v : "");
+}
+
+/**
+ * @brief `checked` 读取器 / The `checked` getter
+ */
+static JsValue eg_checked(HpeJs *js, HpeDomNode *node, const char *prop)
+{
+    HPE_UNUSED(js);
+    HPE_UNUSED(prop);
+    return js_bool(hpe_dom_attr(node, "checked") != NULL);
+}
+
+/**
+ * @brief `disabled` 读取器 / The `disabled` getter
+ */
+static JsValue eg_disabled(HpeJs *js, HpeDomNode *node, const char *prop)
+{
+    HPE_UNUSED(js);
+    HPE_UNUSED(prop);
+    return js_bool(hpe_dom_attr(node, "disabled") != NULL);
+}
+
+/**
+ * @brief `open` 读取器（`<details>` / `<dialog>`）/ The `open` getter
+ */
+static JsValue eg_open(HpeJs *js, HpeDomNode *node, const char *prop)
+{
+    HPE_UNUSED(js);
+    HPE_UNUSED(prop);
+    return js_bool(hpe_dom_attr(node, "open") != NULL);
+}
+
+/**
+ * @brief `type` 读取器 / The `type` getter
+ */
+static JsValue eg_type(HpeJs *js, HpeDomNode *node, const char *prop)
+{
+    HPE_UNUSED(js);
+    HPE_UNUSED(prop);
+    if (node->tag && !strcmp(node->tag, "input"))
+        return js_string(js, form_input_type(node));
+    return element_upper_tag(js, node);
+}
+
+/**
+ * @brief `defaultValue` 读取器 / The `defaultValue` getter
+ */
+static JsValue eg_default_value(HpeJs *js, HpeDomNode *node, const char *prop)
+{
+    const char *v;
+
+    HPE_UNUSED(prop);
+    v = hpe_dom_attr(node, "data-defval");
+    if (!v && node->tag && !strcmp(node->tag, "textarea"))
+        return element_get_text(js, node);
+    if (!v)
+        v = hpe_dom_attr(node, "value");
+    return js_string(js, v ? v : "");
+}
+
+/**
+ * @brief `defaultChecked` 读取器 / The `defaultChecked` getter
+ */
+static JsValue eg_default_checked(HpeJs *js, HpeDomNode *node, const char *prop)
+{
+    const char *v = hpe_dom_attr(node, "data-defchk");
+
+    HPE_UNUSED(js);
+    HPE_UNUSED(prop);
+    if (!v)
+        v = hpe_dom_attr(node, "checked");
+    return js_bool(v != NULL && v[0] == '1');
+}
+
+/**
+ * @brief `form.elements` 读取器 / The `form.elements` getter
+ */
+static JsValue eg_form_elements(HpeJs *js, HpeDomNode *node, const char *prop)
+{
+    JsObj *arr = js_array_new(js);
+    int count = 0;
+
+    HPE_UNUSED(prop);
+    collect_controls(node->first_child, arr, js, &count);
+    js_obj_set(js, arr, "length", js_num((double)count));
+    return js_objval(arr);
 }
 
 static const struct {
@@ -2598,6 +3080,16 @@ static const struct {
     { "parentElement",        eg_parent_element },
     { "classList",    eg_class_list },
     { "dataset",      eg_dataset },
+    { "value",          eg_value },
+    { "checked",        eg_checked },
+    { "disabled",       eg_disabled },
+    { "type",           eg_type },
+    { "defaultValue",   eg_default_value },
+    { "defaultChecked", eg_default_checked },
+    { "elements",       eg_form_elements },
+    { "open",           eg_open },
+    { "scrollTop",      eg_scroll_offset },
+    { "scrollLeft",     eg_scroll_offset },
     { NULL, NULL }
 };
 
@@ -2647,6 +3139,62 @@ static int element_vt_get(HpeJs *js, void *target, const char *prop, JsValue *ou
 }
 
 /**
+ * @brief 写入表单控件相关属性 / Write a form-control property
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] node 元素节点 / Element node
+ * @param[in]     prop 属性名 / Property name
+ * @param[in]     value 待写入的值 / Value to write
+ *
+ * @return 已处理返回 1，未识别返回 0 / 1 when handled, 0 otherwise
+ */
+static int element_vt_set_form(HpeJs *js, HpeDomNode *node, const char *prop, JsValue value)
+{
+    if (!strcmp(prop, "scrollTop") || !strcmp(prop, "scrollLeft")) {
+        float v = (float)js_to_number(js, value);
+        if (g_scroll_hook)
+            g_scroll_hook(g_scroll_hook_ud, node,
+                          prop[6] == 'T' ? 3 : 4, v, v);
+        return 1;
+    }
+    if (!strcmp(prop, "open")) {
+        if (js_truthy(value))
+            hpe_dom_set_attr(node, "open", "");
+        else
+            hpe_dom_remove_attr(node, "open");
+        if (g_dialog_hook && node->tag && !strcmp(node->tag, "dialog"))
+            g_dialog_hook(g_dialog_hook_ud, node,
+                          hpe_dom_attr(node, "open") ? HPE_DIALOG_HOOK_SHOW
+                                                     : HPE_DIALOG_HOOK_CLOSE);
+        return 1;
+    }
+    if (!strcmp(prop, "value")) {
+        if (node->tag && !strcmp(node->tag, "textarea"))
+            node_replace_children_with_text(node, js_to_string(js, value));
+        else if (node->tag && !strcmp(node->tag, "select"))
+            select_set_value(node, js_to_string(js, value));
+        else
+            hpe_dom_set_attr(node, "value", js_to_string(js, value));
+        return 1;
+    }
+    if (!strcmp(prop, "checked")) {
+        if (js_truthy(value))
+            hpe_dom_set_attr(node, "checked", "");
+        else
+            hpe_dom_remove_attr(node, "checked");
+        return 1;
+    }
+    if (!strcmp(prop, "disabled")) {
+        if (js_truthy(value))
+            hpe_dom_set_attr(node, "disabled", "");
+        else
+            hpe_dom_remove_attr(node, "disabled");
+        return 1;
+    }
+    return 0;
+}
+
+/**
  * @brief 元素宿主的属性写入虚函数 / Property-set virtual for element hosts
  *
  * @param[in,out] js JS 运行时上下文 / JS runtime context
@@ -2683,6 +3231,8 @@ static int element_vt_set(HpeJs *js, void *target, const char *prop, JsValue val
         hpe_dom_set_attr(node, "class", js_to_string(js, value));
         return 1;
     }
+    if (element_vt_set_form(js, node, prop, value))
+        return 1;
     if (prop[0] == 'o' && prop[1] == 'n') {
         const char *ev = on_prop_event(prop);
         if (ev) {
@@ -2694,6 +3244,36 @@ static int element_vt_set(HpeJs *js, void *target, const char *prop, JsValue val
 }
 
 static const HpeJsHostVt g_element_vt = {element_vt_get, element_vt_set};
+
+/**
+ * @brief 把 select 的选中标记移到匹配值的 option / Move a select's selection onto the option matching a value
+ *
+ * @details 先按 option 的 `value` 属性匹配，再按 option 文本匹配；都没有时保持不变。
+ *          Matching tries the option's `value` attribute first, then the option text;
+ *          when nothing matches the selection stays put.
+ */
+static void select_set_value(HpeDomNode *select, const char *value)
+{
+    HpeDomNode *c;
+    for (c = select->first_child; c; c = c->next_sibling) {
+        const char *ov;
+        if (c->type != HPE_NODE_ELEMENT || !c->tag || strcmp(c->tag, "option"))
+            continue;
+        ov = hpe_dom_attr(c, "value");
+        if ((ov && !strcmp(ov, value)) || (!ov && c->text && !strcmp(c->text, value))) {
+            HpeDomNode *o;
+            for (o = select->first_child; o; o = o->next_sibling) {
+                if (o->type == HPE_NODE_ELEMENT && o->tag && !strcmp(o->tag, "option")) {
+                    if (o == c)
+                        hpe_dom_set_attr(o, "selected", "");
+                    else
+                        hpe_dom_remove_attr(o, "selected");
+                }
+            }
+            return;
+        }
+    }
+}
 
 /**
  * @brief 文档片段宿主的属性读取虚函数 / Property-get virtual for document-fragment hosts
@@ -2963,6 +3543,14 @@ static int document_vt_get(HpeJs *js, void *target, const char *prop, JsValue *o
     }
     if (!strcmp(prop, "activeElement")) {
         *out = g_active_element ? node_value(js, g_active_element) : js_null();
+        return 1;
+    }
+    if (!strcmp(prop, "forms")) {
+        JsObj *arr = js_array_new(js);
+        int count = 0;
+        collect_by_tag(doc, "form", arr, js, &count);
+        js_obj_set(js, arr, "length", js_num((double)count));
+        *out = js_objval(arr);
         return 1;
     }
     if (method_is(prop)) {
@@ -3402,12 +3990,92 @@ static JsValue history_push(HpeJs *js, JsValue thisv, JsValue *args, int argc, v
 }
 
 /**
+ * @brief 向文档节点派发导航类事件 / Dispatch a navigation event on the document node
+ */
+static void nav_dispatch(HpeJs *js, const char *type)
+{
+    HpeJsEventInit init;
+    if (!js || !js->dom_document)
+        return;
+    memset(&init, 0, sizeof(init));
+    init.no_bubble = 1;
+    hpe_js_dom_dispatch_self(js, (HpeDomNode *)js->dom_document, type, &init);
+}
+
+/**
+ * @brief `history.back/forward/go` 的实现，触发 `popstate` / Implementation of history navigation, firing popstate
+ */
+static JsValue history_nav(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *ud)
+{
+    int kind = (int)(intptr_t)ud; /* 0 = back, 1 = forward, 2 = go */
+    int delta;
+    HPE_UNUSED(thisv);
+    delta = kind == 2 ? (argc > 0 ? (int)js_to_number(js, args[0]) : 0)
+                      : (kind == 0 ? -1 : 1);
+    g_history.index += delta;
+    if (g_history.index < 0)
+        g_history.index = 0;
+    if (g_history.index >= g_history.count)
+        g_history.index = g_history.count - 1;
+    nav_dispatch(js, "popstate");
+    return js_undef();
+}
+
+/**
+ * @brief `location.hash` 读取器 / Reader for location.hash
+ */
+static JsValue loc_hash_get(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *ud)
+{
+    JsValue v;
+    HPE_UNUSED(args);
+    HPE_UNUSED(argc);
+    HPE_UNUSED(ud);
+    v = thisv.t == JS_OBJ && thisv.obj ? js_obj_get(js, thisv.obj, "_hash") : js_undef();
+    return v.t == JS_UNDEF ? js_string(js, "") : v;
+}
+
+/**
+ * @brief `location.hash` 写入器，变化时触发 `hashchange` / Writer for location.hash, firing hashchange on change
+ */
+static JsValue loc_hash_set(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *ud)
+{
+    char buf[512];
+    JsValue old;
+    HPE_UNUSED(ud);
+    old = loc_hash_get(js, thisv, NULL, 0, NULL);
+    snprintf(buf, sizeof(buf), "%s", argc > 0 ? js_to_string(js, args[0]) : "");
+    if (thisv.t == JS_OBJ && thisv.obj)
+        js_obj_set(js, thisv.obj, "_hash", js_string(js, buf));
+    if (strcmp(js_to_string(js, old), buf))
+        nav_dispatch(js, "hashchange");
+    return js_undef();
+}
+
+/**
+ * @brief 把 window 的监听器转接到文档节点 / Route window listeners onto the document node
+ */
+static JsValue win_add_listener(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *ud)
+{
+    HPE_UNUSED(thisv);
+    return dm_add_event_listener(js, (HpeDomNode *)ud, args, argc);
+}
+
+/**
+ * @brief 把 window 的监听器移除转接到文档节点 / Route window listener removal onto the document node
+ */
+static JsValue win_remove_listener(HpeJs *js, JsValue thisv, JsValue *args, int argc, void *ud)
+{
+    HPE_UNUSED(thisv);
+    return dm_remove_event_listener(js, (HpeDomNode *)ud, args, argc);
+}
+
+/**
  * @brief 构造并注册 `history` 与两个存储区对象 / Build and register `history` and the two storage areas
  *
  * @param[in,out] js JS 运行时上下文 / JS runtime context
  * @param[in,out] win `window` 宿主对象 / The `window` host object
  *
- * @note `back`/`forward`/`go` 在无导航的引擎里是空实现，但都返回 `undefined` 而不是抛错 / `back`/`forward`/`go` are no-ops in a navigation-less engine but return `undefined` rather than throwing
+ * @note `back`/`forward`/`go` 在无导航的引擎里更新历史游标并派发 `popstate` / `back`/`forward`/`go` update the history cursor and dispatch popstate in this navigation-less engine
  */
 static void install_history_storage(HpeJs *js, JsObj *win)
 {
@@ -3427,9 +4095,9 @@ static void install_history_storage(HpeJs *js, JsObj *win)
     set_prop(js, hist, "scrollRestoration", js_string(js, "auto"));
     set_prop(js, hist, "pushState", nat(js, history_push, NULL));
     set_prop(js, hist, "replaceState", nat(js, history_push, (void *)(size_t)1));
-    set_prop(js, hist, "back", nat(js, native_noop, NULL));
-    set_prop(js, hist, "forward", nat(js, native_noop, NULL));
-    set_prop(js, hist, "go", nat(js, native_noop, NULL));
+    set_prop(js, hist, "back", nat(js, history_nav, (void *)(intptr_t)0));
+    set_prop(js, hist, "forward", nat(js, history_nav, (void *)(intptr_t)1));
+    set_prop(js, hist, "go", nat(js, history_nav, (void *)(intptr_t)2));
 
     g_history_obj = hist;
     set_prop(js, win, "history", js_objval(hist));
@@ -3563,6 +4231,8 @@ static int computed_box_value(HpeBox *box, const char *prop, char *out, size_t n
 static int computed_value(HpeDomNode *node, const char *prop, char *out, size_t n)
 {
     HpeBox *box = (HpeBox *)node->box;
+    if (prop[0] == '-' && prop[1] == '-' && box)
+        return hpe_css_style_custom_value(&box->style, prop, out, n);
     if (!box)
         return hpe_css_inline_get(node, prop, out, n);
     return computed_box_value(box, prop, out, n);
@@ -3734,19 +4404,27 @@ static void install_window_globals(HpeJs *js, JsObj *win)
 {
     static const struct {
         const char *name;
-        int is_raf;
+        int kind; /* 0 = fixed fn, 1 = raf, 2 = scrollTo, 3 = scrollBy */
     } globals[] = {
         {"getComputedStyle", 0}, {"requestAnimationFrame", 1}, {"cancelAnimationFrame", 0},
-        {"scrollTo", 0},         {"scrollBy", 0},              {"alert", 0},
+        {"scrollTo", 2},         {"scrollBy", 3},              {"alert", 0},
         {"matchMedia", 0},
     };
     size_t i;
     for (i = 0; i < sizeof(globals) / sizeof(globals[0]); i++) {
-        JsNativeFn fn = globals[i].is_raf ? dom_raf
-                        : !strcmp(globals[i].name, "getComputedStyle")
-                            ? dom_get_computed_style
-                            : native_noop;
-        JsValue v = nat(js, fn, NULL);
+        JsNativeFn fn;
+        void *ud = NULL;
+        JsValue v;
+        if (globals[i].kind == 1)
+            fn = dom_raf;
+        else if (globals[i].kind == 2 || globals[i].kind == 3) {
+            fn = dom_scroll_xy;
+            ud = (void *)(intptr_t)(globals[i].kind - 2); /* scrollTo=0, scrollBy=1 */
+        } else if (!strcmp(globals[i].name, "getComputedStyle"))
+            fn = dom_get_computed_style;
+        else
+            fn = native_noop;
+        v = nat(js, fn, ud);
         set_prop(js, win, globals[i].name, v);
         js_obj_set(js, js->global_obj, globals[i].name, v);
     }
@@ -3770,7 +4448,6 @@ static void install_window_builtins(HpeJs *js, HpeDomNode *document)
     JsObj *win = js_object_new(js);
     JsObj *loc = js_object_new(js);
     JsObj *nav = js_object_new(js);
-    HPE_UNUSED(document);
 
     set_prop(js, loc, "protocol", js_string(js, "file:"));
     set_prop(js, loc, "host", js_string(js, ""));
@@ -3779,7 +4456,9 @@ static void install_window_builtins(HpeJs *js, HpeDomNode *document)
     set_prop(js, loc, "pathname", js_string(js, ""));
     set_prop(js, loc, "href", js_string(js, "file:"));
     set_prop(js, loc, "search", js_string(js, ""));
-    set_prop(js, loc, "hash", js_string(js, ""));
+    js_obj_set_accessor(js, loc, "hash", nat(js, loc_hash_get, NULL),
+                        nat(js, loc_hash_set, NULL));
+    js_obj_set(js, loc, "_hash", js_string(js, ""));
     set_prop(js, loc, "reload", nat(js, native_noop, NULL));
     set_prop(js, loc, "replace", nat(js, native_noop, NULL));
     set_prop(js, loc, "assign", nat(js, native_noop, NULL));
@@ -3792,14 +4471,16 @@ static void install_window_builtins(HpeJs *js, HpeDomNode *document)
     set_prop(js, win, "innerWidth", js_num(0.0));
     set_prop(js, win, "innerHeight", js_num(0.0));
     set_prop(js, win, "devicePixelRatio", js_num(1.0));
-    set_prop(js, win, "pageXOffset", js_num(0.0));
-    set_prop(js, win, "pageYOffset", js_num(0.0));
-    set_prop(js, win, "scrollX", js_num(0.0));
-    set_prop(js, win, "scrollY", js_num(0.0));
+    /* 滚动偏移用访问器实时读取引擎状态 / Scroll offsets use accessors to read live engine state */
+    js_obj_set_accessor(js, win, "pageXOffset", nat(js, dom_scroll_offset, (void *)(intptr_t)0), js_undef());
+    js_obj_set_accessor(js, win, "pageYOffset", nat(js, dom_scroll_offset, (void *)(intptr_t)1), js_undef());
+    js_obj_set_accessor(js, win, "scrollX", nat(js, dom_scroll_offset, (void *)(intptr_t)0), js_undef());
+    js_obj_set_accessor(js, win, "scrollY", nat(js, dom_scroll_offset, (void *)(intptr_t)1), js_undef());
     set_prop(js, win, "location", js_objval(loc));
     set_prop(js, win, "navigator", js_objval(nav));
-    set_prop(js, win, "addEventListener", nat(js, native_noop, NULL));
-    set_prop(js, win, "removeEventListener", nat(js, native_noop, NULL));
+    /* window listeners share the document node so scroll/navigation events reach them */
+    set_prop(js, win, "addEventListener", nat(js, win_add_listener, document));
+    set_prop(js, win, "removeEventListener", nat(js, win_remove_listener, document));
 
     install_history_storage(js, win);
 
@@ -3832,6 +4513,7 @@ void hpe_js_dom_install(HpeJs *js, HpeDomNode *document)
     /* DOM change notification: the sink forwards mutations to any observer */
     hpe_js_mutation_install(js);
     hpe_js_mutation_install_ctor(js);
+    hpe_js_sel_install(js);
 }
 
 /**
@@ -3848,6 +4530,37 @@ void hpe_js_dom_set_focus_hook(HpeJs *js, void (*fn)(void *ud, HpeDomNode *node)
     HPE_UNUSED(js);
     g_focus_hook = fn;
     g_focus_hook_ud = ud;
+}
+
+void hpe_js_dom_set_form_hook(void (*fn)(void *ud, HpeDomNode *form, int kind), void *ud)
+{
+    g_form_hook = fn;
+    g_form_hook_ud = ud;
+}
+
+void hpe_js_dom_set_dialog_hook(void (*fn)(void *ud, HpeDomNode *dialog, int kind), void *ud)
+{
+    g_dialog_hook = fn;
+    g_dialog_hook_ud = ud;
+}
+
+void hpe_js_dom_set_scroll_hook(void (*fn)(void *ud, HpeDomNode *node, int kind, float x, float y),
+                                void *ud)
+{
+    g_scroll_hook = fn;
+    g_scroll_hook_ud = ud;
+}
+
+void hpe_js_dom_set_scroll_getter(float (*fn)(void *ud, HpeDomNode *node, int axis), void *ud)
+{
+    g_scroll_getter = fn;
+    g_scroll_getter_ud = ud;
+}
+
+void hpe_js_dom_set_write_hook(void (*fn)(void *ud, const char *text), void *ud)
+{
+    g_write_hook = fn;
+    g_write_hook_ud = ud;
 }
 
 /**

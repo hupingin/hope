@@ -19,7 +19,11 @@ enum {
     /* a Text node (nodeType 3, `data`/`textContent`, tree links) */
     HPE_HOST_TEXT = 8,
     /* a `localStorage` / `sessionStorage` area (keys are properties) */
-    HPE_HOST_STORAGE = 9
+    HPE_HOST_STORAGE = 9,
+    /* `window.getSelection()` result (reads the engine's page selection) */
+    HPE_HOST_SELECTION = 10,
+    /* `canvas.getContext('2d')` result (wraps a canvas surface) */
+    HPE_HOST_CANVAS_CTX = 11
 };
 
 /**
@@ -82,6 +86,7 @@ typedef struct HpeJsEventInit {
     int no_bubble;       /* 1 to keep the event on its target only (a `bubbles: false` Event) */
     const char *key;     /* keyboard: the printable key name (`a`, `Enter`) */
     const char *code;    /* keyboard: the physical key code (`KeyA`) */
+    const char *new_state; /* toggle/beforetoggle: `"open"` or `"closed"` */
     HpeDomNode *related; /* mouseover/mouseout: where the pointer came from or went to */
 } HpeJsEventInit;
 
@@ -103,6 +108,23 @@ typedef struct HpeJsEventInit {
  */
 int hpe_js_dom_dispatch_ex(HpeJs *js, HpeDomNode *target, const char *type,
                            const HpeJsEventInit *init);
+
+/**
+ * @brief 派发一个可取消事件并回报默认行为是否被阻止 / Dispatch a cancelable event and report whether the default was prevented
+ *
+ * @param[in,out] js JS 运行时上下文 / JS runtime context
+ * @param[in,out] target 事件目标节点 / The event target node
+ * @param[in]     type 事件类型名（如 `submit` / `reset`）/ The event type name (`submit` / `reset`)
+ * @param[in]     init 附加数据；传 `NULL` 表示全默认 / Extra data, or `NULL` for all defaults
+ * @param[out]    prevented 处理函数调用 `preventDefault` 时置 1，可为 `NULL` / Set to 1 when a handler called `preventDefault`, may be `NULL`
+ *
+ * @return 有处理函数被调用返回 1 / 1 when any handler was invoked
+ *
+ * @note 事件对象带真正生效的 `preventDefault()`；嵌套的取消派发共享同一回报槽 /
+ *       The event object carries a working `preventDefault()`; nested cancelable dispatches share one reporting slot
+ */
+int hpe_js_dom_dispatch_cancelable(HpeJs *js, HpeDomNode *target, const char *type,
+                                   const HpeJsEventInit *init, int *prevented);
 
 /**
  * @brief 只在目标节点上触发、不传播的事件 / Dispatch an event on the target only, without propagation
@@ -131,6 +153,22 @@ int hpe_js_dom_dispatch_self(HpeJs *js, HpeDomNode *target, const char *type,
 void hpe_js_dom_set_focus_hook(HpeJs *js, void (*fn)(void *ud, HpeDomNode *node), void *ud);
 
 /**
+ * @brief 注册表单语义回调（`form.submit()` / `form.reset()` 的引擎侧行为）/ Register the form-semantics callback (the engine side of `form.submit()` / `form.reset()`)
+ *
+ * @param[in]     fn 回调；`kind` 为 0（`submit` 绕过事件直接跳转 `action`）或 1（`reset` 恢复默认值）/ The callback; `kind` is 0 (`submit`: navigate to `action` bypassing events) or 1 (`reset`: restore the defaults)
+ * @param[in,out] ud 用户数据 / User data
+ */
+void hpe_js_dom_set_form_hook(void (*fn)(void *ud, HpeDomNode *form, int kind), void *ud);
+
+/**
+ * @brief 注册 `<dialog>` 语义回调（show/showModal/close 的引擎侧行为）/ Register the `<dialog>` semantics callback
+ *
+ * @param[in]     fn 回调；`kind` 为 0（show）、1（showModal）或 2（close）/ The callback; `kind` is 0 (show), 1 (showModal) or 2 (close)
+ * @param[in,out] ud 用户数据 / User data
+ */
+void hpe_js_dom_set_dialog_hook(void (*fn)(void *ud, HpeDomNode *dialog, int kind), void *ud);
+
+/**
  * @brief 注册“立即排版”回调 / Register the layout-now callback
  *
  * @param[in,out] js JS 运行时上下文 / JS runtime context
@@ -153,6 +191,34 @@ void hpe_js_dom_set_layout_hook(HpeJs *js, void (*fn)(void *ud), void *ud);
 void hpe_js_dom_set_viewport_hook(HpeJs *js,
                                   void (*fn)(void *ud, float *w, float *h, float *sx, float *sy),
                                   void *ud);
+
+/**
+ * @brief 注册滚动操作回调 / Register the scroll-operation callback
+ *
+ * @param[in]     fn 回调；node 为 NULL 表示文档，否则为目标元素 / Callback; NULL node means the document, otherwise the target element
+ * @param[in,out] ud 用户数据 / User data
+ *
+ * @note kind: 0 = scrollTo(x,y), 1 = scrollBy(x,y), 2 = scrollIntoView(element),
+ *       3 = element.scrollTop=y, 4 = element.scrollLeft=x / See the kinds listed
+ */
+void hpe_js_dom_set_scroll_hook(void (*fn)(void *ud, HpeDomNode *node, int kind, float x, float y),
+                                void *ud);
+
+/**
+ * @brief 注册滚动偏移读取回调 / Register the scroll-offset getter
+ *
+ * @param[in]     fn 回调；axis 0 = 横向、1 = 纵向；node NULL 表示文档 / Callback; axis 0 = x, 1 = y; NULL node = document
+ * @param[in,out] ud 用户数据 / User data
+ */
+void hpe_js_dom_set_scroll_getter(float (*fn)(void *ud, HpeDomNode *node, int axis), void *ud);
+
+/**
+ * @brief 注册 document.write 回调 / Register the document.write callback
+ *
+ * @param[in]     fn 回调，接收待写入的 HTML 文本 / Callback receiving the HTML text to write
+ * @param[in,out] ud 用户数据 / User data
+ */
+void hpe_js_dom_set_write_hook(void (*fn)(void *ud, const char *text), void *ud);
 
 /**
  * @brief 查询当前拥有 `:focus` 的元素 / Query the element that currently owns `:focus`

@@ -174,7 +174,7 @@ HTML 解析 → CSS 层叠 → 块/行内布局 → 软件光栅 → 上屏。
 - **样式属性扩展（v0.9）**：`min-width/max-width/min-height/max-height`、`box-sizing`（content-box/border-box）、
   `overflow`（visible/hidden/auto/scroll）、`opacity`、`visibility`、`cursor`、`text-decoration`、
   `background-image` 与 `background` 的线性渐变、`box-shadow`/`text-shadow`、
-  `transform`（translate/scale/rotate）、`transition`/`animation`（仅解析存储）、
+  `transform`（translate/scale/rotate）、`transition`/`animation`（v0.22 起为完整插值时钟）、
   `em/rem/vh/vw/ch` 精确长度、`letter-spacing`/`word-spacing`/`text-indent`/`vertical-align`、负 `margin`、
   `list-style-type`/`list-style-position`、四值 `border-color`（四边独立）、`rgba()/hsl()/transparent` 与完整具名色表。
 - **层叠与继承扩展（v0.10）**：`!important` 参与层叠（`strip_important` 回报存在性，逐条声明记入
@@ -230,6 +230,92 @@ HTML 解析 → CSS 层叠 → 块/行内布局 → 软件光栅 → 上屏。
     `css-layout-matrix.html`（56 过 + 12 XFAIL）；基准入库 `tools/bench_run.py` +
     `bench_compare.py`；内存账本 `HPE_ALLOC_STATS=1|2`（借其修复 emoji 精灵/竖排掩码/
     PNG 解压缓冲/图片缓存键四类泄漏）。
+- **动画插值时钟（v0.22）**：`transition`/`animation` 从仅解析存储升级为完整插值。
+  - **解析**：`src/css/hpe_anim.c`——`@keyframes`（`from`/`to`/百分比停靠点，停靠点声明为堆上
+    `HpeStyle`，同名重定义整体替换）；缓动 `linear`/`ease*`/`cubic-bezier()`（Newton 8 次+二分
+    32 次）/`steps(n, start|end)`（start 端 t=0 即跳第一步）；简写按顶层逗号切段（括号深度感知，
+    `cubic-bezier(...)` 内部逗号不分段），animation 简写顺序无关 token 归位（时间→duration/delay、
+    `infinite`/数字→迭代、direction/fill 关键字、余下标识符为动画名）。
+  - **运行时**：`src/hope_anim.c`——每元素 `HpeAnimNodeState`（过渡运行项 8 槽 + 动画运行项 4 槽 +
+    上一帧值快照）；层叠钩子 `hpe_css_set_anim_hook` 在 `hpe_css_compute` 完成后覆盖插值结果
+    （避免 css→engine 反向依赖）；过渡在声明变化且值不同时启动（delay 期间显示起始值）；动画
+    fill backwards/forwards/both 补帧；几何属性（width/height/margin/padding/inset/font-size 等）
+    触发 LAYOUT 级重排并以 `layout_sticky` 粘滞到动画结束，其余走 PAINT 级。
+  - **时钟**：`hpe_engine_tick` 先推进动画时钟再泵 JS 定时器；无 JS 也运行。测试钩子：
+    `HOPE_TEST_ANIM_STEP=<sec>` 固定步长、`HOPE_TEST_TICKS=<n>` 精确泵 n 轮、
+    `HOPE_TEST_ANIM_SNAPSHOT=<id>` 输出元素动画值快照（`ANIM-SNAP id opacity=... width=...`）。
+  - **验证**：`examples/anim.html` 像素基线 + 6 项帧断言（线性/bezier/多动画/fill/steps/结束帧）；
+    `tests/test_anim.c` 10 用例 55 断言。遗留见 `docs/需求.md` §14.2。
+
+- **表单控件与表单事件（v0.23）**：`src/hope_form.c` + `src/paint/hpe_paint_form.c` + JS DOM 绑定。
+  - **控件模型**：`hpe_form_kind()` 分类 input type；value 取自 `value` 属性 / select 选中 option /
+    textarea·output·progress·meter 子文本；checked 取自 `checked` 属性；radio 同名互斥、select 点击
+    循环、range 点击按落点取值；label 通过 `for` 或隐式 labelable 后代转发点击。
+  - **默认值与 reset**：install 时以 `data-defval`/`data-defchk`/`data-defsel` 记快照，`innerHTML`
+    序列化跳过这些内部属性；reset 恢复值/选中态并派发 `reset` 事件；submit 按 `action` 走本地
+    文件跳转，两者均支持 `preventDefault()`（`hpe_js_dom_dispatch_cancelable()`）。
+  - **呈现**：复用 `<img>` 替换盒（`is_replaced`/`repl_w`/`repl_h`/`repl_css_*`），内置固有尺寸表；
+    UA 样式表分段存文件作用域常量（结构/排版/表单），绘制含文本值、password 圆点、checkbox 勾选、
+    radio 圆点、range 滑块、color 色块、select 箭头、progress/meter 填充与聚焦插入符。
+  - **JS API**：`document.forms`、`form.elements`、`value`/`checked`/`disabled`/`type`/
+    `defaultValue`/`defaultChecked`、`form.submit()`/`form.reset()`/`checkValidity()`、
+    `input`/`change`/`submit`/`reset`/`invalid` 监听器（监听器 `this` 为目标节点）。
+  - **验证**：`examples/form.html` 像素基线 + 24/24 交互断言、typing snapshot、全量回归；
+    `HPE_ALLOC_STATS=1` 零泄漏。顺带修复 `block_reset_lines()` 漏释放 `frags` 的增量重排泄漏。
+    遗留见 `docs/需求.md` §14.1。
+
+- **CSS 自定义属性（v0.24）**（`src/css/hpe_css.h/.c` + JS computed-style 桥）。
+  - **存储**：`HpeStyle` 内联 `HpeCustomProp[8]`（name/value/important/declared）与 `HpeVarDecl[8]`；
+    自定义属性默认继承（`inherit_parent_style` 复制并把 `declared` 清零）；同名覆盖按层叠顺序，
+    `!important` 在第二趟单独覆盖。
+  - **var()**：含 `var(` 的声明值先暂存，层叠后用该元素最终自定义属性展开（括号/引号感知定位
+    匹配右括号、顶层逗号切回退值、递归嵌套深度上限 8），重建 `prop: value` 再走正常声明解析，
+    因此任意属性与简写均可使用。
+  - **@property**：`HpeStylesheet.props` 注册 `syntax` / `inherits` / `initial-value`；继承后、层叠前
+    注入初始值，非继承注册属性在后代恢复初始值。
+  - **读取**：`hpe_css_style_custom_value()` 与 `getComputedStyle(el).getPropertyValue('--x')`。
+  - **验证**：`examples/css-vars.html` 像素基线 + 11/11 断言（继承、嵌套、回退、important、
+    @property 非继承）；`tests/test_css.c` 3 个用例（59/59 总通过、336 断言）。
+    遗留见 `docs/需求.md` §14.2。
+
+- **Selection / Range API（v0.25）**：`src/js/hpe_js_selection.c/.h`。
+  - **Range**：`document.createRange()` 返回普通 JS 对象，端点存为 `startContainer/startOffset` /
+    `endContainer/endOffset` 属性；支持 setStart/setEnd/collapse/selectNodeContents/cloneRange/
+    toString/extractContents/deleteContents，无 C 侧分配。
+  - **Selection**：`window.getSelection()` 返回宿主对象（getters 经 `HpeJsSelApi` 读引擎页面选区），
+    支持 addRange/removeAllRanges/collapse/extend/getRangeAt/selectAllChildren/deleteFromDocument/
+    toString；引擎侧回调在 `hope.c`，写入选区触发 FULL 重绘。
+  - **文本收集**：按 DOM 前序遍历端点间文本，逆序端点自动交换；`extractContents()` 返回轻量
+    片段对象（仅 `textContent`）以避免 C DOM 节点无法随 JS GC 回收的泄漏。
+  - **验证**：`examples/sel-api.html` 像素基线 + 23/23 断言、零泄漏、全量回归通过。
+    顺带修复 `is_style_host()` 对文本节点父节点无 `tag` 的崩溃（fragment 追加文本时触发）。
+    遗留见 `docs/需求.md` §14.3。
+
+- **`<details>` / `<summary>` 与 `<dialog>`（v0.26）**：`src/hope_details.c/.h` +
+  `src/paint/hpe_paint_details.c/.h`。
+  - **details**：closed 时布局阶段 `build_children` 只构建 `<summary>` 盒（内容盒不生成）；
+    summary UA 样式 `display:list-item; padding-left:18px`，绘制层在左侧空档画 disclosure 三角
+    （收起朝右 / 展开朝下）；点击 summary 经 `hpe_details_owner` 只认 summary 子树，切换父 `open`，
+    派发可取消 `beforetoggle`（`preventDefault()` 否决）与 `toggle`，事件带 `newState`。
+  - **dialog**：`open` 属性读写、`show()` / `showModal()` / `close()` / `close` 事件；JS 侧经
+    `hpe_js_dom_set_dialog_hook` 回 `hope.c` 登记模态顶层，绘制层在 dialog 盒绘制前铺半透明
+    `::backdrop`（覆盖视口内容区、位于 dialog 之下）；`show()` 非模态无遮罩；导航清模态状态。
+  - **验证**：`examples/details-dialog.html` 像素基线 + 18/18 断言，像素级验证模态遮罩
+    `(255,0,0)`→`(165,0,0)` 与非模态无遮罩，零泄漏、全量回归通过。
+    遗留（点击 backdrop 关闭、Esc 关闭、自动居中、`::backdrop` 选择器、`returnValue`）见
+    `docs/需求.md` §14.1。
+
+- **`<canvas>` 2D context（v0.27）**：`src/canvas/hpe_canvas.c/.h` + `src/js/hpe_js_canvas.c/.h`。
+  - **表面**：`<canvas>` 按替换盒排版（width/height 属性定固有尺寸，默认 300×150），离屏 32bpp
+    像素表面按 DOM 节点懒创建，存于 `hpe_canvas` 注册表；绘制层缩放混合进内容盒；引擎销毁/
+    加载新文档时 `hpe_canvas_shutdown()` 全量释放。
+  - **API**：`canvas.getContext('2d')` 返回宿主对象（`HPE_HOST_CANVAS_CTX=11`），支持矩形
+    （fillRect/clearRect/strokeRect）、路径（beginPath/moveTo/lineTo/arc/closePath/fill/stroke，
+    even-odd 扫描线填充）、变换（translate/rotate/scale/setTransform/resetTransform/save/restore）、
+    样式（fillStyle/strokeStyle/lineWidth/globalAlpha）、像素读写（getImageData/putImageData，RGBA
+    字节序）；绘制后经 invalidate 回调标记引擎重绘，无需 DOM mutation。
+  - **验证**：`examples/canvas.html` 像素基线 + 16/16 断言、像素级确认离屏内容绘制到页面、
+    零泄漏、全量回归通过。遗留（fillText/drawImage/渐变/lineCap/3D 等）见 `docs/需求.md` §14.1。
 
 ## JS 引擎（v0.7）
 纯 C 手写，无第三方依赖。执行时机：DOM 解析 + 样式收集完成后、首次布局之前（等价于 defer 脚本）。
@@ -328,12 +414,16 @@ HTML 解析 → CSS 层叠 → 块/行内布局 → 软件光栅 → 上屏。
    table separate 模式的 12 条 XFAIL 边界；`flow-root`、跨容器 `clear`）。
    （已解决：grid/table 布局、flex wrap/shrink/order/stretch、元素级滚动容器、
    absolute 百分比 inset 精确解算、完整层叠上下文（v0.14–v0.18））
-3. 绘制：`transition`/`animation` 插值时钟（仍仅解析存储为标志）、渐变多层/多色标高级语法。
+3. 绘制：动画遗留子项（每元素动画声明上限 4、停靠点级 easing、`animationstart/end` 事件等，
+   见 `docs/需求.md` §14.2）、渐变多层/多色标高级语法。
    （已解决：`<img>` 四格式解码、滚动条 UI、`background-position/size`、子像素文字定位、
    彩色 emoji/字形回退链、**页面内文本选中与复制**、竖排文本 `writing-mode`；SVG 的
    `mask`/`clipPath`/`marker`/`filter`/`gradientTransform` 也已落地——见 `svg-fx.html` 基线）
-4. 样式：渐变多层/多色标高级语法、`transform` 的 3D、`transition`/`animation` 插值时钟。
-   （已解决：结构伪类、伪元素、状态伪类、`skew`/`matrix`、`cursor` 与平台光标联动（v0.20））
+4. 样式：渐变多层/多色标高级语法、`transform` 的 3D。
+   （已解决：结构伪类、伪元素、状态伪类、`skew`/`matrix`、`cursor` 与平台光标联动（v0.20）、
+   `transition`/`animation` 插值时钟（v0.22：`@keyframes`/缓动/delay/direction/iteration/
+   fill-mode/transform 分解插值，`hpe_anim.c`+`hope_anim.c`，测试页 `anim.html` + `test_anim.c`）、
+   表单控件 UA 主题化外观（v0.23：`hpe_paint_form.c` + UA 样式表表单段））
 5. 基础设施：无跨平台后端（仅 Win32，**显式豁免项**）、真实系统时钟之外的单调时钟
    `hpe_time_monotonic`（**显式豁免项**）。
    （已解决：JS GC（`hpe_js_gc_*`，`js-gc.html` 断言 10/10）、C 单测框架 `hope_tests`

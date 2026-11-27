@@ -61,6 +61,50 @@ typedef struct HpeTab {
     float scroll_y;                           /* 切走时的滚动偏移 / Scroll offset when last left */
 } HpeTab;
 
+/* one running CSS animation instance bound to a @keyframes rule */
+typedef struct HpeAnimRun {
+    int used;
+    char name[HPE_ANIM_NAME_MAX];
+    double start;         /* 引擎动画时钟下的起始时刻 / Start on the engine's animation clock */
+    HpeAnimDecl decl;     /* 声明快照（direction/fill/迭代等）/ Declaration snapshot */
+} HpeAnimRun;
+
+/* one running transition: from -> to on one animatable property */
+typedef struct HpeAnimTransRun {
+    int used;
+    int prop;             /* HpeAnimProp */
+    double start;
+    float duration;
+    HpeEasing easing;
+    HpeAnimValue from, to;
+} HpeAnimTransRun;
+
+/* per-node runtime state; entries exist only for elements that declare
+ * transitions/animations, keyed by DOM node (not box) so restyles and full
+ * box-tree rebuilds keep the runs alive */
+typedef struct HpeAnimNodeState {
+    HpeDomNode *node;
+    int used;
+    HpeAnimValue prev[HPE_AP_COUNT]; /* 上次层叠的目标值（用于变化检测）/ Last cascade's target values */
+    int has_prev;
+    HpeAnimRun runs[HPE_ANIM_MAX];
+    HpeAnimTransRun trans[HPE_TRANS_MAX];
+} HpeAnimNodeState;
+
+/* engine-level animation world: the interpolation clock and the per-node states */
+typedef struct HpeAnimWorld {
+    double clock;      /* 动画时钟（秒）/ Animation clock in seconds */
+    double last_real;  /* 上次推进的墙钟 / Wall-clock time of the last advance */
+    int active;        /* 尚有进行中的过渡或动画 / A transition or animation is in flight */
+    int reflow_need;   /* 当前活动项所需的重排级别 / Reflow level the active items need */
+    int layout_sticky; /* 活动项触几何属性：本段活动期内每次 flush 都要重建盒树 / An active
+                          item hits layout properties: every flush of this active period
+                          must rebuild the box tree */
+    HpeAnimNodeState *nodes;
+    int count;
+    size_t cap;
+} HpeAnimWorld;
+
 struct HpeEngine {
     HpePixmap pm;
     int width;
@@ -77,6 +121,12 @@ struct HpeEngine {
     HpeDomNode *hover_node; /* element currently under the pointer (:hover) */
     HpeDomNode *active_node; /* element the pointer is pressed on (:active) */
     HpeDomNode *focus_node;  /* element owning the focus (:focus) */
+    /* form editing state (hope_form.c): the focused text-like control, its
+     * caret offset (bytes into the value), and the value it had when focus
+     * was gained (a `change` fires on blur only when they differ) */
+    HpeDomNode *form_focus; /* focused editable control (text-like / textarea) */
+    int form_caret;         /* caret offset in bytes within the control's value */
+    char *form_value0;      /* value snapshot taken when focus was gained */
     float content_height;
     /* author stylesheet bookkeeping: the number of rules parsed after the
      * user-agent sheet and the last (dom node, text revision) that produced
@@ -181,6 +231,9 @@ struct HpeEngine {
     HpeTab tabs[HPE_TAB_MAX];
     int tab_count;
     int tab_active;
+
+    /* CSS transition / animation runtime (hope_anim.c) */
+    HpeAnimWorld anim;
 };
 
 /**
@@ -344,6 +397,55 @@ void hpe_sel_reset(HpeEngine *engine);
 void hpe_sel_shutdown(HpeEngine *engine);
 
 /* ---------------- hope.c: tabs ---------------- */
+
+/* ---------------- hope_anim.c ---------------- */
+
+/**
+ * @brief 注册层叠钩子并重置动画世界 / Register the cascade hook and reset the animation world
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @note 在引擎创建时调用；时钟归零、节点状态表清空 / Called at engine creation; the clock
+ *       is zeroed and the node-state table emptied
+ */
+void hpe_anim_install(HpeEngine *engine);
+
+/**
+ * @brief 推进动画时钟并求值所有运行项 / Advance the animation clock and evaluate every run
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @return 仍有进行中的过渡或动画返回 1，否则 0 / 1 while a transition or animation is in flight, 0 otherwise
+ *
+ * @note `HOPE_TEST_ANIM_STEP=秒` 时每 tick 固定推进该秒数（无头回归用确定性时钟），否则按墙钟差推进（截断到 0.25s）；活动项所需重排级别写入 `engine->anim.reflow_need` / With `HOPE_TEST_ANIM_STEP=sec` each tick advances a fixed amount (a deterministic clock for headless regression), otherwise the wall-clock delta is used (clamped to 0.25s); the reflow level required by the active items lands in `engine->anim.reflow_need`
+ */
+int hpe_anim_tick(HpeEngine *engine);
+
+/**
+ * @brief 换页时重置动画世界 / Reset the animation world on a page load
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @note 时钟归零、节点状态表清空；缓冲保留复用 / The clock is zeroed and the node-state table emptied; the buffer is kept for reuse
+ */
+void hpe_anim_reset(HpeEngine *engine);
+
+/**
+ * @brief 释放动画世界缓冲 / Free the animation world's buffers
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ */
+void hpe_anim_shutdown(HpeEngine *engine);
+
+/**
+ * @brief 打印某元素当前动画/过渡后的计算值快照 / Dump an element's post-animation computed value snapshot
+ *
+ * @param[in] engine 引擎实例 / Engine instance
+ * @param[in] id 目标元素的 id 属性 / id attribute of the target element
+ *
+ * @note `HOPE_TEST_ANIM_SNAPSHOT=id` 测试钩子使用；输出 `ANIM-SNAP <id> ...` 行，值取该元素盒树的最新级叠结果 / Used by the `HOPE_TEST_ANIM_SNAPSHOT=id` test hook; prints an `ANIM-SNAP <id> ...` line with the element's latest cascaded values
+ */
+void hpe_anim_snapshot_dump(HpeEngine *engine, const char *id);
 
 /**
  * @brief 新建一个空白标签并切换过去 / Open a new blank tab and switch to it

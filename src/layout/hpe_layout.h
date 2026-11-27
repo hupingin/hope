@@ -160,4 +160,14 @@ void hpe_layout_free(HpeBox *box);
  */
 float hpe_layout_content_height(HpeBox *root);
 
+/**
+ * @brief 判断一个元素是否按替换盒处理的表单控件 / Test whether an element is a replaced form control
+ *
+ * @param[in] node 目标元素 / Target element
+ *
+ * @return input（button 型除外）与 select / progress / meter 返回 1 / 1 for an `input`
+ *         (except button types) and for `select` / `progress` / `meter`
+ */
+int form_is_replaced_control(const HpeDomNode *node);
+
 #endif /* HPE_LAYOUT_H */

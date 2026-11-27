@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Selection / Range API</title>
+<style>
+body { font: 14px sans-serif; margin: 16px; }
+#out { font: 12px monospace; white-space: pre; }
+.ok { color: #0a7a0a; font-weight: bold; }
+.fail { color: #d93025; font-weight: bold; }
+</style>
+</head>
+<body>
+<p id="p">Hello world</p>
+<p id="q">second</p>
+<div id="out"></div>
+
+<script>
+var lines = [], total = 0, passCount = 0;
+function ck(name, got, want) {
+  var ok = got === want;
+  total++;
+  lines.push((ok ? "  ok  " : "  FAIL") + " " + name +
+             (ok ? "" : " (got " + JSON.stringify(got) + ", want " + JSON.stringify(want) + ")"));
+  if (ok) passCount++;
+  return ok;
+}
+var t = document.getElementById("p").firstChild;
+var sel = getSelection();
+
+ck("createRange exists", typeof document.createRange, "function");
+ck("getSelection exists", typeof sel.addRange, "function");
+ck("initial rangeCount", sel.rangeCount, 0);
+ck("initial isCollapsed", sel.isCollapsed, true);
+
+var r = document.createRange();
+r.setStart(t, 0);
+r.setEnd(t, 5);
+ck("Range.startOffset", r.startOffset, 0);
+ck("Range.endOffset", r.endOffset, 5);
+ck("Range.toString", r.toString(), "Hello");
+ck("Range collapsed false", r.collapsed, false);
+
+var clone = r.cloneRange();
+ck("cloneRange start", clone.startOffset, 0);
+ck("cloneRange end", clone.endOffset, 5);
+
+sel.addRange(r);
+ck("Selection rangeCount", sel.rangeCount, 1);
+ck("Selection.toString", sel.toString(), "Hello");
+ck("Selection.anchorOffset", sel.anchorOffset, 0);
+ck("Selection.focusOffset", sel.focusOffset, 5);
+
+var rr = sel.getRangeAt(0);
+ck("getRangeAt string", rr.toString(), "Hello");
+
+sel.collapse(t, 2);
+ck("collapse isCollapsed", sel.isCollapsed, true);
+ck("collapse offset", sel.anchorOffset, 2);
+sel.extend(t, 7);
+ck("extend isCollapsed", sel.isCollapsed, false);
+ck("extend toString", sel.toString(), "llo w");
+
+var whole = document.createRange();
+whole.selectNodeContents(document.getElementById("p"));
+ck("selectNodeContents", whole.toString(), "Hello world");
+
+var fragRange = document.createRange();
+fragRange.setStart(t, 0);
+fragRange.setEnd(t, 5);
+var frag = fragRange.extractContents();
+ck("extractContents fragment", frag.textContent, "Hello");
+ck("extractContents source", document.getElementById("p").textContent, " world");
+sel.removeAllRanges();
+ck("removeAllRanges", sel.rangeCount, 0);
+
+lines.unshift((passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total + " checks");
+var out = document.getElementById("out");
+for (var i = 0; i < lines.length; i++) {
+  var row = document.createElement("div");
+  row.textContent = lines[i];
+  out.appendChild(row);
+}
+document.title = (passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total;
+</script>
+</body>
+</html>

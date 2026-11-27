@@ -1,0 +1,597 @@
+{
+  "find_base_href": {
+    "brief": "查找文档的 `<base href>` / Find the document's `<base href>`",
+    "params": {
+      "node": "开始查找的 DOM 节点，递归其子树 / DOM node to search from, recursing into its subtree"
+    },
+    "return": "首个非空 `href` 的指针（由 DOM 拥有），未找到返回 `NULL` / Pointer to the first non-empty `href` owned by the DOM, `NULL` when none",
+    "note": "深度优先遍历；按规范首个带非空 href 的 `<base>` 生效 / Depth-first; per spec the first `<base>` with a non-empty href wins"
+  },
+  "resolve_url": {
+    "brief": "把文档相对地址解析为绝对路径 / Resolve a document-relative reference to an absolute path",
+    "params": {
+      "engine": "引擎实例，提供 `<base href>` / Engine instance, supplies `<base href>`",
+      "out": "out:接收绝对路径的缓冲区 / Buffer that receives the absolute path",
+      "out_size": "输出缓冲区容量（字节）/ Capacity of the output buffer in bytes",
+      "dir": "文档所在目录 / Directory of the document",
+      "rel": "待解析的相对引用 / Relative reference to resolve"
+    },
+    "note": "存在 `<base href>` 且 `rel` 非绝对时以 base 所在目录为基准，否则用文档目录 / Uses the base href's directory when a base is present and `rel` is not absolute, otherwise the document directory"
+  },
+  "normalize_rel": {
+    "brief": "把 rel 属性规范成小写、空格分隔的 token 串 / Normalise a rel attribute into a lowercase space-separated token string",
+    "params": {
+      "rel": "in:待规范的 rel 属性值 / rel attribute value to normalise",
+      "out": "out:接收规范串的缓冲区 / Buffer that receives the normalised string",
+      "out_size": "输出缓冲区容量（字节）/ Capacity of the output buffer in bytes"
+    },
+    "note": "合并连续空白、去首尾空白并转小写，使 `rel=\"ICON\"` 与 `rel=\"shortcut icon\"` 可预测比较 / Collapses runs of whitespace, trims it and lowercases, so `rel=\"ICON\"` and `rel=\"shortcut icon\"` compare predictably"
+  },
+  "rel_has_token": {
+    "brief": "判断 rel 串是否含指定 token / Test whether a rel string contains a given token",
+    "params": {
+      "rel": "规范化的 rel token 串 / Normalised rel token string",
+      "token": "要查找的 token（不区分大小写）/ Token to look for (case-insensitive)"
+    },
+    "return": "含该 token 返回 1，否则 0 / 1 when the token is present, otherwise 0",
+    "note": "按空格分词后逐段比较 / Splits on spaces and compares each field"
+  },
+  "collect_styles": {
+    "brief": "递归收集 `<style>` 规则与 `<link rel=stylesheet>` 外链样式 / Recursively collect `<style>` rules and `<link rel=stylesheet>` external sheets",
+    "params": {
+      "engine": "引擎实例，规则累加进 `sheet` / Engine instance, rules are appended to `sheet`",
+      "node": "开始遍历的 DOM 节点 / DOM node to walk from",
+      "dir": "解析外链 href 的基准目录 / Base directory used to resolve external hrefs"
+    },
+    "note": "非 stylesheet 的 `<link>` 记入资源提示表（上限 `HPE_MAX_LINKS`）；外链读取失败打印到 stderr 后跳过 / Non-stylesheet `<link>`s are recorded as resource hints (capped at `HPE_MAX_LINKS`); a failed external read is reported on stderr and skipped"
+  },
+  "is_style_host": {
+    "brief": "判断节点是否会增删改样式表 / Test whether a node can add, remove or edit the stylesheet",
+    "params": {
+      "n": "待检查的 DOM 节点 / DOM node to inspect"
+    },
+    "return": "是 `<style>`/`<link>` 元素或其文本子节点返回 1，否则 0 / 1 for a `<style>`/`<link>` element or its text child, otherwise 0"
+  },
+  "reflow_for_props": {
+    "brief": "按属性位集判定所需重排级别 / Classify the reflow level a property bit set requires",
+    "params": {
+      "set": "变更涉及的属性位集 / Bit set of the changed properties",
+      "set2": "变更涉及的第二组属性位集 / Second bit set of the changed properties"
+    },
+    "return": "所需重排级别 `HPE_REFLOW_*` / The `HPE_REFLOW_*` level required",
+    "retval": {
+      "HPE_REFLOW_LAYOUT": "任一变更属性影响几何（盒度量/位置/流/排版）/ A changed property affects geometry (box metrics, position, flow, typography)",
+      "HPE_REFLOW_PAINT": "仅纯视觉属性（颜色/不透明度/阴影）/ Only purely visual properties (colour, opacity, shadow)",
+      "HPE_REFLOW_NONE": "无变更 / Nothing changed"
+    },
+    "details": "保守策略：除非每个变更位都确知为纯绘制，整组声明按 `HPE_REFLOW_LAYOUT` 处理 / Conservative: the whole declaration set is treated as `HPE_REFLOW_LAYOUT` unless every changed bit is known to be paint-only.",
+    "see": "reflow_for_inline_style reflow_for_attr"
+  },
+  "reflow_for_inline_style": {
+    "brief": "比较 style 属性新旧值得出重排级别 / Compare old and new `style` attribute values to get the reflow level",
+    "params": {
+      "old_value": "变更前的 style 值，可为 NULL / Previous style value, may be NULL",
+      "new_value": "变更后的 style 值，可为 NULL / New style value, may be NULL"
+    },
+    "return": "所需重排级别 `HPE_REFLOW_*` / The `HPE_REFLOW_*` level required",
+    "note": "两份解析后的声明位掩码完全一致时返回 `HPE_REFLOW_NONE` / Returns `HPE_REFLOW_NONE` when both parsed declaration sets carry identical bit masks",
+    "see": "reflow_for_props"
+  },
+  "reflow_for_attr": {
+    "brief": "判定某属性变更所需的重排级别 / Classify the reflow level an attribute change requires",
+    "params": {
+      "target": "属性所在 DOM 元素 / DOM element the attribute belongs to",
+      "name": "属性名 / Attribute name",
+      "old_value": "变更前的属性值 / Previous attribute value"
+    },
+    "return": "所需重排级别 `HPE_REFLOW_*` / The `HPE_REFLOW_*` level required",
+    "note": "`<svg>` 元素（几何存于属性）与 `class`/`id` 变更按 `HPE_REFLOW_LAYOUT`；`style` 走内联比较；其余属性对本引擎无影响返回 `HPE_REFLOW_NONE` / `<svg>` (geometry lives in its attributes) and `class`/`id` changes yield `HPE_REFLOW_LAYOUT`; `style` goes through the inline comparison; other attributes are inert here and give `HPE_REFLOW_NONE`",
+    "see": "reflow_for_inline_style"
+  },
+  "note_reflow": {
+    "brief": "把待重排级别抬升到 `need` / Ratchet the pending reflow level up to `need`",
+    "params": {
+      "engine": "引擎实例 / Engine instance",
+      "need": "要达到的重排级别 `HPE_REFLOW_*` / Reflow level to ratchet up to (`HPE_REFLOW_*`)"
+    },
+    "note": "只抬升不下降；`hpe_engine_flush` 处理后统一清零 / Only ratchets up, never down; `hpe_engine_flush` resets it after acting",
+    "see": "hpe_engine_flush"
+  },
+  "dom_is_ancestor": {
+    "brief": "判断 `anc` 是否为 `node` 自身或其祖先 / Test whether `anc` is `node` itself or one of its ancestors",
+    "params": {
+      "anc": "候选祖先节点 / Candidate ancestor node",
+      "node": "被检查的节点 / Node being inspected"
+    },
+    "return": "是返回 1，否则 0 / 1 when it is, otherwise 0"
+  },
+  "note_reflow_node": {
+    "brief": "记录需局部重建的盒子树对应的 DOM 节点 / Record the DOM node whose box subtree an incremental rebuild must replace",
+    "params": {
+      "engine": "引擎实例 / Engine instance",
+      "node": "变更涉及的 DOM 节点 / DOM node involved in the change"
+    },
+    "note": "只保留最靠近根的外层候选，深入已记录子树内的变更不会缩小作用域；文本节点上溯到元素；无父的分离节点无盒信息被忽略 / Keeps the outermost candidate so a change nested inside an already-recorded subtree does not narrow the scope; a text node walks up to its element; a detached node (no parent) carries no box information and is ignored",
+    "see": "hpe_engine_flush"
+  },
+  "style_sink": {
+    "brief": "DOM 变更汇聚点：分类重排并跟踪样式表编辑 / DOM mutation sink: classify the reflow and track stylesheet edits",
+    "params": {
+      "ud": "宿主回调透传的引擎实例 / Opaque user data, the engine instance",
+      "kind": "变更种类 `HPE_MUT_*` / Mutation kind (`HPE_MUT_*`)",
+      "target": "变更的目标 DOM 节点 / DOM node the mutation targets",
+      "name": "变更的属性名（`HPE_MUT_ATTR` 时）/ Attribute name (for `HPE_MUT_ATTR`)",
+      "old_value": "变更前的旧值 / Previous value",
+      "added": "新增的节点 / Added node",
+      "removed": "被移除的节点 / Removed node"
+    },
+    "note": "触及 `<style>`/`<link>` 会标记样式表脏并强制定界为全量布局（把 `reflow_node` 置空）；`HPE_MUT_CHILD_LIST` 与 `HPE_MUT_TEXT` 记为其父节点的局部重排 / Touching `<style>`/`<link>` marks the sheet dirty and forces an unbounded LAYOUT (clears `reflow_node`); `HPE_MUT_CHILD_LIST` and `HPE_MUT_TEXT` are recorded as a partial reflow of the parent",
+    "see": "refresh_styles hpe_engine_flush"
+  },
+  "refresh_styles": {
+    "brief": "`<style>`/`<link>` 变动后重建作者规则 / Rebuild the author rules after a `<style>`/`<link>` change",
+    "params": {
+      "engine": "引擎实例 / Engine instance"
+    },
+    "return": "重建了样式表返回 1（调用方须重新级联），否则 0 / 1 when the sheet was rebuilt (the caller must re-cascade), otherwise 0",
+    "note": "从干净表开始：`hpe_css_init` 先追加 UA 规则，再遍历（可能已被脚本编辑的）树收集作者规则；link 提示表重新扫描以免累积 / Starts from a clean sheet: `hpe_css_init` re-adds the user-agent rules, then the (possibly script-edited) tree is walked for author rules; the link hint list is re-scanned so it does not accumulate",
+    "see": "is_style_host collect_styles"
+  },
+  "restyle_boxes": {
+    "brief": "按（可能已编辑的）DOM 重算每个盒的样式 / Recompute every box's style from the (possibly edited) DOM",
+    "params": {
+      "box": "起始盒，递归其子树 / Starting box, recursing into its subtree",
+      "sheet": "用于级联的样式表 / Stylesheet used for the cascade",
+      "parent": "父盒的计算样式，可为 NULL / Parent box's computed style, may be NULL"
+    },
+    "note": "只覆盖样式、不动几何；纯几何编辑因无相应属性而无操作，因而零代价 / Only styles are overwritten, geometry is untouched; a pure-geometry edit is a no-op with no such property, so it pays nothing",
+    "see": "hpe_engine_flush"
+  },
+  "flush_rebuild_layout": {
+    "brief": "执行 LAYOUT 级 flush 的盒树重建 / Rebuild the box tree for a LAYOUT-level flush",
+    "params": {
+      "engine": "引擎实例 / Engine instance",
+      "scope": "局部重建的 DOM 作用域，NULL 表示整树重建 / DOM scope for a partial rebuild, NULL for a full rebuild"
+    },
+    "note": "有有效 `scope` 且未设 `HPE_NO_PARTIAL` 时走 `hpe_layout_rebuild` 局部子树重建，否则整树重建；`HOPE_TRACE_REFLOW` 打印走了哪条路径 / Does a partial subtree rebuild via `hpe_layout_rebuild` when a valid `scope` exists and `HPE_NO_PARTIAL` is unset, otherwise a full rebuild; `HOPE_TRACE_REFLOW` traces which path ran",
+    "see": "hpe_engine_flush"
+  },
+  "clamp_scroll": {
+    "brief": "把滚动偏移夹到 `[0, content_height - view_height]` / Clamp the scroll offset to `[0, content_height - view_height]`",
+    "params": {
+      "engine": "引擎实例 / Engine instance"
+    },
+    "see": "hpe_engine_scroll_by"
+  },
+  "hpe_engine_flush": {
+    "brief": "应用自上次以来记录的 DOM 变更 / Apply the DOM mutations recorded since the last call",
+    "params": {
+      "engine": "引擎实例，NULL 时直接返回 / Engine instance, returns early when NULL",
+      "force": "非零请求全量重建（新加载或缩放）/ Non-zero requests a full rebuild (fresh load or resize)"
+    },
+    "details": "惰性重排策略：LAYOUT 重建受影响的盒子树（作用域无界时整树）；PAINT 重算样式并重绘；NONE 完全跳过渲染。| Lazy policy: LAYOUT rebuilds the affected box subtree (everything when unbounded); PAINT recomputes styles and repaints; NONE skips the render entirely.",
+    "note": "`HPE_FORCE_EAGER` 强制走急切全量路径以便与惰性结果对比；处理后清零 `reflow_need`/`reflow_node`/`mutation_pending` 并按需置 `HPE_DIRTY_FULL` / `HPE_FORCE_EAGER` forces the eager full path so the lazy result can be compared; afterwards `reflow_need`/`reflow_node`/`mutation_pending` are cleared and `HPE_DIRTY_FULL` is set as needed",
+    "see": "hpe_engine_relayout flush_rebuild_layout restyle_boxes"
+  },
+  "path_basename": {
+    "brief": "取路径的最后一段 / Get the final path component",
+    "params": {
+      "path": "文件路径 / File path"
+    },
+    "return": "末尾的文件名部分，`path` 为 NULL 时返回空串 / The trailing file name, an empty string when `path` is NULL",
+    "note": "同时识别 `/` 与 `\\` 分隔符 / Handles both `/` and `\\` separators"
+  },
+  "hpe_engine_refresh_status": {
+    "brief": "刷新状态行文本 / Refresh the status-line text",
+    "params": {
+      "engine": "引擎实例 / Engine instance"
+    },
+    "note": "汇总文件名、尺寸、是否含地址栏、加载/绘制耗时与滚动位置，并在末尾追加粘性加载错误（若有）/ Formats the file name, size, chrome flag, load/paint timings and scroll position, appending the sticky load error when present",
+    "see": "hpe_engine_status"
+  },
+  "hpe_engine_view_height": {
+    "brief": "取页面视口高度（窗口高减地址栏）/ Get the page viewport height (window height minus chrome)",
+    "params": {
+      "engine": "引擎实例 / Engine instance"
+    },
+    "return": "视口高度（像素），不小于 0；`engine` 为 NULL 时返回 0 / Viewport height in pixels, never below 0; 0 when `engine` is NULL"
+  },
+  "dump_boxes": {
+    "brief": "递归打印盒树及行/文本段（调试）/ Recursively dump the box tree with lines and runs (debug)",
+    "params": {
+      "box": "起始盒，递归其子树 / Starting box, recursing into its subtree",
+      "depth": "当前缩进层级 / Current indentation depth"
+    },
+    "note": "输出到 stderr；`HOPE_DEBUG` 下由 `load_source` 在加载后调用，供无头诊断 / Writes to stderr; called by `load_source` after a load under `HOPE_DEBUG` for headless diagnostics",
+    "see": "dump_dom"
+  },
+  "collect_script_nodes": {
+    "brief": "收集子树的 `<script>` 元素 / Collect the `<script>` elements of a subtree",
+    "params": {
+      "node": "开始遍历的 DOM 节点 / DOM node to walk from",
+      "out": "out:接收脚本元素的数组 / Array that receives the script elements",
+      "max": "数组容量上限 / Maximum number of array entries",
+      "count": "inout:已收集个数 / Number collected so far"
+    },
+    "note": "按文档顺序填充，最多 `max` 个 / Fills in document order, at most `max` entries",
+    "see": "run_scripts"
+  },
+  "hope_module_load": {
+    "brief": "模块加载器：解析说明符并读取模块源码 / Module loader: resolve a specifier and read the module source",
+    "params": {
+      "ud": "宿主透传的基础目录 / Opaque user data, the base directory",
+      "spec": "模块说明符 / Module specifier",
+      "from_dir": "发起导入的模块所在目录，空则用 `ud` / Directory of the importing module, `ud` when empty",
+      "out_path": "out:接收解析后的模块路径 / Receives the resolved module path",
+      "out_src": "out:接收模块源码 / Receives the module source"
+    },
+    "return": "加载成功返回 1，否则 0 / 1 when loaded, otherwise 0",
+    "note": "无扩展名的说明符补 `.js`；裸说明符回退到文档目录；失败时不写出 `out_path` / Appends `.js` to an extension-less specifier; a bare specifier falls back to the document directory; `out_path` is not written on failure"
+  },
+  "script_source": {
+    "brief": "读取单个 `<script>` 的源码 / Read one `<script>`'s source",
+    "params": {
+      "node": "`<script>` 元素节点 / The `<script>` element node",
+      "dir": "解析 `src` 的基准目录 / Base directory used to resolve `src`",
+      "is_module": "out:置为非空表示 `type=\"module\"` / Set non-NULL for `type=\"module\"`"
+    },
+    "return": "新分配的缓冲区（须 `hpe_free`），无内容返回 `NULL` / A freshly allocated buffer (free with `hpe_free`), `NULL` when there is nothing",
+    "note": "有 `src` 时读文件，否则取内联原始文本 / Reads the `src` file when present, otherwise the inline raw text"
+  },
+  "run_one_script": {
+    "brief": "在引擎 JS 上下文中求值一个已收集的 `<script>` / Evaluate one already-collected `<script>` in the engine's JS context",
+    "params": {
+      "engine": "引擎实例，提供 `js` / Engine instance, provides `js`",
+      "node": "要执行的 `<script>` 元素 / The `<script>` element to run",
+      "dir": "脚本所在目录 / Directory of the script"
+    },
+    "note": "module 走 `hpe_js_eval_module`，否则 `hpe_js_eval`；错误打印到 stderr 且不中断后续脚本 / Modules go through `hpe_js_eval_module`, otherwise `hpe_js_eval`; an error is printed to stderr and does not stop later scripts",
+    "see": "run_scripts"
+  },
+  "run_scripts": {
+    "brief": "重建 JS 上下文并执行文档内全部脚本 / Rebuild the JS context and run every script in the document",
+    "params": {
+      "engine": "引擎实例 / Engine instance"
+    },
+    "note": "先销毁旧 JS 上下文；无脚本时不创建上下文直接返回；安装 DOM 绑定与模块加载器后按文档顺序执行（上限 `HPE_MAX_SCRIPTS`）/ Destroys the old JS context first; returns without creating one when there are no scripts; installs the DOM bindings and module loader, then runs them in document order (capped at `HPE_MAX_SCRIPTS`)",
+    "see": "run_one_script collect_script_nodes"
+  },
+  "dump_dom": {
+    "brief": "递归打印 DOM 元素与文本节点（调试）/ Recursively dump DOM elements and text nodes (debug)",
+    "params": {
+      "node": "起始 DOM 节点 / Starting DOM node",
+      "depth": "当前缩进层级 / Current indentation depth"
+    },
+    "note": "元素打印标签与 class，文本最多打印 40 字节；输出到 stderr / Elements print their tag and class, text is truncated to 40 bytes; writes to stderr",
+    "see": "dump_boxes"
+  },
+  "hpe_engine_relayout": {
+    "brief": "急切重排：无条件全量重建盒树 / Eager relayout: unconditionally rebuild the whole box tree",
+    "params": {
+      "engine": "引擎实例 / Engine instance"
+    },
+    "note": "等价于 `hpe_engine_flush(engine, 1)`；供加载、缩放、悬停、定时器等必须重排的路径使用，惰性策略在 `hpe_engine_flush` / Equivalent to `hpe_engine_flush(engine, 1)`; used by paths that must relayout (load, resize, hover, timers), while the lazy policy lives in `hpe_engine_flush`",
+    "see": "hpe_engine_flush"
+  },
+  "hpe_engine_create": {
+    "brief": "创建引擎实例并初始化像素缓冲 / Create an engine instance and initialise its pixel buffer",
+    "params": {
+      "width": "窗口宽度 / Window width",
+      "height": "窗口高度 / Window height"
+    },
+    "return": "新引擎实例 / The new engine instance",
+    "note": "非正或缺失的宽高分别回退为 800×600 / Non-positive dimensions fall back to 800×600",
+    "see": "hpe_engine_destroy"
+  },
+  "hpe_engine_destroy": {
+    "brief": "销毁引擎并释放全部资源 / Destroy the engine and release all resources",
+    "params": {
+      "engine": "引擎实例，NULL 时直接返回 / Engine instance, returns early when NULL"
+    },
+    "note": "释放盒树、DOM、样式表、像素缓冲与 JS 上下文，并关闭字体子系统 / Frees the box tree, DOM, stylesheet, pixel buffer and JS context, and shuts the font subsystem down",
+    "see": "hpe_engine_create"
+  },
+  "reset_document": {
+    "brief": "拆掉上一份文档的全部产物，准备重新加载 / Tear down everything the previous document produced, ready for a new load",
+    "params": {
+      "engine": "引擎实例 / Engine instance",
+      "path": "新文档路径，NULL 表示空白页 / New document path, NULL for the blank page"
+    },
+    "note": "释放旧路径/盒树/DOM 并重建样式表（含 `hpe_css_init` 的 UA 规则）；`path` 为 NULL 时清空路径 / Frees the old path, box tree and DOM and rebuilds the sheet (with the user-agent rules from `hpe_css_init`); a NULL `path` clears the path",
+    "see": "load_source"
+  },
+  "parse_document": {
+    "brief": "解码原始字节、解析 DOM 并解析 `<base href>` / Decode the raw bytes, parse the DOM and resolve `<base href>`",
+    "params": {
+      "engine": "引擎实例 / Engine instance",
+      "src": "原始字节缓冲，函数接管并释放 / Raw byte buffer; ownership is taken and freed",
+      "size": "缓冲区字节数 / Number of bytes in the buffer",
+      "path": "文档路径，供相对引用重定基 / Document path, used to rebase relative references"
+    },
+    "note": "按 BOM / `<meta charset>` / UTF-8 校验探测编码并转成 UTF-8 再解析；在收集作者样式前解析 base href，使相对引用正确重定基 / Detects the charset (BOM / `<meta charset>` / UTF-8 validation), decodes to UTF-8 before parsing, and resolves base href before author styles are collected so relative references rebase correctly",
+    "see": "reset_document install_styles"
+  },
+  "install_styles": {
+    "brief": "收集作者规则并安装 DOM 变更汇聚点 / Collect the author rules and install the DOM mutation sink",
+    "params": {
+      "engine": "引擎实例 / Engine instance",
+      "path": "文档路径，用于解析外链 / Document path, used to resolve external links"
+    },
+    "note": "记录 `author_rule_base` 与样式签名，并注册 `style_sink`，使脚本后续对 `<style>`/`<link>` 的改动保持同步 / Records `author_rule_base` and the style signature, and registers `style_sink` so later `<style>`/`<link>` edits by page scripts stay in sync",
+    "see": "collect_styles style_sink"
+  },
+  "debug_dump_document": {
+    "brief": "`HOPE_DEBUG` 下转储 DOM 与前若干条级联规则 / Under `HOPE_DEBUG`, dump the DOM and the first few cascade rules",
+    "params": {
+      "engine": "引擎实例 / Engine instance"
+    },
+    "note": "未设置 `HOPE_DEBUG` 时直接返回；最多打印 40 条规则 / Returns immediately when `HOPE_DEBUG` is unset; at most 40 rules are printed",
+    "see": "dump_dom"
+  },
+  "run_test_hooks": {
+    "brief": "运行 `HOPE_TEST_*` 合成事件测试钩子 / Run the `HOPE_TEST_*` synthetic-event test hooks",
+    "params": {
+      "engine": "引擎实例 / Engine instance"
+    },
+    "note": "读取环境变量：`HOPE_TEST_CLICK`（按 id 点击）、`HOPE_TEST_HOVER`（`x,y` 悬停）、`HOPE_TEST_WAIT`（在给定秒数内跑 tick）、`HOPE_TEST_TEXT`（按 id 打印文本）；在排版后调用一次，供无头 `--dump` 验证交互页 / Reads env vars: `HOPE_TEST_CLICK` (click by id), `HOPE_TEST_HOVER` (`x,y` hover), `HOPE_TEST_WAIT` (tick for the given seconds), `HOPE_TEST_TEXT` (print text by id); runs once after layout so headless `--dump` can verify interactive pages",
+    "see": "click_element_by_id print_text_by_id"
+  },
+  "load_source": {
+    "brief": "共享加载流水线 / Shared load pipeline",
+    "params": {
+      "engine": "引擎实例 / Engine instance",
+      "src": "原始字节缓冲，函数接管并释放 / Raw byte buffer; ownership is taken and freed",
+      "size": "缓冲区字节数 / Number of bytes in the buffer",
+      "path": "文档路径，NULL 表示内置空白页 / Document path, NULL for the built-in blank page"
+    },
+    "return": "排版出盒树返回 1，否则 0 / 1 when a box tree was produced, otherwise 0",
+    "note": "清错、重置、解析、收集样式，先排版一次（供脚本读取 `clientWidth`/`clientHeight`），跑脚本后再排版一次，最后跑测试钩子；记录加载耗时并刷新状态 / Clears the error, resets, parses and collects styles, lays out once (so scripts can read `clientWidth`/`clientHeight`), runs the scripts and lays out again, then runs the test hooks; records the load time and refreshes the status",
+    "see": "parse_document run_scripts"
+  },
+  "hpe_engine_load_file": {
+    "brief": "加载并排版一个 HTML 文件 / Load and lay out an HTML file",
+    "params": {
+      "engine": "引擎实例 / Engine instance",
+      "path": "要加载的文件路径 / Path of the file to load"
+    },
+    "return": "加载成功返回 1，否则 0 / 1 when loaded, otherwise 0",
+    "retval": {
+      "1": "已读取并排版 / The file was read and laid out",
+      "0": "`engine`/`path` 为 NULL 或文件无法打开（错误写入状态行）/ `engine` or `path` is NULL, or the file could not be opened (the error is stored in the status line)"
+    },
+    "note": "启用地址栏时把绝对路径写入地址栏 / Writes the absolute path into the address bar when chrome is enabled",
+    "see": "load_source hpe_engine_reload"
+  },
+  "hpe_engine_load_blank": {
+    "brief": "加载内置空白页 / Load the built-in blank page",
+    "params": {
+      "engine": "引擎实例，NULL 时返回 0 / Engine instance, returns 0 when NULL"
+    },
+    "return": "加载成功返回 1，否则 0 / 1 when loaded, otherwise 0",
+    "note": "无文件参数启动时使用；启用地址栏时清空地址并失焦 / Used when the engine starts without a file argument; clears and blurs the address bar when chrome is enabled",
+    "see": "hpe_engine_load_file"
+  },
+  "hpe_engine_reload": {
+    "brief": "重新加载当前文档 / Reload the current document",
+    "params": {
+      "engine": "引擎实例，NULL 时返回 0 / Engine instance, returns 0 when NULL"
+    },
+    "return": "加载成功返回 1，否则 0 / 1 when reloaded, otherwise 0",
+    "note": "无路径时加载内置空白页 / Loads the built-in blank page when there is no path",
+    "see": "hpe_engine_load_file hpe_engine_load_blank"
+  },
+  "hpe_engine_resize": {
+    "brief": "调整窗口与像素缓冲尺寸并重排 / Resize the window and pixel buffer and relayout",
+    "params": {
+      "engine": "引擎实例 / Engine instance",
+      "width": "新的窗口宽度 / New window width",
+      "height": "新的窗口高度 / New window height"
+    },
+    "note": "宽高非正或与当前完全一致时直接返回；否则重设缓冲、重排并刷新状态 / Returns early for non-positive or unchanged dimensions; otherwise resizes the buffer, relayouts and refreshes the status",
+    "see": "hpe_engine_relayout"
+  },
+  "hpe_engine_scroll_by": {
+    "brief": "按行滚动页面 / Scroll the page by a number of lines",
+    "params": {
+      "engine": "引擎实例，NULL 时直接返回 / Engine instance, returns early when NULL",
+      "lines": "滚动的行数，可正可负 / Number of lines to scroll, may be negative"
+    },
+    "note": "一行等于 `HPE_SCROLL_LINE_PX` 像素；夹到合法范围后取整到整像素，使损伤矩形路径与全量重绘逐字节一致；仅在未脏时置 `HPE_DIRTY_SCROLL` / One line is `HPE_SCROLL_LINE_PX` pixels; the offset is clamped then snapped to whole pixels so the damage-rect path stays byte-identical to a full repaint; only sets `HPE_DIRTY_SCROLL` when not already dirty",
+    "see": "hpe_engine_scroll_offset clamp_scroll"
+  },
+  "dirty_disabled": {
+    "brief": "查询是否禁用损伤矩形滚动（`HPE_NO_DIRTY`）/ Test whether damage-rect scrolling is disabled (`HPE_NO_DIRTY`)",
+    "return": "禁用为 1，否则 0 / 1 when disabled, otherwise 0",
+    "note": "环境变量只读一次并缓存，作为基准对比用 / The environment variable is read once and cached, as a benchmark aid"
+  },
+  "collect_fixed_boxes": {
+    "brief": "收集 `position:fixed` 的盒 / Collect `position:fixed` boxes",
+    "params": {
+      "box": "起始盒，递归其子树 / Starting box, recursing into its subtree",
+      "out": "out:接收 fixed 盒的数组 / Array that receives the fixed boxes",
+      "max": "数组容量上限 / Maximum number of array entries",
+      "count": "inout:已收集个数 / Number collected so far"
+    },
+    "note": "递归子树，最多 `max` 个；供仅滚动的局部重绘使用 / Recurses the subtree, at most `max` entries; used by the scroll-only partial repaint",
+    "see": "render_scrolled"
+  },
+  "render_scrolled": {
+    "brief": "仅滚动的局部重绘 / Scroll-only repaint",
+    "params": {
+      "engine": "引擎实例 / Engine instance"
+    },
+    "note": "先按滚动差竖直平移已有像素并重绘露出的条带；位移达到整屏则回退为 `hpe_paint_document` 全量；`fixed` 盒不随滚动移动，最后覆盖其区域 / Shifts the existing pixels by the scroll delta then repaints the exposed strip; a delta of a full viewport or more falls back to a full `hpe_paint_document`; `fixed` boxes do not move and their regions are repainted last",
+    "see": "hpe_engine_render collect_fixed_boxes"
+  },
+  "hpe_engine_render": {
+    "brief": "按脏标记把引擎绘制到像素缓冲 / Paint the engine into its pixel buffer according to the dirty flag",
+    "params": {
+      "engine": "引擎实例，NULL 时直接返回 / Engine instance, returns early when NULL"
+    },
+    "note": "脏标记为 `HPE_DIRTY_NONE` 且已绘制过时整帧跳过（使无实际变更的 DOM mutation 免费）；`HPE_DIRTY_CHROME` 只重画地址栏，`HPE_DIRTY_SCROLL` 走 `render_scrolled`（`HPE_NO_DIRTY` 下跳过），否则整帧重绘；结束清零脏标记并记录绘制耗时 / Skips the whole frame when the flag is `HPE_DIRTY_NONE` and a frame exists (making a no-op mutation free); `HPE_DIRTY_CHROME` repaints only the bar, `HPE_DIRTY_SCROLL` goes through `render_scrolled` (skipped under `HPE_NO_DIRTY`), otherwise a full repaint; clears the flag and records the paint time",
+    "see": "render_scrolled hpe_engine_pixmap"
+  },
+  "hpe_engine_pixmap": {
+    "brief": "取引擎的像素缓冲 / Get the engine's pixel buffer",
+    "params": {
+      "engine": "引擎实例 / Engine instance"
+    },
+    "return": "像素缓冲指针，`engine` 为 NULL 时返回 `NULL` / Pointer to the pixel buffer, `NULL` when `engine` is NULL"
+  },
+  "hpe_engine_status": {
+    "brief": "取状态行文本 / Get the status-line text",
+    "params": {
+      "engine": "引擎实例 / Engine instance"
+    },
+    "return": "状态文本，`engine` 为 NULL 时返回空串 / The status text, an empty string when `engine` is NULL",
+    "see": "hpe_engine_refresh_status"
+  },
+  "hpe_engine_scroll_offset": {
+    "brief": "取当前纵向滚动偏移 / Get the current vertical scroll offset",
+    "params": {
+      "engine": "引擎实例 / Engine instance"
+    },
+    "return": "滚动偏移（像素），`engine` 为 NULL 时返回 0 / Scroll offset in pixels, 0 when `engine` is NULL",
+    "see": "hpe_engine_scroll_by"
+  },
+  "hpe_engine_document_encoding": {
+    "brief": "取上次加载文档所用的字符编码 / Get the charset the last loaded document was decoded from",
+    "params": {
+      "engine": "引擎实例 / Engine instance"
+    },
+    "return": "编码名（如 `utf-8`、`latin1`、`utf-16le`、`utf-16be`），`engine` 为 NULL 时返回空串 / The charset label (e.g. `utf-8`, `latin1`, `utf-16le`, `utf-16be`), an empty string when `engine` is NULL",
+    "note": "直到下次加载前有效 / Valid until the next load"
+  },
+  "hpe_engine_meta_charset": {
+    "brief": "查询编码是否来自文档内 `<meta charset>` / Query whether the charset came from an in-document `<meta charset>`",
+    "params": {
+      "engine": "引擎实例 / Engine instance"
+    },
+    "return": "来自 meta 返回 1，否则 0 / 1 when it came from meta, otherwise 0",
+    "note": "与来自 BOM 或 UTF-8 校验的情况区分 / Distinguishes it from a BOM or UTF-8 validation"
+  },
+  "hpe_engine_base_href": {
+    "brief": "取解析后的 `<base href>` / Get the resolved `<base href>`",
+    "params": {
+      "engine": "引擎实例 / Engine instance"
+    },
+    "return": "绝对基址，文档未声明时返回空串 / The absolute base URL, an empty string when the document declares none"
+  },
+  "hpe_engine_link_count": {
+    "brief": "取非 stylesheet 的 `<link>` 资源数 / Get the number of non-stylesheet `<link>` resources",
+    "params": {
+      "engine": "引擎实例 / Engine instance"
+    },
+    "return": "记录的资源提示个数（icon/preload/alternate 等），`engine` 为 NULL 时返回 0 / Number of recorded resource hints (icon/preload/alternate ...), 0 when `engine` is NULL",
+    "see": "hpe_engine_link_at"
+  },
+  "hpe_engine_link_at": {
+    "brief": "取某条资源提示的归一化 rel 与绝对 href / Get a resource hint's normalised rel token and resolved absolute href",
+    "params": {
+      "engine": "引擎实例 / Engine instance",
+      "index": "资源提示下标 / Resource hint index",
+      "rel": "out:接收归一化 rel token 串，可为 NULL / Receives the normalised rel token string, may be NULL",
+      "href": "out:接收解析后的绝对地址，可为 NULL / Receives the resolved absolute URL, may be NULL"
+    },
+    "return": "`index` 有效返回 1，越界返回 0 / 1 for a valid `index`, 0 when out of range",
+    "note": "越界时不写出任何输出 / Nothing is written when the index is out of range",
+    "see": "hpe_engine_link_count"
+  },
+  "hit_test_box": {
+    "brief": "在盒树中做命中测试，返回最深命中的盒 / Hit-test the box tree, returning the deepest matching box",
+    "params": {
+      "box": "起始盒，递归其子树 / Starting box, recursing into its subtree",
+      "x": "X 坐标（视口坐标）/ X coordinate in viewport space",
+      "y_vp": "Y 坐标（视口坐标）/ Y coordinate in viewport space",
+      "scroll": "文档滚动偏移 / Document scroll offset"
+    },
+    "return": "命中的盒，未命中返回 `NULL` / The hit box, `NULL` when nothing matched",
+    "note": "`fixed` 盒按视口坐标比较，普通流盒按文档坐标（视口 y 加滚动量）；子级优先，最深命中获胜 / `fixed` boxes compare in viewport coordinates, normal-flow boxes in document coordinates (viewport y plus scroll); children are tested first and the deepest match wins",
+    "see": "node_from_hit"
+  },
+  "node_from_hit": {
+    "brief": "由窗口坐标求命中的 DOM 元素 / Resolve the DOM element under a window coordinate",
+    "params": {
+      "engine": "引擎实例 / Engine instance",
+      "x": "X 坐标（窗口坐标）/ X coordinate in window space",
+      "y": "Y 坐标（窗口坐标）/ Y coordinate in window space"
+    },
+    "return": "命中的元素节点，未命中或落在地址栏内返回 `NULL` / The hit element, `NULL` when nothing matched or the point is inside the chrome strip",
+    "note": "减去地址栏高度后做命中测试；`<svg>` 子树无盒，改由 SVG 模块判定具体图形；非元素节点上溯到元素 / Subtracts the chrome height before hit-testing; an `<svg>` has no boxes for its children so the SVG module decides the shape; non-element nodes walk up to their element",
+    "see": "hit_test_box hpe_engine_mouse_move"
+  },
+  "clear_hover_flags": {
+    "brief": "清除子树的 `:hover` 标记 / Clear the `:hover` flags of a subtree",
+    "params": {
+      "node": "起始 DOM 节点 / Starting DOM node"
+    },
+    "note": "递归自身及其所有兄弟子树 / Recurses over the node and all its siblings",
+    "see": "hpe_engine_mouse_move"
+  },
+  "hpe_engine_mouse_move": {
+    "brief": "处理指针移动：更新 `:hover` 并派发 `mousemove` / Handle a pointer move: update `:hover` and fire `mousemove`",
+    "params": {
+      "engine": "引擎实例，NULL 或无盒树时返回 0 / Engine instance, returns 0 when NULL or without a box tree",
+      "x": "X 坐标（窗口坐标）/ X coordinate in window space",
+      "y": "Y 坐标（窗口坐标）/ Y coordinate in window space"
+    },
+    "return": "需要重绘返回 1（悬停变化或有监听器改动了页面），否则 0 / 1 when a repaint is needed (hover changed or a listener mutated the page), otherwise 0",
+    "note": "地址栏拖选进行中时交给地址栏处理；悬停变化总是强制重排（`:hover` 是选择器），否则仅在监听器产生变更时惰性 flush / Hands off to the address bar while a drag selection is live; a hover change always forces a relayout (`:hover` is a selector), otherwise a listener-driven change is flushed lazily",
+    "see": "node_from_hit clear_hover_flags"
+  },
+  "hpe_engine_tick": {
+    "brief": "泵到期定时器与 rAF 回调 / Drain due timers and rAF callbacks",
+    "params": {
+      "engine": "引擎实例，无 JS 上下文时返回 0 / Engine instance, returns 0 without a JS context"
+    },
+    "return": "有回调运行返回 1，否则 0 / 1 when at least one callback ran, otherwise 0",
+    "note": "有回调时惰性 flush 并刷新状态 / Lazily flushes and refreshes the status when a callback ran",
+    "see": "hpe_engine_flush"
+  },
+  "hpe_engine_mouse_event": {
+    "brief": "派发一次鼠标按下 / 抬起 / Deliver a mouse press/release",
+    "params": {
+      "engine": "引擎实例 / Engine instance",
+      "x": "X 坐标（窗口坐标）/ X coordinate in window space",
+      "y": "Y 坐标（窗口坐标）/ Y coordinate in window space",
+      "button": "鼠标按键（0 = 左键）/ Mouse button (0 = left)",
+      "down": "按下为 1、抬起为 0 / 1 when pressed, 0 when released"
+    },
+    "return": "页面发生变更返回 1（引擎已重排，窗口应重绘），否则 0 / 1 when the page mutated (the engine already relaid-out and the window should repaint), otherwise 0",
+    "note": "等价于修饰键掩码为 0 的 `hpe_engine_mouse_event_mods` / Equivalent to calling `hpe_engine_mouse_event_mods` with a zero modifier mask",
+    "see": "hpe_engine_mouse_event_mods"
+  },
+  "hpe_engine_mouse_event_mods": {
+    "brief": "带修饰键地派发一次鼠标按下 / 抬起 / Deliver a mouse press/release with modifiers",
+    "params": {
+      "engine": "引擎实例，NULL 或无盒树时返回 0 / Engine instance, returns 0 when NULL or without a box tree",
+      "x": "X 坐标（窗口坐标）/ X coordinate in window space",
+      "y": "Y 坐标（窗口坐标）/ Y coordinate in window space",
+      "button": "鼠标按键（当前未使用）/ Mouse button (currently unused)",
+      "down": "按下为 1、抬起为 0 / 1 when pressed, 0 when released",
+      "mods": "修饰键掩码 / Modifier mask"
+    },
+    "return": "触发监听器或使地址栏失焦返回 1，否则 0 / 1 when a listener fired or the address bar was blurred, otherwise 0",
+    "note": "落在地址栏条带内或拖选进行中时交给地址栏；点击页面使地址栏失焦；抬起时依次派发 `mousedown`/`mouseup`/`click`，并按记录的变更做惰性 flush / Points inside the chrome strip or an in-progress drag go to the address bar; clicking the page blurs the bar; a release dispatches `mousedown`/`mouseup`/`click` in turn and lazily flushes the recorded mutations",
+    "see": "hpe_engine_mouse_event"
+  },
+  "click_element_by_id": {
+    "brief": "测试钩子：对指定 id 的元素触发一次点击 / Test hook: fire a click on the element with the given id",
+    "params": {
+      "engine": "引擎实例，无 JS 上下文时返回 0 / Engine instance, returns 0 without a JS context",
+      "id": "目标元素的 id / id of the target element"
+    },
+    "return": "找到并派发了事件返回 1，否则 0 / 1 when the element was found and the events dispatched, otherwise 0",
+    "note": "由 `HOPE_TEST_CLICK` 使用；用广度优先遍历按 id 找元素，再依次派发 `mousedown`/`mouseup`/`click` 并 flush，无需窗口即可走真实事件路径 / Used by `HOPE_TEST_CLICK`; finds the element by id with a breadth-first walk, then dispatches `mousedown`/`mouseup`/`click` and flushes, exercising the real event path without a window",
+    "see": "run_test_hooks"
+  },
+  "print_text_by_id": {
+    "brief": "测试钩子：把指定 id 元素的文本内容打印到 stdout / Test hook: print the text content of the element with the given id to stdout",
+    "params": {
+      "engine": "引擎实例 / Engine instance",
+      "id": "目标元素的 id，空则直接返回 / id of the target element, returns early when empty"
+    },
+    "note": "由 `HOPE_TEST_TEXT` 使用；深度优先收集子树文本后换行输出，找不到 id 时打印 `<no element id=...>`；供无头运行断言脚本对 DOM 的修改 / Used by `HOPE_TEST_TEXT`; concatenates the subtree's text and prints it followed by a newline, printing `<no element id=...>` when the id is absent; lets headless runs assert script-driven DOM updates",
+    "see": "run_test_hooks"
+  }
+}

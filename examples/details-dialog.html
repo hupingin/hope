@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>details / dialog</title>
+<style>
+body { font: 13px sans-serif; margin: 16px; }
+#out { font: 12px monospace; white-space: pre; }
+.ok { color: #0a7a0a; font-weight: bold; }
+.fail { color: #d93025; font-weight: bold; }
+</style>
+</head>
+<body>
+<h3>Details &amp; Dialog</h3>
+
+<details id="d1">
+  <summary id="sum1">展开详情</summary>
+  <div id="detailbody">隐藏的内容 A</div>
+</details>
+
+<details id="d2">
+  <summary id="sum2">不可展开</summary>
+  <div>隐藏的内容 B</div>
+</details>
+
+<dialog id="dlg"><p id="dlgbody">对话框内容</p></dialog>
+
+<div id="evlog"></div>
+<div id="out"></div>
+
+<script>
+var lines = [], total = 0, passCount = 0;
+function ck(name, got, want) {
+  var ok = got === want;
+  total++;
+  lines.push((ok ? "  ok  " : "  FAIL") + " " + name +
+             (ok ? "" : " (got " + JSON.stringify(got) + ", want " + JSON.stringify(want) + ")"));
+  if (ok) passCount++;
+  return ok;
+}
+
+var d1 = document.getElementById("d1");
+var sum1 = document.getElementById("sum1");
+var d2 = document.getElementById("d2");
+var dlg = document.getElementById("dlg");
+
+/* ---- default state ---- */
+ck("details open getter defaults false", d1.open, false);
+ck("summary tagName", sum1.tagName, "SUMMARY");
+ck("dialog open getter defaults false", dlg.open, false);
+ck("show is a function", typeof dlg.show, "function");
+ck("showModal is a function", typeof dlg.showModal, "function");
+ck("close is a function", typeof dlg.close, "function");
+
+/* ---- JS dialog API (synchronous) ---- */
+dlg.show();
+ck("show() sets open", dlg.open, true);
+dlg.close();
+ck("close() clears open", dlg.open, false);
+dlg.showModal();
+ck("showModal() sets open", dlg.open, true);
+dlg.close();
+ck("close() after modal clears open", dlg.open, false);
+/* open attribute setter */
+d1.open = true;
+ck("open setter opens", d1.open, true);
+d1.open = false;
+ck("open setter closes", d1.open, false);
+
+/* ---- event capture ---- */
+var toggleLog = [];
+var closeCount = 0;
+var beforeCount = 0;
+d1.addEventListener("toggle", function (e) {
+  toggleLog.push(e.newState);
+});
+dlg.addEventListener("close", function () { closeCount++; });
+d2.addEventListener("beforetoggle", function (e) {
+  beforeCount++;
+  e.preventDefault(); /* veto d2 expansion */
+});
+
+/* dialog close event */
+dlg.showModal();
+dlg.close();
+ck("close event fired", closeCount, 1);
+
+/* ---- interaction (engine clicks fire before setTimeout) ---- */
+setTimeout(function () {
+  ck("click summary opens details", d1.open, true);
+  ck("toggle newState open seen", toggleLog.join("|"), "open");
+  ck("second click does not run here", toggleLog.length, 1);
+  ck("beforetoggle vetoed d2", d2.open, false);
+  ck("beforetoggle handler ran", beforeCount >= 1, true);
+
+  lines.unshift((passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total + " checks");
+  var cls = passCount === total ? "ok" : "fail";
+  var el = document.getElementById("out");
+  for (var li = 0; li < lines.length; li++) {
+    var row = document.createElement("div");
+    row.className = "row " + (li === 0 ? cls : "");
+    row.textContent = lines[li];
+    el.appendChild(row);
+  }
+  document.title = (passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total;
+}, 120);
+</script>
+</body>
+</html>

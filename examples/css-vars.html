@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>css custom properties</title>
+<style>
+:root { --brand: #123456; --space: 14px; --inner: 24px; --outer: var(--inner); }
+.a { color: var(--brand); margin-left: var(--space); }
+.b { color: var(--missing, #abcdef); width: var(--none, 90px); }
+.c { padding-left: var(--outer); }
+.d { --tone: #222222; }
+.d .e { color: var(--tone); }
+.f { --imp: one !important; }
+div.f { --imp: two; }
+@property --tone { syntax: "<color>"; inherits: false; initial-value: #111111; }
+</style>
+</head>
+<body>
+<div class="a" id="a">A</div>
+<div class="b" id="b">B</div>
+<div class="c" id="c">C</div>
+<div class="d" id="d"><div class="e" id="e">E</div></div>
+<div class="f" id="f">F</div>
+<div id="out"></div>
+
+<script>
+var lines = [], total = 0, passCount = 0;
+function ck(name, got, want) {
+  var ok = got === want;
+  total++;
+  lines.push((ok ? "  ok  " : "  FAIL") + " " + name +
+             (ok ? "" : " (got " + JSON.stringify(got) + ", want " + JSON.stringify(want) + ")"));
+  if (ok) passCount++;
+  return ok;
+}
+function cv(id, prop) { return getComputedStyle(document.getElementById(id)).getPropertyValue(prop); }
+
+ck("custom read on root inheritor", cv("a", "--brand"), "#123456");
+ck("custom inherited deep", cv("e", "--inner"), "24px");
+ck("var() resolves length", cv("a", "margin-left"), "14px");
+ck("var() fallback length", cv("b", "width"), "90px");
+ck("var() nested fallback chain", cv("c", "padding-left"), "24px");
+ck("undefined custom is empty", cv("b", "--missing"), "");
+ck("important custom wins", cv("f", "--imp"), "one");
+ck("@property own value", cv("d", "--tone"), "#222222");
+ck("@property non-inheriting initial", cv("e", "--tone"), "#111111");
+ck("var() picks up @property initial", cv("e", "color"), "rgb(17, 17, 17)");
+
+var inline = document.createElement("div");
+inline.setAttribute("style", "width: var(--space)");
+document.body.appendChild(inline);
+ck("var() in inline style", getComputedStyle(inline).getPropertyValue("width"), "14px");
+
+lines.unshift((passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total + " checks");
+var out = document.getElementById("out");
+for (var i = 0; i < lines.length; i++) {
+  var row = document.createElement("div");
+  row.textContent = lines[i];
+  out.appendChild(row);
+}
+document.title = (passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total;
+</script>
+</body>
+</html>

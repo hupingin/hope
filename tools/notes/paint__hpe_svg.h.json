@@ -1,0 +1,21 @@
+{
+  "hpe_svg_paint": {
+    "brief": "绘制 `<svg>` 子树 / Paint the `<svg>` subtree",
+    "params": {
+      "pm": "inout:目标像素缓冲 / Target pixel buffer",
+      "box": "in:`<svg>` 盒 / The `<svg>` box",
+      "y_dev": "in:盒子顶边的设备 y / Device y of the box's top edge"
+    },
+    "note": "内容直接来自 DOM，不经过盒子树 / The content is painted straight from the DOM rather than from boxes"
+  },
+  "hpe_svg_hit_test": {
+    "brief": "对 `<svg>` 子树做命中测试 / Hit test an `<svg>` subtree",
+    "params": {
+      "box": "in:`<svg>` 盒 / The `<svg>` box",
+      "x": "in:文档坐标 X / Document-space X",
+      "y": "in:文档坐标 Y / Document-space Y"
+    },
+    "return": "最深的包含该点的 SVG 元素（`<rect>` 上的点击会冒泡到其 `<g>`），未命中返回 `NULL` / The deepest SVG element containing the point (a click on a `<rect>` bubbles up to its `<g>`), or `NULL`",
+    "note": "路径目前尚未参与命中测试 / Paths are not hit tested yet"
+  }
+}

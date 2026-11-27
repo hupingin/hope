@@ -33,13 +33,34 @@
 13. ✅ HTML 解析补全：容错自动闭合、`<table>`/`<select>`/`<template>` 专用规则、字符编码探测、`<base href>` 与 `<link>` 资源提示（v0.13）
 14. ✅ 布局补全（二）：grid、table、flex wrap/shrink/order、元素级滚动容器（v0.14–v0.18）
 15. ✅ 绘制补全（二）：`<img>`、滚动条、页面内文本选中、radial 渐变、`background-position/size`、彩色 emoji、竖排文本（v0.14–v0.21）
-16. ✅ 样式补全（三）：结构伪类、伪元素、状态伪类、`skew`/`matrix`、`cursor` 联动（`transition` 时钟仍为缺口）
+16. ✅ 样式补全（三）：结构伪类、伪元素、状态伪类、`skew`/`matrix`、`cursor` 联动
 17. ✅ JS 补全：真正的事件循环与 GC（`Proxy`/`Reflect`/`Intl`/`WeakMap` 仍为缺口）
 18. ✅ 基础设施：JS GC、C 单测框架、性能基准入库、内存泄漏检测账本（跨平台后端为显式豁免项）
 19. ✅ 浏览器能力批次：页面内文本选中与复制（DOM 端点选区/拖选/双击选词/整行高亮/跨块复制）、
     多标签页（每标签历史/滚动 + Ctrl+T/W/Tab）、IME 组合输入（内联下划线组合串）、C 单测框架
     （42 用例/223 断言）、CSS 布局矩阵（56 过 + 12 XFAIL）、基准入库对比、`HPE_ALLOC_STATS`
     分配账本并借其修复四类泄漏（v0.21）
+20. ✅ 动画插值时钟：`transition`/`animation` 从解析存储升级为完整插值——`@keyframes` 解析、
+    缓动（关键字/`cubic-bezier()`/`steps`）、delay/direction/iteration/fill-mode、transform
+    分解插值、引擎 tick 泵与无头确定性时钟、C 单测（v0.22）
+21. ✅ 表单控件与表单事件（v0.23）：`input` 各 type / `textarea` / `select` / `button` 呈现与交互、
+    label 转发、radio 互斥、默认值快照与 reset、文本编辑与 caret、替换盒复用与 UA 主题化绘制、
+    `input`/`change`/`submit`/`reset`/`invalid` 事件、`document.forms` 与元素表单属性 API。
+    顺带修复增量重排时 `block_reset_lines()` 漏释放行片段数组导致的泄漏。
+22. ✅ CSS 自定义属性（v0.24）：`--name` 声明/继承、`var()` 替换与回退（嵌套引用、括号/引号感知）、
+    `!important` 覆盖次序、`@property` 注册（syntax/inherits/initial-value）、
+    `getComputedStyle().getPropertyValue('--x')`；C 单测 3 例 + `css-vars.html` 11 断言。
+23. ✅ Selection / Range API（v0.25）：`document.createRange()` / `window.getSelection()`，端点读写、
+    `toString()` / `extractContents()` / `deleteContents()` 与 Selection 的 addRange / getRangeAt /
+    collapse / extend / removeAllRanges；`src/js/hpe_js_selection.c` + `sel-api.html` 23 断言。
+    顺带修复 `is_style_host()` 对文本节点父节点无 `tag` 时空指针崩溃。
+24. ✅ `<details>` / `<summary>` 与 `<dialog>`（v0.26）：closed details 布局阶段只建 summary 盒；
+    summary disclosure 三角绘制；点击切换 `open` 并派发可取消 `beforetoggle` / `toggle`（带 `newState`）；
+    dialog 的 `open` / `show()` / `showModal()` / `close()` / `close` 事件与模态 `::backdrop` 遮罩。
+    新增 `src/hope_details.{c,h}` 与 `src/paint/hpe_paint_details.{c,h}`；`details-dialog.html` 18 断言。
+25. ✅ `<canvas>` 2D context（v0.27）：`src/canvas/hpe_canvas.{c,h}` 离屏 32bpp 表面注册表 +
+    `src/js/hpe_js_canvas.{c,h}` JS 桥；getContext('2d') + 矩形/路径/变换/样式/getImageData·putImageData；
+    `examples/canvas.html` 16 断言 + 像素级绘制验证。
 
 > 注：早期规划中的「float / flex 属绘制补全」已在 v0.4 / v0.6 提前落地，本列表据实回填。
 
@@ -368,7 +389,7 @@ typedef struct HpeCompound {
 | `text-decoration` | none / underline / overline / line-through | v0.9：可叠加（位标志）|
 | `box-shadow` / `text-shadow` | `[ox oy blur spread] color` | v0.9：盒阴影 / 文字阴影 |
 | `transform` | `translate` / `scale` / `rotate` | v0.9：2D 仿射；绘制期按盒左上角为原点，离屏合成并逆映射采样 |
-| `transition` / `animation` | 简写 | v0.9：**仅解析存储为标志，无插值时钟**（见 §17 缺口）|
+| `transition` / `animation` | 简写 + 长属性 | v0.9：解析存储；**v0.22：完整插值时钟**——`@keyframes`（停靠点级联样式）、缓动 `linear`/`ease*`/`cubic-bezier()`（Newton+二分）/`steps(n, start\|end)`、delay/direction/iteration/fill-mode、`transform` 分解插值（退化离散切换）；引擎侧运行项由 `hpe_engine_tick` 驱动，几何属性触发 LAYOUT 级重排并以 `layout_sticky` 粘滞到动画结束（`src/css/hpe_anim.c` + `src/hope_anim.c`，遗留见 §17）|
 | `letter-spacing` / `word-spacing` / `text-indent` | `px`（或长度）| v0.9：逐字形推进；`text-indent` 仅作用于首行；v0.10：三者均继承 |
 | `vertical-align` | baseline / top / middle / bottom / text-top / text-bottom | v0.9：作用于原子行内盒（inline-block）|
 | `list-style-type` | disc / circle / square / none / decimal | v0.9：列表项标记绘制；v0.10：继承（逐项可覆盖）|
@@ -1147,7 +1168,10 @@ cmake --build build
 > 子像素文字定位、彩色 emoji 与字形回退链、**页面内文本选中与复制**）、样式补全（结构伪类、
 > 伪元素、状态伪类、`cursor` 与平台光标联动）、基础设施（JS GC、单测框架、基准入库、分配账本）、
 > 外壳（插入符闪烁、I 形光标、前进/后退/刷新、**多标签页**、**IME 组合输入**）、
-> **竖排文本**（`writing-mode: vertical-rl/lr`）。以下为**当前**仍存在的缺口：
+> **竖排文本**（`writing-mode: vertical-rl/lr`）、**动画插值时钟**（v0.22）、
+> **表单控件与表单事件**（v0.23）、**CSS 自定义属性**（v0.24）、**Selection / Range API**（v0.25）、
+> **`<details>` / `<summary>` 与 `<dialog>`**（v0.26）、**`<canvas>` 2D context**（v0.27）。
+> 以下为**当前**仍存在的缺口：
 
 0. **HTML 解析**：仍不是完整 HTML5 状态机——未实现 `<frameset>`、`<form>` 的隐式闭合细节、
    `<math>`/`<svg>` 外来内容命名空间切换、RCDATA 转义细节、属性重复剔除、模板内容惰性解析；
@@ -1156,11 +1180,24 @@ cmake --build build
    生成器为急切物化（无 `yield` 暂停/无限生成器）；`await` 同步 settle；无 `Proxy`/`Reflect`/
    `Intl`/`WeakMap`·`WeakSet`；`Date` 无历史时区库/夏令时规则。事件暂无 `mouseover`。
 2. **布局**：见 §10.10（flex baseline 细节、grid/table 若干 XFAIL 边界、flow-root 等）。
-3. **绘制**：`transition`/`animation` 插值时钟（仍仅解析存储为标志）；渐变多层/多色标高级语法。
+3. **绘制**：动画遗留子项（每元素动画声明上限 4、停靠点级 easing、非可插值 keyframe 属性、`animationstart/end/iteration` 事件、伪元素动画、`play-state: paused`）；渐变多层/多色标高级语法。
 4. **基础设施**：非 Windows 平台后端（macOS/Linux 目前为空）、真实系统时钟之外的单调时钟
    （`hpe_time_monotonic`）——两项为显式豁免项。
 5. **内存**：DOM 游离节点（JS 侧创建后脱离文档树）与 SVG 派生上下文 `cov_scratch`
    指针复制模式存在各 ≤4KB 的既有小泄漏，可用 `HPE_ALLOC_STATS=1` 复现。
+6. **表单**（v0.23 已覆盖主体，剩余）：number/date/email/url 的专用校验与微调 UI、color 拾色器、
+   file 选择对话框、`<datalist>` 候选下拉、ValidityState 对象与 `validationMessage`、
+   `reportValidity()` 气泡、`FormData` 构造与遍历、`formdata` 事件、`form` 属性跨层级关联。
+7. **自定义属性**（v0.24 已覆盖主体，剩余）：`var()` 参与 `calc()` 组合与按 `syntax` 的类型校验、
+   单元素自定义属性 / var() 声明各 8 项上限、同一声明块内同名属性混合 `!important` 的覆盖次序。
+8. **Selection / Range**（v0.25 已覆盖主体，剩余）：`compareBoundaryPoints()` / `modify()` /
+   `insertNode()` / `surroundContents()`，`extractContents()` 返回轻量片段对象而非真实
+   DocumentFragment，跨文本节点的 `deleteContents()` 未完整删除。
+9. **`<details>` / `<dialog>`**（v0.26 已覆盖主体，剩余）：点击 backdrop 关闭模态 dialog、
+   Esc 键关闭、dialog 自动居中与 `::backdrop` 伪元素选择器样式（`showModal()` 目前在文档流
+   静态位置绘制遮罩）、`returnValue` / `close()` 参数。
+10. **`<canvas>` 2D**（v0.27 已覆盖主体，剩余）：文本绘制（fillText/strokeText/measureText）、
+    drawImage、渐变与图案样式、lineCap/lineJoin/setLineDash、非零环绕填充、3D context、toDataURL。
 
 ---
 

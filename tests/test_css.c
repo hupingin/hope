@@ -254,3 +254,79 @@ HPE_TEST_CASE(inline_style, get_missing)
     HPE_TEST_ASSERT_INT(hpe_css_inline_get(node, "color", NULL, 0), 0);
     hpe_dom_free(node);
 }
+
+/* ---------------- custom properties / var() (v0.24) ---------------- */
+
+/**
+ * @brief 测试自定义属性继承与 var() 求值 / Test custom-property inheritance and var() resolution
+ */
+HPE_TEST_CASE(custom, inherit_and_var)
+{
+    HpeStylesheet sheet;
+    HpeDomNode *doc = make_dom_chain();
+    HpeDomNode *div = doc->first_child;
+    HpeDomNode *p = div->first_child;
+    HpeStyle div_style, p_style;
+    const char *css = "div { --brand: #112233; --gap: 7px; } "
+                      "p { color: var(--brand); margin-left: var(--gap, 9px); }";
+    char buf[64];
+
+    hpe_css_init(&sheet);
+    hpe_css_parse(&sheet, css, strlen(css));
+    hpe_css_compute(&sheet, div, NULL, &div_style);
+    hpe_css_compute(&sheet, p, &div_style, &p_style);
+    HPE_TEST_ASSERT_INT(hpe_css_style_custom_value(&div_style, "--brand", buf, sizeof(buf)), 1);
+    HPE_TEST_ASSERT_STR(buf, "#112233");
+    HPE_TEST_ASSERT_INT(hpe_css_style_custom_value(&p_style, "brand", buf, sizeof(buf)), 1);
+    HPE_TEST_ASSERT_STR(buf, "#112233");
+    HPE_TEST_ASSERT_INT(p_style.color.r, 0x11);
+    HPE_TEST_ASSERT_INT(p_style.color.b, 0x33);
+    HPE_TEST_ASSERT_NEAR(p_style.margin[3].value, 7.0, 1e-6);
+    hpe_css_free(&sheet);
+    hpe_dom_free(doc);
+}
+
+/**
+ * @brief 测试 var() 回退与嵌套自定义属性 / Test var() fallback and nested custom properties
+ */
+HPE_TEST_CASE(custom, fallback_and_nested)
+{
+    HpeStylesheet sheet;
+    HpeDomNode *node = hpe_dom_element("p");
+    HpeStyle style;
+    const char *css = "p { --inner: 12px; --outer: var(--inner); "
+                      "padding-left: var(--outer); width: var(--nope, 30px); }";
+
+    hpe_css_init(&sheet);
+    hpe_css_parse(&sheet, css, strlen(css));
+    hpe_css_compute(&sheet, node, NULL, &style);
+    HPE_TEST_ASSERT_NEAR(style.padding[3].value, 12.0, 1e-6);
+    HPE_TEST_ASSERT_INT((style.set & HPE_PROP_WIDTH) != 0, 1);
+    HPE_TEST_ASSERT_NEAR(style.width.value, 30.0, 1e-6);
+    hpe_css_free(&sheet);
+    hpe_dom_free(node);
+}
+
+/**
+ * @brief 测试 @property 的初始值与非继承语义 / Test @property initial value and non-inheritance
+ */
+HPE_TEST_CASE(custom, at_property)
+{
+    HpeStylesheet sheet;
+    HpeDomNode *node = hpe_dom_element("p");
+    HpeStyle style;
+    const char *css = "@property --tone { syntax: \"<color>\"; inherits: false; "
+                      "initial-value: #444444; } p { color: var(--tone); }";
+    char buf[64];
+
+    hpe_css_init(&sheet);
+    hpe_css_parse(&sheet, css, strlen(css));
+    HPE_TEST_ASSERT_INT(sheet.prop_count, 1);
+    HPE_TEST_ASSERT_STR(sheet.props[0].name, "tone");
+    hpe_css_compute(&sheet, node, NULL, &style);
+    HPE_TEST_ASSERT_INT(hpe_css_style_custom_value(&style, "--tone", buf, sizeof(buf)), 1);
+    HPE_TEST_ASSERT_STR(buf, "#444444");
+    HPE_TEST_ASSERT_INT(style.color.r, 0x44);
+    hpe_css_free(&sheet);
+    hpe_dom_free(node);
+}

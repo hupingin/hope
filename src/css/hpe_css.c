@@ -1,4 +1,5 @@
 #include "css/hpe_css.h"
+#include "css/hpe_anim.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -12,9 +13,16 @@ static int selector_matches(const HpeSelector *sel, const HpeDomNode *node);
 static void parse_selector_list(HpeRule *rule, const char *text, size_t length);
 static int parse_compound(const char **pp, const char *end, HpeCompound *out);
 static void selector_free(HpeSelector *sel);
+static void parse_keyframes(HpeStylesheet *sheet, const char *prelude, size_t prelude_len,
+                            const char *block, const char *block_end);
+static const char *find_decl_block_end(const char *p, const char *end);
 /* recursive stylesheet walker; @media blocks re-enter it with a deeper stack */
 static void css_parse_into(HpeStylesheet *sheet, const char *css, size_t length,
                            HpeMediaQuery *mq_stack, int mq_depth);
+
+/* post-cascade animation override hook (set by the engine, see hope_anim.c) */
+static HpeCssAnimHook g_anim_hook;
+static void *g_anim_hook_ud;
 
 /**
  * @brief 判断字符是否为 ASCII 十进制数字 / Test whether a character is an ASCII decimal digit
@@ -2382,37 +2390,63 @@ static void apply_transform(HpeStyle *d, const char *value)
 }
 
 /**
- * @brief 记录 `transition` 是否被声明 / Record whether `transition` was declared
+ * @brief 把 `transition` 简写解析进样式 / Parse the `transition` shorthand into the style
  *
- * @details 值为 `none` 时 `has_transition` 置 0，否则置 1；只记录存在性，引擎尚无插值时钟。
- *          `has_transition` is 0 for `none` and 1 otherwise; only presence is recorded as the engine has no interpolation clock yet.
+ * @details 委托给 `hpe_anim_parse_transition_shorthand`：逗号列表逐项填 `transitions`，
+ *          `none` 清空；插值时钟由引擎侧驱动（hope_anim.c）。
+ *          Delegates to `hpe_anim_parse_transition_shorthand`: the comma list fills
+ *          `transitions` item by item and `none` clears it; the interpolation clock is
+ *          driven engine-side (hope_anim.c).
  *
  * @param[in,out] d 目标样式 / Target style
  * @param[in]     value 声明值 / Declaration value
  *
- * @see apply_animation
+ * @see hpe_anim_parse_transition_shorthand apply_animation
  */
 static void apply_transition(HpeStyle *d, const char *value)
 {
-    d->has_transition = !strcmp(value, "none") ? 0 : 1;
-    d->set2 |= HPE_PROP2_TRANSITION;
+    hpe_anim_parse_transition_shorthand(value, d);
 }
 
 /**
- * @brief 记录 `animation` 是否被声明 / Record whether `animation` was declared
+ * @brief 把 `animation` 简写解析进样式 / Parse the `animation` shorthand into the style
  *
- * @details 值为 `none` 时 `has_animation` 置 0，否则置 1；只记录存在性，尚未实现动画播放。
- *          `has_animation` is 0 for `none` and 1 otherwise; only presence is recorded and animation playback is not implemented.
+ * @details 委托给 `hpe_anim_parse_animation_shorthand`：逗号列表逐项填 `anims`（名称、
+ *          时长、缓动、迭代、方向、填充），`none` 清空。
+ *          Delegates to `hpe_anim_parse_animation_shorthand`: the comma list fills
+ *          `anims` item by item (name, duration, easing, iteration, direction, fill) and
+ *          `none` clears it.
  *
  * @param[in,out] d 目标样式 / Target style
  * @param[in]     value 声明值 / Declaration value
  *
- * @see apply_transition
+ * @see hpe_anim_parse_animation_shorthand apply_transition
  */
 static void apply_animation(HpeStyle *d, const char *value)
 {
-    d->has_animation = !strcmp(value, "none") ? 0 : 1;
-    d->set2 |= HPE_PROP2_ANIMATION;
+    hpe_anim_parse_animation_shorthand(value, d);
+}
+
+/**
+ * @brief 把 transition / animation 长属性解析进样式 / Parse a transition/animation longhand into the style
+ *
+ * @details 按 `prop` 前缀分派到 `hpe_anim_parse_transition_longhand` 或
+ *          `hpe_anim_parse_animation_longhand`。
+ *          Dispatches on the `prop` prefix to `hpe_anim_parse_transition_longhand` or
+ *          `hpe_anim_parse_animation_longhand`.
+ *
+ * @param[in,out] d 目标样式 / Target style
+ * @param[in]     prop 长属性名 / Longhand name
+ * @param[in]     value 声明值 / Declaration value
+ *
+ * @see hpe_anim_parse_transition_longhand hpe_anim_parse_animation_longhand
+ */
+static void apply_anim_longhand(HpeStyle *d, const char *prop, const char *value)
+{
+    if (!strncmp(prop, "transition-", 11))
+        hpe_anim_parse_transition_longhand(prop, value, d);
+    else if (!strncmp(prop, "animation-", 10))
+        hpe_anim_parse_animation_longhand(prop, value, d);
 }
 
 /**
@@ -3234,6 +3268,17 @@ static const PropEntry k_prop_table[] = {
     {"transform", apply_transform},
     {"transition", apply_transition},
     {"animation", apply_animation},
+    {"transition-property", NULL},
+    {"transition-duration", NULL},
+    {"transition-timing-function", NULL},
+    {"transition-delay", NULL},
+    {"animation-name", NULL},
+    {"animation-duration", NULL},
+    {"animation-timing-function", NULL},
+    {"animation-delay", NULL},
+    {"animation-iteration-count", NULL},
+    {"animation-direction", NULL},
+    {"animation-fill-mode", NULL},
     {"border-top-color", apply_border_top_color},
     {"border-right-color", apply_border_right_color},
     {"border-bottom-color", apply_border_bottom_color},
@@ -3298,7 +3343,10 @@ static void apply_property(HpeStyle *d, const char *prop, const char *value)
 
     for (i = 0; i < sizeof(k_prop_table) / sizeof(k_prop_table[0]); i++) {
         if (!strcmp(lprop, k_prop_table[i].name)) {
-            k_prop_table[i].fn(d, value);
+            if (k_prop_table[i].fn)
+                k_prop_table[i].fn(d, value);
+            else
+                apply_anim_longhand(d, lprop, value);
             return;
         }
     }
@@ -3354,50 +3402,179 @@ static const char *strip_important(const char *value, char *buf, size_t buf_size
  *
  * @see apply_property strip_important
  */
+/**
+ * @brief 就地剥离声明块中的块注释 / Strip block comments from a declaration block in place
+ *
+ * @details 逐字符扫描，引号内的文本原样保留（字符串值中可能出现注释起始符）；每段注释
+ *          整体替换为空格，保持后续声明的相对位置不受影响。
+ *          The block is scanned character by character; quoted text is kept verbatim (a
+ *          string value may contain a comment opener), and each comment is replaced by
+ *          spaces so the offsets of later declarations are preserved.
+ *
+ * @param[in,out] p 声明块文本（可写缓冲）/ Declaration block text (writable buffer)
+ */
+static void decl_strip_comments(char *p)
+{
+    char quote = 0;
+    while (*p) {
+        if (quote) {
+            if (*p == quote)
+                quote = 0;
+        } else if (*p == '"' || *p == '\'') {
+            quote = *p;
+        } else if (p[0] == '/' && p[1] == '*') {
+            while (*p && !(p[0] == '*' && p[1] == '/')) {
+                *p = ' ';
+                p++;
+            }
+            if (*p) {
+                *p++ = ' ';
+                *p = ' ';
+            }
+            continue;
+        }
+        p++;
+    }
+}
+
+/**
+ * @brief 按名字查找自定义属性 / Find a custom property by name
+ *
+ * @return 下标，未找到返回 -1 / Index, or -1 when absent
+ */
+static int custom_find(const HpeStyle *style, const char *name)
+{
+    int i;
+    for (i = 0; i < style->custom_count; i++)
+        if (!strcmp(style->custom[i].name, name))
+            return i;
+    return -1;
+}
+
+/**
+ * @brief 写入一条自定义属性（同名覆盖）/ Store one custom property, replacing an existing one
+ */
+static void custom_set(HpeStyle *style, const char *name, const char *value, int important,
+                       int declared)
+{
+    int i = custom_find(style, name);
+    if (i < 0) {
+        if (style->custom_count >= HPE_CUSTOM_PROP_MAX)
+            return;
+        i = style->custom_count++;
+        memset(&style->custom[i], 0, sizeof(style->custom[i]));
+        snprintf(style->custom[i].name, sizeof(style->custom[i].name), "%s", name);
+    }
+    snprintf(style->custom[i].value, sizeof(style->custom[i].value), "%s", value ? value : "");
+    style->custom[i].important = important;
+    style->custom[i].declared = declared;
+}
+
+/**
+ * @brief 合并另一声明中的自定义属性与 var() 声明 / Merge custom properties and var() declarations
+ *
+ * @param[in,out] dst 目标样式 / Target style
+ * @param[in]     src 源声明 / Source declaration
+ * @param[in]     important_only 只合并 important 自定义属性 / Merge only important custom properties
+ */
+static void merge_custom(HpeStyle *dst, const HpeStyle *src, int important_only)
+{
+    int i;
+    for (i = 0; i < src->custom_count; i++) {
+        const HpeCustomProp *p = &src->custom[i];
+        if (important_only && !p->important)
+            continue;
+        custom_set(dst, p->name, p->value, p->important, 1);
+    }
+    if (important_only)
+        return;
+    for (i = 0; i < src->var_count; i++) {
+        int j;
+        if (dst->var_count >= HPE_VAR_DECL_MAX)
+            break;
+        for (j = 0; j < dst->var_count; j++)
+            if (!strcmp(dst->vars[j].prop, src->vars[i].prop))
+                break;
+        if (j < dst->var_count)
+            dst->vars[j] = src->vars[i];
+        else
+            dst->vars[dst->var_count++] = src->vars[i];
+    }
+}
+
+/**
+ * @brief 应用一条已切分的 `prop: value` 声明 / Apply one split `prop: value` declaration
+ *
+ * @details 剥离 `!important` 后写属性；important 标记精确到该声明实际置位的属性位。
+ *          以 `--` 开头的属性存为自定义属性；含 `var(` 的值暂存为待解析声明，等层叠完成后再用
+ *          该元素的最终自定义属性求值。
+ *          `!important` is stripped before applying; the important mark covers exactly
+ *          the property bits this declaration set. Properties starting with `--` are stored as
+ *          custom properties; values containing `var(` are queued for resolution after the cascade.
+ */
+static void parse_decl_apply(HpeStyle *decl, const char *prop, const char *value, char *vbuf,
+                             size_t vsize)
+{
+    int important = 0;
+    uint64_t before = decl->set, before2 = decl->set2;
+    const char *clean;
+
+    if (!*prop || !*value)
+        return;
+    clean = strip_important(value, vbuf, vsize, &important);
+    if (prop[0] == '-' && prop[1] == '-') {
+        custom_set(decl, prop + 2, clean, important, 1);
+        return;
+    }
+    if (strstr(clean, "var(")) {
+        int i;
+        if (decl->var_count >= HPE_VAR_DECL_MAX)
+            return;
+        for (i = 0; i < decl->var_count; i++)
+            if (!strcmp(decl->vars[i].prop, prop))
+                break;
+        if (i == decl->var_count)
+            decl->var_count++;
+        snprintf(decl->vars[i].prop, sizeof(decl->vars[i].prop), "%s", prop);
+        snprintf(decl->vars[i].value, sizeof(decl->vars[i].value), "%s", clean);
+        return;
+    }
+    apply_property(decl, prop, clean);
+    if (important) {
+        decl->imp |= decl->set & ~before;
+        decl->imp2 |= decl->set2 & ~before2;
+    }
+}
+
 void hpe_css_parse_declarations(const char *text, size_t length, HpeStyle *decl)
 {
     char *copy;
     char *p;
+    char vbuf[512];
+
     if (!decl)
         return;
     memset(decl, 0, sizeof(*decl));
     if (!text || length == 0)
         return;
     copy = hpe_strndup(text, length);
+    decl_strip_comments(copy);
     p = copy;
     while (*p) {
         char *decl_end = p;
         char *colon;
-        char *prop, *value;
-        char vbuf[512];
+        char saved;
 
         while (*decl_end && *decl_end != ';')
             decl_end++;
-        {
-            char saved = *decl_end;
-            *decl_end = '\0';
-            colon = strchr(p, ':');
-            if (colon) {
-                *colon = '\0';
-                prop = hpe_trim(p);
-                value = hpe_trim(colon + 1);
-                if (*prop && *value) {
-                    int important = 0;
-                    uint64_t before, before2;
-                    const char *clean =
-                        strip_important(value, vbuf, sizeof(vbuf), &important);
-                    before = decl->set;
-                    before2 = decl->set2;
-                    apply_property(decl, prop, clean);
-                    if (important) {
-                        /* mark exactly the properties this declaration set */
-                        decl->imp |= decl->set & ~before;
-                        decl->imp2 |= decl->set2 & ~before2;
-                    }
-                }
-            }
-            *decl_end = saved;
+        saved = *decl_end;
+        *decl_end = '\0';
+        colon = strchr(p, ':');
+        if (colon) {
+            *colon = '\0';
+            parse_decl_apply(decl, hpe_trim(p), hpe_trim(colon + 1), vbuf, sizeof(vbuf));
         }
+        *decl_end = saved;
         if (*decl_end == ';')
             p = decl_end + 1;
         else
@@ -5412,6 +5589,225 @@ static int eval_supports(const char *text, size_t len)
     return supports_condition_ok(buf, len);
 }
 
+/* ---------------- @keyframes ---------------- */
+
+/**
+ * @brief 把一个 keyframe 选择器换算成百分比 / Convert one keyframe selector into a percentage
+ *
+ * @details `from` = 0、`to` = 100、`NN%` 按数值；非法或越界返回 -1。
+ *          `from` is 0, `to` is 100 and `NN%` is the literal value; invalid or
+ *          out-of-range selectors return -1.
+ */
+static int kf_pct_from_selector(const char *p, int len)
+{
+    char buf[32];
+    char *end;
+    long v;
+
+    while (len > 0 && (*p == ' ' || *p == '\t' || *p == '\n'))
+        p++, len--;
+    while (len > 0 && (p[len - 1] == ' ' || p[len - 1] == '\t' || p[len - 1] == '\n'))
+        len--;
+    if (len <= 0 || len >= (int)sizeof(buf))
+        return -1;
+    memcpy(buf, p, (size_t)len);
+    buf[len] = '\0';
+    if (hpe_str_ieq(buf, "from"))
+        return 0;
+    if (hpe_str_ieq(buf, "to"))
+        return 100;
+    v = strtol(buf, &end, 10);
+    if (end != buf && end[0] == '%' && end[1] == '\0' && v >= 0 && v <= 100)
+        return (int)v;
+    return -1;
+}
+
+/**
+ * @brief 清空一条 @keyframes 的全部停靠点 / Clear every stop of one @keyframes rule
+ */
+static void kf_stops_clear(HpeKeyframes *kf)
+{
+    int i;
+    for (i = 0; i < kf->stop_count; i++) {
+        if (kf->stops[i].decl)
+            hpe_free(kf->stops[i].decl);
+        kf->stops[i].decl = NULL;
+    }
+    kf->stop_count = 0;
+}
+
+/**
+ * @brief 把一段声明块写入一个 keyframe 停靠点 / Write one declaration block into a keyframe stop
+ */
+static void kf_fill_stop(HpeKeyframes *kf, int pct, const char *decl, size_t decl_len)
+{
+    HpeKeyframeStop *stop;
+
+    if (kf->stop_count >= HPE_KF_STOPS_MAX)
+        return;
+    stop = &kf->stops[kf->stop_count++];
+    memset(stop, 0, sizeof(*stop));
+    stop->pct = (float)pct;
+    stop->decl = (HpeStyle *)hpe_alloc(sizeof(HpeStyle));
+    memset(stop->decl, 0, sizeof(*stop->decl));
+    hpe_css_parse_declarations(decl, decl_len, stop->decl);
+}
+
+/**
+ * @brief 解析一个 keyframe 停靠点（选择器 + 声明块）/ Parse one keyframe stop (selectors plus a declaration block)
+ *
+ * @details 选择器是逗号列表（`from` / `to` / `NN%`），每个合法百分比各产生一个停靠点，
+ *          共享同一份声明；`!important` 在停靠点内无效（按规范忽略标志本身无碍）。
+ *          The selector is a comma list (`from` / `to` / `NN%`); every valid percentage
+ *          produces one stop sharing the same declarations.
+ */
+static void kf_parse_stop(HpeKeyframes *kf, const char **pp, const char *end)
+{
+    const char *p = *pp;
+    const char *decl_start;
+    const char *scan;
+    int pcts[8];
+    int pct_count = 0;
+    int i;
+
+    while (p < end && *p != '{') {
+        const char *q = p;
+        while (q < end && *q != '{' && *q != ',')
+            q++;
+        if (pct_count < (int)(sizeof(pcts) / sizeof(pcts[0]))) {
+            int pct = kf_pct_from_selector(p, (int)(q - p));
+            if (pct >= 0)
+                pcts[pct_count++] = pct;
+        }
+        p = (*q == ',') ? q + 1 : q;
+    }
+    if (p >= end) {
+        *pp = end;
+        return;
+    }
+    p++;
+    decl_start = p;
+    scan = find_decl_block_end(p, end);
+    for (i = 0; i < pct_count; i++)
+        kf_fill_stop(kf, pcts[i], decl_start, (size_t)(scan - decl_start));
+    *pp = (scan < end) ? scan + 1 : end;
+}
+
+/**
+ * @brief 解析一个完整的 @keyframes 块 / Parse one complete @keyframes block
+ *
+ * @details 先从 prelude 取动画名并在样式表中找（或新建）槽位，然后逐个停靠点解析块体；
+ *          同名后定义整体替换先定义（槽位逻辑在 `hpe_anim_sheet_keyframes_slot`）。
+ *          The animation name is taken from the prelude and its slot found (or created)
+ *          in the stylesheet, then the body is parsed stop by stop; a later definition
+ *          with the same name replaces an earlier one wholesale (slot logic in
+ *          `hpe_anim_sheet_keyframes_slot`).
+ */
+static void parse_keyframes(HpeStylesheet *sheet, const char *prelude, size_t prelude_len,
+                            const char *block, const char *block_end)
+{
+    char name[HPE_ANIM_NAME_MAX];
+    HpeKeyframes *kf;
+    const char *p = block;
+    size_t n = prelude_len;
+
+    while (n > 0 && (*prelude == ' ' || *prelude == '\t' || *prelude == '\n'))
+        prelude++, n--;
+    while (n > 0 && (prelude[n - 1] == ' ' || prelude[n - 1] == '\t' || prelude[n - 1] == '\n'))
+        n--;
+    if (n == 0 || n >= sizeof(name))
+        return;
+    memcpy(name, prelude, n);
+    name[n] = '\0';
+    kf = hpe_anim_sheet_keyframes_slot(sheet, name);
+    if (!kf)
+        return;
+    while (p < block_end) {
+        while (p < block_end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+            p++;
+        if (p >= block_end)
+            break;
+        kf_parse_stop(kf, &p, block_end);
+    }
+}
+
+/**
+ * @brief 解析 @property 块中的一条描述符 / Parse one descriptor inside an @property block
+ *
+ * @details 只识别 `syntax` / `inherits` / `initial-value`，其余忽略。
+ *          Only `syntax`, `inherits` and `initial-value` are recognised; others are ignored.
+ */
+static void property_parse_desc(HpePropertyReg *reg, const char *p, const char *semi)
+{
+    const char *colon = NULL;
+    char key[32], val[HPE_CUSTOM_VALUE_MAX];
+    char *k, *v;
+    int i;
+
+    for (i = 0; p + i < semi; i++)
+        if (p[i] == ':') { colon = p + i; break; }
+    if (!colon)
+        return;
+    snprintf(key, sizeof(key), "%.*s", (int)(colon - p), p);
+    snprintf(val, sizeof(val), "%.*s", (int)(semi - colon - 1), colon + 1);
+    k = hpe_trim(key);
+    v = hpe_trim(val);
+    if (!strcmp(k, "syntax")) {
+        size_t n = strlen(v);
+        if (n >= 2 && v[0] == '"' && v[n - 1] == '"') {
+            memmove(v, v + 1, n - 2);
+            v[n - 2] = '\0';
+        }
+        snprintf(reg->syntax, sizeof(reg->syntax), "%s", v);
+    } else if (!strcmp(k, "inherits"))
+        reg->inherits = !strcmp(v, "true");
+    else if (!strcmp(k, "initial-value"))
+        snprintf(reg->initial, sizeof(reg->initial), "%s", v);
+}
+
+/**
+ * @brief 解析 `@property --name { ... }` 注册块 / Parse an @property registration block
+ *
+ * @details 只识别 `syntax` / `inherits` / `initial-value` 三个描述符；同名注册整体替换。
+ *          Only the `syntax`, `inherits` and `initial-value` descriptors are recognised; a
+ *          registration with the same name replaces the previous one.
+ */
+static void parse_property_rule(HpeStylesheet *sheet, const char *name_start, size_t name_len,
+                                const char *block, const char *end)
+{
+    char name[HPE_CUSTOM_NAME_MAX];
+    HpePropertyReg reg;
+    const char *p = block;
+    char *nm;
+    int i;
+
+    memset(&reg, 0, sizeof(reg));
+    snprintf(name, sizeof(name), "%.*s", (int)name_len, name_start);
+    nm = hpe_trim(name);
+    if (nm[0] == '-' && nm[1] == '-')
+        nm += 2;
+    if (!*nm)
+        return;
+    snprintf(reg.name, sizeof(reg.name), "%s", nm);
+    while (p < end) {
+        const char *semi = p;
+        while (semi < end && *semi != ';')
+            semi++;
+        property_parse_desc(&reg, p, semi);
+        p = semi < end ? semi + 1 : end;
+    }
+    for (i = 0; i < sheet->prop_count; i++)
+        if (!strcmp(sheet->props[i].name, reg.name))
+            break;
+    if (i == sheet->prop_count) {
+        sheet->props = (HpePropertyReg *)hpe_grow(sheet->props, &sheet->prop_cap,
+                                                  (size_t)sheet->prop_count + 1,
+                                                  sizeof(HpePropertyReg));
+        sheet->prop_count++;
+    }
+    sheet->props[i] = reg;
+}
+
 /**
  * @brief 解析一个 at-rule 的体 / Parse the body of an at-rule
  *
@@ -5433,7 +5829,7 @@ static void parse_at_rule(HpeStylesheet *sheet, const char **pp, const char *q,
                           const char *end, HpeMediaQuery *mq_stack, int mq_depth)
 {
     const char *p = *pp;
-    int is_media, is_supports;
+    int is_media, is_supports, is_keyframes, is_property;
 
     if (*q == ';') {
         *pp = q + 1;
@@ -5441,11 +5837,23 @@ static void parse_at_rule(HpeStylesheet *sheet, const char **pp, const char *q,
     }
     is_media = (size_t)(q - p) >= 6 && hpe_str_ieq_n(p, "@media", 6);
     is_supports = (size_t)(q - p) >= 9 && hpe_str_ieq_n(p, "@supports", 9);
+    is_keyframes = (size_t)(q - p) >= 10 && hpe_str_ieq_n(p, "@keyframes", 10);
+    is_property = (size_t)(q - p) >= 9 && hpe_str_ieq_n(p, "@property", 9);
     {
         const char *block = q + 1;
         const char *scan = find_block_end(block, end);
         int stacked = 0;
 
+        if (is_keyframes) {
+            parse_keyframes(sheet, p + 10, (size_t)(q - (p + 10)), block, scan);
+            *pp = scan < end ? scan + 1 : end;
+            return;
+        }
+        if (is_property) {
+            parse_property_rule(sheet, p + 9, (size_t)(q - (p + 9)), block, scan);
+            *pp = scan < end ? scan + 1 : end;
+            return;
+        }
         if (is_media && mq_depth < HPE_MEDIA_MAX_DEPTH) {
             HpeMediaQuery mq;
 
@@ -5541,7 +5949,7 @@ static void parse_style_rule(HpeStylesheet *sheet, const char **pp, const char *
         HpeStyle decl;
 
         hpe_css_parse_declarations(decl_start, decl_len, &decl);
-        if (decl.set != 0 || decl.set2 != 0) {
+        if (decl.set != 0 || decl.set2 != 0 || decl.custom_count > 0 || decl.var_count > 0) {
             /* store one single-property declaration per entry for ordered application */
             rule.decls = (HpeStyle *)hpe_alloc(sizeof(HpeStyle));
             rule.decls[0] = decl;
@@ -5658,6 +6066,12 @@ void hpe_css_free(HpeStylesheet *sheet)
         rule_free(&sheet->rules[i]);
     if (sheet->rules)
         hpe_free(sheet->rules);
+    for (i = 0; i < sheet->kf_count; i++)
+        kf_stops_clear(&sheet->kf[i]);
+    if (sheet->kf)
+        hpe_free(sheet->kf);
+    if (sheet->props)
+        hpe_free(sheet->props);
     memset(sheet, 0, sizeof(*sheet));
 }
 
@@ -5760,8 +6174,12 @@ static const ScalarCopy k_scalars_word2[] = {
     SCALAR_COPY(HPE_PROP2_BOX_SHADOW, box_shadow),
     SCALAR_COPY(HPE_PROP2_TEXT_SHADOW, text_shadow),
     SCALAR_COPY(HPE_PROP2_TRANSFORM, transform),
-    SCALAR_COPY(HPE_PROP2_TRANSITION, has_transition),
-    SCALAR_COPY(HPE_PROP2_ANIMATION, has_animation),
+    /* transition / animation declarations: the whole comma list plus its count
+     * rides under the shorthand's presence bits */
+    SCALAR_COPY(HPE_PROP2_TRANSITION, transitions),
+    SCALAR_COPY(HPE_PROP2_TRANSITION, transition_count),
+    SCALAR_COPY(HPE_PROP2_ANIMATION, anims),
+    SCALAR_COPY(HPE_PROP2_ANIMATION, anim_count),
     /* generated content (`content` carries the resolved text plus the
      * `attr()` argument that is only resolved once the node is known) */
     SCALAR_COPY(HPE_PROP2_CONTENT, content),
@@ -5949,6 +6367,7 @@ static void apply_decl_masked(HpeStyle *dst, const HpeStyle *src, uint64_t mask,
 static void apply_decl(HpeStyle *dst, const HpeStyle *src)
 {
     apply_decl_masked(dst, src, ~(uint64_t)0, ~(uint64_t)0);
+    merge_custom(dst, src, 0);
 }
 
 /**
@@ -5965,6 +6384,146 @@ static void apply_decl(HpeStyle *dst, const HpeStyle *src)
 static void apply_decl_important(HpeStyle *dst, const HpeStyle *src)
 {
     apply_decl_masked(dst, src, src->imp, src->imp2);
+    merge_custom(dst, src, 1);
+}
+
+/**
+ * @brief 追加文本到带容量上限的输出缓冲 / Append text to a bounded output buffer
+ */
+static void var_append(char *out, size_t cap, size_t *len, const char *s, size_t n)
+{
+    size_t i;
+    if (cap == 0)
+        return;
+    for (i = 0; i < n && *len + 1 < cap; i++)
+        out[(*len)++] = s[i];
+    out[*len] = '\0';
+}
+
+/**
+ * @brief 找到 var( ... ) 中匹配的右括号 / Find the parenthesis closing a var() argument
+ */
+static const char *var_close(const char *p, const char *end)
+{
+    int depth = 0;
+    char quote = 0;
+    for (; p < end; p++) {
+        if (quote) {
+            if (*p == quote)
+                quote = 0;
+            continue;
+        }
+        if (*p == '"' || *p == '\'') {
+            quote = *p;
+            continue;
+        }
+        if (*p == '(')
+            depth++;
+        else if (*p == ')' && depth-- == 0)
+            return p;
+    }
+    return NULL;
+}
+
+/**
+ * @brief 展开一段文本中的 var() 引用 / Expand var() references in a token stream
+ *
+ * @param[in]     style 提供最终自定义属性的样式 / Style holding the resolved custom properties
+ * @param[in]     src 待展开文本 / Text to expand
+ * @param[out]    out 接收结果的缓冲 / Output buffer
+ * @param[in]     cap 输出容量 / Output capacity
+ * @param[in]     depth 当前递归深度 / Current recursion depth
+ */
+static void var_resolve(const HpeStyle *style, const char *src, char *out, size_t cap, int depth)
+{
+    const char *p = src, *end = src + strlen(src);
+    size_t olen = 0;
+
+    out[0] = '\0';
+    if (depth > 8)
+        return;
+    while (p < end) {
+        const char *at = strstr(p, "var(");
+        const char *arg, *close, *stop, *comma = NULL, *q;
+        char *name, *nmp;
+        char part[HPE_CUSTOM_VALUE_MAX * 2];
+        int idx, d = 0;
+
+        if (!at || at >= end) {
+            var_append(out, cap, &olen, p, (size_t)(end - p));
+            break;
+        }
+        var_append(out, cap, &olen, p, (size_t)(at - p));
+        arg = at + 4;
+        close = var_close(arg, end);
+        if (!close) {
+            var_append(out, cap, &olen, "var(", 4);
+            p = arg;
+            continue;
+        }
+        for (q = arg; q < close; q++) {
+            if (*q == '(') d++;
+            else if (*q == ')') d--;
+            else if (*q == ',' && d == 0) { comma = q; break; }
+        }
+        stop = comma ? comma : close;
+        name = hpe_strndup(arg, (size_t)(stop - arg));
+        nmp = hpe_trim(name);
+        if (nmp[0] == '-' && nmp[1] == '-')
+            nmp += 2;
+        idx = custom_find(style, nmp);
+        if (idx >= 0)
+            var_resolve(style, style->custom[idx].value, part, sizeof(part), depth + 1);
+        else if (comma) {
+            char *fb = hpe_strndup(comma + 1, (size_t)(close - comma - 1));
+            var_resolve(style, hpe_trim(fb), part, sizeof(part), depth + 1);
+            hpe_free(fb);
+        } else
+            part[0] = '\0';
+        hpe_free(name);
+        var_append(out, cap, &olen, part, strlen(part));
+        p = close + 1;
+    }
+}
+
+/**
+ * @brief 层叠后解析所有暂存的 var() 声明 / Resolve queued var() declarations after the cascade
+ */
+static void resolve_var_decls(HpeStyle *style)
+{
+    HpeVarDecl queued[HPE_VAR_DECL_MAX];
+    char resolved[HPE_CUSTOM_VALUE_MAX * 2];
+    char decltext[HPE_CUSTOM_VALUE_MAX * 2 + HPE_CUSTOM_NAME_MAX];
+    HpeStyle tmp;
+    int i, n = style->var_count;
+
+    if (n <= 0)
+        return;
+    memcpy(queued, style->vars, (size_t)n * sizeof(queued[0]));
+    style->var_count = 0;
+    for (i = 0; i < n; i++) {
+        var_resolve(style, queued[i].value, resolved, sizeof(resolved), 0);
+        snprintf(decltext, sizeof(decltext), "%s: %s", queued[i].prop, resolved);
+        hpe_css_parse_declarations(decltext, strlen(decltext), &tmp);
+        if (tmp.set || tmp.set2)
+            apply_decl(style, &tmp);
+    }
+}
+
+/**
+ * @brief 应用 @property 注册的初始值 / Apply initial values from @property registrations
+ */
+static void apply_property_registry(HpeStylesheet *sheet, HpeStyle *style)
+{
+    int i;
+    if (!sheet)
+        return;
+    for (i = 0; i < sheet->prop_count; i++) {
+        const HpePropertyReg *r = &sheet->props[i];
+        int idx = custom_find(style, r->name);
+        if (idx < 0 || (!r->inherits && !style->custom[idx].declared))
+            custom_set(style, r->name, r->initial, 0, 0);
+    }
 }
 
 typedef struct {
@@ -5996,6 +6555,7 @@ typedef struct {
  */
 static void inherit_parent_style(HpeStyle *style, const HpeStyle *parent)
 {
+    int i;
     style->color = parent->color;
     style->font_size = parent->font_size;
     style->font_weight = parent->font_weight;
@@ -6011,6 +6571,15 @@ static void inherit_parent_style(HpeStyle *style, const HpeStyle *parent)
     style->word_spacing = parent->word_spacing;
     style->text_indent = parent->text_indent;
     style->writing_mode = parent->writing_mode;
+    /* custom properties inherit by default; the "declared" flag tells the
+     * @property registry which values came from this element itself */
+    style->custom_count = parent->custom_count;
+    if (style->custom_count > HPE_CUSTOM_PROP_MAX)
+        style->custom_count = HPE_CUSTOM_PROP_MAX;
+    for (i = 0; i < style->custom_count; i++) {
+        style->custom[i] = parent->custom[i];
+        style->custom[i].declared = 0;
+    }
 }
 
 /**
@@ -6218,11 +6787,15 @@ static void apply_normal_declarations(HpeStyle *style, const HpeMatch *matches, 
 static void collect_imps(const HpeMatch *matches, int n, const HpeDomNode *node,
                          HpeImpMatch **imps, size_t *count, size_t *cap)
 {
-    int i;
+    int i, j;
 
     for (i = 0; i < n; i++) {
         const HpeStyle *d = matches[i].decl;
-        if (!d->imp && !d->imp2)
+        int has_imp = (d->imp || d->imp2) != 0;
+
+        for (j = 0; !has_imp && j < d->custom_count; j++)
+            has_imp = d->custom[j].important;
+        if (!has_imp)
             continue;
         *imps = (HpeImpMatch *)hpe_grow(*imps, cap, *count + 1, sizeof(HpeImpMatch));
         (*imps)[*count].decl = d;
@@ -6233,7 +6806,13 @@ static void collect_imps(const HpeMatch *matches, int n, const HpeDomNode *node,
     }
     {
         HpeStyle decl;
-        if (parse_inline_style(node, &decl) && (decl.imp || decl.imp2)) {
+        int has_imp = 0;
+        if (parse_inline_style(node, &decl)) {
+            has_imp = (decl.imp || decl.imp2) != 0;
+            for (i = 0; !has_imp && i < decl.custom_count; i++)
+                has_imp = decl.custom[i].important;
+        }
+        if (has_imp) {
             *imps = (HpeImpMatch *)hpe_grow(*imps, cap, *count + 1, sizeof(HpeImpMatch));
             (*imps)[*count].decl = (const HpeStyle *)hpe_dom_attr(node, "style"); /* marker */
             (*imps)[*count].specificity = (1 << 20); /* higher than any selector */
@@ -6380,9 +6959,26 @@ void hpe_css_compute_pseudo(HpeStylesheet *sheet, const HpeDomNode *node, const 
         collect_pseudo_matches(sheet, node, which, &matches, &match_count, &match_cap);
     sort_matches(matches, (int)match_count);
     apply_normal_declarations(&style, matches, (int)match_count, NULL);
+    resolve_var_decls(&style);
     if (matches)
         hpe_free(matches);
     *out = style;
+}
+
+int hpe_css_style_custom_value(const HpeStyle *style, const char *name, char *out, size_t n)
+{
+    int i;
+    if (!style || !name || !out || n == 0)
+        return 0;
+    if (name[0] == '-' && name[1] == '-')
+        name += 2;
+    for (i = 0; i < style->custom_count; i++) {
+        if (!strcmp(style->custom[i].name, name)) {
+            snprintf(out, n, "%s", style->custom[i].value);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 void hpe_css_compute(HpeStylesheet *sheet, const HpeDomNode *node, const HpeStyle *parent,
@@ -6397,6 +6993,7 @@ void hpe_css_compute(HpeStylesheet *sheet, const HpeDomNode *node, const HpeStyl
     style = hpe_style_default();
     if (parent)
         inherit_parent_style(&style, parent);
+    apply_property_registry(sheet, &style);
 
     if (sheet && node)
         collect_matches(sheet, node, &matches, &match_count, &match_cap);
@@ -6409,12 +7006,35 @@ void hpe_css_compute(HpeStylesheet *sheet, const HpeDomNode *node, const HpeStyl
     collect_imps(matches, (int)match_count, node, &imps, &imp_count, &imp_cap);
     sort_imps(imps, (int)imp_count);
     apply_important_pass(&style, imps, (int)imp_count, node);
+    resolve_var_decls(&style);
 
     if (matches)
         hpe_free(matches);
     if (imps)
         hpe_free(imps);
     *out = style;
+    /* element cascades give the engine's animation clock a chance to overlay
+     * interpolated transition / animation values onto the fresh result */
+    if (g_anim_hook && node)
+        g_anim_hook(g_anim_hook_ud, node, out);
+}
+
+/**
+ * @brief 注册层叠后的动画覆盖钩子 / Register the post-cascade animation override hook
+ *
+ * @details 只写入全局函数指针与用户数据；`fn` 为 `NULL` 时注销钩子，层叠恢复纯 CSS 结果。
+ *          Only the global function pointer and user data are written; a `NULL` `fn`
+ *          unregisters the hook so the cascade yields the pure CSS result again.
+ *
+ * @param[in] fn 钩子函数，`NULL` 表示注销 / Hook function, `NULL` unregisters
+ * @param[in] ud 透传给钩子的用户数据 / Opaque data passed through to the hook
+ *
+ * @see hpe_css_compute
+ */
+void hpe_css_set_anim_hook(HpeCssAnimHook fn, void *ud)
+{
+    g_anim_hook = fn;
+    g_anim_hook_ud = ud;
 }
 
 /**
@@ -6567,38 +7187,81 @@ int hpe_css_inline_get(const HpeDomNode *node, const char *prop, char *out, size
  * @see hpe_css_init
  */
 
+/* UA 样式表按段存为文件作用域常量，避免单个函数超过 50 行上限。
+ * Kept as file-scope segments so the assembling function stays within 50 lines. */
+static const char UA_CSS_STRUCTURE[] =
+    "html { display: block; }\n"
+    "body { display: block; margin: 8px; }\n"
+    "head, script, style, title, meta, link, base, noscript, template { display: none; }\n"
+    "div, p, section, article, header, footer, main, nav, aside, ul, ol, li, dl, dt, dd,\n"
+    "blockquote, pre, form, fieldset, figure,\n"
+    "figcaption, hr, address, center { display: block; }\n"
+    "table { display: table; border-spacing: 0; border-color: #c0c0c0; }\n"
+    "thead, tbody, tfoot { display: table-row-group; }\n"
+    "tr { display: table-row; }\n"
+    "td, th { display: table-cell; }\n"
+    "caption { display: table-caption; }\n"
+    "th { font-weight: bold; text-align: center; }\n"
+    "span, a, b, i, em, strong, code, small, sub, sup, label, br, img, u, s, mark\n"
+    "  { display: inline; }\n"
+    "button, input, select, textarea { display: inline-block; font-size: 13px; }\n"
+    "button, select, input[type=button], input[type=submit], input[type=reset]\n"
+    "  { text-align: center; }\n"
+    "button { padding: 1px 6px; border: 1px solid #767676; background: #efefef; }\n"
+    "details { display: block; }\n"
+    "summary { display: list-item; padding-left: 18px; cursor: pointer; }\n"
+    "dialog { display: none; position: absolute; left: 0; top: 0;\n"
+    "  border: 1px solid #767676; padding: 12px; background: #ffffff; }\n"
+    "dialog[open] { display: block; }\n";
+
+static const char UA_CSS_TYPOGRAPHY[] =
+    "h1 { display: block; font-size: 32px; font-weight: bold; margin: 21px 0; }\n"
+    "h2 { display: block; font-size: 24px; font-weight: bold; margin: 19px 0; }\n"
+    "h3 { display: block; font-size: 19px; font-weight: bold; margin: 18px 0; }\n"
+    "h4 { display: block; font-size: 16px; font-weight: bold; margin: 21px 0; }\n"
+    "h5 { display: block; font-size: 13px; font-weight: bold; margin: 22px 0; }\n"
+    "h6 { display: block; font-size: 11px; font-weight: bold; margin: 24px 0; }\n"
+    "p { margin: 16px 0; }\n"
+    "ul, ol { margin: 16px 0; padding-left: 40px; }\n"
+    "blockquote { margin: 16px 40px; }\n"
+    "pre { font-size: 13px; margin: 13px 0; }\n"
+    "code { font-size: 13px; }\n"
+    "b, strong { font-weight: bold; }\n"
+    "a { color: #1a0dab; cursor: pointer; }\n"
+    "button, input, select, textarea { cursor: default; }\n"
+    "hr { border: 1px solid #c0c0c0; height: 0; margin: 8px 0; }\n";
+
+static const char UA_CSS_FORMS[] =
+    "/* --- form controls (v0.23) --- */\n"
+    "option, optgroup, datalist { display: none; }\n"
+    "output { display: inline; }\n"
+    "input[type=button], input[type=submit], input[type=reset]\n"
+    "  { padding: 1px 6px; border: 1px solid #767676; background: #efefef; }\n"
+    "input[type=text], input[type=search], input[type=email], input[type=url],\n"
+    "input[type=tel], input[type=number], input[type=date], input[type=time],\n"
+    "input[type=datetime-local], input[type=password]\n"
+    "  { background: #ffffff; border: 1px solid #767676; text-align: left;\n"
+    "    padding: 1px 2px; }\n"
+    "input[type=checkbox], input[type=radio]\n"
+    "  { background: #ffffff; border: 1px solid #767676; margin: 0 3px;\n"
+    "    vertical-align: -2px; }\n"
+    "select { background: #ffffff; border: 1px solid #767676;\n"
+    "  padding: 1px 18px 1px 3px; }\n"
+    "textarea { white-space: pre-wrap; }\n"
+    "textarea { display: inline-block; font-size: 13px; text-align: left;\n"
+    "  width: 183px; height: 57px; padding: 2px; overflow: auto;\n"
+    "  border: 1px solid #767676; background: #ffffff; }\n"
+    "fieldset { border: 2px groove #a0a0a0; margin: 0 2px; padding: 6px 10px 8px;\n"
+    "  min-width: 0; }\n"
+    "legend { display: block; padding: 0 4px; }\n";
+
 const char *hpe_ua_stylesheet(void)
 {
-    return
-        "html { display: block; }\n"
-        "body { display: block; margin: 8px; }\n"
-        "head, script, style, title, meta, link, base, noscript, template { display: none; }\n"
-        "div, p, section, article, header, footer, main, nav, aside, ul, ol, li, dl, dt, dd,\n"
-        "blockquote, pre, form, fieldset, figure,\n"
-        "figcaption, hr, address, center { display: block; }\n"
-        "table { display: table; border-spacing: 0; border-color: #c0c0c0; }\n"
-        "thead, tbody, tfoot { display: table-row-group; }\n"
-        "tr { display: table-row; }\n"
-        "td, th { display: table-cell; }\n"
-        "caption { display: table-caption; }\n"
-        "th { font-weight: bold; text-align: center; }\n"
-        "span, a, b, i, em, strong, code, small, sub, sup, label, br, img, u, s, mark\n"
-        "  { display: inline; }\n"
-        "button, input, select, textarea { display: inline-block; font-size: 13px; text-align: center; }\n"
-        "button { padding: 1px 6px; border: 1px solid #767676; background: #efefef; }\n"
-        "h1 { display: block; font-size: 32px; font-weight: bold; margin: 21px 0; }\n"
-        "h2 { display: block; font-size: 24px; font-weight: bold; margin: 19px 0; }\n"
-        "h3 { display: block; font-size: 19px; font-weight: bold; margin: 18px 0; }\n"
-        "h4 { display: block; font-size: 16px; font-weight: bold; margin: 21px 0; }\n"
-        "h5 { display: block; font-size: 13px; font-weight: bold; margin: 22px 0; }\n"
-        "h6 { display: block; font-size: 11px; font-weight: bold; margin: 24px 0; }\n"
-        "p { margin: 16px 0; }\n"
-        "ul, ol { margin: 16px 0; padding-left: 40px; }\n"
-        "blockquote { margin: 16px 40px; }\n"
-        "pre { font-size: 13px; margin: 13px 0; }\n"
-        "code { font-size: 13px; }\n"
-        "b, strong { font-weight: bold; }\n"
-        "a { color: #1a0dab; cursor: pointer; }\n"
-        "button, input, select, textarea { cursor: default; }\n"
-        "hr { border: 1px solid #c0c0c0; height: 0; margin: 8px 0; }\n";
+    static char buf[4096];
+    static int built = 0;
+    if (!built) {
+        snprintf(buf, sizeof(buf), "%s%s%s", UA_CSS_STRUCTURE, UA_CSS_TYPOGRAPHY, UA_CSS_FORMS);
+        built = 1;
+    }
+    return buf;
 }

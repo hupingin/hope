@@ -16,13 +16,17 @@ set(HOPE_CORE_SOURCES
     src/html/hpe_html.c
     src/html/hpe_encoding.c
     src/css/hpe_css.c
+    src/css/hpe_anim.c
     src/layout/hpe_layout.c
     src/paint/hpe_paint.c
+    src/paint/hpe_paint_form.c
+    src/paint/hpe_paint_details.c
     src/paint/hpe_svg.c
     src/js/hpe_js_value.c
     src/js/hpe_js_parser.c
     src/js/hpe_js_interp.c
     src/js/hpe_js_dom.c
+    src/js/hpe_js_selection.c
     src/js/hpe_js_mutation.c
     src/js/hpe_js_timers.c
     src/js/hpe_js_regex.c
@@ -35,6 +39,11 @@ set(HOPE_CORE_SOURCES
     src/js/hpe_js_async.c
     src/js/hpe_js_gc.c
     src/hope.c
+    src/hope_anim.c
+    src/hope_form.c
+    src/hope_details.c
+    src/canvas/hpe_canvas.c
+    src/js/hpe_js_canvas.c
     src/hope_chrome.c
     src/hope_sel.c
 )
@@ -56,9 +65,11 @@ add_executable(hope_tests
     tests/test_main.c
     tests/test_base.c
     tests/test_css.c
+    tests/test_anim.c
     tests/test_html.c
     src/base/hpe_util.c
     src/css/hpe_css.c
+    src/css/hpe_anim.c
     src/dom/hpe_dom.c
     src/html/hpe_html.c
     src/html/hpe_encoding.c

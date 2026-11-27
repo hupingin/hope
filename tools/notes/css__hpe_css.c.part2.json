@@ -1,0 +1,346 @@
+{
+  "strip_important": {
+    "brief": "去除尾部 `!important` 并报告是否存在 / Strip a trailing `!important` and report whether it was present",
+    "details": "先把值复制到 `buf` 并去掉尾部空白，若末尾恰好是 `!important` 则截断并把 `*out_important` 置 1。| The value is copied into `buf` and trailing whitespace trimmed; when the tail is exactly `!important` it is cut off and `*out_important` is set to 1.",
+    "params": {
+      "value": "待处理的声明值 / Declaration value to process",
+      "buf": "out:存放剥离后文本的缓冲 / Buffer that holds the stripped text",
+      "buf_size": "`buf` 的容量 / Capacity of `buf`",
+      "out_important": "out:置 1 表示存在 `!important` / Set to 1 when `!important` was present"
+    },
+    "return": "指向 `buf` 内去空白后的值文本 / Pointer to the trimmed value text inside `buf`",
+    "note": "`out_important` 可为 `NULL` / `out_important` may be `NULL`",
+    "see": "hpe_css_parse_declarations"
+  },
+  "hpe_css_parse_declarations": {
+    "brief": "解析声明块并写入样式 / Parse a declaration block into a style",
+    "details": "输入通常是 `style=\"\"` 属性的内容；按 `;` 逐条拆分，对每条解析 `属性: 值` 并调用 `apply_property`，随后据该条是否带 `!important` 把新置位的属性位补记到 `imp`/`imp2`。| The input is normally the content of a `style=\"\"` attribute; it is split on `;` and each `property: value` pair is parsed through `apply_property`, after which the bits newly set by that declaration are copied into `imp`/`imp2` when it carried `!important`.",
+    "params": {
+      "text": "声明块文本 / Declaration block text",
+      "length": "`text` 的字节长度 / Byte length of `text`",
+      "decl": "out:接收解析结果的样式 / Receives the parsed style"
+    },
+    "note": "进入时先清零 `decl`；属性名或值为空、或无冒号的声明会被跳过 / `decl` is zeroed on entry; a declaration with a missing name or value, or without a colon, is skipped",
+    "see": "apply_property strip_important"
+  },
+  "is_ident_char": {
+    "brief": "判断字符是否为标识符字符 / Test whether a character may appear in an identifier",
+    "details": "只接受 ASCII 字母、数字、下划线与连字符。| Only ASCII letters, digits, underscores and hyphens are accepted.",
+    "params": {
+      "c": "待判断的字符 / Character to test"
+    },
+    "return": "是标识符字符返回 1，否则返回 0 / 1 when it is an identifier character, 0 otherwise",
+    "see": "read_ident"
+  },
+  "read_ident": {
+    "brief": "从游标处读取一个标识符 / Read one identifier starting at the cursor",
+    "details": "连续读取标识符字符，超过 `out_size-1` 的部分被截断；什么都没读到则返回 `NULL`；成功后 `*pp` 前移到标识符末尾。| Consecutive identifier characters are read and anything beyond `out_size-1` is truncated; `NULL` is returned when nothing was read and otherwise `*pp` advances past the identifier.",
+    "params": {
+      "pp": "inout:解析游标指针 / Parse cursor pointer",
+      "end": "输入缓冲区末尾 / End of the input buffer",
+      "out": "out:标识符缓冲 / Identifier buffer",
+      "out_size": "`out` 的容量 / Capacity of `out`"
+    },
+    "return": "标识符缓冲 `out`，无标识符时返回 `NULL` / The identifier buffer `out`, or `NULL` when none was read",
+    "see": "is_ident_char"
+  },
+  "compound_add_class": {
+    "brief": "给复合选择器追加一个类名 / Append a class name to a compound selector",
+    "details": "扩容 `classes` 数组并存入类名的副本，类计数加一。| The `classes` array is grown and a copy of the name stored, incrementing the class count.",
+    "params": {
+      "c": "inout:目标复合选择器 / Target compound selector",
+      "name": "类名 / Class name"
+    },
+    "see": "compound_free parse_class_or_id"
+  },
+  "compound_free": {
+    "brief": "释放复合选择器持有的全部内存 / Release every allocation held by a compound selector",
+    "details": "依次释放标签、id、各类名与属性选择器的名字/运算符/值，最后把整个结构清零。| The tag, id, each class name and every attribute selector's name, operator and value are released before the struct is zeroed.",
+    "params": {
+      "c": "inout:目标复合选择器 / Target compound selector"
+    },
+    "see": "compound_add_class compound_add_attr"
+  },
+  "parse_class_or_id": {
+    "brief": "解析一个 `.class` 或 `#id` token / Parse one `.class` or `#id` token",
+    "details": "读取标记符（`.` 或 `#`）后的标识符：`.` 追加类名，`#` 写入 id（已有 id 时替换）；标识符为空视为格式错误。| The identifier after the sigil (`.` or `#`) is read: `.` appends a class and `#` writes the id, replacing any previous one; an empty identifier is a malformed selector.",
+    "params": {
+      "out": "inout:目标复合选择器 / Target compound selector",
+      "pp": "inout:解析游标指针 / Parse cursor pointer",
+      "end": "输入缓冲区末尾 / End of the input buffer",
+      "ident": "out:标识符临时缓冲 / Scratch identifier buffer",
+      "ident_size": "`ident` 的容量 / Capacity of `ident`"
+    },
+    "return": "成功返回 1，格式错误返回 0 / 1 on success, 0 on a malformed selector",
+    "see": "read_ident compound_add_class"
+  },
+  "parse_pseudo": {
+    "brief": "解析一个 `:pseudo` token / Parse one `:pseudo` token",
+    "details": "`:root` 在缺少标签时补上 `html`，`:hover` 置位 `pseudo_hover`；其余动态/结构伪类被有意忽略，以便含它们的选择器仍能解析而不失败。| `:root` supplies an `html` tag when the tag is absent and `:hover` sets `pseudo_hover`; other dynamic and structural pseudo-classes are deliberately ignored so a selector containing them still parses instead of failing.",
+    "params": {
+      "out": "inout:目标复合选择器 / Target compound selector",
+      "pp": "inout:解析游标指针 / Parse cursor pointer",
+      "end": "输入缓冲区末尾 / End of the input buffer",
+      "ident": "out:标识符临时缓冲 / Scratch identifier buffer",
+      "ident_size": "`ident` 的容量 / Capacity of `ident`"
+    },
+    "return": "成功返回 1，缺少标识符返回 0 / 1 on success, 0 when the identifier is missing",
+    "see": "read_ident parse_compound"
+  },
+  "dissect_attr_expr": {
+    "brief": "把 `[...]` 内容拆为属性名/运算符/值 / Split an `[...]` body into name, operator and value",
+    "details": "属性名读到空格或 `=` 为止；遇到 `=` 时记录运算符（`~`/`|`/`^`/`$`/`*` 后接连写 `=`），并读取可选的、可带引号的值；无 `=` 但以运算符结尾的畸形输入也被容忍。| The name is read up to a space or `=`, the operator is recorded when `=` is present (with `~`/`|`/`^`/`$`/`*` prefixed), and the optional possibly-quoted value is read; malformed input that trails an operator without `=` is also tolerated.",
+    "params": {
+      "body": "`[...]` 括号内的文本 / Text inside the `[...]` brackets",
+      "aname": "out:属性名 / Attribute name",
+      "aop": "out:属性匹配运算符 / Attribute match operator",
+      "avalue": "out:属性值 / Attribute value",
+      "avalue_size": "`avalue` 的容量 / Capacity of `avalue`",
+      "has_val": "out:是否带值 / Whether a value is present"
+    },
+    "note": "沿用引擎既有的宽松（非规范）分词方式以保持行为不变 / It mirrors the engine's lenient, non-spec tokenisation so behaviour is unchanged",
+    "see": "parse_attr_selector compound_add_attr"
+  },
+  "compound_add_attr": {
+    "brief": "给复合选择器追加一个属性选择器 / Append an attribute selector to a compound selector",
+    "details": "先把属性名就地转为小写，再扩容 `attrs` 数组并存入名字、运算符与值的副本；无值时值为空串。| The attribute name is lowercased in place, the `attrs` array is grown and copies of the name, operator and value are stored, with an empty value when none was given.",
+    "params": {
+      "out": "inout:目标复合选择器 / Target compound selector",
+      "aname": "属性名（会被就地转小写）/ Attribute name, lowercased in place",
+      "aop": "属性匹配运算符 / Attribute match operator",
+      "avalue": "属性值 / Attribute value",
+      "has_val": "是否带值 / Whether a value is present"
+    },
+    "see": "dissect_attr_expr compound_free"
+  },
+  "parse_attr_selector": {
+    "brief": "解析一个 `[attr]` / `[attr=v]` / `[attr~=v]` 选择器 / Parse a `[attr]`, `[attr=v]` or `[attr~=v]` selector",
+    "details": "先找到配对的 `]`，缺失则视为格式错误；把括号内文本交给 `dissect_attr_expr` 拆分后追加到复合选择器，游标移到 `]` 之后。| The matching `]` is located and its absence is a malformed selector; the bracketed text is split by `dissect_attr_expr` and appended to the compound, and the cursor moves past `]`.",
+    "params": {
+      "out": "inout:目标复合选择器 / Target compound selector",
+      "pp": "inout:解析游标指针 / Parse cursor pointer",
+      "end": "输入缓冲区末尾 / End of the input buffer"
+    },
+    "return": "成功返回 1，括号不配返回 0 / 1 on success, 0 when the brackets are unbalanced",
+    "see": "dissect_attr_expr compound_add_attr"
+  },
+  "parse_compound": {
+    "brief": "解析一个复合选择器（标签 + 若干简单选择器）/ Parse one compound selector (a tag plus simple selectors)",
+    "details": "先处理可选的 `*` 或标签名（标签转小写存入），随后循环读取 `.class`/`#id`/`:pseudo`/`[attr]`，遇到其它字符即停止；任一简单选择器解析失败则整体失败并清零结果。| The optional `*` or a tag name is handled first (the tag lowercased), after which `.class`/`#id`/`:pseudo`/`[attr]` are read in a loop until any other character stops it; a failing simple selector fails the whole compound and leaves the result zeroed.",
+    "params": {
+      "pp": "inout:解析游标指针 / Parse cursor pointer",
+      "end": "输入缓冲区末尾 / End of the input buffer",
+      "out": "out:接收解析出的复合选择器 / Receives the parsed compound selector"
+    },
+    "return": "成功返回 1，失败返回 0 / 1 on success, 0 on failure",
+    "see": "parse_class_or_id parse_pseudo parse_attr_selector"
+  },
+  "selector_add_part": {
+    "brief": "给选择器追加一个复合部分并累加特异性 / Append one compound part to a selector and accumulate its specificity",
+    "details": "扩容 `parts` 并以值拷贝存入该部分，然后累加特异性：id 记 100、每个类记 10、`:hover` 记 10（伪类按类计）、标签记 1。| The `parts` array is grown and the compound copied in by value, then specificity accumulates: 100 for an id, 10 per class, 10 for `:hover` (a pseudo-class counts as a class) and 1 for a tag.",
+    "params": {
+      "sel": "inout:目标选择器 / Target selector",
+      "part": "待追加的复合选择器 / Compound selector to append"
+    },
+    "return": "恒返回 1 / Always returns 1",
+    "see": "parse_one_selector"
+  },
+  "selector_free": {
+    "brief": "释放选择器持有的全部内存 / Release every allocation held by a selector",
+    "details": "逐部分调用 `compound_free`，再释放 `parts` 数组并把结构清零。| Each part is released through `compound_free`, then the `parts` array is freed and the struct zeroed.",
+    "params": {
+      "sel": "inout:目标选择器 / Target selector"
+    },
+    "see": "compound_free rule_free"
+  },
+  "rule_free": {
+    "brief": "释放规则持有的选择器与声明 / Release the selectors and declarations held by a rule",
+    "details": "逐条释放选择器，再释放选择器数组与声明数组，最后把规则清零。| Every selector is released, then the selector array and the declaration array are freed and the rule zeroed.",
+    "params": {
+      "rule": "inout:目标 CSS 规则 / Target CSS rule"
+    },
+    "see": "selector_free"
+  },
+  "read_combinator": {
+    "brief": "读取组合符 token，缺省为后代组合符 / Read a combinator token, defaulting to the descendant combinator",
+    "details": "识别 `>`/`+`/`~` 分别为子代/相邻兄弟/一般兄弟，其后跳过空白并把游标前移；无组合符时返回后代。| `>`/`+`/`~` map to child, adjacent sibling and general sibling respectively, whitespace is then skipped and the cursor advanced; without a combinator the descendant combinator is returned.",
+    "params": {
+      "pq": "inout:解析游标指针 / Parse cursor pointer",
+      "end": "输入缓冲区末尾 / End of the input buffer"
+    },
+    "return": "读到的 `HpeCombinator` 枚举 / The `HpeCombinator` value that was read",
+    "see": "parse_one_selector"
+  },
+  "parse_one_selector": {
+    "brief": "解析一个以逗号分隔的单个选择器（复合链）/ Parse one comma-separated selector (a chain of compounds)",
+    "details": "逐个读取复合部分并记录其相对前一部分的组合符，首部分的组合符固定为后代；某部分解析失败时把 `count` 置 -1 以标记整个选择器无效。| Compound parts are read one by one with each recording its combinator relative to the previous part, the first part always using the descendant combinator; a failing part sets `count` to -1 to mark the whole selector invalid.",
+    "params": {
+      "part_start": "选择器文本起始指针 / Start pointer of the selector text",
+      "part_end": "选择器文本结束指针 / End pointer of the selector text",
+      "sel": "out:接收解析出的选择器 / Receives the parsed selector"
+    },
+    "note": "进入时先清零 `sel` / `sel` is zeroed on entry",
+    "see": "read_combinator parse_compound selector_add_part"
+  },
+  "parse_selector_list": {
+    "brief": "把 `a b, c > d` 形式的文本解析为选择器列表 / Parse text such as `a b, c > d` into a selector list",
+    "details": "按逗号切分为各选择器，逐个解析后仅把 `count > 0` 的有效选择器追加到规则；空或无效的选择器被释放丢弃。| Segments are split on commas and parsed individually, and only valid selectors with `count > 0` are appended to the rule; empty or invalid selectors are freed and dropped.",
+    "params": {
+      "rule": "inout:接收选择器的 CSS 规则 / CSS rule that receives the selectors",
+      "text": "选择器列表文本 / Selector list text",
+      "length": "`text` 的字节长度 / Byte length of `text`"
+    },
+    "see": "parse_one_selector selector_free"
+  },
+  "class_list_contains": {
+    "brief": "判断 `class` 属性值是否含某个类名 / Test whether a `class` attribute value contains a given class name",
+    "details": "把 `list` 按空白切成单词，逐个与目标名做等长比较，命中返回 1；`list` 为 `NULL` 返回 0。| The `list` is split into whitespace-separated words compared for equal length against the name and 1 is returned on a hit; a `NULL` list returns 0.",
+    "params": {
+      "list": "空的 `class` 属性值 / The `class` attribute value",
+      "name": "要查找的类名 / Class name to look for"
+    },
+    "return": "包含返回 1，否则返回 0 / 1 when present, 0 otherwise",
+    "see": "compound_matches"
+  },
+  "attr_word_contains": {
+    "brief": "判断 `val` 是否作为空白分隔的整词出现在 `list` 中 / Test whether `val` appears as a whitespace-separated word inside `list`",
+    "details": "用于 `~=` 运算符：按空白分词后做等长比较；`list` 为 `NULL` 或 `val` 为空返回 0。| Used by the `~=` operator: the list is split on whitespace and compared for equal length; a `NULL` list or an empty `val` returns 0.",
+    "params": {
+      "list": "被搜索的文本 / Text to search",
+      "val": "要查找的整词 / Word to look for"
+    },
+    "return": "命中返回 1，否则返回 0 / 1 on a hit, 0 otherwise",
+    "see": "attr_op_matches"
+  },
+  "attr_op_matches": {
+    "brief": "按运算符把属性选择器与节点属性值匹配 / Match an attribute selector against a node's raw attribute value",
+    "details": "空运算符表示仅测试存在性（`attr_val` 非 `NULL` 即匹配）；`=` 全等、`~=` 整词、`|=` 前缀且其后为 `-` 或结束、`^=` 前缀、`$=` 后缀、`*=` 子串；任何无法识别的运算符都按匹配处理，避免将来新增形式时整条规则被静默丢弃。| An empty operator is a bare presence test (`attr_val` non-`NULL` matches); `=` is equality, `~=` a whole word, `|=` a prefix followed by `-` or end, `^=` a prefix, `$=` a suffix and `*=` a substring; any unrecognised operator is treated as a match so a future selector form degrades gracefully rather than silently dropping the rule.",
+    "params": {
+      "as": "属性选择器 / Attribute selector",
+      "attr_val": "节点的属性值，属性不存在时为 `NULL` / The node's attribute value, `NULL` when the attribute is absent"
+    },
+    "return": "匹配返回 1，否则返回 0 / 1 on a match, 0 otherwise",
+    "see": "attr_word_contains compound_matches"
+  },
+  "compound_matches": {
+    "brief": "判断复合选择器是否匹配一个元素节点 / Test whether a compound selector matches an element node",
+    "details": "元素类型不符直接不匹配；依次校验标签、`hover` 状态、id、全部类名（逐个要求在 `class` 中）与全部属性选择器，全部通过才匹配。| A non-element node fails immediately; the tag, hover state, id, every class (each required to appear in `class`) and every attribute selector are checked in turn and all must pass.",
+    "params": {
+      "c": "复合选择器 / Compound selector",
+      "node": "待测试的 DOM 节点 / DOM node to test"
+    },
+    "return": "匹配返回 1，否则返回 0 / 1 on a match, 0 otherwise",
+    "see": "attr_op_matches class_list_contains"
+  },
+  "hpe_css_selector_matches": {
+    "brief": "测试单个选择器是否匹配给定节点 / Test whether a standalone selector matches a node",
+    "details": "把 `sel` 解析成临时规则，依次测试其中每个选择器，一旦命中即用 `hit` 提前跳出循环并返回。| `sel` is parsed into a temporary rule and its selectors are tested in turn; `hit` breaks the loop on the first match.",
+    "params": {
+      "node": "待测试的 DOM 节点 / DOM node to test",
+      "sel": "选择器文本（可含逗号）/ Selector text, possibly comma-separated",
+      "len": "`sel` 的字节长度 / Byte length of `sel`"
+    },
+    "return": "匹配返回 1，否则返回 0 / 1 on a match, 0 otherwise",
+    "note": "供 `querySelector` 一类接口使用 / Used by interfaces such as `querySelector`",
+    "see": "parse_selector_list selector_matches rule_free"
+  },
+  "selector_matches": {
+    "brief": "从句尾（主体）向左逐部分匹配选择器 / Match a selector right-to-left from its subject part",
+    "details": "先要求最后一个部分匹配当前节点，再依次向左处理组合符：子代回退到直接父节点、相邻兄弟回退到前一个兄弟、一般兄弟向前搜索任意匹配的兄弟、后代则沿父链向上找首个匹配的祖先，中途失败即返回 0。| The last part must match the current node, after which combinators are walked leftwards: a child moves to the direct parent, an adjacent sibling to the previous sibling, a general sibling searches earlier siblings for any match, and a descendant climbs the parent chain to the first matching ancestor; any failure returns 0.",
+    "params": {
+      "sel": "选择器 / Selector",
+      "node": "待测试的 DOM 节点 / DOM node to test"
+    },
+    "return": "匹配返回 1，否则返回 0 / 1 on a match, 0 otherwise",
+    "see": "compound_matches hpe_css_selector_matches"
+  },
+  "media_feature_id": {
+    "brief": "把媒体特性名映射为 `HPE_MF_*` 编号 / Map a media feature name to its `HPE_MF_*` id",
+    "details": "识别 min-width/max-width/min-height/max-height/width/height，未知名称返回 0。| It recognises min-width/max-width/min-height/max-height/width/height and returns 0 for an unknown name.",
+    "params": {
+      "name": "媒体特性名 / Media feature name"
+    },
+    "return": "对应的特性编号，未识别返回 0 / The feature id, or 0 when unrecognised",
+    "see": "media_parse_condition media_alt_matches"
+  },
+  "media_feature_value": {
+    "brief": "解析媒体特性值（仅接受 px 长度）/ Parse a media feature value, accepting only px lengths",
+    "details": "读取数值后允许可选的 `px` 后缀与空白，其后必须为空；带其它单位的输入判为失败，只理解裸的 px 长度。| A number is read followed by an optional `px` suffix and whitespace, after which nothing may remain; input with any other unit fails as only a bare px length is understood.",
+    "params": {
+      "s": "待解析的值文本 / Value text to parse",
+      "out": "out:解析出的像素值 / Receives the value in pixels"
+    },
+    "return": "成功返回 1，失败返回 0 / 1 on success, 0 on failure",
+    "see": "media_parse_condition"
+  },
+  "media_consume_qualifier": {
+    "brief": "消费前导的 `not`/`only` 并返回取反标志 / Consume a leading `not`/`only` and return the negate flag",
+    "details": "以 `not` 开头时前移游标并返回 1；以 `only` 开头时只前移游标并返回 0；均以不区分大小写匹配并跳过其后空白。| A leading `not` advances the cursor and returns 1, a leading `only` advances the cursor and returns 0, both matched case-insensitively with trailing whitespace skipped.",
+    "params": {
+      "pq": "inout:解析游标指针 / Parse cursor pointer"
+    },
+    "return": "存在 `not` 返回 1，否则返回 0 / 1 when `not` was present, 0 otherwise",
+    "see": "parse_media_query"
+  },
+  "media_parse_condition": {
+    "brief": "解析一个 `(feature: value)` 条件到备选分支 / Parse one `(feature: value)` condition into an alternative",
+    "details": "截取到 `)` 为止并拆出特性名与值，能识别且未超过条件上限时写入 `conds` 并计数；特性名或值无法识别时把该备选标记为 `unknown`。| The text up to `)` is taken and split into feature and value; a recognised pair within the condition limit is stored in `conds` and counted, while an unrecognised name or value marks the alternative `unknown`.",
+    "params": {
+      "pq": "inout:解析游标指针 / Parse cursor pointer",
+      "alt": "inout:媒体条件备选分支 / Alternative media branch"
+    },
+    "note": "缺少 `)` 时直接返回，不消费任何输入 / It returns without consuming anything when `)` is missing",
+    "see": "media_feature_id media_feature_value media_parse_alt_body"
+  },
+  "media_parse_type": {
+    "brief": "解析一个裸媒体类型 token 到备选分支 / Parse a bare media-type token into an alternative",
+    "details": "截取到空白为止，`all`/`screen`/`print` 分别映射到对应 `HPE_MTYPE_*`，其它值把备选标记为 `unknown`。| The text up to whitespace is taken and `all`/`screen`/`print` map to their `HPE_MTYPE_*` values while anything else marks the alternative `unknown`.",
+    "params": {
+      "pq": "inout:解析游标指针 / Parse cursor pointer",
+      "alt": "inout:媒体条件备选分支 / Alternative media branch"
+    },
+    "see": "media_parse_alt_body"
+  },
+  "media_parse_alt_body": {
+    "brief": "解析一个备选分支内以 `and` 连接的合取 / Parse the `and`-joined conjunction inside one alternative",
+    "details": "循环读取条件或媒体类型，之后跳过空白；遇 `and` 继续、直接遇 `(` 亦继续，否则结束。| Conditions or media types are read in a loop with trailing whitespace skipped; an `and` continues the loop, a following `(` also continues, and anything else ends it.",
+    "params": {
+      "q": "inout:备选分支的文本游标 / Text cursor of the alternative",
+      "alt": "inout:媒体条件备选分支 / Alternative media branch"
+    },
+    "see": "media_parse_condition media_parse_type"
+  },
+  "parse_media_query": {
+    "brief": "解析 `@media` 与 `{` 之间的文本为媒体查询 / Parse the text between `@media` and `{` into a media query",
+    "details": "按逗号切分为各备选分支，每段复制成 NUL 结尾串后先消费 `not`/`only` 限定符，再解析类型与 `and` 条件；备选数超过上限即停止。| The text is split into alternatives on commas; each segment is copied into a NUL-terminated string, its `not`/`only` qualifier consumed, and its type and `and` conditions parsed; parsing stops once the alternative limit is reached.",
+    "params": {
+      "text": "`@media` 关键字之后的文本 / Text after the `@media` keyword",
+      "length": "`text` 的字节长度 / Byte length of `text`",
+      "mq": "out:接收解析出的媒体查询 / Receives the parsed media query"
+    },
+    "note": "进入时先清零并置 `present=1`；`alt_count` 记录实际备选数 / The struct is zeroed with `present=1` on entry and `alt_count` records the alternatives parsed",
+    "see": "media_consume_qualifier media_parse_alt_body"
+  },
+  "media_alt_matches": {
+    "brief": "按视口尺寸求值一组媒体条件 / Evaluate one media condition list against the viewport size",
+    "details": "逐个备选分支计算：`unknown` 或 `print` 类型直接不匹配；各条件按 min/max-width/height 与视口宽高比较（width/height 取整后相等），再按需取反；任一备选匹配即返回 1（备选之间为或关系）。| Each alternative is evaluated: `unknown` or a `print` type never matches; conditions compare the feature against the viewport width or height (with width/height requiring integer equality) and the result is negated when needed; any matching alternative returns 1 since alternatives are OR-ed.",
+    "params": {
+      "mq": "媒体查询 / Media query",
+      "vw": "视口宽度 / Viewport width",
+      "vh": "视口高度 / Viewport height"
+    },
+    "return": "匹配返回 1，否则返回 0 / 1 on a match, 0 otherwise",
+    "see": "rule_media_ok"
+  },
+  "hpe_css_set_viewport": {
+    "brief": "设置用于求值 @media 的视口尺寸 / Set the viewport size used to evaluate @media",
+    "details": "只写入宽高两个字段；规则的 `@media` 条件在层叠时按此尺寸即时求值，因此在重新层叠前调用即可让媒体查询随窗口变化生效。| Only the width and height fields are written; each rule's `@media` conditions are evaluated against this size at cascade time, so calling it before a re-cascade makes media queries follow the window.",
+    "params": {
+      "sheet": "inout:目标样式表 / Target stylesheet",
+      "vw": "视口宽度（像素）/ Viewport width in pixels",
+      "vh": "视口高度（像素）/ Viewport height in pixels"
+    },
+    "note": "传 `NULL` 时直接返回 / Returns immediately when `NULL` is passed",
+    "see": "hpe_css_compute"
+  }
+}

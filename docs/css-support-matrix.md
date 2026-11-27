@@ -1,10 +1,10 @@
 # Hope UI Engine — CSS 支持矩阵
 
-> 引擎版本基线：**v0.13**（`docs/需求.md` 最后更新 2026-11-24）
+> 引擎版本基线：**v0.27**（`docs/需求.md` 最后更新 2026-11-27）
 > 本表按 `docs/需求.md` §4/§5/§6 各条目整理，并抽样回源码核对（`src/css/hpe_css.c`、`src/layout/hpe_layout.c`）。
 > 状态图例：✅ 支持 ｜ 🟡 部分支持（缺口见说明）｜ ❌ 不支持
 
-**统计：62 支持 / 3 部分支持 / 11 不支持，共 76 条**
+**统计：64 支持 / 7 部分支持 / 10 不支持，共 81 条**
 
 ---
 
@@ -19,7 +19,7 @@
 | 结构伪类 | `:first-child` / `:last-child` / `:nth-child()` / `:not()` | ✅ | — |
 | 逻辑伪类 | `:is()` / `:where()`（含优先级细化） | ✅ | — |
 | 伪元素 | `::before` / `::after` | ✅ | — |
-| 其余伪类 / 伪元素 | `:nth-of-type`、`:checked`、`:disabled`、`::selection` 等 | ❌ | 需求清单与源码均未覆盖 |
+| 其余伪类 / 伪元素 | `:checked` / `:disabled` 已支持；`:nth-of-type`、`::selection` 等 | 🟡 | 状态伪类 `:checked` / `:disabled` 已用于表单控件样式（v0.23）；其余仍未覆盖 |
 
 ## 2. 层叠与继承
 
@@ -28,11 +28,15 @@
 | specificity + 作者顺序层叠 | — | ✅ | — |
 | 行内样式 | `style` 属性 | ✅ | — |
 | UA 样式表 | 引擎内置默认样式 | ✅ | — |
+| 自定义属性 `--x` / `var()` | 继承、回退、嵌套、`!important` | 🟡 | v0.24：层叠后展开，可用于任意属性/简写；`calc()` 组合与 `syntax` 类型校验未做，单元素上限 8 项 |
+| `@property` | `syntax` / `inherits` / `initial-value` | 🟡 | v0.24：注册与初始值注入已支持，`syntax` 仅记录不求值 |
 | 继承属性集合 | `color` / `font-size` / `font-weight` / `text-align` / `line-height` / `white-space` / `font-family` / `visibility` / `cursor` / `list-style-type` / `list-style-position` / `letter-spacing` / `word-spacing` / `text-indent` | ✅ | — |
 | `!important` | 两趟层叠（normal 先、important 后） | ✅ | — |
 | `@media` | 媒体类型 / `and` / `not` / `only` / 逗号列表 / 区间特性 / 嵌套 | ✅ | — |
 | `@supports` | `(prop: value)` / `not` / `and` / `or` / 嵌套括号 | ✅ | — |
 | `@font-face` | 自定义字体 | ❌ | 需求清单与源码均未覆盖 |
+| UA 默认样式：`<details>` / `<summary>` / `<dialog>` | `details{display:block}`、`summary{display:list-item}`、`dialog[open]{display:block}` | 🟡 | v0.26：closed details 只呈现 summary、summary disclosure 三角、dialog 模态 `::backdrop` 遮罩逐像素绘制；`::backdrop` 选择器样式、dialog 自动居中未做 |
+| 替换元素 `<canvas>` | width/height 属性定固有尺寸、作者 CSS 尺寸优先 | 🟡 | v0.27：按替换盒排版 + 离屏 2D 绘制混合进内容盒；fillText/drawImage/渐变未做 |
 
 ## 3. 盒模型
 
@@ -115,8 +119,8 @@
 | `opacity` | <1 离屏合成并建立层叠上下文 | ✅ | — |
 | `box-shadow` / `text-shadow` | 阴影 | ✅ | — |
 | `transform` | `translate` / `scale` / `rotate`（2D 仿射，离屏合成） | 🟡 | `skew` / `matrix` 等其余函数未支持（需求 §4 #121）；SVG 侧的 skew/matrix 另见绘制子系统 |
-| `transition` | 过渡 | 🟡 | 仅解析存储，无插值时钟（需求 §4 #121） |
-| `animation` / `@keyframes` | 关键帧动画 | ❌ | 无插值时钟；源码未见 `keyframes` 解析（抽样核对为 0） |
+| `transition` | 过渡（简写 + 4 个长属性；插值时钟，v0.22） | 🟢 | 简写顶层逗号列表逐项解析（时间→duration/delay、缓动、属性名）；`hpe_engine_tick` 驱动插值，几何属性触发 LAYOUT 级重排；遗留见需求 §14.2（伪元素、`animation*` 事件等） |
+| `animation` / `@keyframes` | 关键帧动画（Web Animations 子集，v0.22） | 🟢 | `@keyframes`（`from`/`to`/百分比，同名重定义整体替换）；缓动 `linear`/`ease*`/`cubic-bezier()`/`steps(n, start\|end)`；简写顺序无关 token 归位；delay/direction/iteration/fill-mode；`transform` 分解插值；遗留：停靠点级 easing、`animationstart/end` 事件、`play-state: paused`（需求 §14.2） |
 | `filter`（CSS 属性） | 滤镜 | ❌ | CSS 属性未支持；SVG `filter` 子集（feGaussianBlur/feOffset）另见绘制子系统 |
 | `cursor` | 13 值全部映射（`pointer` / `move` / `not-allowed` / `crosshair` / `wait` / `ew-resize` / `grab` / `grabbing` 等） | ✅ | `grab` / `grabbing` 绘制近似为手形 |
 
@@ -128,6 +132,7 @@
 | `visibility` | `visible` / `hidden` | ✅ | — |
 | `list-style-type` / `list-style-position` | `disc` / `circle` / `square` / `none` / `decimal`；`inside` / `outside` | ✅ | — |
 | BFC 规则 | 浮动 / abspos / 行内块 / 表格单元 / overflow 非 visible 建立 BFC | ✅ | 缺口：BFC 边界阻断 margin 塌陷、行宽不足下沉循环（需求 §5 #153） |
+| 表单控件 UA 样式（v0.23） | `input[type=…]` / `button` / `select` / `textarea` / `fieldset` / `legend` / `progress` / `meter` | 🟡 | UA 表提供边框/内边距/背景/字体与 `:checked`/`:disabled` 状态样式；`src/paint/hpe_paint_form.c` 绘制勾选/圆点/箭头/填充/色块/插入符；number/date/color/file/datalist 专用外观仍缺（需求 §14.1） |
 
 ---
 
@@ -142,4 +147,4 @@
 - `cursor` 十三值映射（`apply_cursor`，`hpe_css.c:1981`，含 `grab`/`grabbing`）
 - `display` 的 `grid`/`inline-grid`/`table`/`inline-table`/`inline-flex` 取值（`hpe_css.c:974-976, 5159`）
 - `border-style` 的 `solid`/`dashed`/`dotted`/`double`（`hpe_css.c:1226-1227`）
-- 负向确认：`sticky`（0 处）、`keyframes`（0 处）→ 对应 ❌ 条目
+- 负向确认（v0.22 前的盘点）：`sticky`（0 处）→ 对应 ❌ 条目；`transition`/`animation` 时钟已于 v0.22 落地（`src/css/hpe_anim.c` + `src/hope_anim.c`）

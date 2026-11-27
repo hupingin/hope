@@ -1,0 +1,698 @@
+{
+  "style_init_box": {
+    "brief": "写入盒模型相关长属性的非零初值 / Write the non-zero initial values of the box-model longhands",
+    "details": "填充背景/边框/宽高/内外边距/inset 等长度与颜色字段，并把 `transform` 置为单位矩阵。| It fills the length and colour fields for background, border, width/height, margins, padding and inset, and sets `transform` to the identity matrix.|CSS 初值本身即 0 的字段交给调用方的 `memset`，这里只写非零初值。| Fields whose CSS initial value is already zero are left to the caller's `memset`; only non-zero initials are written here.",
+    "params": {
+      "s": "inout:待初始化的样式 / Style being initialised"
+    },
+    "see": "style_init_scalars hpe_style_default"
+  },
+  "style_init_scalars": {
+    "brief": "写入枚举与标量长属性的非零初值 / Write the non-zero initial values of the enum and scalar longhands",
+    "details": "设置颜色、`display: inline`、`font-size: 16px`、`font-weight: 400`、`line-height: 0`（表示 `normal`）以及各枚举属性的初始枚举值，并令 `background_image.kind` 为 `HPE_BG_NONE`。| It sets the colour, `display: inline`, `font-size: 16px`, `font-weight: 400`, `line-height: 0` (meaning `normal`), the initial enum value of every enum property, and `background_image.kind` to `HPE_BG_NONE`.",
+    "params": {
+      "s": "inout:待初始化的样式 / Style being initialised"
+    },
+    "see": "style_init_box hpe_style_default"
+  },
+  "hpe_style_default": {
+    "brief": "返回一份填好 CSS 初始值的默认样式 / Return a default style seeded with CSS initial values",
+    "details": "先 `memset` 清零，再依次调用 `style_init_box` 与 `style_init_scalars`，使所有非零初值就位。| The struct is zeroed and then `style_init_box` and `style_init_scalars` bring every non-zero initial value into place.",
+    "return": "初始化完毕的样式值（按值返回）/ A fully initialised style returned by value",
+    "see": "style_init_box style_init_scalars"
+  },
+  "split_ws": {
+    "brief": "按空白切分字符串，并保持括号内的空白 / Split a string on whitespace while keeping whitespace inside parentheses",
+    "details": "就地以 `\\0` 截断并写入各段起始指针，最多记录 `max` 段；括号深度大于 0 的空白不视为分隔，因此 `func(a, b, c)` 仍是一个 token。| Segments are NUL-terminated in place and their start pointers stored, at most `max` of them; whitespace at paren depth greater than 0 is not a separator, so `func(a, b, c)` stays a single token.",
+    "params": {
+      "s": "inout:待切分的字符串（会被就地改写）/ String to split, modified in place",
+      "out": "out:各段起始指针数组 / Array that receives each segment pointer",
+      "max": "最多可写入的段数 / Maximum number of segments to store"
+    },
+    "return": "实际切分出的段数 / Number of segments written",
+    "see": "split_top_level"
+  },
+  "parse_plain_number": {
+    "brief": "解析一个不含单位的纯数字 / Parse a bare number with no unit",
+    "details": "用 `strtod` 读取后要求其后只剩空白，否则视为解析失败，因此带单位的长度不会通过。| After `strtod` the remainder must be whitespace only, so a length carrying a unit does not pass.",
+    "params": {
+      "s": "待解析的字符串 / String to parse",
+      "out": "out:解析出的数值 / Receives the parsed number"
+    },
+    "return": "成功返回 1，失败返回 0 / 1 on success, 0 on failure",
+    "see": "parse_float_token media_feature_value"
+  },
+  "parse_float_token": {
+    "brief": "解析角度/数值 token，支持 `deg`/`rad`/`turn` 等后缀 / Parse an angle or number token, accepting `deg`, `rad` and `turn` suffixes",
+    "details": "带 `rad` 时换算为度、带 `turn` 时乘以 360；允许的后缀为 `deg`/`px`/`%`/`rad`/`turn`，其它非空后缀判为失败。| `rad` is converted to degrees and `turn` multiplied by 360; the accepted suffixes are `deg`/`px`/`%`/`rad`/`turn`, and any other trailing text fails the parse.",
+    "params": {
+      "s": "待解析的 token / Token to parse",
+      "out": "out:解析出的数值（角度已换算为度）/ Receives the parsed number with angles converted to degrees"
+    },
+    "return": "成功返回 1，失败返回 0 / 1 on success, 0 on failure",
+    "see": "parse_plain_number"
+  },
+  "split_top_level": {
+    "brief": "按顶层逗号切分，忽略括号内的逗号 / Split on top-level commas, ignoring commas inside parentheses",
+    "details": "只在括号深度为 0 的逗号处切断，颜色函数自带的逗号因此不会拆开参数；最多记录 `max` 段并返回段数。| Splitting only happens at commas where the paren depth is 0, so commas inside a colour function do not break a segment; up to `max` segments are stored and their count returned.",
+    "params": {
+      "body": "inout:待切分的文本（会被就地改写）/ Text to split, modified in place",
+      "seg": "out:各段起始指针数组 / Array that receives each segment pointer",
+      "max": "最多可写入的段数 / Maximum number of segments to store"
+    },
+    "return": "实际切分出的段数 / Number of segments written",
+    "see": "split_ws collect_gradient_stops"
+  },
+  "gradient_direction": {
+    "brief": "把 `to <side>` 关键字或角度 token 映射为度数 / Map a `to <side>` keyword or angle token to degrees",
+    "details": "`to top`/`bottom`/`left`/`right` 及四个对角关键字映射为对应的度数值（0 表示向上、90 表示向右）；也接受带 `deg`/`rad`/`turn` 的角度 token。| `to top`/`bottom`/`left`/`right` and the four corner keywords map to their degree values (0 points up, 90 points right); an angle token carrying `deg`/`rad`/`turn` is also accepted.",
+    "params": {
+      "tok": "待识别的 token / Token to recognise",
+      "angle": "out:解析出的角度（度）/ Receives the angle in degrees"
+    },
+    "return": "是方向 token 返回 1，否则返回 0 / 1 when the token was a direction, 0 otherwise",
+    "note": "返回 1 的 token 不应再当作色标处理 / A token that returns 1 must not also be treated as a colour stop",
+    "see": "collect_gradient_stops parse_gradient_stop"
+  },
+  "parse_gradient_stop": {
+    "brief": "解析 `<颜色> [<位置>]` 形式的色标 / Parse a `<color> [<position>]` gradient stop",
+    "details": "颜色与位置以空白分隔，位置缺省时置为 -1（稍后由 `distribute_gradient_stops` 补齐）；位置大于 1 或带 `%` 时按百分数换算为 0..1。| The colour and position are whitespace-separated and a missing position is marked -1 for `distribute_gradient_stops` to fill in later; a position above 1 or carrying `%` is treated as a percentage scaled to 0..1.",
+    "params": {
+      "tok": "待解析的色标 token / Stop token to parse",
+      "c": "out:解析出的颜色 / Receives the parsed colour",
+      "pos": "out:解析出的位置 0..1，缺省为 -1 / Receives the position in 0..1, or -1 when absent"
+    },
+    "return": "token 中含有颜色返回 1，否则返回 0 / 1 when the token held a colour, 0 otherwise",
+    "see": "collect_gradient_stops distribute_gradient_stops"
+  },
+  "distribute_gradient_stops": {
+    "brief": "为未设置位置的色标按均匀分布补齐位置 / Fill in unset stop positions by even distribution",
+    "details": "首尾色标缺省时分别置为 0 与 1，中间色标缺省时按下标均分到 [0,1]，已显式给出的位置保持不变。| The first and last stops default to 0 and 1 and interior stops default to an even division of [0,1]; explicitly given positions are left untouched.",
+    "params": {
+      "bg": "inout:渐变描述 / Gradient description",
+      "count": "色标个数 / Number of colour stops"
+    },
+    "see": "collect_gradient_stops"
+  },
+  "collect_gradient_stops": {
+    "brief": "把 `linear-gradient(...)` 的参数体解析为色标数组 / Parse a `linear-gradient(...)` body into the stop array",
+    "details": "按顶层逗号分段，跳过空段与方向段，颜色段写入 `bg->stops`（上限 `HPE_MAX_GRADIENT_STOPS`），同时输出首个方向段解析出的角度。| The body is split on top-level commas; empty and direction segments are skipped, colour segments are written into `bg->stops` up to `HPE_MAX_GRADIENT_STOPS`, and the angle parsed from the leading direction segment is returned.",
+    "params": {
+      "body": "inout:渐变的参数体（会被就地改写）/ Gradient argument body, modified in place",
+      "bg": "inout:接收色标的渐变描述 / Gradient description that receives the stops",
+      "angle": "out:渐变角度（度）/ Receives the gradient angle in degrees"
+    },
+    "return": "写入的色标个数 / Number of stops written",
+    "see": "parse_linear_gradient distribute_gradient_stops"
+  },
+  "parse_linear_gradient": {
+    "brief": "解析 `linear-gradient(...)` 为背景描述 / Parse `linear-gradient(...)` into a background description",
+    "details": "仅支持带可选起始方向（`to right`、`to bottom`、`Ndeg` 等）的 2 段及以上的颜色列表形式；角度缺省为 `180deg`（to bottom），色标少于 2 个视为失败。| Only the 2-or-more-stop colour-list form with an optional leading direction such as `to right`, `to bottom` or `Ndeg` is supported; the angle defaults to `180deg` (to bottom) and fewer than two stops fails the parse.",
+    "params": {
+      "value": "属性值文本 / Property value text",
+      "bg": "inout:接收解析结果的背景描述 / Background description that receives the result"
+    },
+    "return": "成功返回 1，否则返回 0 / 1 on success, 0 otherwise",
+    "note": "成功时把 `bg->kind` 置为 `HPE_BG_LINEAR_GRADIENT` / On success `bg->kind` is set to `HPE_BG_LINEAR_GRADIENT`",
+    "see": "collect_gradient_stops apply_background apply_background_image"
+  },
+  "parse_shadow": {
+    "brief": "解析 `[ox oy blur spread] color` 形式的阴影 / Parse a `[ox oy blur spread] color` shadow",
+    "details": "逐个 token 分类：能解析为颜色的作为颜色（缺省为半透明黑），能解析为数字的依次填入偏移/模糊/扩散；至少要有两个数字才算成功，颜色可出现在任意位置（前导或尾随）。| Each token is classified: one that parses as a colour becomes the colour (defaulting to translucent black) and numeric ones fill offset, blur and spread in order; at least two numbers are required and the colour may lead or trail.",
+    "params": {
+      "value": "属性值文本 / Property value text",
+      "out": "out:接收阴影描述 / Receives the shadow description"
+    },
+    "return": "成功返回 1，否则返回 0 / 1 on success, 0 otherwise",
+    "note": "成功时把 `out->valid` 置为 1 / `out->valid` is set to 1 on success",
+    "see": "apply_box_shadow apply_text_shadow"
+  },
+  "mat_mul": {
+    "brief": "计算两个仿射矩阵的乘积 `m * n` / Compute the product `m * n` of two affine matrices",
+    "details": "计算方式是先应用 `n` 再应用 `m`，结果为 2D 仿射（末行为 `0 0 1`），并据结果是否等于单位矩阵更新 `identity` 标志。| It applies `n` first and then `m`, produces a 2D affine matrix (implicit last row `0 0 1`), and updates the `identity` flag according to whether the result equals the identity.",
+    "params": {
+      "dst": "out:接收乘积的矩阵 / Receives the product matrix",
+      "m": "左矩阵 / Left matrix",
+      "n": "右矩阵 / Right matrix"
+    },
+    "note": "`dst` 可与 `m` 或 `n` 为同一对象（就地累乘）/ `dst` may alias `m` or `n` for in-place accumulation",
+    "see": "transform_from_fn apply_transform_fn"
+  },
+  "transform_from_fn": {
+    "brief": "为单个变换函数名与两个参数构建仿射矩阵 / Build the affine matrix for one transform function name and its two arguments",
+    "details": "支持 `translate`/`translatex`/`translatey`、`scale`/`scalex`/`scaley`、`rotate` 与 `skewx`/`skewy`；`rotate` 与 `skew` 的角度参数按度转弧度；`matrix` 不支持，保持单位矩阵。| It supports `translate`/`translatex`/`translatey`, `scale`/`scalex`/`scaley`, `rotate` and `skewx`/`skewy`; the angles of `rotate` and the skew functions convert from degrees to radians; `matrix` is unsupported and leaves the identity.",
+    "params": {
+      "fn": "小写的变换函数名 / Lowercased transform function name",
+      "v1": "第一个参数 / First argument",
+      "v2": "第二个参数 / Second argument",
+      "m": "out:接收构建出的矩阵 / Receives the built matrix"
+    },
+    "see": "apply_transform_fn parse_transform"
+  },
+  "apply_transform_fn": {
+    "brief": "把一个 `name(args)` 变换累积到累加矩阵上 / Accumulate one `name(args)` transform onto the accumulator matrix",
+    "details": "复制参数体后按逗号拆出最多两个数值，构建该函数的矩阵；仅在矩阵非单位矩阵时左乘累加，因此 `translate(0)` 一类不改变结果。| The argument body is copied and split on the comma into at most two numbers to build the function's matrix; it is left-multiplied onto the accumulator only when the matrix is not the identity, so calls like `translate(0)` change nothing.",
+    "params": {
+      "fn": "小写的变换函数名 / Lowercased transform function name",
+      "body": "函数括号内的参数文本 / Argument text inside the function parentheses",
+      "acc": "inout:累加矩阵 / Accumulator matrix"
+    },
+    "see": "transform_from_fn parse_transform mat_mul"
+  },
+  "parse_transform": {
+    "brief": "解析逗号/空白分隔的 2D 变换函数列表 / Parse a comma- or space-separated list of 2D transform functions",
+    "details": "从单位矩阵开始，逐个识别 `name(...)` 并累积相乘；值为 `none` 或为空时输出单位矩阵，函数名会被转为小写，未知函数名由 `transform_from_fn` 视为不变。| Starting from the identity it recognises each `name(...)` in turn and multiplies it in; `none` or an empty value yields the identity, function names are lowercased, and unknown names are treated as no-ops by `transform_from_fn`.",
+    "params": {
+      "value": "属性值文本 / Property value text",
+      "out": "out:接收解析出的矩阵 / Receives the parsed matrix"
+    },
+    "see": "apply_transform_fn apply_transform"
+  },
+  "last_color_token": {
+    "brief": "返回以空白分隔后最后一个能解析为颜色的 token / Return the last whitespace-separated token that parses as a colour",
+    "details": "从末段向前扫描，遇到第一个颜色即返回，用于处理颜色位于尾部的简写（如 `1px solid #ccc`）。| It scans from the last segment backwards and returns on the first colour, handling shorthands whose colour trails such as `1px solid #ccc`.",
+    "params": {
+      "value": "属性值文本 / Property value text",
+      "out": "out:接收解析出的颜色 / Receives the parsed colour"
+    },
+    "return": "找到颜色返回 1，否则返回 0 / 1 when a colour was found, 0 otherwise",
+    "see": "apply_background"
+  },
+  "expand_border_colors": {
+    "brief": "把 1..4 个边框颜色按 CSS 规则展开到四边 / Expand 1..4 border colours across the four sides per the CSS rule",
+    "details": "按 (上,右,下,左) 顺序重复取值：1 个值四边相同，2 个值上下取首值、左右取次值，3 个值下边取次值，4 个值一一对应；同时置位各边颜色位并把简写颜色同步为第一个值。| Values repeat in (top,right,bottom,left) order: one value fills all sides, two values give the first to top/bottom and the second to right/left, three values give the second to the bottom, and four map one-to-one; each side colour bit is set and the shorthand colour is synced to the first value.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "vals": "已解析出的颜色数组 / Array of parsed colours",
+      "got": "有效颜色个数 1..4 / Number of valid colours, 1..4"
+    },
+    "see": "apply_border_color"
+  },
+  "set_border_width": {
+    "brief": "设置某一侧或全部四侧的边框宽度 / Set the border width of one side or of all four sides",
+    "details": "`side` 非负时只写该侧并置位其宽度位；`side` 为负时把四侧统一写入并置位简写宽度位。| When `side` is non-negative only that side is written and its width bit set; when `side` is negative all four sides are written uniformly and the shorthand width bit is set.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "w": "边框宽度（像素）/ Border width in pixels",
+      "side": "边序号 0..3，小于 0 表示全部四边 / Side index 0..3, negative for all four sides",
+      "side_bit": "该边的宽度属性位 / Width property bit for that side"
+    },
+    "see": "apply_border_side"
+  },
+  "classify_font_family": {
+    "brief": "按名称关键字把字体族归入 mono/serif/sans / Classify a font family name into mono, serif or sans by keyword",
+    "details": "名称同时匹配中英文关键字，例如 `mono`/`courier`/`consolas` 归等宽，`serif`/`times`/`宋` 归衬线，`sans`/`yahei`/`arial`/`黑` 归无衬线；无法识别时返回默认族。| The name is matched against both Latin and Chinese keywords: `mono`/`courier`/`consolas` map to monospace, `serif`/`times`/`宋` to serif, `sans`/`yahei`/`arial`/`黑` to sans-serif; an unrecognised name falls back to the default family.",
+    "params": {
+      "name": "已小写的字体族名 / Lowercased font family name"
+    },
+    "return": "对应的 `HpeFontFamily` 枚举 / The matching `HpeFontFamily` value",
+    "see": "normalize_family_name apply_font_family"
+  },
+  "normalize_family_name": {
+    "brief": "就地去除字体名两侧引号并转为小写 / Strip surrounding quotes from a family name in place and lowercase it",
+    "details": "名称首尾同为 `\"` 时去掉这对引号，然后把整串按 ASCII 转为小写，便于后续关键字匹配。| When the name starts and ends with `\"` that pair is removed, then the whole string is lowercased by ASCII so keyword matching works.",
+    "params": {
+      "name": "inout:待规范化的字体名（会被就地改写）/ Family name to normalise, modified in place"
+    },
+    "see": "classify_font_family apply_font_family"
+  },
+  "overflow_keyword": {
+    "brief": "把 overflow 关键字映射为枚举值 / Map an overflow keyword to its enum value",
+    "details": "`hidden`/`scroll`/`auto` 分别映射到对应枚举，其余（含 `visible`）一律返回 `HPE_OVERFLOW_VISIBLE`。| `hidden`, `scroll` and `auto` map to their enums and anything else, including `visible`, returns `HPE_OVERFLOW_VISIBLE`.",
+    "params": {
+      "tok": "关键字 token / Keyword token"
+    },
+    "return": "对应的 `HpeOverflow` 枚举 / The matching `HpeOverflow` value",
+    "see": "apply_overflow apply_overflow_x apply_overflow_y"
+  },
+  "apply_display": {
+    "brief": "把 `display` 声明写入样式 / Write a `display` declaration into the style",
+    "details": "识别 `none`/`inline-block`/`flex`/`inline`，其余（含缺省）按 `block` 处理；`inline-flex` 因引擎没有行内级弹性容器而被提升为 `flex`。| It recognises `none`, `inline-block`, `flex` and `inline` and treats everything else, including the default, as `block`; `inline-flex` is blockified to `flex` because the engine has no inline-level flex container.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "note": "同时置位 `HPE_PROP_DISPLAY` / It also sets `HPE_PROP_DISPLAY`",
+    "see": "apply_property"
+  },
+  "apply_color": {
+    "brief": "把 `color` 声明写入样式的文本颜色 / Write a `color` declaration into the style's text colour",
+    "details": "用 `hpe_color_parse` 解析成功才写入；解析失败时保持原值不变。| The value is written only when `hpe_color_parse` succeeds; on failure the previous value is kept.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "hpe_color_parse apply_property"
+  },
+  "apply_background": {
+    "brief": "解析 `background`/`background-color` 简写 / Parse the `background`/`background-color` shorthand",
+    "details": "先尝试 `linear-gradient(...)` 并写入背景图层；`none`/`transparent` 置为透明色；否则先整体解析颜色（`rgba(...)` 等带空格的函数式写法不拆分），失败再取最后一个颜色 token（处理 `1px solid #ccc` 之类）。| It first tries `linear-gradient(...)` and writes the image layer; `none`/`transparent` become transparent; otherwise the whole value is parsed as a colour first (so `rgba(...)` with spaces is not split) and on failure the last colour token is used, handling cases like `1px solid #ccc`.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "parse_linear_gradient last_color_token"
+  },
+  "apply_min_width": {
+    "brief": "把 `min-width` 声明写入样式 / Write a `min-width` declaration into the style",
+    "details": "仅接受 `px` 或百分比长度，其它单位（如 `auto`）不改动样式。| Only `px` and percentage lengths are accepted; other units such as `auto` leave the style unchanged.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "apply_width hpe_len_parse"
+  },
+  "apply_width": {
+    "brief": "把 `width` 声明写入样式 / Write a `width` declaration into the style",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "note": "无条件写入并置位 `HPE_PROP_WIDTH`，`auto` 由 `hpe_len_parse` 表示 / It writes unconditionally and sets `HPE_PROP_WIDTH`; `auto` is represented by `hpe_len_parse`",
+    "see": "apply_height hpe_len_parse"
+  },
+  "apply_height": {
+    "brief": "把 `height` 声明写入样式 / Write a `height` declaration into the style",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "note": "无条件写入并置位 `HPE_PROP_HEIGHT` / It writes unconditionally and sets `HPE_PROP_HEIGHT`",
+    "see": "apply_width hpe_len_parse"
+  },
+  "apply_margin": {
+    "brief": "解析 `margin` 简写并展开到四条边 / Parse the `margin` shorthand and expand it across the four sides",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "set_sides apply_padding"
+  },
+  "apply_padding": {
+    "brief": "解析 `padding` 简写并展开到四条边 / Parse the `padding` shorthand and expand it across the four sides",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "set_sides apply_margin"
+  },
+  "apply_box_side": {
+    "brief": "写入 margin/padding 的单边长属性 / Write one side of the margin/padding shorthand as a longhand",
+    "details": "`idx` 取 0..3 对应上右下左，`is_margin` 决定写入外边距还是内边距，并据类型置位对应的单边属性位。| `idx` 0..3 selects top, right, bottom and left and `is_margin` chooses the outer or inner edge, setting the matching per-side property bit.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value",
+      "idx": "边序号 0..3（上右下左）/ Side index 0..3 (top, right, bottom, left)",
+      "is_margin": "为 1 时写外边距，为 0 时写内边距 / 1 writes a margin, 0 writes padding"
+    },
+    "see": "apply_margin apply_padding"
+  },
+  "apply_border_color": {
+    "brief": "解析 `border-color` 简写 / Parse the `border-color` shorthand",
+    "details": "按空白最多拆出四段并逐个尝试解析颜色，至少解析出一个颜色才展开到四边。| At most four whitespace-separated segments are tried as colours and expansion happens only when at least one colour parses.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "expand_border_colors"
+  },
+  "apply_border_side": {
+    "brief": "解析 `border` 与 `border-<side>` 简写 / Parse the `border` and `border-<side>` shorthands",
+    "details": "逐 token 处理宽度、样式与颜色（顺序无关）：`none` 把该侧宽度置 0，`solid`/`dashed`/`dotted`/`double` 被跳过，颜色分别写入该侧或四边，`px` 长度作为宽度；`side` 小于 0 表示四边。| Each token is handled for width, style or colour in any order: `none` zeroes that side's width, `solid`/`dashed`/`dotted`/`double` are skipped, a colour goes to that side or to all four, and a `px` length becomes the width; `side` below 0 means all four sides.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value",
+      "side": "边序号 0..3，小于 0 表示全部四边 / Side index 0..3, negative for all four sides",
+      "side_bit": "该边的宽度属性位 / Width property bit for that side"
+    },
+    "see": "set_border_width apply_border_width"
+  },
+  "apply_border_radius": {
+    "brief": "把 `border-radius` 声明写入样式 / Write a `border-radius` declaration into the style",
+    "details": "`px` 长度原样写入；百分比因需依赖边框盒而被存为负值，留待绘制阶段求解。| A `px` length is stored as-is; a percentage is stored negated because it depends on the border box, and is solved at paint time.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "hpe_len_parse"
+  },
+  "apply_inset": {
+    "brief": "解析 `inset` 简写并展开到四边 / Parse the `inset` shorthand and expand it across the four sides",
+    "details": "按 1/2/3/4 值的 CSS 规则展开到 (上,右,下,左)，逐边写入并置位对应的 inset 属性位。| It expands 1/2/3/4 values across (top,right,bottom,left) per the CSS rule, writing each edge and setting the inset property bit.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "apply_inset_side hpe_len_parse"
+  },
+  "apply_flex_direction": {
+    "brief": "把 `flex-direction` 声明写入样式 / Write a `flex-direction` declaration into the style",
+    "details": "仅 `column` 映射为 `HPE_FLEX_COLUMN`，其余（含 `row`）为 `HPE_FLEX_ROW`；不支持 `*-reverse`。| Only `column` maps to `HPE_FLEX_COLUMN` and everything else, including `row`, is `HPE_FLEX_ROW`; `*-reverse` is not supported.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "apply_property"
+  },
+  "apply_align_items": {
+    "brief": "把 `align-items` 声明写入样式 / Write an `align-items` declaration into the style",
+    "details": "识别 `center`、`flex-start`/`start`、`flex-end`/`end`、`baseline`，其余一律为 `stretch`。| It recognises `center`, `flex-start`/`start`, `flex-end`/`end` and `baseline`, and treats everything else as `stretch`.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "apply_align_self"
+  },
+  "apply_align_self": {
+    "brief": "把 `align-self` 声明写入样式 / Write an `align-self` declaration into the style",
+    "details": "识别 `center`、`flex-start`/`start`、`flex-end`/`end`、`stretch`，其余（含 `auto`）为 `HPE_ALIGN_ITEMS_AUTO`。| It recognises `center`, `flex-start`/`start`, `flex-end`/`end` and `stretch`, and treats everything else, including `auto`, as `HPE_ALIGN_ITEMS_AUTO`.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "apply_align_items"
+  },
+  "apply_justify": {
+    "brief": "把 `justify-content` 声明写入样式 / Write a `justify-content` declaration into the style",
+    "details": "识别 `center`、`flex-end`/`end`、`space-between`、`space-around`，其余（含 `flex-start`/`start`）为起始对齐。| It recognises `center`, `flex-end`/`end`, `space-between` and `space-around`; everything else, including `flex-start`/`start`, is start-aligned.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "apply_property"
+  },
+  "apply_gap": {
+    "brief": "把 `gap`/`row-gap`/`column-gap` 声明写入样式 / Write a `gap`/`row-gap`/`column-gap` declaration into the style",
+    "details": "仅 `px` 与百分比长度取值为间距，其它单位落为 0。| Only `px` and percentage lengths yield a spacing; other units become 0.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "apply_flex_grow"
+  },
+  "apply_flex_grow": {
+    "brief": "把 `flex`/`flex-grow` 声明写入样式 / Write a `flex`/`flex-grow` declaration into the style",
+    "details": "仅 `px` 与百分比长度取值为伸缩系数（复用长度解析读取数值），其它单位落为 0。| Only `px` and percentage lengths yield a grow factor (the length parser supplies the number); other units become 0.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "apply_gap"
+  },
+  "apply_font_size": {
+    "brief": "把 `font-size` 声明写入样式 / Write a `font-size` declaration into the style",
+    "details": "支持 `small`/`medium`/`large`/`x-large`/`xx-large`/`smaller`/`larger` 关键字；`px` 直接取值，百分比与 `em` 以父级 16px 为基准换算，`rem` 以 16px 根字号换算；结果非正时不写入。| It supports the `small`/`medium`/`large`/`x-large`/`xx-large`/`smaller`/`larger` keywords; `px` is taken directly, percentage and `em` resolve against a 16px parent and `rem` against a 16px root size; a non-positive result is not written.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "hpe_len_parse"
+  },
+  "apply_font_weight": {
+    "brief": "把 `font-weight` 声明归一为 400 或 700 / Normalise a `font-weight` declaration to 400 or 700",
+    "details": "`bold` 取 700、`normal` 取 400，其它情况解析为数值后按是否大于等于 600 归为 700 或 400（只有常规与粗体两档）。| `bold` is 700 and `normal` is 400; otherwise the value is parsed as a number and mapped to 700 when at least 600 and 400 otherwise (only a regular and a bold weight exist).",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "parse_plain_number"
+  },
+  "apply_text_align": {
+    "brief": "把 `text-align` 声明写入样式 / Write a `text-align` declaration into the style",
+    "details": "识别 `center` 与 `right`，其余（含 `left`/`justify`）一律左对齐。| It recognises `center` and `right` and treats everything else, including `left`/`justify`, as left-aligned.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "apply_property"
+  },
+  "apply_line_height": {
+    "brief": "把 `line-height` 声明写入样式 / Write a `line-height` declaration into the style",
+    "details": "`normal` 置 0；无单位数字存为负值（表示字号倍数）；`px` 长度原样写入；其它单位不生效。| `normal` stores 0; a unitless number is stored negated to mean a multiple of the font size; a `px` length is stored as-is; other units have no effect.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "note": "`line_height <= 0` 表示 `auto`，负值 -n 表示 n 倍字号 / `line_height <= 0` means `auto` and a negative -n means an n-multiple of the font size",
+    "see": "parse_plain_number hpe_len_parse"
+  },
+  "apply_white_space": {
+    "brief": "把 `white-space` 声明写入样式 / Write a `white-space` declaration into the style",
+    "details": "识别 `nowrap`、`pre`、`pre-wrap`、`pre-line`，其余（含 `normal`）为 `HPE_WS_NORMAL`。| It recognises `nowrap`, `pre`, `pre-wrap` and `pre-line`; everything else, including `normal`, is `HPE_WS_NORMAL`.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "apply_property"
+  },
+  "apply_font_family": {
+    "brief": "从字体族列表中取首个可识别的族 / Take the first recognisable family from a font family list",
+    "details": "按逗号分段，逐段去引号、转小写并按关键字归类，取第一个非默认族即停止；整串都识别不出时落到 `HPE_FONT_SANS`。| Segments are split on commas, each is de-quoted, lowercased and classified by keyword, and the first non-default family wins; when none is recognisable it falls back to `HPE_FONT_SANS`.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "classify_font_family normalize_family_name"
+  },
+  "apply_position": {
+    "brief": "把 `position` 声明写入样式 / Write a `position` declaration into the style",
+    "details": "识别 `relative`、`absolute`、`fixed`，其余（含 `static`）为 `HPE_POS_STATIC`。| It recognises `relative`, `absolute` and `fixed`; everything else, including `static`, is `HPE_POS_STATIC`.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "apply_inset_side"
+  },
+  "apply_inset_side": {
+    "brief": "写入 top/right/bottom/left 中的一条 inset 长属性 / Write one inset longhand out of top, right, bottom and left",
+    "details": "解析长度后写入 `inset[idx]` 并置位 `bit`。| The length is parsed into `inset[idx]` and `bit` is set.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value",
+      "idx": "边序号 0..3（上右下左）/ Side index 0..3 (top, right, bottom, left)",
+      "bit": "该边的 inset 属性位 / Inset property bit for that side"
+    },
+    "see": "apply_inset"
+  },
+  "apply_z_index": {
+    "brief": "把 `z-index` 声明写入样式 / Write a `z-index` declaration into the style",
+    "details": "`auto` 置 `z_auto=1` 且 `z_index=0`；纯数字则关闭 `auto` 并取整数值；其它值不改动。| `auto` sets `z_auto=1` with `z_index=0`; a bare number clears `auto` and stores the integer value; other values are ignored.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "parse_plain_number"
+  },
+  "apply_float": {
+    "brief": "把 `float` 声明写入样式 / Write a `float` declaration into the style",
+    "details": "识别 `left`、`right`，其余（含 `none`）为 `HPE_FLOAT_NONE`。| It recognises `left` and `right`; everything else, including `none`, is `HPE_FLOAT_NONE`.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "apply_clear"
+  },
+  "apply_clear": {
+    "brief": "把 `clear` 声明写入样式 / Write a `clear` declaration into the style",
+    "details": "识别 `left`、`right`、`both`，其余（含 `none`）为 `HPE_CLEAR_NONE`。| It recognises `left`, `right` and `both`; everything else, including `none`, is `HPE_CLEAR_NONE`.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "apply_float"
+  },
+  "apply_size2": {
+    "brief": "写入第二属性字中的一条尺寸长属性 / Write one size longhand carried in the second property word",
+    "details": "解析长度写入 `slot` 并置位 `bit`，用于 `min-height`/`max-width`/`max-height`（`min-width` 单独处理）。| The length is parsed into `slot` and `bit` is set; used by `min-height`, `max-width` and `max-height` while `min-width` is handled separately.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value",
+      "slot": "inout:目标长度槽位 / Length member that receives the value",
+      "bit": "对应的属性位 / The matching property bit"
+    },
+    "see": "apply_min_width hpe_len_parse"
+  },
+  "apply_box_sizing": {
+    "brief": "把 `box-sizing` 声明写入样式 / Write a `box-sizing` declaration into the style",
+    "details": "`border-box` 映射为 `HPE_BOX_SIZING_BORDER`，其余为 `HPE_BOX_SIZING_CONTENT`。| `border-box` maps to `HPE_BOX_SIZING_BORDER` and everything else to `HPE_BOX_SIZING_CONTENT`.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "apply_property"
+  },
+  "apply_overflow": {
+    "brief": "解析 `overflow` 简写写入两轴 / Parse the `overflow` shorthand into the two axes",
+    "details": "一个值同时设置两轴，两个值依次为 x、y；关键字经 `overflow_keyword` 映射后同时置位两轴的属性位。| One value sets both axes and two values give x then y; keywords are mapped by `overflow_keyword` and both axis property bits are set.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "overflow_keyword apply_overflow_x apply_overflow_y"
+  },
+  "apply_overflow_x": {
+    "brief": "把 `overflow-x` 声明写入横向溢出 / Write an `overflow-x` declaration into the horizontal overflow",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "overflow_keyword apply_overflow"
+  },
+  "apply_overflow_y": {
+    "brief": "把 `overflow-y` 声明写入纵向溢出 / Write an `overflow-y` declaration into the vertical overflow",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "overflow_keyword apply_overflow"
+  },
+  "apply_opacity": {
+    "brief": "把 `opacity` 声明写入样式并按 0..1 夹取 / Write an `opacity` declaration into the style, clamped to 0..1",
+    "details": "只有能解析为纯数字时才写入，写入前把值夹到 [0,1]。| The value is written only when it parses as a bare number and is clamped to [0,1] beforehand.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "parse_plain_number"
+  },
+  "apply_visibility": {
+    "brief": "把 `visibility` 声明写入样式 / Write a `visibility` declaration into the style",
+    "details": "识别 `hidden`、`collapse`，其余（含 `visible`）为 `HPE_VISIBILITY_VISIBLE`。| It recognises `hidden` and `collapse`; everything else, including `visible`, is `HPE_VISIBILITY_VISIBLE`.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "apply_property"
+  },
+  "apply_cursor": {
+    "brief": "把 `cursor` 声明映射为光标枚举 / Map a `cursor` declaration to the cursor enum",
+    "details": "识别 pointer/text/move/wait/help/crosshair/not-allowed/grab/grabbing、`ew-resize`/`col-resize`、`ns-resize`/`row-resize`、`default`；其余（含 `auto`）为 `HPE_CURSOR_AUTO`。| It recognises pointer/text/move/wait/help/crosshair/not-allowed/grab/grabbing, `ew-resize`/`col-resize`, `ns-resize`/`row-resize` and `default`; everything else, including `auto`, is `HPE_CURSOR_AUTO`.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "apply_property"
+  },
+  "apply_text_decoration": {
+    "brief": "解析 `text-decoration` 写入装饰位掩码 / Parse `text-decoration` into the decoration bit mask",
+    "details": "按空白分段，`underline`/`overline`/`line-through` 按位或累加，`none` 清空；多个装饰可叠加。| Segments are split on whitespace and `underline`/`overline`/`line-through` are OR-ed in while `none` clears the mask, so several decorations can combine.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "apply_property"
+  },
+  "apply_text_spacing": {
+    "brief": "写入 letter/word-spacing 与 text-indent 长属性 / Write the letter/word-spacing and text-indent longhands",
+    "details": "解析长度写入 `slot`；`auto`（即 `normal`）被替换为 0px，然后置位 `bit`。| The length is parsed into `slot`; `auto`, i.e. `normal`, is replaced with 0px, then `bit` is set.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value",
+      "slot": "inout:目标长度槽位 / Length member that receives the value",
+      "bit": "对应的属性位 / The matching property bit"
+    },
+    "see": "apply_letter_spacing apply_vertical_align"
+  },
+  "apply_vertical_align": {
+    "brief": "把 `vertical-align` 声明写入样式 / Write a `vertical-align` declaration into the style",
+    "details": "识别 middle/top/bottom/text-top/text-bottom，其余（含 `baseline`）为 `HPE_VALIGN_BASELINE`。| It recognises middle/top/bottom/text-top/text-bottom; everything else, including `baseline`, is `HPE_VALIGN_BASELINE`.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "apply_text_spacing"
+  },
+  "apply_list_style": {
+    "brief": "解析 `list-style` 简写写入类型与位置 / Parse the `list-style` shorthand into type and position",
+    "details": "按空白分段，circle/square/disc/decimal/none 设置列表类型，inside/outside 设置位置，每命中一项即置位对应的属性位。| Segments are split on whitespace: circle/square/disc/decimal/none set the type and inside/outside set the position, each setting the matching property bit.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "apply_list_style_position"
+  },
+  "apply_list_style_position": {
+    "brief": "把 `list-style-position` 声明写入样式 / Write a `list-style-position` declaration into the style",
+    "details": "`inside` 映射为 `HPE_LIST_INSIDE`，其余（含 `outside`）为 `HPE_LIST_OUTSIDE`。| `inside` maps to `HPE_LIST_INSIDE`; everything else, including `outside`, is `HPE_LIST_OUTSIDE`.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "apply_list_style"
+  },
+  "apply_background_image": {
+    "brief": "把 `background-image` 声明写入背景图层 / Write a `background-image` declaration into the image layer",
+    "details": "能解析为线性渐变则写入渐变图层，`none` 则把图层类型置为 `HPE_BG_NONE`；两种情形都置位背景图层属性位。| A linear gradient is written into the image layer and `none` clears the layer kind to `HPE_BG_NONE`; both set the background-image property bit.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "parse_linear_gradient apply_background"
+  },
+  "apply_box_shadow": {
+    "brief": "把 `box-shadow` 声明写入样式 / Write a `box-shadow` declaration into the style",
+    "details": "解析成功写入阴影并使 `valid` 为 1；`none` 则把 `valid` 置 0；两种情形都置位阴影属性位。| A successful parse writes the shadow with `valid` 1 and `none` clears `valid`; both set the box-shadow property bit.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "parse_shadow apply_text_shadow"
+  },
+  "apply_text_shadow": {
+    "brief": "把 `text-shadow` 声明写入样式 / Write a `text-shadow` declaration into the style",
+    "details": "解析成功写入文本阴影并使 `valid` 为 1；`none` 则把 `valid` 置 0；两种情形都置位文本阴影属性位。| A successful parse writes the text shadow with `valid` 1 and `none` clears `valid`; both set the text-shadow property bit.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "parse_shadow apply_box_shadow"
+  },
+  "apply_transform": {
+    "brief": "把 `transform` 声明写入样式 / Write a `transform` declaration into the style",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "note": "无条件写入矩阵并置位 `HPE_PROP2_TRANSFORM` / It writes the matrix unconditionally and sets `HPE_PROP2_TRANSFORM`",
+    "see": "parse_transform"
+  },
+  "apply_transition": {
+    "brief": "记录 `transition` 是否被声明 / Record whether `transition` was declared",
+    "details": "值为 `none` 时 `has_transition` 置 0，否则置 1；只记录存在性，引擎尚无插值时钟。| `has_transition` is 0 for `none` and 1 otherwise; only presence is recorded as the engine has no interpolation clock yet.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "apply_animation"
+  },
+  "apply_animation": {
+    "brief": "记录 `animation` 是否被声明 / Record whether `animation` was declared",
+    "details": "值为 `none` 时 `has_animation` 置 0，否则置 1；只记录存在性，尚未实现动画播放。| `has_animation` is 0 for `none` and 1 otherwise; only presence is recorded and animation playback is not implemented.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value"
+    },
+    "see": "apply_transition"
+  },
+  "apply_border_side_color": {
+    "brief": "写入某一边的边框颜色长属性 / Write the border colour longhand of one side",
+    "details": "解析成功才写入该侧颜色，同时把简写颜色同步为该值，并置位简写颜色位与该侧的颜色位。| The colour is written to that side only on a successful parse, the shorthand colour is synced to the same value, and both the shorthand bit and that side's colour bit are set.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "value": "声明值 / Declaration value",
+      "side": "边序号 0..3（上右下左）/ Side index 0..3 (top, right, bottom, left)",
+      "bit": "该边的颜色属性位 / Colour property bit for that side"
+    },
+    "see": "apply_border_color"
+  },
+  "apply_property": {
+    "brief": "按属性名查表并分派到对应应用函数 / Look a property name up in the table and dispatch to its applier",
+    "details": "先把属性名转为小写，`inherit` 直接忽略（层叠已从父样式起步）；随后在 `k_prop_table` 中按名匹配并调用对应函数，未注册的属性名静默忽略。| The property name is lowercased, `inherit` is ignored outright because the cascade already starts from the parent style, and the name is then matched in `k_prop_table` and dispatched; an unregistered name is silently ignored.",
+    "params": {
+      "d": "inout:目标样式 / Target style",
+      "prop": "CSS 属性名（大小写不敏感）/ CSS property name, case-insensitive",
+      "value": "已剥离 `!important` 的声明值 / Declaration value with `!important` already stripped"
+    },
+    "see": "hpe_css_parse_declarations"
+  }
+}

@@ -1,0 +1,460 @@
+{
+  "native_decode_uri_component": {
+    "brief": "实现全局 `decodeURIComponent`：把 `%XX` 还原为字节 / Implement global `decodeURIComponent`: turn `%XX` escapes back into bytes",
+    "details": "逐字节扫描输入串，遇到合法的 `%` 加两位十六进制时解码为单个字节，否则原样拷贝。解码结果按字节直接构造字符串，因此多字节 UTF-8 序列会被还原成原始字符。| The input is scanned byte by byte; a valid `%` followed by two hex digits is decoded to one byte, anything else is copied verbatim. The result is built as a byte string, so multi-byte UTF-8 sequences are reassembled.",
+    "return": "解码后的字符串；输入无法转换时按空串处理 / The decoded string; treated as empty when the input cannot be converted"
+  },
+  "str_this": {
+    "brief": "把 `thisv` 当作可读写的普通对象取出 / Take `thisv` as a plain mutable object",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "thisv": "调用时的 this 值 / The `this` value of the call"
+    },
+    "return": "普通对象指针；类型不是带实体的普通对象时返回 `NULL` / The plain object pointer, or `NULL` when it is not a plain object with storage"
+  },
+  "str_arg": {
+    "brief": "把参数强制转换为字符串 / Coerce an argument to a string",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "a": "待转换的实参 / Argument to convert"
+    },
+    "return": "转换后的以 NUL 结尾的字符串，由 arena 持有 / The converted NUL-terminated string, owned by the arena"
+  },
+  "strv": {
+    "brief": "构造字符串值，空指针按空串处理 / Build a string value, treating a null pointer as the empty string",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "s": "源字符串，可为 `NULL` / Source string, may be `NULL`"
+    },
+    "return": "指向该文本的 JS 字符串值 / A JS string value wrapping the text"
+  },
+  "string_charAt": {
+    "brief": "实现 `String.prototype.charAt`：按码点下标取单字符 / Implement `String.prototype.charAt`: read one character at a code-point index",
+    "return": "该下标的单字符字符串；下标越界时为空串 / The single-character string at that index, or the empty string when out of range"
+  },
+  "string_charCodeAt": {
+    "brief": "实现 `String.prototype.charCodeAt`：按码点下标取码点值 / Implement `String.prototype.charCodeAt`: read the code point at an index",
+    "return": "该下标的 Unicode 码点；下标越界时返回 `NaN` / The Unicode code point at that index, or `NaN` when out of range"
+  },
+  "string_indexOf": {
+    "brief": "实现 `String.prototype.indexOf`：从前往后查找子串 / Implement `String.prototype.indexOf`: find a substring searching forward",
+    "return": "命中处的码点下标；未命中或起点越界时返回 -1 / The code-point index of the match, or -1 when absent or the start is out of range"
+  },
+  "string_lastIndexOf": {
+    "brief": "实现 `String.prototype.lastIndexOf`：从后往前查找子串 / Implement `String.prototype.lastIndexOf`: find a substring searching backward",
+    "return": "最后一次命中的码点下标；未命中时返回 -1；空子串返回字符串长度 / The code-point index of the last match, -1 when absent, or the length for an empty needle"
+  },
+  "utf8_offset": {
+    "brief": "求第 `i` 个码点对应的字节偏移 / Byte offset of the `i`-th code point",
+    "params": {
+      "s": "以 NUL 结尾的字符串 / NUL-terminated string",
+      "i": "码点下标 / Code-point index"
+    },
+    "return": "该码点在串中的字节偏移；`i` 超过长度时返回字符串的字节长度 / The byte offset of that code point, or the byte length when `i` runs past the end"
+  },
+  "string_slice": {
+    "brief": "实现 `String.prototype.slice`：按可负的下标区间取子串 / Implement `String.prototype.slice`: extract a substring from a possibly negative range",
+    "return": "区间内的子串 / The substring within the range"
+  },
+  "string_substring": {
+    "brief": "实现 `String.prototype.substring`：取 `[start, end)` 子串并把负值夹到 0 / Implement `String.prototype.substring`: take the `[start, end)` substring clamping negatives to 0",
+    "note": "`start` 大于 `end` 时两者自动交换 / `start` and `end` are swapped when `start` exceeds `end`"
+  },
+  "string_substr": {
+    "brief": "实现 `String.prototype.substr`：从起点取指定长度 / Implement `String.prototype.substr`: take a given length from a start offset",
+    "return": "从 `start` 起长度至多 `count` 的子串 / The substring of at most `count` characters starting at `start`"
+  },
+  "string_toUpperCase": {
+    "brief": "实现 `String.prototype.toUpperCase`：仅对 ASCII 字母转大写 / Implement `String.prototype.toUpperCase`: uppercase ASCII letters only",
+    "return": "转换后的新字符串 / The converted new string"
+  },
+  "string_toLowerCase": {
+    "brief": "实现 `String.prototype.toLowerCase`：仅对 ASCII 字母转小写 / Implement `String.prototype.toLowerCase`: lowercase ASCII letters only",
+    "return": "转换后的新字符串 / The converted new string"
+  },
+  "string_trim": {
+    "brief": "实现 `String.prototype.trim`：去掉两端的 ASCII 空白 / Implement `String.prototype.trim`: strip ASCII whitespace from both ends",
+    "return": "去空白后的子串 / The trimmed substring"
+  },
+  "string_pad": {
+    "brief": "实现 `padStart`/`padEnd`：用填充串把字符串补到目标长度 / Implement `padStart`/`padEnd`: pad a string to a target length with a fill string",
+    "details": "目标长度按码点计。`ud` 非空时往左侧填充（padStart），为空时往右侧填充（padEnd）；需要补的字符数按填充串字节数循环取用。| The target length is counted in code points. A non-null `ud` pads on the left (padStart), null pads on the right (padEnd); the missing characters are taken cyclically from the fill string.",
+    "return": "补长后的字符串；无需补长时原样返回 / The padded string, returned unchanged when no padding is needed"
+  },
+  "string_repeat": {
+    "brief": "实现 `String.prototype.repeat`：把字符串重复若干次 / Implement `String.prototype.repeat`: repeat the string a given number of times",
+    "return": "重复后的新字符串 / The repeated new string",
+    "warning": "`count` 为负时抛出 `Invalid count value` / Throws `Invalid count value` when the count is negative"
+  },
+  "string_trim_side": {
+    "brief": "只裁剪字符串的一端：`ud` 选择裁右端还是左端 / Trim only one end of the string: `ud` selects right end versus left end",
+    "params": {
+      "ud": "非空裁右端（trimEnd），为空裁左端（trimStart）/ Non-null trims the right end (trimEnd), null the left end (trimStart)"
+    },
+    "return": "裁剪后的子串 / The trimmed substring"
+  },
+  "repl_grow": {
+    "brief": "确保缓冲区还能再放下 `need` 字节，不够则翻倍扩容 / Ensure the buffer holds `need` more bytes, doubling its capacity when short",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "out": "inout:当前输出缓冲区，扩容时会被替换 / Current output buffer, replaced when grown",
+      "o": "已写入的字节数 / Number of bytes already written",
+      "cap": "inout:缓冲区容量，扩容后写回新值 / Buffer capacity, updated in place when grown",
+      "need": "本次还需要写入的字节数 / Number of additional bytes required"
+    },
+    "return": "可能已扩容的缓冲区指针 / The buffer pointer, possibly after growth",
+    "note": "容量足够时原样返回，不做任何分配 / Returns the buffer untouched when capacity suffices"
+  },
+  "repl_value": {
+    "brief": "把替换参数取成字符串；若为函数则先回调求值 / Resolve a replacement argument to a string, calling it first when it is a function",
+    "details": "替换值为可调用对象时，以 `(match, offset, input)` 三个实参调用，并把返回值转成字符串；否则直接转字符串。| When the replacement is callable it is invoked with `(match, offset, input)` and the result is stringified; otherwise the value itself is stringified.",
+    "return": "替换文本 / The replacement text"
+  },
+  "replaceall_empty": {
+    "brief": "空查找串：在每两个字符之间插入替换文本 / Empty search string: insert the replacement between every pair of characters",
+    "return": "插入后的新字符串 / The resulting new string"
+  },
+  "replaceall_plain": {
+    "brief": "逐处替换非空子串的所有出现 / Replace every occurrence of a non-empty substring",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "s": "源文本 / Source text",
+      "n": "非空的查找子串 / Non-empty search substring",
+      "rep": "替换值 / Replacement value"
+    },
+    "return": "替换后的新字符串 / The resulting new string",
+    "note": "输出缓冲区按需经 `repl_grow` 翻倍扩容 / The output buffer is grown on demand through `repl_grow`"
+  },
+  "string_replaceAll": {
+    "brief": "实现 `String.prototype.replaceAll`：替换全部匹配 / Implement `String.prototype.replaceAll`: replace all matches",
+    "details": "查找值为正则时复用 `string.replace` 的全局路径；空查找串走逐字符插入；否则逐处替换。| A regex search string reuses the global path of `string.replace`; an empty needle inserts between characters; otherwise every occurrence is replaced.",
+    "return": "替换后的新字符串 / The resulting new string"
+  },
+  "string_codePointAt": {
+    "brief": "实现 `String.prototype.codePointAt`：取下标处码点的完整值 / Implement `String.prototype.codePointAt`: read the full code point at an index",
+    "return": "该下标的完整 Unicode 码点；下标越界时返回 `undefined` / The full Unicode code point at that index, or `undefined` when out of range"
+  },
+  "string_localeCompare": {
+    "brief": "实现 `String.prototype.localeCompare`：按码元比较返回 -1/0/1 / Implement `String.prototype.localeCompare`: compare code units returning -1/0/1",
+    "details": "引擎没有本地化排序表，因此退化为普通 `strcmp` 比较。| The engine has no collation tables, so this degrades to a plain `strcmp` comparison.",
+    "return": "小于返回 -1、相等返回 0、大于返回 1 / -1 when smaller, 0 when equal, 1 when larger"
+  },
+  "string_matchAll": {
+    "brief": "实现 `String.prototype.matchAll`：收集全局正则的全部匹配 / Implement `String.prototype.matchAll`: collect all matches of a global regex",
+    "return": "由各次匹配结果数组组成的数组 / An array of per-match result arrays"
+  },
+  "arr_of": {
+    "brief": "把 `thisv` 当作数组对象取出 / Take `thisv` as an array object",
+    "params": {
+      "thisv": "调用时的 this 值 / The `this` value of the call"
+    },
+    "return": "数组对象指针；`thisv` 不是对象时返回 `NULL` / The object pointer, or `NULL` when `thisv` is not an object"
+  },
+  "array_join_impl": {
+    "brief": "用分隔符把数组元素连接成字符串 / Join the elements of an array into a string using a separator",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "src": "源数组对象 / Source array object",
+      "sep": "元素之间的分隔符 / Separator inserted between elements"
+    },
+    "return": "连接后的字符串值 / The joined string value",
+    "note": "`undefined` 与 `null` 元素按空串处理，输出缓冲按需翻倍扩容 / `undefined` and `null` elements become the empty string and the output buffer doubles on demand"
+  },
+  "array_join": {
+    "brief": "实现 `Array.prototype.join`：用分隔符连接元素 / Implement `Array.prototype.join`: join elements with a separator",
+    "return": "连接后的字符串；`thisv` 非数组时为空串 / The joined string, or the empty string when `thisv` is not an array"
+  },
+  "array_push": {
+    "brief": "实现 `Array.prototype.push`：在尾部追加元素 / Implement `Array.prototype.push`: append elements at the end",
+    "return": "追加后的新长度 / The new length after appending"
+  },
+  "array_pop": {
+    "brief": "实现 `Array.prototype.pop`：弹出并返回尾元素 / Implement `Array.prototype.pop`: remove and return the last element",
+    "return": "被移除的尾元素；数组为空时返回 `undefined` / The removed last element, or `undefined` when the array is empty"
+  },
+  "array_shift": {
+    "brief": "实现 `Array.prototype.shift`：移除并返回首元素 / Implement `Array.prototype.shift`: remove and return the first element",
+    "return": "被移除的首元素；数组为空时返回 `undefined` / The removed first element, or `undefined` when the array is empty",
+    "note": "剩余元素整体前移一位 / The remaining elements are shifted one slot toward the front"
+  },
+  "array_unshift": {
+    "brief": "实现 `Array.prototype.unshift`：在头部插入元素 / Implement `Array.prototype.unshift`: insert elements at the front",
+    "return": "插入后的新长度 / The new length after insertion"
+  },
+  "array_slice": {
+    "brief": "实现 `Array.prototype.slice`：按可负区间截取新数组 / Implement `Array.prototype.slice`: copy a possibly negative range into a new array",
+    "return": "由区间元素组成的新数组 / A new array holding the range elements"
+  },
+  "array_splice": {
+    "brief": "实现 `Array.prototype.splice`：删除并可选插入元素 / Implement `Array.prototype.splice`: delete and optionally insert elements",
+    "return": "由被删除元素组成的新数组 / A new array holding the removed elements",
+    "note": "从第 2 个实参起作为要插入的元素，插入到删除位置 / Arguments from the second onward are inserted at the removal position"
+  },
+  "array_concat": {
+    "brief": "实现 `Array.prototype.concat`：拼接自身与各实参 / Implement `Array.prototype.concat`: concatenate the receiver and all arguments",
+    "return": "拼接后的新数组 / The concatenated new array",
+    "note": "数组实参逐个展开，非数组实参整体作为单个元素 / Array arguments are spread, other arguments are appended as single elements"
+  },
+  "array_indexOf": {
+    "brief": "实现 `Array.prototype.indexOf`：从前往后查找元素 / Implement `Array.prototype.indexOf`: search for an element forward",
+    "return": "命中元素的下标；未命中时返回 -1 / The index of the matching element, or -1 when not found"
+  },
+  "array_lastIndexOf": {
+    "brief": "实现 `Array.prototype.lastIndexOf`：从后往前查找元素 / Implement `Array.prototype.lastIndexOf`: search for an element backward",
+    "return": "最后一次命中的下标；未命中时返回 -1 / The index of the last match, or -1 when not found"
+  },
+  "array_includes": {
+    "brief": "实现 `Array.prototype.includes`：判断是否包含某值 / Implement `Array.prototype.includes`: test whether a value is present",
+    "return": "命中返回 `true`，否则返回 `false` / `true` when present, otherwise `false`",
+    "note": "同时按 `SameValueZero` 处理 `NaN` / `NaN` is matched following `SameValueZero`"
+  },
+  "arr_iterate": {
+    "brief": "数组遍历公共骨架：按模式决定回调与返回形态 / Shared array-iteration skeleton: the mode selects the callback and result shape",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "src": "源数组对象 / Source array object",
+      "cb": "逐元素回调 / Per-element callback",
+      "this_arg": "回调调用时的 this / `this` value for the callback",
+      "mode": "遍历模式（`ARR_*` 枚举）/ Iteration mode (`ARR_*` enum)"
+    },
+    "return": "随 `mode` 变化：新数组、布尔、元素值、下标或 `undefined` / Varies with `mode`: a new array, a boolean, an element, an index, or `undefined`",
+    "note": "回调以 `(value, index, array)` 三个实参调用 / The callback is invoked with `(value, index, array)`"
+  },
+  "array_forEach": {
+    "brief": "实现 `Array.prototype.forEach`：逐元素调用回调 / Implement `Array.prototype.forEach`: invoke a callback per element",
+    "return": "始终返回 `undefined` / Always returns `undefined`",
+    "note": "回调不可调用时直接返回 / Returns immediately when the callback is not callable"
+  },
+  "array_map": {
+    "brief": "实现 `Array.prototype.map`：把回调结果收集为新数组 / Implement `Array.prototype.map`: collect callback results into a new array",
+    "return": "映射后的新数组；回调不可调用时为空数组 / The mapped new array, or an empty array when the callback is not callable"
+  },
+  "array_filter": {
+    "brief": "实现 `Array.prototype.filter`：保留回调为真的元素 / Implement `Array.prototype.filter`: keep the elements whose callback is truthy",
+    "return": "筛选后的新数组 / The filtered new array"
+  },
+  "array_some": {
+    "brief": "实现 `Array.prototype.some`：是否存在回调为真的元素 / Implement `Array.prototype.some`: test whether any element passes the callback",
+    "return": "任一为真返回 `true`，否则返回 `false` / `true` when any element passes, otherwise `false`"
+  },
+  "array_every": {
+    "brief": "实现 `Array.prototype.every`：是否所有元素都通过回调 / Implement `Array.prototype.every`: test whether all elements pass the callback",
+    "return": "全部通过返回 `true`，否则返回 `false` / `true` when all pass, otherwise `false`"
+  },
+  "array_find": {
+    "brief": "实现 `Array.prototype.find`：返回首个通过回调的元素 / Implement `Array.prototype.find`: return the first element passing the callback",
+    "return": "首个命中的元素；无命中时返回 `undefined` / The first matching element, or `undefined` when none matches"
+  },
+  "array_findIndex": {
+    "brief": "实现 `Array.prototype.findIndex`：返回首个通过回调的下标 / Implement `Array.prototype.findIndex`: return the index of the first element passing the callback",
+    "return": "首个命中的下标；无命中时返回 -1 / The first matching index, or -1 when none matches"
+  },
+  "array_reduce": {
+    "brief": "实现 `Array.prototype.reduce`：从左到右累积 / Implement `Array.prototype.reduce`: accumulate from left to right",
+    "return": "最终累积值 / The final accumulator value",
+    "warning": "回调不可调用或空数组且无初值时抛出错误 / Throws when the callback is not callable, or on an empty array without an initial value"
+  },
+  "array_reduceRight": {
+    "brief": "实现 `Array.prototype.reduceRight`：从右到左累积 / Implement `Array.prototype.reduceRight`: accumulate from right to left",
+    "return": "最终累积值 / The final accumulator value",
+    "warning": "回调不可调用或空数组且无初值时抛出错误 / Throws when the callback is not callable, or on an empty array without an initial value"
+  },
+  "array_find_last": {
+    "brief": "实现 `findLast`/`findLastIndex`：从右往左找首个命中 / Implement `findLast`/`findLastIndex`: find the first hit scanning from the right",
+    "params": {
+      "ud": "非空返回元素（findLast），为空返回下标（findLastIndex）/ Non-null returns the element (findLast), null returns the index (findLastIndex)"
+    },
+    "return": "命中的元素或其下标，无命中时分别为 `undefined` 或 -1 / The matching element or its index, or `undefined` / -1 when none matches"
+  },
+  "array_copyWithin": {
+    "brief": "实现 `Array.prototype.copyWithin`：区间内就地搬运元素 / Implement `Array.prototype.copyWithin`: copy an element range in place",
+    "details": "把 `[from, end)` 拷贝到 `target` 起的位置，区间重叠时反向拷贝以免覆盖源数据。| Copies `[from, end)` to start at `target`, copying backwards when the ranges overlap so source data is not clobbered.",
+    "return": "被修改的数组本身 / The modified array itself"
+  },
+  "array_entries": {
+    "brief": "实现 `Array.prototype.entries`：产出 `[下标, 元素]` 对的可迭代对象 / Implement `Array.prototype.entries`: an iterable of `[index, value]` pairs",
+    "return": "可迭代的结果对象 / An iterable result object"
+  },
+  "array_iter_self": {
+    "brief": "`Array.prototype[Symbol.iterator]`：直接返回数组自身 / `Array.prototype[Symbol.iterator]`: return the array itself",
+    "details": "取迭代长度与元素的下标访问已经能遍历数组元素，因此直接返回 `this` 即可支持 for-of 与展开。| Length and indexed access already walk array elements, so returning `this` supports for-of and spread directly.",
+    "return": "未改动的 `thisv` / `thisv` unchanged"
+  },
+  "array_reverse": {
+    "brief": "实现 `Array.prototype.reverse`：就地反转元素顺序 / Implement `Array.prototype.reverse`: reverse the elements in place",
+    "return": "被修改的数组本身 / The modified array itself"
+  },
+  "default_cmp": {
+    "brief": "默认排序比较：按字符串字典序，`undefined` 排在末尾 / Default sort comparison: lexicographic by string, with `undefined` ordered last",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "x": "左参与比较的值 / Left value to compare",
+      "y": "右参与比较的值 / Right value to compare",
+      "undef": "out:置 1 表示本次比较涉及 `undefined` / Set to 1 when this comparison involved `undefined`"
+    },
+    "return": "负、零、正分别表示 x 小于、等于、大于 y / Negative, zero, or positive as x is less than, equal to, or greater than y"
+  },
+  "array_sort": {
+    "brief": "实现 `Array.prototype.sort`：就地稳定排序 / Implement `Array.prototype.sort`: sort in place, stably",
+    "details": "使用插入排序以保证稳定性；提供了比较函数时用其返回值定序，返回 `NaN` 视为相等；否则走 `default_cmp`。| Insertion sort is used for stability; a supplied comparator decides the order with `NaN` treated as equal; otherwise `default_cmp` is used.",
+    "return": "被修改的数组本身 / The modified array itself"
+  },
+  "flat_into": {
+    "brief": "把数组按指定深度展平并追加到输出数组 / Flatten an array to a given depth, appending into an output array",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "out": "接收展平结果的数组 / Array receiving the flattened elements",
+      "src": "待展平的源数组 / Source array to flatten",
+      "depth": "剩余可展平深度，为 0 时不再下钻 / Remaining flatten depth, no recursion when 0"
+    },
+    "note": "深度大于 0 且元素为数组时递归下钻，否则原样追加 / Recurses when depth is positive and an element is an array, otherwise appends it verbatim"
+  },
+  "array_flat": {
+    "brief": "实现 `Array.prototype.flat`：按深度展平数组 / Implement `Array.prototype.flat`: flatten an array to a given depth",
+    "return": "展平后的新数组 / The flattened new array"
+  },
+  "array_flatMap": {
+    "brief": "实现 `Array.prototype.flatMap`：先映射再按深度 1 展平 / Implement `Array.prototype.flatMap`: map then flatten to depth 1",
+    "return": "映射并展平后的新数组 / The mapped and flattened new array"
+  },
+  "array_toString": {
+    "brief": "实现 `Array.prototype.toString`：等同于无分隔符参数的 `join` / Implement `Array.prototype.toString`: equivalent to `join` with the default separator",
+    "return": "连接后的字符串 / The joined string"
+  },
+  "array_at": {
+    "brief": "实现 `Array.prototype.at`：支持下标的负值取元素 / Implement `Array.prototype.at`: read an element with possibly negative index",
+    "return": "该下标处的元素；越界时返回 `undefined` / The element at that index, or `undefined` when out of range"
+  },
+  "array_fill": {
+    "brief": "实现 `Array.prototype.fill`：把区间元素填成同一个值 / Implement `Array.prototype.fill`: set a range of elements to one value",
+    "return": "被修改的数组本身 / The modified array itself"
+  },
+  "array_keys": {
+    "brief": "实现 `Array.prototype.keys`：产出下标数组 / Implement `Array.prototype.keys`: produce the index array",
+    "return": "由 0 到长度减一组成的数组 / An array of 0 through length - 1"
+  },
+  "array_values": {
+    "brief": "实现 `Array.prototype.values`：产出元素数组 / Implement `Array.prototype.values`: produce the value array",
+    "return": "按顺序复制出的元素数组 / An array of the elements in order"
+  },
+  "native_array_from": {
+    "brief": "实现 `Array.from`：由可迭代对象构造数组并可选映射 / Implement `Array.from`: build an array from an iterable, optionally mapping",
+    "details": "遍历源对象的迭代长度；若传入映射函数则对每个元素以 `(value, index)` 调用并采用其返回值。| Walks the source's iteration length; when a map function is given each element is passed through it as `(value, index)`.",
+    "return": "新建的数组 / The newly built array"
+  },
+  "native_array_of": {
+    "brief": "实现 `Array.of`：用全部实参构造数组 / Implement `Array.of`: build an array from all arguments",
+    "return": "由实参组成的数组 / An array built from the arguments"
+  },
+  "native_array_is_array": {
+    "brief": "实现 `Array.isArray`：判断是否为数组对象 / Implement `Array.isArray`: test whether a value is an array object",
+    "return": "是数组返回 `true`，否则返回 `false` / `true` when it is an array, otherwise `false`"
+  },
+  "js_array_install_methods": {
+    "brief": "数组方法安装占位：当前为空实现 / Placeholder for array-method installation: currently a no-op",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "arr": "目标数组对象 / Target array object"
+    },
+    "note": "两个参数均未被使用，保留以维持调用点稳定 / Both parameters are unused and kept only to keep the call site stable"
+  },
+  "object_keys": {
+    "brief": "实现 `Object.keys`：取对象的自有可枚举键 / Implement `Object.keys`: own enumerable keys of an object",
+    "return": "键名组成的数组；非对象参数为空数组 / An array of key names, or an empty array for a non-object argument"
+  },
+  "object_values": {
+    "brief": "实现 `Object.values`：取对象的自有可枚举值 / Implement `Object.values`: own enumerable values of an object",
+    "return": "属性值组成的数组 / An array of property values"
+  },
+  "object_entries": {
+    "brief": "实现 `Object.entries`：取 `[键, 值]` 对数组 / Implement `Object.entries`: an array of `[key, value]` pairs",
+    "return": "由键值对数组组成的数组 / An array of key/value pair arrays"
+  },
+  "object_assign": {
+    "brief": "实现 `Object.assign`：把各来源对象属性拷入目标 / Implement `Object.assign`: copy properties from sources into the target",
+    "return": "目标对象；目标不是对象时原样返回 / The target object, returned unchanged when it is not an object",
+    "note": "只处理对象来源，非对象来源被跳过 / Only object sources are processed; others are skipped"
+  },
+  "object_freeze": {
+    "brief": "实现 `Object.freeze`：把对象标记为冻结 / Implement `Object.freeze`: mark an object as frozen",
+    "return": "被冻结的对象 / The frozen object",
+    "note": "仅设置内部状态位，实际仍可读写 / Only an internal state flag is set; the object remains readable and writable"
+  },
+  "object_create": {
+    "brief": "实现 `Object.create`：以给定原型新建对象 / Implement `Object.create`: create an object with a given prototype",
+    "return": "新对象 / The new object",
+    "note": "原型参数非对象时新对象的原型为 `NULL` / The new object's prototype is `NULL` when the argument is not an object"
+  },
+  "object_define_property": {
+    "brief": "实现 `Object.defineProperty`：写入数据属性或访问器属性 / Implement `Object.defineProperty`: install a data or accessor property",
+    "details": "描述符含 `get`/`set` 时安装访问器，否则取 `value` 写入数据属性。| When the descriptor provides `get`/`set` an accessor is installed; otherwise `value` is written as a data property.",
+    "return": "目标对象；目标不是对象时原样返回 / The target object, returned unchanged when it is not an object"
+  },
+  "object_get_property_descriptor": {
+    "brief": "实现 `Object.getOwnPropertyDescriptor`：读取属性的描述符 / Implement `Object.getOwnPropertyDescriptor`: read a property's descriptor",
+    "return": "含 `value`/`writable` 或 `get`/`set` 及 `enumerable` 的描述符对象；属性不存在时返回 `undefined` / A descriptor object with `value`/`writable` or `get`/`set` plus `enumerable`, or `undefined` when the property is absent"
+  },
+  "object_has_own": {
+    "brief": "实现 `Object.hasOwn`：判断是否含自有属性 / Implement `Object.hasOwn`: test whether an object has an own property",
+    "return": "包含返回 `true`，否则返回 `false` / `true` when present, otherwise `false`"
+  },
+  "object_get_prototype_of": {
+    "brief": "实现 `Object.getPrototypeOf`：读取对象的原型 / Implement `Object.getPrototypeOf`: read an object's prototype",
+    "return": "原型对象；无原型或参数非对象时返回 `null` / The prototype object, or `null` when there is none or the argument is not an object"
+  },
+  "object_set_prototype_of": {
+    "brief": "实现 `Object.setPrototypeOf`：设置对象的原型 / Implement `Object.setPrototypeOf`: set an object's prototype",
+    "return": "传入的对象本身 / The object passed in",
+    "note": "原型参数非对象时置为 `NULL` / The prototype becomes `NULL` when the argument is not an object"
+  },
+  "object_this_toString": {
+    "brief": "实现 `Object.prototype.toString`：返回 `[object 类名]` 形式 / Implement `Object.prototype.toString`: return the `[object Class]` form",
+    "details": "`undefined`/`null` 单独处理，原始值按 `String`/`Number`/`Boolean` 归类，对象取 `class_name`（`Module` 归为 `Object`）。| `undefined`/`null` are handled specially, primitives map to `String`/`Number`/`Boolean`, and objects use `class_name` (`Module` collapses to `Object`).",
+    "return": "形如 `[object Class]` 的字符串 / A string of the form `[object Class]`"
+  },
+  "object_this_valueOf": {
+    "brief": "实现 `Object.prototype.valueOf`：返回 `this` 本身 / Implement `Object.prototype.valueOf`: return `this` as-is",
+    "return": "未改动的 `thisv` / `thisv` unchanged"
+  },
+  "object_from_entries": {
+    "brief": "实现 `Object.fromEntries`：由 `[键, 值]` 列表构造对象 / Implement `Object.fromEntries`: build an object from a list of `[key, value]` pairs",
+    "return": "新建的对象 / The newly built object"
+  },
+  "object_get_own_property_names": {
+    "brief": "实现 `Object.getOwnPropertyNames`：列出含不可枚举的自有键 / Implement `Object.getOwnPropertyNames`: list own keys including non-enumerable ones",
+    "return": "自有属性名组成的数组 / An array of own property names",
+    "note": "数组参数会先补上下标键，再列出显式属性 / For an array argument the index keys are listed first, followed by explicit properties"
+  },
+  "object_seal": {
+    "brief": "实现 `Object.seal`：把对象标记为封闭 / Implement `Object.seal`: mark an object as sealed",
+    "return": "被封闭的对象 / The sealed object",
+    "note": "仅设置内部状态位，属性属性未被真正锁定 / Only an internal state flag is set; attributes are not actually locked"
+  },
+  "object_is_sealed": {
+    "brief": "实现 `Object.isSealed`：判断对象是否被封闭 / Implement `Object.isSealed`: test whether an object is sealed",
+    "return": "已封闭或非对象返回 `true`，否则 `false` / `true` when sealed or not an object, otherwise `false`"
+  },
+  "object_is_frozen": {
+    "brief": "实现 `Object.isFrozen`：判断对象是否被冻结 / Implement `Object.isFrozen`: test whether an object is frozen",
+    "return": "已冻结或非对象返回 `true`，否则 `false` / `true` when frozen or not an object, otherwise `false`"
+  },
+  "number_this_valueOf": {
+    "brief": "实现 `Number.prototype.valueOf`：取出 `this` 的数值 / Implement `Number.prototype.valueOf`: extract the numeric value of `this`",
+    "details": "原始数字直接返回；包装对象读取内部 `__prim`；其余情况按数值强转。| A primitive number is returned as-is; a wrapper object reads its internal `__prim`; anything else is coerced to a number.",
+    "return": "数值结果 / The numeric result"
+  },
+  "number_this_toString": {
+    "brief": "实现 `Number.prototype.toString`：按指定进制转字符串 / Implement `Number.prototype.toString`: format a number in a given radix",
+    "details": "十进制或缺省走常规数字转字符串；`2..36` 内的整数在 `±1e15` 范围内手工按位转换，其余回退到十进制。| Decimal or no radix uses the ordinary number formatter; integers within `±1e15` and a radix of `2..36` are converted digit by digit, anything else falls back to decimal.",
+    "return": "格式化后的字符串 / The formatted string"
+  },
+  "number_toFixed": {
+    "brief": "实现 `Number.prototype.toFixed`：保留指定小数位 / Implement `Number.prototype.toFixed`: format with a fixed number of fraction digits",
+    "details": "小数位数裁剪到 `0..20`；`NaN` 与无穷回退到常规数字字符串。| The fraction-digit count is clamped to `0..20`; `NaN` and infinities fall back to the ordinary number string.",
+    "return": "定点格式的字符串 / The fixed-point formatted string"
+  },
+  "number_toPrecision": {
+    "brief": "实现 `Number.prototype.toPrecision`：按有效数字位格式化 / Implement `Number.prototype.toPrecision`: format with a given number of significant digits",
+    "return": "格式化后的字符串；未给参数时等同常规数字字符串 / The formatted string, or the ordinary number string when no argument is given"
+  }
+}

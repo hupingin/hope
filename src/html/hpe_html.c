@@ -556,13 +556,16 @@ static int is_head_content(const char *tag)
  *
  * @param[in]     tag 标签名 / Tag name
  *
- * @return `style` 或 `script` 返回 1 / 1 for `style` or `script`
+ * @return `style` / `script` 或 `textarea` 返回 1 / 1 for `style`, `script` or `textarea`
  *
- * @note 原始文本元素内部不做标签解析，直到遇到自己的结束标签 / Their body is not tag-parsed until their own end tag appears
+ * @note 原始文本元素内部不做标签解析，直到遇到自己的结束标签；`textarea` 按 HTML 规范是
+ *       RCDATA（实体仍解码，`parse_rawtext_body` 已有该行为）/ Their body is not tag-parsed
+ *       until their own end tag appears; per the HTML spec `textarea` is RCDATA (entities
+ *       still decoded, which `parse_rawtext_body` already does)
  */
 static int is_rawtext(const char *tag)
 {
-    return !strcmp(tag, "style") || !strcmp(tag, "script");
+    return !strcmp(tag, "style") || !strcmp(tag, "script") || !strcmp(tag, "textarea");
 }
 
 /**

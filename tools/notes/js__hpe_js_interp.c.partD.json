@@ -1,0 +1,948 @@
+{
+  "number_toExponential": {
+    "brief": "Number.prototype.toExponential：把数字格式化为科学计数法 / Number.prototype.toExponential: format a number in exponential notation",
+    "params": {
+      "thisv": "被转换的数字接收者 / The numeric receiver being converted",
+      "a": "实参数组，`a[0]` 为小数位数 / Argument array; `a[0]` is the fraction-digit count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "格式化后的字符串 / The formatted string",
+    "note": "数字为 NaN 或 ±Infinity 时回退到 js_num_to_string；未给位数时用 `%e` 默认精度 / NaN and ±Infinity fall back to js_num_to_string; without a digit count the default `%e` precision is used"
+  },
+  "number_toLocaleString": {
+    "brief": "Number.prototype.toLocaleString：按本地化形式返回数字（无 Intl，等于普通数值串）/ Number.prototype.toLocaleString: return the number in locale form (no Intl, so it is the plain numeric string)",
+    "params": {
+      "a": "实参数组，忽略 / Argument array; ignored",
+      "argc": "实参个数，忽略 / Argument count; ignored",
+      "ud": "未使用 / Unused"
+    },
+    "return": "数字的普通字符串形式 / The number as a plain string",
+    "note": "引擎未实现 Intl，不做千分位分组 / The engine has no Intl database and performs no grouping"
+  },
+  "number_is_integer": {
+    "brief": "Number.isInteger：判断参数是否为整数值 / Number.isInteger: test whether the argument is an integer value",
+    "params": {
+      "a": "实参数组，`a[0]` 为待测值 / Argument array; `a[0]` is the value under test",
+      "thisv": "忽略 / Ignored",
+      "ud": "未使用 / Unused"
+    },
+    "return": "是整数值返回 true / true when the value is an integer",
+    "note": "仅当类型为 `number`、非 NaN、非 ±Infinity 且 `floor(v)==v` 时为真 / True only when the type is `number`, not NaN, not ±Infinity and `floor(v)==v`"
+  },
+  "number_is_finite_fn": {
+    "brief": "Number.isFinite：判断参数是否为有限数字 / Number.isFinite: test whether the argument is a finite number",
+    "params": {
+      "a": "实参数组，`a[0]` 为待测值 / Argument array; `a[0]` is the value under test",
+      "thisv": "忽略 / Ignored",
+      "ud": "未使用 / Unused"
+    },
+    "return": "是有限数字返回 true / true when the value is a finite number",
+    "note": "与全局 isFinite 不同，不做类型转换：非 `number` 一律为假 / Unlike the global isFinite this performs no coercion: anything that is not a `number` is false"
+  },
+  "number_is_nan_fn": {
+    "brief": "Number.isNaN：判断参数是否为数值 NaN / Number.isNaN: test whether the argument is the numeric NaN",
+    "params": {
+      "a": "实参数组，`a[0]` 为待测值 / Argument array; `a[0]` is the value under test",
+      "thisv": "忽略 / Ignored",
+      "ud": "未使用 / Unused"
+    },
+    "return": "是 NaN 返回 true / true when the value is NaN",
+    "note": "仅当类型为 `number` 且 `v != v` 时为真，不做类型转换 / True only when the type is `number` and `v != v`, with no coercion"
+  },
+  "number_is_safe_integer": {
+    "brief": "Number.isSafeInteger：判断参数是否为安全整数 / Number.isSafeInteger: test whether the argument is a safe integer",
+    "params": {
+      "a": "实参数组，`a[0]` 为待测值 / Argument array; `a[0]` is the value under test",
+      "thisv": "忽略 / Ignored",
+      "ud": "未使用 / Unused"
+    },
+    "return": "是安全整数返回 true / true when the value is a safe integer",
+    "note": "要求类型为 `number`、`floor(v)==v` 且 |v| ≤ 2^53-1 / Requires type `number`, `floor(v)==v` and |v| ≤ 2^53-1"
+  },
+  "bool_this_valueOf": {
+    "brief": "Boolean.prototype.valueOf：取布尔接收者的原始布尔值 / Boolean.prototype.valueOf: return the primitive boolean of the receiver",
+    "params": {
+      "a": "实参数组，忽略 / Argument array; ignored",
+      "argc": "实参个数，忽略 / Argument count; ignored",
+      "ud": "未使用 / Unused"
+    },
+    "return": "原始布尔值 / The primitive boolean value",
+    "note": "接收者已是布尔则直接返回；是对象时取内部 `__prim`；否则对接收者做数值转换后判非零 / Returns the receiver when already boolean, reads the internal `__prim` for objects, otherwise coerces the receiver to a number and tests it against zero"
+  },
+  "bool_this_toString": {
+    "brief": "Boolean.prototype.toString：返回 `true` 或 `false` / Boolean.prototype.toString: return `true` or `false`",
+    "params": {
+      "a": "实参数组，忽略 / Argument array; ignored",
+      "argc": "实参个数，忽略 / Argument count; ignored",
+      "ud": "未使用 / Unused"
+    },
+    "return": "`true` 或 `false` 字符串 / The string `true` or `false`",
+    "note": "基于 js_truthy 判定接收者的真值 / The receiver's truthiness is decided by js_truthy"
+  },
+  "number_this_toString_radix": {
+    "brief": "Number.prototype.toString 的基数版本（占位实现）/ Radix-aware Number.prototype.toString (placeholder implementation)",
+    "params": {
+      "thisv": "忽略 / Ignored",
+      "a": "实参数组，忽略 / Argument array; ignored",
+      "argc": "实参个数，忽略 / Argument count; ignored",
+      "ud": "未使用 / Unused"
+    },
+    "return": "目前固定返回 `undefined` / Currently always returns `undefined`",
+    "note": "该版本尚未实现，所有入参均被忽略 / This version is not implemented yet and ignores all arguments"
+  },
+  "jsbuf_init": {
+    "brief": "初始化字符串输出缓冲 / Initialise a string output buffer",
+    "details": "容量固定为 256 字节并分配堆内存，`len` 清零，缓冲区置为空串 / The capacity starts at 256 bytes, heap memory is allocated, `len` is zeroed and the buffer is set to the empty string.",
+    "params": {
+      "b": "inout:待初始化的字符串缓冲 / String buffer to initialise"
+    },
+    "note": "使用完毕必须调用 jsbuf_free 释放 / The caller must release it with jsbuf_free"
+  },
+  "jsbuf_add": {
+    "brief": "向字符串缓冲追加指定字节数 / Append bytes to a string buffer",
+    "details": "缓冲不足时容量反复翻倍再 realloc，随后拷贝 `n` 字节并补写结尾 NUL / When the buffer is too small the capacity is doubled repeatedly and realloc'd, then `n` bytes are copied and a trailing NUL is written.",
+    "params": {
+      "b": "inout:目标字符串缓冲 / Target string buffer",
+      "s": "要追加的字节 / Bytes to append",
+      "n": "要追加的字节数（可为 0）/ Number of bytes to append (may be 0)"
+    },
+    "note": "缓冲未成功分配（`b->s` 为 `NULL`）时直接返回 / Returns immediately when the buffer was never allocated (`b->s` is `NULL`)"
+  },
+  "jsbuf_free": {
+    "brief": "释放字符串输出缓冲 / Free a string output buffer",
+    "params": {
+      "b": "inout:要释放的字符串缓冲 / String buffer to release"
+    },
+    "note": "释放后把 `b->s` 置为 `NULL`，可安全重复调用 / After freeing, `b->s` is set to `NULL` so repeated calls are safe"
+  },
+  "json_quote": {
+    "brief": "按 JSON 语法给字符串加引号并转义 / Quote and escape a string per the JSON grammar",
+    "details": "处理 `\"`、`\\` 与 `\\n \\r \\t \\b \\f` 等控制字符；其余小于 0x20 的字节转成 `\\u00xx`，高位 UTF-8 字节原样输出 / Handles `\"`, `\\` and the control escapes `\\n \\r \\t \\b \\f`; other bytes below 0x20 become `\\u00xx` and multi-byte UTF-8 is copied verbatim.",
+    "params": {
+      "b": "inout:JSON 输出缓冲 / JSON output buffer",
+      "s": "要转义的字符串，`NULL` 视作空串 / String to escape; `NULL` is treated as the empty string"
+    }
+  },
+  "json_is_function": {
+    "brief": "判断值是否为函数或原生对象 / Test whether a value is a function or a native object",
+    "params": {
+      "v": "待检查的值 / Value to inspect"
+    },
+    "return": "是函数或原生对象返回 1，否则返回 0 / 1 for a function or native object, otherwise 0",
+    "note": "这类值不可序列化，JSON.stringify 时按 `null` 处理 / Such values are not serialisable and become `null` in JSON.stringify"
+  },
+  "json_write_array": {
+    "brief": "把数组序列化为 `[e, ...]` / Serialise an array as `[e, ...]`",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "b": "inout:JSON 输出缓冲 / JSON output buffer",
+      "o": "要序列化的数组对象 / The array object to serialise",
+      "depth": "当前递归深度 / Current recursion depth"
+    },
+    "note": "按索引逐个写出，包括空洞 / Elements are written index by index, holes included"
+  },
+  "json_write_object": {
+    "brief": "把对象序列化为 `{\"k\":v, ...}` / Serialise an object as `{\"k\":v, ...}`",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "b": "inout:JSON 输出缓冲 / JSON output buffer",
+      "v": "被序列化的对象值 / The object value being serialised",
+      "o": "对象本体 / The underlying object",
+      "depth": "当前递归深度 / Current recursion depth"
+    },
+    "note": "遍历自有键，跳过值为 `undefined` 或函数的属性 / Walks own keys and skips properties whose value is `undefined` or a function"
+  },
+  "json_write_date": {
+    "brief": "把 Date 实例序列化为其 toJSON() 结果 / Serialise a Date instance as its toJSON() result",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "b": "inout:JSON 输出缓冲 / JSON output buffer",
+      "v": "Date 值 / The Date value",
+      "depth": "当前递归深度 / Current recursion depth"
+    },
+    "return": "成功的状态码，透传自 json_write / A status code propagated from json_write",
+    "note": "存在可调用的 `toJSON` 时调用并继续写出，否则直接输出 `js_to_string(v)` 的带引号形式 / When a callable `toJSON` exists it is invoked and its result written; otherwise the quoted `js_to_string(v)` is emitted"
+  },
+  "json_write": {
+    "brief": "递归写出任意值的 JSON 表示 / Recursively write the JSON representation of any value",
+    "details": "`undefined`/`null` 写 `null`；布尔写 `true`/`false`；数字写数值串，NaN 与 ±Infinity 写 `null`；字符串加引号；对象按数组、函数、Date、普通对象分派；其他类型统一写 `null` / `undefined`/`null` become `null`; booleans become `true`/`false`; numbers are written as numeric strings with NaN and ±Infinity as `null`; strings are quoted; objects dispatch to array, function, Date or plain-object handling; everything else writes `null`.",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "b": "inout:JSON 输出缓冲 / JSON output buffer",
+      "v": "待序列化的值 / Value to serialise",
+      "depth": "当前递归深度 / Current recursion depth"
+    },
+    "return": "写出成功返回 1；深度超过 64 层返回 0 以中断循环引用 / 1 on success; returns 0 once the depth exceeds 64 to break out of circular references",
+    "retval": {
+      "0": "递归过深，判定为循环结构 / Recursion too deep, treated as a circular structure",
+      "1": "已写出 / Written"
+    }
+  },
+  "json_stringify": {
+    "brief": "JSON.stringify：把首个参数序列化为 JSON 字符串 / JSON.stringify: serialise the first argument to a JSON string",
+    "params": {
+      "thisv": "忽略 / Ignored",
+      "a": "实参数组，`a[0]` 为待序列化值 / Argument array; `a[0]` is the value to serialise",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "JSON 字符串；参数为 `undefined` 时返回 `undefined` / The JSON string, or `undefined` when the argument is `undefined`",
+    "note": "检测到循环结构（json_write 返回 0）时抛出 “Converting circular structure to JSON” / Throws “Converting circular structure to JSON” when json_write signals a circular structure with 0"
+  },
+  "json_ws": {
+    "brief": "跳过 JSON 文本中的空白字符 / Skip whitespace in the JSON text",
+    "params": {
+      "j": "inout:JSON 解析游标 / JSON parser cursor"
+    },
+    "note": "空白包括空格、制表、换行与回车 / Whitespace covers space, tab, newline and carriage return"
+  },
+  "json_str_grow": {
+    "brief": "把 JSON 解码临时缓冲容量翻倍 / Double the capacity of the JSON decode scratch buffer",
+    "params": {
+      "j": "inout:JSON 解析游标 / JSON parser cursor",
+      "buf": "inout:解码缓冲指针 / Decode scratch buffer pointer",
+      "cap": "inout:缓冲容量 / Buffer capacity",
+      "n": "已写入的字节数，拷贝时保留 / Bytes already written, preserved by the copy"
+    }
+  },
+  "json_str_unicode": {
+    "brief": "把 `\\uXXXX` 转义解码为 UTF-8 / Decode a `\\uXXXX` escape to UTF-8",
+    "details": "最多读取四个十六进制数字并推进游标，随后把码点编码为 UTF-8 追加到缓冲 / Reads up to four hex digits while advancing the cursor, then appends the UTF-8 encoding of the code point.",
+    "params": {
+      "j": "inout:JSON 解析游标 / JSON parser cursor",
+      "buf": "inout:解码缓冲指针 / Decode scratch buffer pointer",
+      "cap": "inout:缓冲容量 / Buffer capacity",
+      "n": "inout:已写入字节计数 / Bytes-written counter"
+    },
+    "note": "代理对不做合并，单个 `\\uD800` 会原样单独编码 / Surrogate pairs are not combined; a lone `\\uD800` is encoded on its own"
+  },
+  "json_escape_simple": {
+    "brief": "解析单字符转义序列 / Resolve a single-character escape sequence",
+    "params": {
+      "e": "反斜杠后的转义字符 / The escape character following the backslash",
+      "c": "转义字符本身，作为默认回退 / The escape character itself, used as the fallback"
+    },
+    "return": "转义对应的实际字符 / The actual character the escape stands for",
+    "note": "只识别 `n t r b f`；其余情况原样返回第二个参数，配合宽容解析器不报错 / Only `n t r b f` are recognised; anything else returns the second argument unchanged so the tolerant parser never rejects it"
+  },
+  "json_parse_string": {
+    "brief": "解析一个 JSON 字符串字面量 / Parse one JSON string literal",
+    "params": {
+      "j": "inout:JSON 解析游标 / JSON parser cursor"
+    },
+    "return": "解析出的 JS 字符串 / The parsed JS string",
+    "note": "处理 `\\uXXXX` 与单字符转义；未闭合引号时以当前缓冲内容结束 / Handles `\\uXXXX` and single-character escapes; unterminated quotes end at the current buffer content"
+  },
+  "json_parse_array": {
+    "brief": "解析一个 JSON 数组 / Parse a JSON array",
+    "params": {
+      "j": "inout:JSON 解析游标 / JSON parser cursor"
+    },
+    "return": "解析出的 JS 数组对象 / The parsed JS array object",
+    "note": "元素之间以 `,` 分隔，遇到 `]` 结束 / Elements are separated by `,` and terminated by `]`"
+  },
+  "json_parse_object": {
+    "brief": "解析一个 JSON 对象 / Parse a JSON object",
+    "params": {
+      "j": "inout:JSON 解析游标 / JSON parser cursor"
+    },
+    "return": "解析出的 JS 普通对象 / The parsed JS plain object",
+    "note": "键必须是带引号的字符串，否则抛出 “JSON.parse: expected a property name” / Keys must be quoted strings, otherwise “JSON.parse: expected a property name” is thrown"
+  },
+  "json_parse_value": {
+    "brief": "递归下降解析一个 JSON 值 / Recursively parse one JSON value",
+    "details": "先跳过空白，再按首字符分派：`{`→对象、`[`→数组、`\"`→字符串、`true`/`false`/`null` 字面量，其余交给 `strtod` 解析数字（含负数与小数）/ Leading whitespace is skipped, then the first character dispatches: `{` to object, `[` to array, `\"` to string, the `true`/`false`/`null` literals, and everything else to `strtod` for numbers (including negatives and fractions).",
+    "params": {
+      "j": "inout:JSON 解析游标 / JSON parser cursor"
+    },
+    "return": "解析出的 JS 值 / The parsed JS value",
+    "note": "数字无法解析时抛出 “JSON.parse: unexpected token”；本函数是整个 JSON.parse 的递归入口，构成对象/数组的互相递归 / Throws “JSON.parse: unexpected token” when the number cannot be parsed; this is the recursion entry point of the whole JSON.parse and mutually recurses with the object and array parsers"
+  },
+  "json_parse": {
+    "brief": "JSON.parse：把首个参数解析为 JS 值 / JSON.parse: parse the first argument into a JS value",
+    "params": {
+      "thisv": "忽略 / Ignored",
+      "a": "实参数组，`a[0]` 为待解析文本 / Argument array; `a[0]` is the text to parse",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "解析得到的 JS 值 / The parsed JS value",
+    "note": "入参先做字符串转换，随后交给 json_parse_value / The argument is coerced to a string before being handed to json_parse_value"
+  },
+  "regex_obj_new": {
+    "brief": "构造一个 RegExp 对象 / Create a RegExp object",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "pattern": "模式串，`NULL` 视作空串 / Pattern string; `NULL` is treated as the empty string",
+      "flags": "标志串，`NULL` 视作空串 / Flag string; `NULL` is treated as the empty string"
+    },
+    "return": "新建的 RegExp 值 / The newly created RegExp value",
+    "note": "编译模式、设置标志，并写入 `source`、`flags`、`lastIndex` 属性 / Compiles the pattern, applies the flags and installs the `source`, `flags` and `lastIndex` properties"
+  },
+  "regex_last_index": {
+    "brief": "读取正则对象的 lastIndex / Read a regex object's lastIndex",
+    "params": {
+      "thisv": "正则对象 / The regex object"
+    },
+    "return": "非负的 lastIndex 整数（缺省或非正时为 0）/ The non-negative lastIndex as an int, or 0 when missing or not positive"
+  },
+  "regex_set_last_index": {
+    "brief": "写回正则对象的 lastIndex / Write back a regex object's lastIndex",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "thisv": "正则对象 / The regex object",
+      "v": "新的 lastIndex 值 / The new lastIndex value"
+    },
+    "note": "接收者不是对象时不做任何处理 / Does nothing when the receiver is not an object"
+  },
+  "regex_make_result": {
+    "brief": "由捕获下标构造正则匹配结果数组 / Build a regex match-result array from capture indices",
+    "details": "首元素为整体匹配子串；其后每个捕获组对应一个元素（未参与匹配时为 `undefined`）；再附加 `index`、`input`、`groups` 属性 / The first element is the whole match, each capture group follows (as `undefined` when unmatched), and `index`, `input` and `groups` are attached as extra properties.",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "s": "被匹配的输入字符串 / The input string that was matched",
+      "caps": "捕获下标数组，`caps[0]`/`caps[1]` 为整体匹配起止 / Capture index array; `caps[0]`/`caps[1]` bound the whole match",
+      "total": "捕获组个数 / Number of capture groups"
+    },
+    "return": "匹配结果数组 / The match-result array",
+    "note": "`caps[0]` 被钳制到 ≥0，`caps[1]` 被钳制到字符串长度 / `caps[0]` is clamped to ≥0 and `caps[1]` to the string length"
+  },
+  "regex_test": {
+    "brief": "RegExp.prototype.test：测试输入是否含匹配 / RegExp.prototype.test: test whether the input contains a match",
+    "params": {
+      "thisv": "正则对象接收者 / The regex receiver",
+      "a": "实参数组，`a[0]` 为被测试文本 / Argument array; `a[0]` is the text under test",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "存在匹配返回 true，否则 false / true when a match exists, otherwise false",
+    "note": "全局正则从 lastIndex 起搜，失败时把 lastIndex 复位为 0，成功时更新为匹配起点 / A global regex searches from lastIndex, resets it to 0 on failure and stores the match start on success"
+  },
+  "regex_exec": {
+    "brief": "RegExp.prototype.exec：执行一次匹配并返回结果 / RegExp.prototype.exec: perform one match and return the result",
+    "params": {
+      "thisv": "正则对象接收者 / The regex receiver",
+      "a": "实参数组，`a[0]` 为输入文本 / Argument array; `a[0]` is the input text",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "匹配结果数组；未匹配返回 `null` / The match-result array, or `null` when there is no match",
+    "note": "全局正则维护并更新 lastIndex；结果由 regex_make_result 生成 / A global regex maintains and updates lastIndex; the result is produced by regex_make_result"
+  },
+  "js_regex_new": {
+    "brief": "由正则字面量创建 RegExp 对象 / Create a RegExp object from a regex literal",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "pattern": "模式串 / Pattern string",
+      "flags": "标志串 / Flag string"
+    },
+    "return": "与 `new RegExp` 等价的 RegExp 值 / A RegExp value equivalent to `new RegExp`",
+    "note": "内部直接转发到 regex_obj_new / Internally forwards straight to regex_obj_new",
+    "see": "regex_obj_new"
+  },
+  "regex_toString": {
+    "brief": "RegExp.prototype.toString：返回 `/模式/标志` 形式 / RegExp.prototype.toString: return the `/pattern/flags` form",
+    "params": {
+      "thisv": "正则对象接收者 / The regex receiver",
+      "a": "实参数组，忽略 / Argument array; ignored",
+      "argc": "实参个数，忽略 / Argument count; ignored",
+      "ud": "未使用 / Unused"
+    },
+    "return": "形如 `/pat/flags` 的字符串 / A string of the form `/pat/flags`",
+    "note": "`source` 与 `flags` 缺失时按空串处理 / Missing `source` and `flags` are treated as empty strings"
+  },
+  "repl_expand": {
+    "brief": "展开替换模板中的 `$$`、`$&`、`$1`..`$9`、``$` ``、`$'` / Expand `$$`, `$&`, `$1`..`$9`, ``$` `` and `$'` in a replacement template",
+    "details": "`$$` 产生字面 `$`；`$&` 整个匹配；`$n` 第 n 组（超出范围或未匹配则跳过）；`` $` `` 匹配前的文本；`$'` 匹配后的文本；其他 `$x` 原样输出 `$` / `$$` yields a literal `$`; `$&` is the whole match; `$n` is capture n (skipped when out of range or unmatched); `` $` `` is the text before the match; `$'` is the text after it; any other `$x` emits a literal `$`.",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "b": "inout:输出缓冲 / Output buffer",
+      "rep": "替换模板（以 NUL 结尾）/ The replacement template, NUL-terminated",
+      "s": "被替换的原始输入 / The original input being replaced",
+      "caps": "捕获下标数组 / Capture index array",
+      "total": "捕获组个数 / Number of capture groups"
+    },
+    "note": "本函数只处理模板；回调形式的替换由 repl_append_match 处理 / This handles the template form only; callback-style replacement is handled by repl_append_match"
+  },
+  "repl_call_args": {
+    "brief": "为替换回调构造实参数组 / Build the argument array for a replacement callback",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "s": "被替换的原始输入 / The original input being replaced",
+      "caps": "捕获下标数组 / Capture index array",
+      "total": "捕获组个数 / Number of capture groups"
+    },
+    "return": "长度为 total+3 的实参数组：整体匹配、各捕获组（未匹配为 `undefined`）、偏移、输入字符串 / An argument array of length total+3: the whole match, each capture group (`undefined` when unmatched), the offset, then the input string"
+  },
+  "repl_append_match": {
+    "brief": "把单次匹配的替换结果追加到输出缓冲 / Append the replacement for one match to the output buffer",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "b": "inout:输出缓冲 / Output buffer",
+      "rep": "替换值，可为回调 / The replacement value, possibly a callback",
+      "rep_s": "替换模板字符串（rep 非回调时使用）/ The replacement template string, used when `rep` is not callable",
+      "s": "被替换的原始输入 / The original input being replaced",
+      "caps": "捕获下标数组 / Capture index array",
+      "total": "捕获组个数 / Number of capture groups"
+    },
+    "note": "`rep` 可调用时以其返回值经字符串转换后追加，否则按模板展开 / When `rep` is callable its result is coerced to a string and appended; otherwise the template is expanded"
+  },
+  "string_replace_regex": {
+    "brief": "用正则替换：非全局只替换首个匹配 / Replace with a RegExp needle: only the first match unless global",
+    "details": "每次搜索后写入匹配前的文本、追加替换结果；全局正则会持续前进，空匹配时前移一个字节以推进 / Before each match the preceding text is copied and the replacement appended; a global regex keeps advancing, and an empty match moves forward one byte to make progress.",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "s": "原始字符串 / The original string",
+      "needle": "正则对象 / The RegExp needle",
+      "rep": "替换值（字符串或回调）/ The replacement (a string or a callback)"
+    },
+    "return": "替换后的新字符串 / The resulting string",
+    "note": "正则未编译成功时原样返回输入 / Returns the input unchanged when the regex was not compiled"
+  },
+  "string_replace_plain": {
+    "brief": "用普通字符串替换：只替换第一个出现 / Replace with a plain-string needle: only the first occurrence",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "s": "原始字符串 / The original string",
+      "needle": "查找串（经字符串转换）/ The needle, coerced to a string",
+      "rep": "替换值（字符串或回调）/ The replacement (a string or a callback)"
+    },
+    "return": "替换后的新字符串；未命中时原样返回 / The resulting string, or the input unchanged when not found",
+    "note": "回调形式接收 (matched, offset, input) 三个实参 / The callback form receives the arguments (matched, offset, input)"
+  },
+  "string_replace": {
+    "brief": "String.prototype.replace：按分隔类型分派替换 / String.prototype.replace: dispatch the replacement by needle type",
+    "params": {
+      "thisv": "接收字符串 / The receiver string",
+      "a": "实参数组：`a[0]` 查找目标、`a[1]` 替换值 / Argument array: `a[0]` is the needle, `a[1]` the replacement",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "替换后的新字符串 / The resulting string",
+    "note": "`needle` 为 RegExp 时走 string_replace_regex，否则走 string_replace_plain / A RegExp `needle` goes to string_replace_regex, anything else to string_replace_plain"
+  },
+  "match_regex_global": {
+    "brief": "全局正则：收集所有不重叠匹配 / Global regex: gather every non-overlapping match",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "re": "已编译的正则 / The compiled regex",
+      "s": "输入字符串 / The input string"
+    },
+    "return": "匹配子串数组；一个都没有时返回 `null` / An array of matched substrings, or `null` when there is none",
+    "note": "推进位置在空匹配时按起点加一，避免死循环 / The advance position is start+1 for an empty match so the loop cannot spin"
+  },
+  "match_regex_once": {
+    "brief": "非全局正则：返回单个匹配结果对象 / Non-global regex: return a single match-result object",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "re": "已编译的正则 / The compiled regex",
+      "s": "输入字符串 / The input string",
+      "total": "捕获组个数 / Number of capture groups"
+    },
+    "return": "匹配结果数组（含捕获组）；未匹配返回 `null` / The match-result array with capture groups, or `null` when unmatched",
+    "note": "始终从位置 0 开始搜索 / The search always starts at offset 0"
+  },
+  "match_plain": {
+    "brief": "普通字符串匹配：模拟匹配数组（含 index/input）/ Plain-string match: emulate the match array with index/input",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "s": "输入字符串 / The input string",
+      "needle": "查找串（经字符串转换）/ The needle, coerced to a string"
+    },
+    "return": "匹配数组 / The match array",
+    "note": "未命中时返回带 `index: -1` 的空数组 / When not found it returns an empty array carrying `index: -1`"
+  },
+  "string_match": {
+    "brief": "String.prototype.match：按分隔类型分派 / String.prototype.match: dispatch by needle type",
+    "params": {
+      "thisv": "接收字符串 / The receiver string",
+      "a": "实参数组，`a[0]` 为查找目标 / Argument array; `a[0]` is the needle",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "匹配结果：正则全局为数组、非全局为结果对象、普通串为匹配数组 / The match: an array for a global regex, a result object for a non-global one, or a match array for a plain string"
+  },
+  "string_search": {
+    "brief": "String.prototype.search：返回首个匹配的下标 / String.prototype.search: return the index of the first match",
+    "params": {
+      "thisv": "接收字符串 / The receiver string",
+      "a": "实参数组，`a[0]` 为查找目标 / Argument array; `a[0]` is the needle",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "首个匹配的字节下标；未找到返回 -1 / The byte offset of the first match, or -1 when not found",
+    "note": "正则忽略其全局标志，始终从 0 开始搜索 / The regex's global flag is ignored and the search always starts at 0"
+  },
+  "native_symbol": {
+    "brief": "Symbol(...)：创建一个最小可用的 Symbol 对象 / Symbol(...): create a minimal Symbol object",
+    "params": {
+      "thisv": "忽略 / Ignored",
+      "a": "实参数组，`a[0]` 为描述文本 / Argument array; `a[0]` is the description",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "新的 Symbol 对象 / The new Symbol object",
+    "note": "对象带 `description`（形如 `Symbol(desc)`）、`toString`，并以自增计数器作为内部标识 / The object carries `description` (of the form `Symbol(desc)`), `toString`, and an auto-incrementing counter as its internal identity"
+  },
+  "symbol_toString": {
+    "brief": "Symbol.prototype.toString：返回 symbol 的描述 / Symbol.prototype.toString: return the symbol's description",
+    "params": {
+      "thisv": "Symbol 对象接收者 / The Symbol receiver",
+      "a": "实参数组，忽略 / Argument array; ignored",
+      "argc": "实参个数，忽略 / Argument count; ignored",
+      "ud": "未使用 / Unused"
+    },
+    "return": "`description` 字符串；缺失时返回 `Symbol()` / The `description` string, or `Symbol()` when absent"
+  },
+  "native_map_ctor": {
+    "brief": "new Map(iterable)：创建 Map 并可选地由键值对初始化 / new Map(iterable): create a Map, optionally initialised from key/value pairs",
+    "params": {
+      "thisv": "忽略 / Ignored",
+      "a": "实参数组，`a[0]` 为可迭代的键值对集合 / Argument array; `a[0]` is an iterable of key/value pairs",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "新建的 Map 对象 / The new Map object",
+    "note": "键以内部数组 `` _keys `` 保存，值以 `vN` 属性按同一索引存放；初始化时逐对调用 map_set_impl / Keys live in an internal `_keys` array while values are stored under `vN` properties at the same index; initialisation pairs are fed one by one into map_set_impl"
+  },
+  "map_locate": {
+    "brief": "在 Map 的键数组中查找键的下标 / Locate the index of a key in a Map's key array",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "o": "Map 对象 / The Map object",
+      "key": "要查找的键 / The key to look up",
+      "create": "占位参数，本实现未使用 / Placeholder; unused by this implementation"
+    },
+    "return": "命中返回下标，否则返回 -1（以数值形式）/ The matching index, otherwise -1, both as numbers",
+    "note": "比较使用 js_values_equal 的 SameValueZero 语义 / Comparison uses js_values_equal with SameValueZero semantics"
+  },
+  "map_set_impl": {
+    "brief": "Map 内部 set：写入键值对 / Map internal set: store a key/value pair",
+    "params": {
+      "thisv": "Map 对象接收者 / The Map receiver",
+      "a": "实参数组：`a[0]` 键、`a[1]` 值 / Argument array: `a[0]` is the key, `a[1]` the value",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "Map 本身，便于链式调用 / The Map itself, for chaining",
+    "note": "键已存在则覆盖 `vN`；否则把键追加到 `` _keys `` 并写入新槽 / An existing key overwrites `vN`; otherwise the key is appended to `_keys` and a fresh slot written",
+    "see": "map_get_impl"
+  },
+  "map_get_impl": {
+    "brief": "Map 内部 get：按键取值 / Map internal get: read the value for a key",
+    "params": {
+      "thisv": "Map 对象接收者 / The Map receiver",
+      "a": "实参数组，`a[0]` 为键 / Argument array; `a[0]` is the key",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "键对应的值；不存在时返回 `undefined` / The value for the key, or `undefined` when absent"
+  },
+  "map_has": {
+    "brief": "Map.prototype.has：判断键是否存在 / Map.prototype.has: test whether a key exists",
+    "params": {
+      "thisv": "Map 对象接收者 / The Map receiver",
+      "a": "实参数组，`a[0]` 为键 / Argument array; `a[0]` is the key",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "存在返回 true，否则 false / true when present, otherwise false"
+  },
+  "map_delete": {
+    "brief": "Map.prototype.delete：删除键并压缩内部存储 / Map.prototype.delete: remove a key and compact the internal storage",
+    "details": "删除对应的 `vN` 槽后会前移其后的键，并同步搬移值属性、更新长度、清掉末尾多余槽 / After removing the `vN` slot it shifts the following keys forward, moves the matching value properties, updates the length and drops the now-extra trailing slot.",
+    "params": {
+      "thisv": "Map 对象接收者 / The Map receiver",
+      "a": "实参数组，`a[0]` 为键 / Argument array; `a[0]` is the key",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "确实删除返回 true，键不存在返回 false / true when a key was removed, false when it was absent"
+  },
+  "map_clear": {
+    "brief": "Map.prototype.clear：清空所有键值对 / Map.prototype.clear: drop every key/value pair",
+    "params": {
+      "thisv": "Map 对象接收者 / The Map receiver",
+      "a": "实参数组，忽略 / Argument array; ignored",
+      "argc": "实参个数，忽略 / Argument count; ignored",
+      "ud": "未使用 / Unused"
+    },
+    "return": "`undefined` / `undefined`",
+    "note": "以新的空键数组替换内部 `` _keys `` 并清空 `items` / Replaces the internal `_keys` with a fresh empty array and clears `items`"
+  },
+  "map_size_get": {
+    "brief": "Map.prototype.size 取值器：返回元素个数 / Map.prototype.size getter: return the entry count",
+    "params": {
+      "thisv": "Map 对象接收者 / The Map receiver",
+      "a": "实参数组，忽略 / Argument array; ignored",
+      "argc": "实参个数，忽略 / Argument count; ignored",
+      "ud": "未使用 / Unused"
+    },
+    "return": "键数组的长度；非 Map 时为 0 / The length of the key array, or 0 for a non-Map",
+    "note": "作为属性访问器调用，非 Map 接收者返回 0 / Invoked as a property accessor; a non-Map receiver yields 0"
+  },
+  "map_forEach": {
+    "brief": "Map.prototype.forEach：按插入顺序遍历键值对 / Map.prototype.forEach: visit every entry in insertion order",
+    "params": {
+      "thisv": "Map 对象接收者 / The Map receiver",
+      "a": "实参数组，`a[0]` 为回调 / Argument array; `a[0]` is the callback",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "`undefined` / `undefined`",
+    "note": "回调实参依次为（值、键、Map 本身）；回调不可调用时不做任何事 / The callback receives (value, key, the Map itself); nothing happens when it is not callable"
+  },
+  "error_ctor": {
+    "brief": "Error 及各类错误构造器：创建错误对象 / The Error and subclass constructors: create an error object",
+    "details": "根据 `ud` 传入的错误类型名选择对应的原型（TypeError/RangeError/SyntaxError/ReferenceError，其余落到 Error 原型），设置 `name`，并在有首参时设置 `message`（否则补齐空串）/ The error type name in `ud` selects the right prototype (TypeError/RangeError/SyntaxError/ReferenceError, otherwise the Error prototype), `name` is set, and `message` is set from the first argument or defaulted to the empty string.",
+    "params": {
+      "thisv": "已构造的实例（`[[Construct]]` 路径），否则新建 / An already-created instance on the `[[Construct]]` path, otherwise a new object is made",
+      "a": "实参数组，`a[0]` 为错误消息 / Argument array; `a[0]` is the error message",
+      "argc": "实参个数 / Argument count",
+      "ud": "错误类型名（如 `TypeError`）/ The error type name, e.g. `TypeError`"
+    },
+    "return": "错误对象 / The error object",
+    "note": "已存在的自有 `name`/`message` 属性不会被覆盖 / Pre-existing own `name`/`message` properties are not overwritten"
+  },
+  "error_this_toString": {
+    "brief": "Error.prototype.toString：返回错误的字符串形式 / Error.prototype.toString: return the string form of an error",
+    "params": {
+      "thisv": "错误对象接收者 / The error receiver",
+      "a": "实参数组，忽略 / Argument array; ignored",
+      "argc": "实参个数，忽略 / Argument count; ignored",
+      "ud": "未使用 / Unused"
+    },
+    "return": "错误对象的字符串表示 / The string representation of the error",
+    "note": "直接走 js_to_string，`name`/`message` 的拼接由该转换负责 / Delegates to js_to_string, which handles the `name`/`message` concatenation"
+  },
+  "promise_hook_resolve": {
+    "brief": "Promise 构造器暴露的 resolve 钩子 / The resolve hook exposed by the Promise constructor",
+    "params": {
+      "thisv": "忽略 / Ignored",
+      "a": "实参数组，`a[0]` 为兑现值 / Argument array; `a[0]` is the fulfilment value",
+      "argc": "实参个数 / Argument count",
+      "ud": "PromiseHooks 钩子上下文 / The `PromiseHooks` hook context"
+    },
+    "return": "`undefined` / `undefined`",
+    "note": "通过 `settled` 标志保证只生效一次，随后交给 promise_resolve_with / The `settled` flag makes it fire only once before delegating to promise_resolve_with"
+  },
+  "promise_hook_reject": {
+    "brief": "Promise 构造器暴露的 reject 钩子 / The reject hook exposed by the Promise constructor",
+    "params": {
+      "thisv": "忽略 / Ignored",
+      "a": "实参数组，`a[0]` 为拒绝原因 / Argument array; `a[0]` is the rejection reason",
+      "argc": "实参个数 / Argument count",
+      "ud": "PromiseHooks 钩子上下文 / The `PromiseHooks` hook context"
+    },
+    "return": "`undefined` / `undefined`",
+    "note": "通过 `settled` 标志保证只生效一次，随后以状态 2 调用 js_settle_promise / The `settled` flag makes it fire only once before calling js_settle_promise with state 2"
+  },
+  "all_hook_ok": {
+    "brief": "Promise.all 的单个兑现回调 / The per-item fulfilment callback of Promise.all",
+    "params": {
+      "thisv": "忽略 / Ignored",
+      "a": "实参数组，`a[0]` 为该项的兑现值 / Argument array; `a[0]` is this item's fulfilment value",
+      "argc": "实参个数 / Argument count",
+      "ud": "AllCtx 聚合上下文 / The `AllCtx` aggregation context"
+    },
+    "return": "`undefined` / `undefined`",
+    "note": "把结果写入对应下标，待计数减到 0 时以结果数组兑现输出 Promise / Stores the result at its index and, once the pending count reaches 0, fulfils the output promise with the results array"
+  },
+  "all_hook_err": {
+    "brief": "Promise.all 的单个拒绝回调 / The per-item rejection callback of Promise.all",
+    "params": {
+      "thisv": "忽略 / Ignored",
+      "a": "实参数组，`a[0]` 为拒绝原因 / Argument array; `a[0]` is the rejection reason",
+      "argc": "实参个数 / Argument count",
+      "ud": "AllCtx 聚合上下文 / The `AllCtx` aggregation context"
+    },
+    "return": "`undefined` / `undefined`",
+    "note": "任意一项拒绝即立即以该原因拒绝输出 Promise / Any single rejection immediately rejects the output promise with that reason"
+  },
+  "promise_ctor_native": {
+    "brief": "new Promise(executor)：同步执行执行器并返回 Promise / new Promise(executor): run the executor synchronously and return a promise",
+    "details": "创建（或复用已有的）Promise 对象，构造 resolve/reject 钩子并立即调用 executor；随后泵出微任务队列以推进已挂起的反应 / A promise is created (or an existing one reused), resolve/reject hooks are built and the executor is called immediately; the microtask queue is then drained to advance any pending reactions.",
+    "params": {
+      "thisv": "已构造的 Promise 实例（`[[Construct]]` 路径），否则新建 / An already-created promise on the `[[Construct]]` path, otherwise a new one is made",
+      "a": "实参数组，`a[0]` 为 executor 函数 / Argument array; `a[0]` is the executor function",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "Promise 对象 / The promise object",
+    "note": "缺少可调用的 executor 时抛出 “Promise resolver is not a function” / Throws “Promise resolver is not a function” when the executor is missing or not callable"
+  },
+  "promise_proto_then": {
+    "brief": "Promise.prototype.then：注册兑现与拒绝回调 / Promise.prototype.then: register fulfilment and rejection callbacks",
+    "params": {
+      "thisv": "Promise 接收者 / The promise receiver",
+      "a": "实参数组：`a[0]` onFulfilled、`a[1]` onRejected / Argument array: `a[0]` onFulfilled, `a[1]` onRejected",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "新的下游 Promise / A new downstream promise",
+    "note": "接收者不是对象时抛出 “Promise.prototype.then called on a non-promise” / Throws “Promise.prototype.then called on a non-promise” when the receiver is not an object"
+  },
+  "promise_proto_catch": {
+    "brief": "Promise.prototype.catch：等价于 `then(undefined, onRejected)` / Promise.prototype.catch: equivalent to `then(undefined, onRejected)`",
+    "params": {
+      "thisv": "Promise 接收者 / The promise receiver",
+      "a": "实参数组，`a[0]` 为拒绝回调 / Argument array; `a[0]` is the rejection callback",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "新的下游 Promise / A new downstream promise"
+  },
+  "promise_proto_finally": {
+    "brief": "Promise.prototype.finally：兑现与拒绝时都调用同一回调 / Promise.prototype.finally: invoke the same callback on both settlement paths",
+    "params": {
+      "thisv": "Promise 接收者 / The promise receiver",
+      "a": "实参数组，`a[0]` 为回调 / Argument array; `a[0]` is the callback",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "新的下游 Promise / A new downstream promise",
+    "note": "实现为 `then(onF, onF)`，回调返回值不影响下游结果 / Implemented as `then(onF, onF)`; the callback's return value does not affect the downstream result"
+  },
+  "promise_static_resolve": {
+    "brief": "Promise.resolve：把值包装成已解决的 Promise / Promise.resolve: wrap a value into a resolved promise",
+    "params": {
+      "thisv": "忽略 / Ignored",
+      "a": "实参数组，`a[0]` 为待解决的值 / Argument array; `a[0]` is the value to resolve",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "已有的 Promise 原样返回，否则新建 / An existing promise is returned as is, otherwise a new one is created",
+    "note": "遇到带 `then` 的 thenable 时以 resolve/reject 钩子调用其 `then`，否则直接兑现 / A thenable with a `then` method has its `then` called with the resolve/reject hooks; otherwise the promise is fulfilled directly"
+  },
+  "promise_static_reject": {
+    "brief": "Promise.reject：创建已拒绝的 Promise / Promise.reject: create an already-rejected promise",
+    "params": {
+      "thisv": "忽略 / Ignored",
+      "a": "实参数组，`a[0]` 为拒绝原因 / Argument array; `a[0]` is the rejection reason",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "已拒绝的 Promise / The rejected promise",
+    "note": "以状态 2 调用 js_settle_promise 立即结算 / Settles immediately via js_settle_promise with state 2"
+  },
+  "promise_static_all": {
+    "brief": "Promise.all：等待全部兑现后以结果数组兑现 / Promise.all: fulfil with an array once every input fulfils",
+    "details": "先按输入长度预置结果数组；长度为 0 时立即以空数组兑现；否则逐个把已解析的 Promise 通过反应钩子挂到 all_hook_ok/all_hook_err 上，最后泵出微任务队列 / The results array is pre-sized to the input length and fulfilled at once with an empty array when that length is 0; otherwise each resolved promise is hooked to all_hook_ok/all_hook_err and the microtask queue is drained.",
+    "params": {
+      "thisv": "忽略 / Ignored",
+      "a": "实参数组，`a[0]` 为可迭代的 Promise 集合 / Argument array; `a[0]` is an iterable of promises",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "聚合结果 Promise / The aggregate promise",
+    "note": "任一输入拒绝即整体拒绝 / Rejects as a whole as soon as any input rejects"
+  },
+  "promise_static_race": {
+    "brief": "Promise.race：以首个结算的输入结果结算 / Promise.race: settle with the first input to settle",
+    "params": {
+      "thisv": "忽略 / Ignored",
+      "a": "实参数组，`a[0]` 为可迭代的 Promise 集合 / Argument array; `a[0]` is an iterable of promises",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "竞赛结果 Promise / The race promise",
+    "note": "每个输入共用一个 resolve/reject 钩子上下文，谁先结算谁生效 / Every input shares one resolve/reject hook context, so whichever settles first wins"
+  },
+  "function_call": {
+    "brief": "Function.prototype.call：以指定 this 立即调用 / Function.prototype.call: invoke immediately with the given `this`",
+    "params": {
+      "thisv": "被调用的函数 / The function being invoked",
+      "a": "实参数组：`a[0]` 作为 this，其后为实参 / Argument array: `a[0]` becomes `this`, the rest are arguments",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "被调函数的返回值 / The callee's return value",
+    "note": "接收者不可调用时抛出 “Function.prototype.call called on a non-function” / Throws “Function.prototype.call called on a non-function” when the receiver is not callable"
+  },
+  "function_apply": {
+    "brief": "Function.prototype.apply：以数组展开实参调用 / Function.prototype.apply: invoke with arguments spread from an array",
+    "params": {
+      "thisv": "被调用的函数 / The function being invoked",
+      "a": "实参数组：`a[0]` 作为 this、`a[1]` 为实参集合 / Argument array: `a[0]` becomes `this` and `a[1]` is the argument collection",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "被调函数的返回值 / The callee's return value",
+    "note": "实参集合按可迭代对象逐个取出；缺省或非对象时视为无实参 / The collection is iterated item by item; a missing or non-object value means no arguments"
+  },
+  "function_bind": {
+    "brief": "Function.prototype.bind：创建预绑定 this 与部分实参的函数 / Function.prototype.bind: create a function with a bound `this` and leading arguments",
+    "details": "新建函数对象，复制目标的 kind、native 入口、用户数据与标志并追加 `FN_BOUND`，记录绑定目标、绑定的 this 与前缀实参（`a[1]` 起），名称固定为 `bound` / A new function object copies the target's kind, native entry, user data and flags, adds `FN_BOUND`, records the bound target, the bound `this` and the leading arguments (`a[1]` onward), and is always named `bound`.",
+    "params": {
+      "thisv": "被绑定的函数 / The function being bound",
+      "a": "实参数组：`a[0]` 绑定为 this，其后为前缀实参 / Argument array: `a[0]` is bound as `this`, the rest become leading arguments",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "绑定后的新函数对象 / The resulting bound function object",
+    "note": "接收者不是函数或原生对象时抛出 “Function.prototype.bind called on a non-function” / Throws “Function.prototype.bind called on a non-function” when the receiver is neither a function nor a native object"
+  },
+  "function_this_toString": {
+    "brief": "Function.prototype.toString：返回原生函数占位文本 / Function.prototype.toString: return the native-function placeholder text",
+    "params": {
+      "thisv": "忽略 / Ignored",
+      "a": "实参数组，忽略 / Argument array; ignored",
+      "argc": "实参个数，忽略 / Argument count; ignored",
+      "ud": "未使用 / Unused"
+    },
+    "return": "固定字符串 `function () { [native code] }` / The fixed string `function () { [native code] }`",
+    "note": "不还原真实函数源码 / The real function source is not reconstructed"
+  },
+  "function_ctor": {
+    "brief": "new Function(...params, body)：动态编译函数 / new Function(...params, body): compile a function from source",
+    "details": "把形参逐个用 `,` 连接、末尾接上函数体，拼装成 `(function(a,b){body})` 后交给表达式解析器，取回内层函数节点并构造函数对象 / Parameter strings are joined with `,` and followed by the body to form `(function(a,b){body})`, which the expression parser turns into the inner function node used to build the function object.",
+    "params": {
+      "thisv": "忽略 / Ignored",
+      "a": "实参数组：最后一个元素为函数体，前面均为形参名 / Argument array: the last element is the body, all preceding ones are parameter names",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "新编译的函数对象 / The newly compiled function object",
+    "note": "解析失败时回退为一个空参数的匿名空函数 / When parsing fails it falls back to an anonymous function with no parameters and an empty body"
+  },
+  "native_string_ctor": {
+    "brief": "String(x)：把参数转换为字符串 / String(x): convert the argument to a string",
+    "params": {
+      "thisv": "忽略 / Ignored",
+      "a": "实参数组，`a[0]` 为待转换值 / Argument array; `a[0]` is the value to convert",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "字符串结果；无实参时返回空串 / The resulting string, or the empty string when called with no arguments"
+  },
+  "string_from_char_code": {
+    "brief": "String.fromCharCode(...codes)：由 UTF-16 码元构造字符串 / String.fromCharCode(...codes): build a string from UTF-16 code units",
+    "params": {
+      "thisv": "忽略 / Ignored",
+      "a": "实参数组，每个元素为一个码元 / Argument array; each element is one code unit",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "拼接后的字符串 / The concatenated string",
+    "note": "每个实参取低 16 位（`& 0xFFFF`）后编码为 UTF-8；BMP 以上的码位需由调用方用代理对表示 / Each argument is masked to its low 16 bits (`& 0xFFFF`) before UTF-8 encoding; code points above the BMP must be supplied as surrogate pairs by the caller"
+  },
+  "string_from_code_point": {
+    "brief": "String.fromCodePoint(...cp)：由码点构造字符串 / String.fromCodePoint(...cp): build a string from code points",
+    "params": {
+      "thisv": "忽略 / Ignored",
+      "a": "实参数组，每个元素为一个码点 / Argument array; each element is one code point",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "拼接后的字符串 / The concatenated string",
+    "note": "码点为 NaN、负数或大于 0x10FFFF 时抛出 `RangeError` / Throws a `RangeError` when a code point is NaN, negative or greater than 0x10FFFF"
+  },
+  "native_number_ctor": {
+    "brief": "Number(x)：把参数转换为数值 / Number(x): convert the argument to a number",
+    "params": {
+      "thisv": "忽略 / Ignored",
+      "a": "实参数组，`a[0]` 为待转换值 / Argument array; `a[0]` is the value to convert",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "数值结果；无实参时返回 0 / The numeric result, or 0 when called with no arguments"
+  },
+  "native_boolean_ctor": {
+    "brief": "Boolean(x)：把参数转换为布尔值 / Boolean(x): convert the argument to a boolean",
+    "params": {
+      "thisv": "忽略 / Ignored",
+      "a": "实参数组，`a[0]` 为待转换值 / Argument array; `a[0]` is the value to convert",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "布尔结果；按 js_truthy 判定 / The boolean result, decided by js_truthy",
+    "note": "无实参时返回 false / Returns false when called with no arguments"
+  },
+  "native_object_ctor": {
+    "brief": "Object(x)：包装或创建对象 / Object(x): wrap or create an object",
+    "params": {
+      "thisv": "忽略 / Ignored",
+      "a": "实参数组，`a[0]` 为待包装值 / Argument array; `a[0]` is the value to wrap",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "有实参时原样返回该值；无实参时返回新建的空对象 / The argument returned as is when present, otherwise a freshly created empty object",
+    "note": "本实现不区分原始值包装与对象透传，两者都原样返回 / This implementation does not distinguish primitive wrapping from object passthrough and returns the argument unchanged in both cases"
+  },
+  "native_array_ctor": {
+    "brief": "Array(...args)：按长度或元素构造数组 / Array(...args): build an array from a length or from elements",
+    "params": {
+      "thisv": "忽略 / Ignored",
+      "a": "实参数组，`a[0]` 为唯一数值时视作长度 / Argument array; a single numeric `a[0]` is treated as the length",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "新数组 / The new array",
+    "note": "单个数值实参时长度取 `floor` 且不小于 0，元素为空槽；否则各实参依次成为元素 / With a single numeric argument the length is `floor`'d and clamped to ≥0 leaving holes; otherwise the arguments become the elements"
+  },
+  "native_iter_symbol": {
+    "brief": "Symbol.iterator 的取值函数：返回一个空对象 / The Symbol.iterator accessor: return an empty object",
+    "params": {
+      "thisv": "忽略 / Ignored",
+      "a": "实参数组，忽略 / Argument array; ignored",
+      "argc": "实参个数，忽略 / Argument count; ignored",
+      "ud": "未使用 / Unused"
+    },
+    "return": "新建的空对象 / A freshly created empty object",
+    "note": "仅用于让 `obj[Symbol.iterator]` 的取值/存在性检查成立，不产生真实迭代器 / Only serves to make a `obj[Symbol.iterator]` read or existence check succeed; no real iterator is produced"
+  },
+  "utf8_strlen_n": {
+    "brief": "统计字节区间内的 UTF-8 码点数 / Count the UTF-8 code points within a byte range",
+    "params": {
+      "s": "以 NUL 结尾的字符串 / NUL-terminated string",
+      "bytes": "限制的字节数 / Byte limit"
+    },
+    "return": "区间内的码点个数 / The number of code points in the range",
+    "note": "遇到 NUL 或达到 `bytes` 即停止 / Stops at a NUL or once `bytes` is reached"
+  },
+  "string_split_regex": {
+    "brief": "用正则分隔符切分，并按规范插入捕获组 / Split on a RegExp separator, interleaving capture groups per spec",
+    "details": "在每次匹配处切出前一段作为元素，随后把每个捕获组依次插入结果，再推进搜索；`limit` 限制元素总数 / Each match contributes the preceding segment as an element followed by every capture group in turn, then the search advances; `limit` caps the total number of elements.",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "out": "out:接收切分结果的数组 / The array receiving the split result",
+      "s": "被切分的字符串 / The string being split",
+      "sep": "正则分隔符 / The RegExp separator",
+      "limit": "元素个数上限，负数表示不限 / Maximum element count; negative means unlimited"
+    },
+    "note": "空匹配时前进一个字节以避免死循环 / An empty match advances one byte to avoid spinning"
+  },
+  "string_split_plain": {
+    "brief": "用普通字符串分隔符切分 / Split on a plain string separator",
+    "params": {
+      "js": "JS 运行时上下文 / JS runtime context",
+      "out": "out:接收切分结果的数组 / The array receiving the split result",
+      "s": "被切分的字符串 / The string being split",
+      "sep": "分隔符（经字符串转换）/ The separator, coerced to a string",
+      "limit": "元素个数上限，负数表示不限 / Maximum element count; negative means unlimited"
+    },
+    "note": "分隔符为空串时按码点逐字切分 / An empty separator splits the string into code points"
+  },
+  "string_split": {
+    "brief": "String.prototype.split：按分隔符切分字符串 / String.prototype.split: split a string by a separator",
+    "params": {
+      "thisv": "接收字符串 / The receiver string",
+      "a": "实参数组：`a[0]` 分隔符、`a[1]` 上限 / Argument array: `a[0]` is the separator, `a[1]` the limit",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "切分结果数组 / The array of split parts",
+    "note": "上限为 0 时返回空数组；分隔符为 `undefined` 时整串作为唯一元素 / A limit of 0 yields an empty array; an `undefined` separator makes the whole string the only element"
+  },
+  "string_concat": {
+    "brief": "String.prototype.concat：依次拼接实参并返回新串 / String.prototype.concat: append the arguments and return a new string",
+    "params": {
+      "thisv": "接收字符串 / The receiver string",
+      "a": "实参数组，按顺序拼接 / Argument array, appended in order",
+      "argc": "实参个数 / Argument count",
+      "ud": "未使用 / Unused"
+    },
+    "return": "拼接后的新字符串 / The concatenated string",
+    "note": "每个实参都经 str_arg 做字符串转换；缓冲区按需成倍扩容 / Every argument is coerced by str_arg; the buffer grows by doubling as needed"
+  }
+}

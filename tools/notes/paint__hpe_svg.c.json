@@ -1,0 +1,1006 @@
+{
+  "mat_identity": {
+    "brief": "返回单位仿射矩阵 / Return the identity affine matrix",
+    "note": "该矩阵为 {1,0,0,1,0,0}，点映射为恒等 / The matrix is `{1,0,0,1,0,0}`, mapping points unchanged"
+  },
+  "mat_mul": {
+    "brief": "矩阵相乘 / Multiply two affine matrices",
+    "params": {
+      "A": "in:左矩阵 / Left matrix",
+      "B": "in:右矩阵 / Right matrix"
+    },
+    "return": "乘积 A*B / The product `A*B`",
+    "note": "结果等价于先应用 B 再应用 A / The result applies B first and then A"
+  },
+  "mat_apply": {
+    "brief": "用矩阵变换一个点 / Transform a point by a matrix",
+    "params": {
+      "m": "in:仿射矩阵 / Affine matrix",
+      "x": "in:输入 X / Input X",
+      "y": "in:输入 Y / Input Y",
+      "ox": "out:变换后 X / Transformed X",
+      "oy": "out:变换后 Y / Transformed Y"
+    }
+  },
+  "mat_invert": {
+    "brief": "求仿射矩阵的逆 / Invert an affine matrix",
+    "params": {
+      "m": "in:仿射矩阵 / Affine matrix"
+    },
+    "return": "逆矩阵；行列式接近 0 时返回单位矩阵 / The inverse, or the identity matrix when the determinant is near zero"
+  },
+  "mat_scale": {
+    "brief": "求矩阵的名义均匀缩放系数 / Nominal uniform scale factor of a matrix",
+    "params": {
+      "m": "in:仿射矩阵 / Affine matrix"
+    },
+    "return": "缩放系数，下限钳到 1.0 / Scale factor, floored at 1.0",
+    "note": "用于描边宽度与字号 / Used for stroke widths and font sizes"
+  },
+  "blend_px": {
+    "brief": "按覆盖率混合一个设备像素 / Blend one device pixel with a coverage value",
+    "params": {
+      "pm": "inout:目标像素缓冲 / Target pixel buffer",
+      "x": "in:设备 X / Device X",
+      "y": "in:设备 Y / Device Y",
+      "c": "in:源颜色 / Source colour",
+      "cov": "in:覆盖率 0..1 / Coverage in 0..1"
+    },
+    "note": "超出裁剪区、图像外或覆盖率非正的像素直接跳过 / Pixels outside the clip, outside the image, or with non-positive coverage are skipped"
+  },
+  "grad_color_at": {
+    "brief": "求渐变（或纯色回退）在设备像素处的颜色 / Resolve the colour of a gradient (or a flat fallback) at a device pixel",
+    "params": {
+      "grad": "in:渐变描述，可为 `NULL` / Gradient description, may be `NULL`",
+      "ctm": "in:用户空间到设备空间的矩阵 / User-to-device matrix",
+      "flat": "in:无渐变时的纯色 / Flat colour used when there is no gradient",
+      "px": "in:设备 X / Device X",
+      "py": "in:设备 Y / Device Y"
+    },
+    "return": "该像素处的颜色 / The colour at that pixel",
+    "note": "线性渐变按沿轴的投影参数采样，径向渐变按到中心的距离采样 / A linear gradient samples the axial projection parameter; a radial one samples the distance to the centre"
+  },
+  "stroke_capsule": {
+    "brief": "以胶囊形描边一条线段 / Stroke one segment as a capsule",
+    "params": {
+      "pm": "inout:目标像素缓冲 / Target pixel buffer",
+      "x0": "in:起点设备 X / Start device X",
+      "y0": "in:起点设备 Y / Start device Y",
+      "x1": "in:终点设备 X / End device X",
+      "y1": "in:终点设备 Y / End device Y",
+      "width": "in:描边宽度（设备像素）/ Stroke width in device pixels",
+      "c": "in:纯色回退 / Flat colour fallback",
+      "grad": "in:渐变描述，可为 `NULL` / Gradient description, may be `NULL`",
+      "ctm": "in:用户空间到设备空间的矩阵 / User-to-device matrix"
+    },
+    "note": "每条线段各自绘制，端点为圆头；宽度非正时直接返回 / Each segment is drawn separately with round caps; returns early when the width is not positive"
+  },
+  "sub_push": {
+    "brief": "向子路径追加一个顶点 / Append a vertex to a subpath",
+    "params": {
+      "sp": "inout:子路径 / Subpath",
+      "x": "in:X 坐标 / X coordinate",
+      "y": "in:Y 坐标 / Y coordinate"
+    },
+    "note": "必要时按倍增扩容顶点数组 / Grows the vertex array by doubling when needed"
+  },
+  "polys_new": {
+    "brief": "在多边形列表中新建一个空子路径 / Create an empty subpath in a polygon list",
+    "params": {
+      "p": "inout:多边形列表 / Polygon list"
+    },
+    "return": "新分配的子路径 / The newly allocated subpath"
+  },
+  "polys_free": {
+    "brief": "释放多边形列表及其全部子路径 / Free a polygon list and all its subpaths",
+    "params": {
+      "p": "inout:多边形列表 / Polygon list"
+    },
+    "note": "释放后把列表重置为空 / The list is reset to empty afterwards"
+  },
+  "add_span": {
+    "brief": "把一段水平覆盖按像素分箱累加 / Distribute a horizontal coverage span across pixel bins",
+    "params": {
+      "cov": "inout:逐像素覆盖率数组 / Per-pixel coverage array",
+      "x0": "in:数组首列的设备 X / Device X of the array's first column",
+      "x1": "in:数组列数 / Number of columns",
+      "a": "in:区间起点 X / Span start X",
+      "b": "in:区间终点 X / Span end X",
+      "w": "in:该段的权重 / Weight of the span"
+    },
+    "note": "区间为空（b<=a）时无操作 / No-op when the span is empty (`b <= a`)"
+  },
+  "polys_bbox_clipped": {
+    "brief": "求所有子路径的设备包围盒并夹紧到裁剪与限界 / Device bounding box of every subpath, clipped to the clip rect and a caller limit",
+    "params": {
+      "p": "in:多边形列表 / Polygon list",
+      "pm": "in:目标像素缓冲 / Target pixel buffer",
+      "bx0": "in:限界左 / Limit left",
+      "by0": "in:限界上 / Limit top",
+      "bx1": "in:限界右 / Limit right",
+      "by1": "in:限界下 / Limit bottom",
+      "ox0": "out:裁剪后左边界 / Clipped left edge",
+      "oy0": "out:裁剪后上边界 / Clipped top edge",
+      "ox1": "out:裁剪后右边界 / Clipped right edge",
+      "oy1": "out:裁剪后下边界 / Clipped bottom edge"
+    }
+  },
+  "polys_scanline": {
+    "brief": "收集所有边与水平线 y = sy 的交点 / Gather the x-intersections of every edge with the horizontal line `y = sy`",
+    "params": {
+      "p": "in:多边形列表 / Polygon list",
+      "sy": "in:扫描线 y / Scanline y",
+      "pxs": "inout:交点数组，跨调用复用 / Intersection array, reused across calls",
+      "pnx": "out:交点个数 / Number of intersections",
+      "pncap": "inout:交点数组容量 / Intersection array capacity"
+    }
+  },
+  "sort_floats": {
+    "brief": "对浮点数组做升序插入排序 / Sort a float array ascending (insertion sort)",
+    "params": {
+      "xs": "inout:待排序数组 / Array to sort",
+      "nx": "in:元素个数 / Element count"
+    }
+  },
+  "grad_linear_proj": {
+    "brief": "求线性渐变在设备空间的原点、方向与长度平方 / Device-space origin, direction and squared length of a linear gradient",
+    "params": {
+      "ctm": "in:用户空间到设备空间的矩阵 / User-to-device matrix",
+      "grad": "in:渐变描述 / Gradient description",
+      "lin": "out:原点与方向（lin[0..1] 为原点，lin[2..3] 为方向）/ Origin and direction: `lin[0..1]` origin, `lin[2..3]` direction",
+      "len2": "out:方向长度的平方 / Squared length of the direction"
+    }
+  },
+  "grad_radial_proj": {
+    "brief": "求径向渐变在设备空间的中心与半径 / Device-space centre and radius of a radial gradient",
+    "params": {
+      "ctm": "in:用户空间到设备空间的矩阵 / User-to-device matrix",
+      "grad": "in:渐变描述 / Gradient description",
+      "pcx": "out:中心设备 X / Centre device X",
+      "pcy": "out:中心设备 Y / Centre device Y",
+      "pr": "out:半径（已缩放）/ Radius, scaled"
+    }
+  },
+  "fill_grad_color": {
+    "brief": "求设备像素中心处的填充颜色 / Resolve the fill colour at a device pixel centre",
+    "params": {
+      "grad": "in:渐变描述，可为 `NULL` / Gradient description, may be `NULL`",
+      "color": "in:纯色回退 / Flat colour fallback",
+      "dcx": "in:设备像素中心 X / Device pixel centre X",
+      "dcy": "in:设备像素中心 Y / Device pixel centre Y",
+      "lin": "in:线性渐变原点与方向 / Linear gradient origin and direction",
+      "len2": "in:线性渐变方向长度平方 / Squared direction length of the linear gradient",
+      "rcx": "in:径向渐变中心 X / Radial gradient centre X",
+      "rcy": "in:径向渐变中心 Y / Radial gradient centre Y",
+      "rr": "in:径向渐变半径 / Radial gradient radius"
+    },
+    "return": "该处的颜色 / The colour at that point"
+  },
+  "fill_polys": {
+    "brief": "对所有子路径做奇偶规则扫描线填充 / Even-odd scanline fill of every subpath",
+    "params": {
+      "ctx": "inout:SVG 上下文 / SVG context",
+      "p": "in:多边形列表 / Polygon list",
+      "color": "in:纯色回退 / Flat colour fallback",
+      "grad": "in:渐变描述，可为 `NULL` / Gradient description, may be `NULL`",
+      "ctm": "in:用户空间到设备空间的矩阵 / User-to-device matrix",
+      "bx0": "in:限界左 / Limit left",
+      "by0": "in:限界上 / Limit top",
+      "bx1": "in:限界右 / Limit right",
+      "by1": "in:限界下 / Limit bottom"
+    },
+    "note": "每行取四个子扫描线并按 0.25 权重累加覆盖率；支持纯色与渐变 / Each row uses four sub-scanlines accumulated with 0.25 weight; supports solid colour and gradients"
+  },
+  "stroke_polys": {
+    "brief": "沿所有子路径逐段描边 / Stroke every subpath segment by segment",
+    "params": {
+      "ctx": "inout:SVG 上下文 / SVG context",
+      "p": "in:多边形列表 / Polygon list",
+      "color": "in:纯色回退 / Flat colour fallback",
+      "width": "in:描边宽度 / Stroke width",
+      "grad": "in:渐变描述，可为 `NULL` / Gradient description, may be `NULL`"
+    },
+    "note": "闭合子路径额外补画首尾相连的一段以保持视觉连续 / A closed subpath also draws the wrap-around segment for visual continuity"
+  },
+  "attr": {
+    "brief": "读取非空属性值 / Read a non-empty attribute value",
+    "params": {
+      "n": "in:DOM 元素 / DOM element",
+      "name": "in:属性名 / Attribute name"
+    },
+    "return": "属性值；缺失或为空时返回 `NULL` / The value, or `NULL` when absent or empty"
+  },
+  "attr_num": {
+    "brief": "把数值属性读入浮点数 / Parse a numeric attribute into a float",
+    "params": {
+      "n": "in:DOM 元素 / DOM element",
+      "name": "in:属性名 / Attribute name",
+      "out": "out:解析结果 / Parsed value"
+    },
+    "return": "解析成功返回 1，否则 0 / 1 on success, else 0"
+  },
+  "attr_color": {
+    "brief": "解析颜色属性 / Parse a colour attribute",
+    "params": {
+      "n": "in:DOM 元素 / DOM element",
+      "name": "in:属性名 / Attribute name",
+      "out": "out:解析出的颜色 / Parsed colour"
+    },
+    "return": "属性存在返回 1，否则 0 / 1 when the attribute exists, else 0",
+    "note": "`none` 得到全透明色；无法解析时回退为不透明黑 / `none` yields a fully transparent colour; an unparsable value falls back to opaque black"
+  },
+  "ctx_apply_style": {
+    "brief": "把元素上的绘制属性应用到上下文 / Apply a node's paint attributes to the context",
+    "params": {
+      "ctx": "inout:SVG 上下文 / SVG context",
+      "n": "in:DOM 元素 / DOM element"
+    },
+    "note": "读取 fill、stroke、stroke-width、fill-opacity、stroke-opacity / Reads fill, stroke, stroke-width, fill-opacity and stroke-opacity"
+  },
+  "transform_rotate": {
+    "brief": "构造绕点旋转（rotate 三参数形式）的矩阵 / Build the matrix for a rotation about a point (3-argument `rotate`)",
+    "params": {
+      "ang_deg": "in:旋转角度（度）/ Rotation angle in degrees",
+      "v": "in:参数数组 / Argument array",
+      "vn": "in:参数个数 / Argument count"
+    },
+    "return": "旋转矩阵 / The rotation matrix",
+    "note": "参数至少 3 个时以 v[1],v[2] 为旋转中心 / When at least three arguments are given, `v[1]` and `v[2]` are the rotation centre"
+  },
+  "transform_from_name": {
+    "brief": "把变换名与参数映射为矩阵 / Map a transform name and its arguments to a matrix",
+    "params": {
+      "name": "in:变换名 / Transform name",
+      "v": "in:参数数组 / Argument array",
+      "vn": "in:参数个数 / Argument count"
+    },
+    "return": "对应的矩阵 / The corresponding matrix",
+    "note": "支持 translate/scale/rotate/skewX/skewY/matrix；名称未知或参数不足时返回单位矩阵 / Supports translate, scale, rotate, skewX, skewY and matrix; returns the identity when the name is unknown or the argument count is short"
+  },
+  "transform_read_name": {
+    "brief": "读取变换名并前移游标 / Read a transform name and advance the cursor",
+    "params": {
+      "pp": "inout:解析游标指针 / Parse cursor pointer",
+      "name": "out:接收变换名 / Receives the transform name",
+      "cap": "in:`name` 缓冲区容量 / Capacity of the `name` buffer"
+    }
+  },
+  "transform_read_args": {
+    "brief": "读取括号内最多 cap 个数值参数 / Read up to `cap` numeric arguments inside the parentheses",
+    "params": {
+      "pp": "inout:解析游标指针 / Parse cursor pointer",
+      "v": "out:接收参数值 / Receives the argument values",
+      "cap": "in:参数数组容量 / Capacity of the argument array"
+    },
+    "return": "实际解析到的参数个数 / Number of arguments actually parsed",
+    "note": "会跳过逗号与空白，并至少前进到右括号之后 / Skips commas and whitespace and always advances past the closing parenthesis"
+  },
+  "transform_skip_parens": {
+    "brief": "跳过一段括号参数（避免死循环）/ Skip a parenthesised argument list to avoid an endless loop",
+    "params": {
+      "p": "in:起始指针 / Start pointer"
+    },
+    "return": "右括号之后的指针 / Pointer past the closing parenthesis"
+  },
+  "parse_transform": {
+    "brief": "解析 transform 属性为累积矩阵 / Parse a `transform` attribute into an accumulated matrix",
+    "params": {
+      "s": "in:transform 属性文本 / The `transform` attribute text"
+    },
+    "return": "累积后的变换矩阵 / The accumulated transform matrix",
+    "note": "多个变换按出现顺序左乘累加；`s` 为 `NULL` 时返回单位矩阵 / Multiple transforms accumulate left to right; returns the identity when `s` is `NULL`"
+  },
+  "find_by_id": {
+    "brief": "在子树中按 id 查找元素 / Find an element by id within a subtree",
+    "params": {
+      "root": "in:子树根 / Subtree root",
+      "id": "in:目标 id / Target id"
+    },
+    "return": "匹配的元素；未找到时返回 `NULL` / The matching element, or `NULL` when not found"
+  },
+  "parse_offset": {
+    "brief": "解析渐变色标偏移 / Parse a gradient stop offset",
+    "params": {
+      "s": "in:偏移文本 / Offset text"
+    },
+    "return": "归一化偏移；带 `%` 时除以 100 / The normalised offset, divided by 100 when it carries a `%`"
+  },
+  "parse_gradient_geometry": {
+    "brief": "读取线性/径向渐变的几何属性 / Read the geometry attributes of a linear or radial gradient",
+    "params": {
+      "n": "in:渐变元素 / Gradient element",
+      "g": "out:渐变描述，被写入 / Gradient description, written to"
+    },
+    "note": "线性读 x1/y1/x2/y2，径向读 cx/cy/r / Linear reads x1/y1/x2/y2; radial reads cx/cy/r"
+  },
+  "parse_gradient_stop": {
+    "brief": "把一个 `<stop>` 子元素追加到色标列表 / Append one `<stop>` child to the gradient's stop list",
+    "params": {
+      "c": "in:`<stop>` 元素 / The `<stop>` element",
+      "g": "out:渐变描述 / Gradient description"
+    },
+    "note": "读取 offset、stop-color、stop-opacity / Reads offset, stop-color and stop-opacity"
+  },
+  "parse_gradient": {
+    "brief": "从 `<linearGradient>`/`<radialGradient>` 元素填充渐变描述 / Fill a gradient description from a `<linearGradient>`/`<radialGradient>` element",
+    "params": {
+      "n": "in:渐变元素 / Gradient element",
+      "g": "out:渐变描述 / Gradient description"
+    },
+    "return": "有色标返回 1，否则 0 / 1 when the gradient has stops, else 0",
+    "note": "标签不匹配时返回 0；色标最多收集 SVG_MAX_STOPS 个 / Returns 0 when the tag does not match; collects at most SVG_MAX_STOPS stops"
+  },
+  "resolve_gradient": {
+    "brief": "把 `fill`/`stroke` 的 `url(#id)` 解析为渐变 / Resolve a `fill`/`stroke` `url(#id)` into a gradient",
+    "params": {
+      "ctx": "inout:SVG 上下文 / SVG context",
+      "n": "in:DOM 元素 / DOM element",
+      "which": "in:属性名（fill 或 stroke）/ Attribute name, `fill` or `stroke`",
+      "out": "out:解析出的渐变 / Resolved gradient",
+      "ux0": "in:形状用户空间包围盒左 / Shape user-space bbox left",
+      "uy0": "in:形状用户空间包围盒上 / Shape user-space bbox top",
+      "ux1": "in:形状用户空间包围盒右 / Shape user-space bbox right",
+      "uy1": "in:形状用户空间包围盒下 / Shape user-space bbox bottom"
+    },
+    "return": "解析成功返回 1，否则 0 / 1 on success, else 0",
+    "note": "objectBoundingBox 单位下把分数坐标映射到形状的用户包围盒 / For objectBoundingBox units the fractional coordinates are mapped onto the shape's user bbox"
+  },
+  "dev_move": {
+    "brief": "开启新子路径并落到设备空间起点 / Open a new subpath at a device-space point",
+    "params": {
+      "p": "inout:多边形列表 / Polygon list",
+      "ctx": "in:SVG 上下文 / SVG context",
+      "ux": "in:用户空间 X / User-space X",
+      "uy": "in:用户空间 Y / User-space Y"
+    },
+    "note": "用户坐标经 CTM 变换后再入队 / User coordinates are mapped by the CTM before being stored"
+  },
+  "dev_line": {
+    "brief": "在当前子路径追加一条线段 / Append a line segment to the current subpath",
+    "params": {
+      "p": "inout:多边形列表 / Polygon list",
+      "ctx": "in:SVG 上下文 / SVG context",
+      "ux": "in:用户空间 X / User-space X",
+      "uy": "in:用户空间 Y / User-space Y"
+    },
+    "note": "尚无子路径时退化为 dev_move / Degrades to dev_move when no subpath exists yet"
+  },
+  "flatten_cubic": {
+    "brief": "把三次贝塞尔曲线展平为线段 / Flatten a cubic Bezier curve into line segments",
+    "params": {
+      "p": "inout:多边形列表 / Polygon list",
+      "ctx": "in:SVG 上下文 / SVG context",
+      "x0": "in:起点 X / Start X",
+      "y0": "in:起点 Y / Start Y",
+      "x1": "in:第一控制点 X / First control point X",
+      "y1": "in:第一控制点 Y / First control point Y",
+      "x2": "in:第二控制点 X / Second control point X",
+      "y2": "in:第二控制点 Y / Second control point Y",
+      "x3": "in:终点 X / End X",
+      "y3": "in:终点 Y / End Y"
+    },
+    "note": "按控制多边形长度与缩放估算步数，上限 200 / The step count is estimated from the control polygon length and the scale, capped at 200"
+  },
+  "flatten_quad": {
+    "brief": "把二次贝塞尔曲线展平为线段 / Flatten a quadratic Bezier curve into line segments",
+    "params": {
+      "p": "inout:多边形列表 / Polygon list",
+      "ctx": "in:SVG 上下文 / SVG context",
+      "x0": "in:起点 X / Start X",
+      "y0": "in:起点 Y / Start Y",
+      "x1": "in:控制点 X / Control point X",
+      "y1": "in:控制点 Y / Control point Y",
+      "x2": "in:终点 X / End X",
+      "y2": "in:终点 Y / End Y"
+    },
+    "note": "按控制多边形长度与缩放估算步数，上限 200 / The step count is estimated from the control polygon length and the scale, capped at 200"
+  },
+  "arc_center_params": {
+    "brief": "把椭圆弧的端点式参数化为中心式 / Endpoint-to-centre parameterisation of an SVG elliptical arc",
+    "params": {
+      "x0": "in:起点 X / Start X",
+      "y0": "in:起点 Y / Start Y",
+      "rx": "inout:X 半径，过大时被放大 / X radius, scaled up when too small",
+      "ry": "inout:Y 半径，过大时被放大 / Y radius, scaled up when too small",
+      "phi": "in:X 轴旋转角（度）/ X-axis rotation in degrees",
+      "large": "in:大弧标志 / Large-arc flag",
+      "sweep": "in:扫描方向标志 / Sweep flag",
+      "x1": "in:终点 X / End X",
+      "y1": "in:终点 Y / End Y",
+      "trig": "out:旋转角的 cos/sin / Cosine and sine of the rotation angle",
+      "out_cx": "out:中心 X / Centre X",
+      "out_cy": "out:中心 Y / Centre Y",
+      "out_theta1": "out:起始角（弧度）/ Start angle in radians",
+      "out_dtheta": "out:扫过角（弧度）/ Swept angle in radians"
+    },
+    "note": "按 SVG 规范 F.6.5 实现 / Follows the SVG spec's implementation notes F.6.5"
+  },
+  "flatten_arc": {
+    "brief": "把椭圆弧展平为线段 / Flatten an elliptical arc into line segments",
+    "params": {
+      "p": "inout:多边形列表 / Polygon list",
+      "ctx": "in:SVG 上下文 / SVG context",
+      "x0": "in:起点 X / Start X",
+      "y0": "in:起点 Y / Start Y",
+      "rx": "in:X 半径 / X radius",
+      "ry": "in:Y 半径 / Y radius",
+      "phi": "in:X 轴旋转角（度）/ X-axis rotation in degrees",
+      "large": "in:大弧标志 / Large-arc flag",
+      "sweep": "in:扫描方向标志 / Sweep flag",
+      "x1": "in:终点 X / End X",
+      "y1": "in:终点 Y / End Y"
+    },
+    "note": "半径之一为 0 时退化为直线；步数按扫过角与半径估算，上限 200 / Degrades to a straight line when either radius is zero; the step count is estimated from the sweep and radius, capped at 200"
+  },
+  "path_cmd_argc": {
+    "brief": "查路径命令所需的参数个数 / Look up the argument count a path command needs",
+    "params": {
+      "upper": "in:大写命令字母 / Uppercased command letter"
+    },
+    "return": "参数个数；未知命令返回 -1 / The argument count, or -1 for an unknown command"
+  },
+  "path_isspace": {
+    "brief": "判断字符是否为路径分隔空白 / Test whether a character is a path separator",
+    "params": {
+      "c": "in:字符 / Character"
+    },
+    "return": "是空格/逗号/制表/换行返回 1 / 1 for space, comma, tab or newline"
+  },
+  "path_skip_sep": {
+    "brief": "跳过当前位置的分隔符 / Skip separators at the current position",
+    "params": {
+      "pb": "inout:路径构建状态 / Path build state"
+    }
+  },
+  "path_read_args": {
+    "brief": "读取最多 want 个数字参数 / Read up to `want` numeric arguments",
+    "params": {
+      "pb": "inout:路径构建状态 / Path build state",
+      "a": "out:接收参数值 / Receives the argument values",
+      "want": "in:期望的参数个数 / Desired argument count"
+    },
+    "return": "实际解析到的个数 / Number actually parsed"
+  },
+  "path_cmd_z": {
+    "brief": "闭合当前子路径 / Close the current subpath",
+    "params": {
+      "pb": "inout:路径构建状态 / Path build state"
+    },
+    "note": "标记子路径闭合并把当前点移回子路径起点 / Marks the subpath closed and moves the current point back to the subpath start"
+  },
+  "path_cmd_move": {
+    "brief": "执行 M 移动命令 / Execute an `M` move command",
+    "params": {
+      "pb": "inout:路径构建状态 / Path build state",
+      "a": "in:参数数组 / Argument array",
+      "rel": "in:相对命令为 1 / 1 for a relative command"
+    },
+    "note": "按规范，紧随的坐标对被视为隐式 lineto / Per the spec, following coordinate pairs are treated as implicit line-tos"
+  },
+  "path_cmd_line": {
+    "brief": "执行 L 直线命令 / Execute an `L` line command",
+    "params": {
+      "pb": "inout:路径构建状态 / Path build state",
+      "a": "in:参数数组 / Argument array",
+      "rel": "in:相对命令为 1 / 1 for a relative command"
+    },
+    "note": "尚无子路径时以该点为起点 / Uses the point as the new subpath start when none exists"
+  },
+  "path_cmd_h": {
+    "brief": "执行 H 水平线命令 / Execute an `H` horizontal line command",
+    "params": {
+      "pb": "inout:路径构建状态 / Path build state",
+      "a": "in:参数数组 / Argument array",
+      "rel": "in:相对命令为 1 / 1 for a relative command"
+    }
+  },
+  "path_cmd_v": {
+    "brief": "执行 V 垂直线命令 / Execute a `V` vertical line command",
+    "params": {
+      "pb": "inout:路径构建状态 / Path build state",
+      "a": "in:参数数组 / Argument array",
+      "rel": "in:相对命令为 1 / 1 for a relative command"
+    }
+  },
+  "path_cmd_cubic": {
+    "brief": "执行 C 三次贝塞尔命令 / Execute a `C` cubic curve command",
+    "params": {
+      "pb": "inout:路径构建状态 / Path build state",
+      "a": "in:参数数组 / Argument array",
+      "rel": "in:相对命令为 1 / 1 for a relative command"
+    },
+    "note": "记录第二控制点供后续 S 反射使用 / Records the second control point for a following `S` reflection"
+  },
+  "path_cmd_smooth_cubic": {
+    "brief": "执行 S 平滑三次贝塞尔命令 / Execute an `S` smooth cubic curve command",
+    "params": {
+      "pb": "inout:路径构建状态 / Path build state",
+      "a": "in:参数数组 / Argument array",
+      "rel": "in:相对命令为 1 / 1 for a relative command"
+    },
+    "note": "首个控制点由前一控制点关于当前点反射得到 / The first control point is the previous control point reflected about the current point"
+  },
+  "path_cmd_quad": {
+    "brief": "执行 Q 二次贝塞尔命令 / Execute a `Q` quadratic curve command",
+    "params": {
+      "pb": "inout:路径构建状态 / Path build state",
+      "a": "in:参数数组 / Argument array",
+      "rel": "in:相对命令为 1 / 1 for a relative command"
+    },
+    "note": "记录控制点供后续 T 反射使用 / Records the control point for a following `T` reflection"
+  },
+  "path_cmd_smooth_quad": {
+    "brief": "执行 T 平滑二次贝塞尔命令 / Execute a `T` smooth quadratic curve command",
+    "params": {
+      "pb": "inout:路径构建状态 / Path build state",
+      "a": "in:参数数组 / Argument array",
+      "rel": "in:相对命令为 1 / 1 for a relative command"
+    },
+    "note": "控制点由前一控制点关于当前点反射得到 / The control point is the previous control point reflected about the current point"
+  },
+  "path_cmd_arc": {
+    "brief": "执行 A 椭圆弧命令 / Execute an `A` elliptical arc command",
+    "params": {
+      "pb": "inout:路径构建状态 / Path build state",
+      "a": "in:参数数组 / Argument array",
+      "rel": "in:相对命令为 1 / 1 for a relative command"
+    }
+  },
+  "path_skip_unknown": {
+    "brief": "跳过一个无法识别的命令 / Skip one unrecognised command",
+    "params": {
+      "pb": "inout:路径构建状态 / Path build state"
+    },
+    "note": "若当前位置不含数字则只前进一个字符 / Advances just one character when the current position holds no number"
+  },
+  "path_apply": {
+    "brief": "把一个命令的参数分派给对应处理器 / Dispatch one command's arguments to its handler",
+    "params": {
+      "pb": "inout:路径构建状态 / Path build state",
+      "upper": "in:大写命令字母 / Uppercased command letter",
+      "a": "in:参数数组 / Argument array",
+      "rel": "in:相对命令为 1 / 1 for a relative command"
+    },
+    "note": "默认分支按 A（椭圆弧）处理 / The default branch handles `A` (elliptical arc)"
+  },
+  "path_run_command": {
+    "brief": "消费当前命令的参数并执行 / Consume the current command's argument list and apply it",
+    "params": {
+      "pb": "inout:路径构建状态 / Path build state"
+    },
+    "note": "参数不足时清空游标以停止扫描；Z 直接闭合 / Clears the cursor to stop the scan when arguments run short; `Z` closes directly"
+  },
+  "build_path": {
+    "brief": "解析路径 `d` 数据构建设备空间多边形 / Parse path `d` data into device-space polygons",
+    "params": {
+      "p": "out:接收几何的多边形列表 / Polygon list receiving the geometry",
+      "ctx": "in:SVG 上下文 / SVG context",
+      "d": "in:路径数据 / Path data"
+    },
+    "note": "`d` 为 `NULL` 时无操作；命令字母切换当前命令，其余交给 path_run_command / No-op when `d` is `NULL`; command letters switch the current command and the rest goes to path_run_command"
+  },
+  "collect_text": {
+    "brief": "收集元素子树内的文本 / Collect the text inside an element's subtree",
+    "params": {
+      "n": "in:元素 / Element",
+      "buf": "out:接收文本的缓冲区 / Buffer receiving the text",
+      "cap": "in:缓冲区容量 / Buffer capacity",
+      "len": "inout:已写入长度，被累加 / Length written so far, accumulated"
+    },
+    "note": "跳过 title/desc 子元素；缓冲区满时不再追加 / Skips `title`/`desc` children; stops appending when the buffer is full"
+  },
+  "draw_text_read_attrs": {
+    "brief": "读取 `<text>` 的文本与锚点属性 / Read a `<text>` element's text and anchor attributes",
+    "params": {
+      "n": "in:`<text>` 元素 / The `<text>` element",
+      "ctx": "in:SVG 上下文 / SVG context",
+      "dt": "out:文本绘制参数 / Text draw parameters"
+    },
+    "return": "有文本返回 1，否则 0 / 1 when there is text, else 0",
+    "note": "解析 x/y/font-size/textLength/font-weight/fill 与 text-anchor、dominant-baseline / Parses x/y/font-size/textLength/font-weight/fill plus text-anchor and dominant-baseline"
+  },
+  "draw_text_stretched": {
+    "brief": "按 textLength 拉伸 advanc 逐字绘制文本 / Draw text glyph by glyph with advances stretched to match `textLength`",
+    "params": {
+      "ctx": "in:SVG 上下文 / SVG context",
+      "font": "in:字体 / Font",
+      "buf": "in:文本缓冲区 / Text buffer",
+      "len": "in:文本字节长度 / Text byte length",
+      "dev_x": "in:设备起点 X / Device start X",
+      "dev_y": "in:设备基线 Y / Device baseline Y",
+      "w": "in:自然宽度 / Natural width",
+      "text_len": "in:目标 textLength / Target `textLength`",
+      "scale": "in:CTM 缩放系数 / CTM scale factor",
+      "color": "in:文本颜色 / Text colour"
+    },
+    "note": "对应 lengthAdjust=\"spacing\" / Corresponds to `lengthAdjust=\"spacing\"`"
+  },
+  "draw_text": {
+    "brief": "绘制一个 `<text>` 元素 / Draw a `<text>` element",
+    "params": {
+      "ctx": "in:SVG 上下文 / SVG context",
+      "n": "in:`<text>` 元素 / The `<text>` element"
+    },
+    "note": "锚点与基线关键字修正绘制起点；给出 textLength 且多字符时走拉伸绘制 / Anchor and baseline keywords adjust the origin; a `textLength` with more than one character goes through the stretched path"
+  },
+  "ellipse_path": {
+    "brief": "构建椭圆/圆的多边形路径（用户空间）/ Build an ellipse/circle polygon path in user space",
+    "params": {
+      "p": "out:多边形列表 / Polygon list",
+      "ctx": "in:SVG 上下文 / SVG context",
+      "cx": "in:中心 X / Centre X",
+      "cy": "in:中心 Y / Centre Y",
+      "rx": "in:X 半径 / X radius",
+      "ry": "in:Y 半径 / Y radius"
+    },
+    "note": "用 64 段采样逼近，路径闭合 / Approximated with 64 samples and closed"
+  },
+  "round_rect_path": {
+    "brief": "构建圆角矩形多边形路径 / Build a rounded-rectangle polygon path",
+    "params": {
+      "p": "out:多边形列表 / Polygon list",
+      "ctx": "in:SVG 上下文 / SVG context",
+      "x": "in:左边界 X / Left X",
+      "y": "in:上边界 Y / Top Y",
+      "w": "in:宽度 / Width",
+      "h": "in:高度 / Height",
+      "r": "in:圆角半径 / Corner radius"
+    },
+    "note": "半径夹紧到半宽/半高；每个圆角用 8 段采样，路径闭合 / The radius is clamped to half the width and height; each corner is sampled with 8 segments and the path is closed"
+  },
+  "points_path": {
+    "brief": "从 points 属性构建多边形/折线 / Build a polygon/polyline from a `points` attribute",
+    "params": {
+      "p": "out:多边形列表 / Polygon list",
+      "ctx": "in:SVG 上下文 / SVG context",
+      "pts": "in:顶点串 / Point list string",
+      "closed": "in:闭合为 1 / 1 for a closed path"
+    },
+    "note": "`pts` 为 `NULL` 时无操作；顶点成对解析 / No-op when `pts` is `NULL`; points are parsed in pairs"
+  },
+  "points_bbox": {
+    "brief": "求 points 串的用户空间包围盒 / User-space bbox of a `points` list",
+    "params": {
+      "pts": "in:顶点串 / Point list string",
+      "x0": "out:左边界 / Left edge",
+      "y0": "out:上边界 / Top edge",
+      "x1": "out:右边界 / Right edge",
+      "y1": "out:下边界 / Bottom edge"
+    }
+  },
+  "path_bbox": {
+    "brief": "求路径串的用户空间包围盒 / User-space bbox of a path string",
+    "params": {
+      "d": "in:路径数据 / Path data",
+      "x0": "out:左边界 / Left edge",
+      "y0": "out:上边界 / Top edge",
+      "x1": "out:右边界 / Right edge",
+      "y1": "out:下边界 / Bottom edge"
+    },
+    "note": "用单位矩阵求值，用于把 objectBoundingBox 渐变映射到路径上 / Evaluated with an identity matrix so objectBoundingBox gradients can map onto paths"
+  },
+  "grad_scale_alpha": {
+    "brief": "按给定系数缩放所有色标的 alpha / Scale every gradient stop's alpha by a factor",
+    "params": {
+      "grad": "inout:渐变描述 / Gradient description",
+      "op": "in:透明度系数 / Opacity factor"
+    }
+  },
+  "paint_shape_fill": {
+    "brief": "用纯色或渐变填充一个形状 / Fill a shape with a solid colour or a gradient",
+    "params": {
+      "ctx": "inout:SVG 上下文 / SVG context",
+      "n": "in:DOM 元素 / DOM element",
+      "p": "in:多边形列表 / Polygon list",
+      "fill": "in:纯色回退 / Flat colour fallback",
+      "fop": "in:填充不透明度 / Fill opacity",
+      "ux0": "in:用户空间包围盒左 / User-space bbox left",
+      "uy0": "in:用户空间包围盒上 / User-space bbox top",
+      "ux1": "in:用户空间包围盒右 / User-space bbox right",
+      "uy1": "in:用户空间包围盒下 / User-space bbox bottom"
+    },
+    "note": "渐变解析成功时优先使用并缩放其 alpha / When the gradient resolves it is used and its alpha is scaled"
+  },
+  "paint_shape_stroke": {
+    "brief": "用纯色或渐变描边一个形状 / Stroke a shape with a solid colour or a gradient",
+    "params": {
+      "ctx": "inout:SVG 上下文 / SVG context",
+      "n": "in:DOM 元素 / DOM element",
+      "p": "in:多边形列表 / Polygon list",
+      "stroke": "in:纯色回退 / Flat colour fallback",
+      "sop": "in:描边不透明度 / Stroke opacity",
+      "ux0": "in:用户空间包围盒左 / User-space bbox left",
+      "uy0": "in:用户空间包围盒上 / User-space bbox top",
+      "ux1": "in:用户空间包围盒右 / User-space bbox right",
+      "uy1": "in:用户空间包围盒下 / User-space bbox bottom"
+    },
+    "note": "描边宽度按 CTM 缩放 / The stroke width is scaled by the CTM"
+  },
+  "paint_shape": {
+    "brief": "填充并/或描边一个已构建的形状 / Fill and/or stroke an already-built shape",
+    "params": {
+      "ctx": "inout:SVG 上下文 / SVG context",
+      "n": "in:DOM 元素 / DOM element",
+      "p": "in:多边形列表 / Polygon list",
+      "ux0": "in:用户空间包围盒左 / User-space bbox left",
+      "uy0": "in:用户空间包围盒上 / User-space bbox top",
+      "ux1": "in:用户空间包围盒右 / User-space bbox right",
+      "uy1": "in:用户空间包围盒下 / User-space bbox bottom",
+      "fillable": "in:允许填充为 1 / 1 when fillable",
+      "strokable": "in:允许描边为 1 / 1 when strokable"
+    },
+    "note": "元素自身的 fill/stroke/opacity 属性覆盖继承状态 / The element's own fill/stroke/opacity attributes override the inherited state"
+  },
+  "draw_children": {
+    "brief": "绘制父元素的所有元素子节点 / Draw all element children of a parent",
+    "params": {
+      "ctx": "in:SVG 上下文 / SVG context",
+      "parent": "in:父元素 / Parent element",
+      "ctm": "in:当前变换矩阵 / Current transformation matrix"
+    },
+    "note": "非元素子节点被跳过 / Non-element children are skipped"
+  },
+  "svg_is_metadata_tag": {
+    "brief": "判断标签是否只承载元数据、不直接绘制 / Test whether a tag carries metadata only and is never painted directly",
+    "params": {
+      "tag": "in:标签名 / Tag name"
+    },
+    "return": "是元数据标签返回 1，否则 0 / 1 for a metadata tag, else 0",
+    "note": "title、desc、defs、linearGradient、radialGradient、stop / `title`, `desc`, `defs`, `linearGradient`, `radialGradient`, `stop`"
+  },
+  "draw_use_ref": {
+    "brief": "绘制 `<use>` 引用的元素 / Draw the element referenced by a `<use>`",
+    "params": {
+      "ctx": "in:SVG 上下文 / SVG context",
+      "sub": "out:派生子上下文 / Derived sub-context",
+      "n": "in:`<use>` 元素 / The `<use>` element",
+      "ctm": "in:当前变换矩阵 / Current transformation matrix"
+    },
+    "note": "按 x/y 平移并应用 use 的样式，随后递归绘制引用元素 / Translated by x/y, applies the `use` style, then recursively draws the referenced element"
+  },
+  "draw_container": {
+    "brief": "绘制 `<g>`/`<svg>` 容器 / Draw a `<g>`/`<svg>` container",
+    "params": {
+      "ctx": "in:SVG 上下文 / SVG context",
+      "sub": "out:派生子上下文 / Derived sub-context",
+      "n": "in:容器元素 / Container element",
+      "ctm": "in:当前变换矩阵 / Current transformation matrix",
+      "tag": "in:标签名 / Tag name"
+    },
+    "note": "压入样式后递归；`<svg>` 额外按其 x/y 偏移 / Pushes the style and recurses; `<svg>` is additionally offset by its x/y"
+  },
+  "draw_rect_node": {
+    "brief": "绘制 `<rect>` 元素 / Draw a `<rect>` element",
+    "params": {
+      "sub": "inout:SVG 子上下文 / SVG sub-context",
+      "n": "in:`<rect>` 元素 / The `<rect>` element"
+    },
+    "note": "rx 缺失时回退到 ry；宽或高非正时不绘制 / Falls back to `ry` when `rx` is absent; draws nothing when the width or height is not positive"
+  },
+  "draw_ellipse_node": {
+    "brief": "绘制 `<circle>`/`<ellipse>` 元素 / Draw a `<circle>`/`<ellipse>` element",
+    "params": {
+      "sub": "inout:SVG 子上下文 / SVG sub-context",
+      "n": "in:元素 / Element",
+      "tag": "in:标签名 / Tag name"
+    },
+    "note": "圆形取 r 作为两半径；半径非正时不绘制 / A circle uses `r` for both radii; draws nothing when a radius is not positive"
+  },
+  "draw_line_node": {
+    "brief": "绘制 `<line>` 元素 / Draw a `<line>` element",
+    "params": {
+      "sub": "inout:SVG 子上下文 / SVG sub-context",
+      "n": "in:`<line>` 元素 / The `<line>` element"
+    },
+    "note": "只描边不填充 / Stroked only, never filled"
+  },
+  "draw_poly_node": {
+    "brief": "绘制 `<polygon>`/`<polyline>` 元素 / Draw a `<polygon>`/`<polyline>` element",
+    "params": {
+      "sub": "inout:SVG 子上下文 / SVG sub-context",
+      "n": "in:元素 / Element",
+      "tag": "in:标签名 / Tag name"
+    },
+    "note": "polygon 填充并描边，polyline 只描边 / `polygon` is filled and stroked while `polyline` is stroked only"
+  },
+  "draw_path_node": {
+    "brief": "绘制 `<path>` 元素 / Draw a `<path>` element",
+    "params": {
+      "sub": "inout:SVG 子上下文 / SVG sub-context",
+      "n": "in:`<path>` 元素 / The `<path>` element"
+    },
+    "note": "以单位矩阵求包围盒供渐变映射 / The bbox for gradient mapping is computed with an identity matrix"
+  },
+  "draw_shape": {
+    "brief": "在独立样式的子上下文中绘制一个叶子形状 / Draw a leaf shape in its own styled sub-context",
+    "params": {
+      "ctx": "in:SVG 上下文 / SVG context",
+      "n": "in:DOM 元素 / DOM element",
+      "ctm": "in:当前变换矩阵 / Current transformation matrix",
+      "tag": "in:标签名 / Tag name"
+    },
+    "note": "按标签分派到 text/rect/circle/ellipse/line/polygon/polyline/path；未知元素递归子节点以免内容丢失 / Dispatches on the tag to text/rect/circle/ellipse/line/polygon/polyline/path; an unknown element recurses into its children so nested content is not lost"
+  },
+  "draw_element": {
+    "brief": "绘制一个 SVG 元素 / Draw one SVG element",
+    "params": {
+      "ctx": "in:SVG 上下文 / SVG context",
+      "n": "in:DOM 元素 / DOM element",
+      "ctm": "in:当前变换矩阵 / Current transformation matrix"
+    },
+    "note": "元数据标签跳过；先累积元素的 transform，再按标签分派到容器/use/形状 / Metadata tags are skipped; the element transform is accumulated first, then dispatch goes to container, `use` or shape"
+  },
+  "svg_ctx_init": {
+    "brief": "从 `<svg>` 盒初始化 SVG 绘制上下文 / Seed the SVG drawing context from the `<svg>` box",
+    "params": {
+      "ctx": "out:SVG 上下文 / SVG context",
+      "pm": "inout:目标像素缓冲 / Target pixel buffer",
+      "box": "in:`<svg>` 盒 / The `<svg>` box",
+      "node": "in:`<svg>` DOM 节点 / The `<svg>` DOM node",
+      "y_dev": "in:盒子顶边的设备 y / Device y of the box top edge"
+    },
+    "note": "设置设备空间 CTM 原点、视口尺寸与默认绘制状态 / Sets the device-space CTM origin, viewport size and default paint state"
+  },
+  "svg_apply_viewbox": {
+    "brief": "应用 viewBox 变换 / Apply the viewBox transform",
+    "params": {
+      "ctx": "inout:SVG 上下文 / SVG context",
+      "node": "in:`<svg>` DOM 节点 / The `<svg>` DOM node",
+      "vw": "out:viewBox 宽度（存在时）/ viewBox width when present",
+      "vh": "out:viewBox 高度（存在时）/ viewBox height when present"
+    },
+    "note": "取均匀缩放并居中；无 viewBox 或格式非法时不变换 / Uses a uniform scale plus centring; does nothing when there is no viewBox or it is malformed"
+  },
+  "hpe_svg_paint": {
+    "brief": "绘制 `<svg>` 子树 / Paint the `<svg>` subtree",
+    "params": {
+      "pm": "inout:目标像素缓冲 / Target pixel buffer",
+      "box": "in:`<svg>` 盒 / The `<svg>` box",
+      "y_dev": "in:盒子顶边的设备 y / Device y of the box top edge"
+    },
+    "note": "裁剪到 SVG 视口并与已激活的损伤矩形求交，避免半透明描边在滚动中被重复混合而变暗 / Clips to the SVG viewport and intersects the already-active damage rect so translucent strokes are not blended twice and darkened on scroll"
+  },
+  "attr_f": {
+    "brief": "读取数值属性，缺失时返回默认值 / Read a numeric attribute, returning a default when absent",
+    "params": {
+      "n": "in:DOM 元素 / DOM element",
+      "name": "in:属性名 / Attribute name",
+      "def": "in:默认值 / Default value"
+    },
+    "return": "属性值或默认值 / The attribute value, or the default"
+  },
+  "point_in_polys": {
+    "brief": "用奇偶规则判断点是否在多边形内 / Test whether a point is inside the polygons using the even-odd rule",
+    "params": {
+      "p": "in:多边形列表 / Polygon list",
+      "x": "in:X 坐标 / X coordinate",
+      "y": "in:Y 坐标 / Y coordinate"
+    },
+    "return": "在内部返回 1，否则 0 / 1 when inside, else 0"
+  },
+  "use_ref_id": {
+    "brief": "从 `<use>` 的 href/xlink:href 取片段 id / Extract the fragment id from a `<use>` `href`/`xlink:href`",
+    "params": {
+      "node": "in:`<use>` 元素 / The `<use>` element",
+      "id": "out:接收片段 id / Receives the fragment id",
+      "cap": "in:`id` 缓冲区容量 / Capacity of the `id` buffer"
+    },
+    "return": "解析成功返回 1，否则 0 / 1 on success, else 0"
+  },
+  "hit_children": {
+    "brief": "命中测试所有元素子节点 / Hit test all element children",
+    "params": {
+      "ctx": "in:SVG 上下文 / SVG context",
+      "node": "in:父节点 / Parent node",
+      "dx": "in:设备点 X / Device point X",
+      "dy": "in:设备点 Y / Device point Y"
+    },
+    "return": "最深命中子节点，未命中返回 `NULL` / The deepest hit child, or `NULL` when nothing is hit",
+    "note": "后出现的兄弟覆盖先出现的，因此取最后一个命中 / Later siblings paint on top, so the last hit wins"
+  },
+  "hit_rect": {
+    "brief": "命中测试一个 `<rect>` / Hit test a `<rect>`",
+    "params": {
+      "n": "in:`<rect>` 元素 / The `<rect>` element",
+      "ux": "in:用户空间 X / User-space X",
+      "uy": "in:用户空间 Y / User-space Y"
+    },
+    "return": "命中则返回该元素，否则 `NULL` / The element when hit, else `NULL`"
+  },
+  "hit_ellipse": {
+    "brief": "命中测试一个 `<circle>`/`<ellipse>` / Hit test a `<circle>`/`<ellipse>`",
+    "params": {
+      "n": "in:元素 / Element",
+      "ux": "in:用户空间 X / User-space X",
+      "uy": "in:用户空间 Y / User-space Y"
+    },
+    "return": "命中则返回该元素，否则 `NULL` / The element when hit, else `NULL`",
+    "note": "把点归一化到单位圆判断 / The point is normalised against the unit circle"
+  },
+  "hit_line": {
+    "brief": "命中测试一条 `<line>` / Hit test a `<line>`",
+    "params": {
+      "n": "in:`<line>` 元素 / The `<line>` element",
+      "ux": "in:用户空间 X / User-space X",
+      "uy": "in:用户空间 Y / User-space Y"
+    },
+    "return": "命中则返回该元素，否则 `NULL` / The element when hit, else `NULL`",
+    "note": "线段周围约 3px 容差 / About 3 px tolerance around the segment"
+  },
+  "hit_points": {
+    "brief": "命中测试 `<polygon>`/`<polyline>` / Hit test a `<polygon>`/`<polyline>`",
+    "params": {
+      "ctx": "in:SVG 上下文 / SVG context",
+      "n": "in:元素 / Element",
+      "ux": "in:用户空间 X / User-space X",
+      "uy": "in:用户空间 Y / User-space Y"
+    },
+    "return": "命中则返回该元素，否则 `NULL` / The element when hit, else `NULL`",
+    "note": "在单位矩阵空间构建几何后测点 / The geometry is built in identity space before the point test"
+  },
+  "hit_path": {
+    "brief": "命中测试一个 `<path>` / Hit test a `<path>`",
+    "params": {
+      "ctx": "in:SVG 上下文 / SVG context",
+      "n": "in:`<path>` 元素 / The `<path>` element",
+      "ux": "in:用户空间 X / User-space X",
+      "uy": "in:用户空间 Y / User-space Y"
+    },
+    "return": "命中则返回该元素，否则 `NULL` / The element when hit, else `NULL`",
+    "note": "在单位矩阵空间构建几何后测点 / The geometry is built in identity space before the point test"
+  },
+  "hit_text": {
+    "brief": "命中测试一个 `<text>` / Hit test a `<text>`",
+    "params": {
+      "n": "in:`<text>` 元素 / The `<text>` element",
+      "ux": "in:用户空间 X / User-space X",
+      "uy": "in:用户空间 Y / User-space Y"
+    },
+    "return": "命中则返回该元素，否则 `NULL` / The element when hit, else `NULL`",
+    "note": "以锚点与字号估算文本框 / The text box is estimated from the anchor point and the font size"
+  },
+  "hit_shape": {
+    "brief": "命中测试一个叶子形状 / Hit test a leaf shape",
+    "params": {
+      "ctx": "inout:SVG 上下文 / SVG context",
+      "node": "in:元素 / Element",
+      "tag": "in:标签名 / Tag name",
+      "dx": "in:设备点 X / Device point X",
+      "dy": "in:设备点 Y / Device point Y"
+    },
+    "return": "命中则返回该元素，否则 `NULL` / The element when hit, else `NULL`",
+    "note": "先把设备点经逆矩阵映射到用户空间 / The device point is inverse-mapped into user space first"
+  },
+  "hit_use": {
+    "brief": "命中测试一个 `<use>` / Hit test a `<use>`",
+    "params": {
+      "ctx": "inout:SVG 上下文 / SVG context",
+      "node": "in:`<use>` 元素 / The `<use>` element",
+      "dx": "in:设备点 X / Device point X",
+      "dy": "in:设备点 Y / Device point Y"
+    },
+    "return": "最深命中节点，未命中返回 `NULL` / The deepest hit node, or `NULL`",
+    "note": "把 use 的 transform 与 x/y 压入 CTM 后递归引用元素 / Pushes the `use` transform and x/y onto the CTM, then recurses into the referenced element"
+  },
+  "hit_walk": {
+    "brief": "递归遍历 SVG 树做命中测试 / Walk the SVG tree recursively for hit testing",
+    "params": {
+      "ctx": "inout:SVG 上下文 / SVG context",
+      "node": "in:当前节点 / Current node",
+      "dx": "in:设备点 X / Device point X",
+      "dy": "in:设备点 Y / Device point Y"
+    },
+    "return": "最深命中节点，未命中返回 `NULL` / The deepest hit node, or `NULL`",
+    "note": "defs/title/desc 不参与命中；g/svg 压入 transform 后递归子节点，use 与形状各自处理 / `defs`/`title`/`desc` never hit; `g`/`svg` push their transform and recurse while `use` and shapes are handled separately"
+  },
+  "hpe_svg_hit_test": {
+    "brief": "对 `<svg>` 子树做命中测试 / Hit test an `<svg>` subtree",
+    "params": {
+      "box": "in:`<svg>` 盒 / The `<svg>` box",
+      "x": "in:文档坐标 X / Document-space X",
+      "y": "in:文档坐标 Y / Document-space Y"
+    },
+    "return": "最深的包含该点的 SVG 元素，未命中返回 `NULL` / The deepest SVG element containing the point, or `NULL`",
+    "note": "以盒内容盒左上角为原点，并按 viewBox 缩放居中；路径目前尚未参与命中测试 / The origin is the box's content-box top-left with viewBox scaling and centring applied; paths are not hit tested yet"
+  }
+}

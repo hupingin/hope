@@ -6,6 +6,10 @@
 #include <string.h>
 
 #include "paint/hpe_svg.h"
+#include "paint/hpe_paint_form.h"
+#include "paint/hpe_paint_details.h"
+#include "canvas/hpe_canvas.h"
+#include "dom/hpe_dom.h"
 #include "base/hpe_util.h"
 #include "render/hpe_emoji.h"
 #include "render/hpe_image.h"
@@ -36,6 +40,11 @@ typedef struct PaintCtx {
      * the page offset: descendants of a scrolled element move with it */
     float elem_scroll;
     int group_depth; /* opacity/transform-group nesting, to cap pathological recursion */
+    /* modal <dialog> backdrop: painted immediately before the dialog's box so
+     * it covers ordinary content but sits under the dialog itself */
+    HpeDomNode *modal_dialog;
+    int backdrop_pending;
+    float backdrop_y; /* device y of the viewport content top edge */
 } PaintCtx;
 
 #define MAX_OPACITY_DEPTH 3
@@ -666,6 +675,52 @@ static void blit_image(HpePixmap *pm, const HpeImage *img, float dx, float dy, f
             sample_bilinear(row0, row1, clamp_idx(ix, img->width), clamp_idx(ix + 1, img->width),
                             fx, fy, &r, &g, &b, &wsum);
             blend_pixel(&dst_row[px], r, g, b, wsum);
+        }
+    }
+}
+
+/**
+ * @brief 把 `<canvas>` 的离屏像素混合进内容盒 / Blit a canvas's offscreen buffer into its content box
+ *
+ * @param[in,out] pm 目标像素缓冲 / Target pixel buffer
+ * @param[in]     box canvas 盒 / The canvas box
+ * @param[in]     bb 设备坐标边框盒 / Border box in device coordinates
+ *
+ * @note 用最近邻缩放把离屏像素铺满内容盒；透明像素不写 / Nearest-neighbour scales the buffer into the content box; transparent pixels are skipped
+ */
+static void paint_canvas_box(HpePixmap *pm, const HpeBox *box, HpeRect bb)
+{
+    HpeCanvas *c = hpe_canvas_find(box->node);
+    HpeRect content = box->content_box;
+    int x0, y0, w, h, px, py;
+    float dx, dy, dw, dh;
+    if (!c || !c->pm.pixels)
+        return;
+    dx = bb.x + (content.x - box->border_box.x);
+    dy = bb.y + (content.y - box->border_box.y);
+    dw = content.w;
+    dh = content.h;
+    if (dw <= 0.0f || dh <= 0.0f)
+        return;
+    x0 = (int)floorf(dx);
+    y0 = (int)floorf(dy);
+    w = (int)ceilf(dw);
+    h = (int)ceilf(dh);
+    if (!clamp_dest_to_clip(pm, &x0, &y0, &w, &h))
+        return;
+    for (py = 0; py < h; py++) {
+        int iy = (int)floorf(((float)(y0 + py) - dy + 0.5f) / dh * (float)c->pm.height);
+        uint32_t *dst = pm->pixels + (size_t)(y0 + py) * (size_t)pm->width + (size_t)x0;
+        if (iy < 0) iy = 0;
+        if (iy >= c->pm.height) iy = c->pm.height - 1;
+        for (px = 0; px < w; px++) {
+            int ix = (int)floorf(((float)(x0 + px) - dx + 0.5f) / dw * (float)c->pm.width);
+            uint32_t src;
+            if (ix < 0) ix = 0;
+            if (ix >= c->pm.width) ix = c->pm.width - 1;
+            src = c->pm.pixels[(size_t)iy * (size_t)c->pm.width + (size_t)ix];
+            if ((src >> 24) & 0xff)
+                dst[px] = src;
         }
     }
 }
@@ -1336,6 +1391,11 @@ static void paint_box(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float scroll)
     int needs_group;
     if (bs->display == HPE_DISPLAY_NONE)
         return;
+    /* paint the modal backdrop just before the dialog's own box */
+    if (ctx->backdrop_pending && box->node == ctx->modal_dialog) {
+        hpe_paint_dialog_backdrop(pm, ctx->backdrop_y);
+        ctx->backdrop_pending = 0;
+    }
     /* `visibility: hidden` suppresses this box's own painting but not its
      * subtree: a descendant may set `visibility: visible` to reappear, so we
      * still recurse (paint_box_inner skips the self-painting when hidden). */
@@ -2036,13 +2096,51 @@ static void paint_box_inner(PaintCtx *ctx, HpePixmap *pm, HpeBox *box, float scr
     if (self_visible)
         paint_box_own_content(ctx, pm, box, own_scroll, bb, radius);
 
+    /* a <summary> draws a disclosure triangle in its left padding gutter */
+    if (self_visible && box->node && box->node->tag &&
+        !strcmp(box->node->tag, "summary")) {
+        HpeDomNode *d = box->node->parent;
+        int open = d && d->tag && !strcmp(d->tag, "details") &&
+                   hpe_dom_attr(d, "open") != NULL;
+        hpe_paint_summary_marker(pm, box, bb, open);
+    }
+
     if (box->node && box->node->tag && !strcmp(box->node->tag, "svg")) {
         if (self_visible)
             hpe_svg_paint(pm, box, bb.y);
         return; /* SVG content is painted from the DOM, not from boxes */
     }
 
+    if (form_is_replaced_control(box->node)) {
+        if (self_visible)
+            hpe_paint_form_control(pm, box, bb);
+        return; /* replaced controls paint from the DOM, not from boxes */
+    }
+
+    if (box->node && box->node->tag && !strcmp(box->node->tag, "canvas")) {
+        if (self_visible)
+            paint_canvas_box(pm, box, bb);
+        return; /* canvas paints its offscreen buffer, never child boxes */
+    }
+
     paint_box_clipped_children(ctx, pm, box, scroll, own_scroll);
+}
+
+/**
+ * @brief 初始化一次绘制的上下文（含模态背景状态）/ Initialise a paint context (including modal backdrop state)
+ *
+ * @param[in,out] ctx 绘制上下文 / Paint context
+ * @param[in]     origin_y 视口内容顶边的设备 y / Device y of viewport content top edge
+ */
+static void paint_ctx_init(PaintCtx *ctx, float origin_y)
+{
+    ctx->dev_x = 0.0f;
+    ctx->dev_y = origin_y;
+    ctx->elem_scroll = 0.0f;
+    ctx->group_depth = 0;
+    ctx->modal_dialog = hpe_paint_modal_dialog();
+    ctx->backdrop_pending = ctx->modal_dialog != NULL;
+    ctx->backdrop_y = origin_y;
 }
 
 /**
@@ -2065,10 +2163,7 @@ void hpe_paint_document(HpePixmap *pm, HpeBox *root, float scroll_y, HpeColor pa
     hpe_pixmap_reset_clip(pm);
     hpe_pixmap_clear(pm, page_background);
     if (root) {
-        ctx.dev_x = 0.0f;
-        ctx.dev_y = origin_y;
-        ctx.elem_scroll = 0.0f;
-        ctx.group_depth = 0;
+        paint_ctx_init(&ctx, origin_y);
         /* keep page content below the browser chrome */
         hpe_pixmap_set_clip(pm, hpe_rect(0.0f, origin_y, (float)pm->width,
                                          (float)pm->height - origin_y));
@@ -2106,9 +2201,7 @@ void hpe_paint_region(HpePixmap *pm, HpeBox *root, float scroll_y, HpeColor page
     hpe_pixmap_set_clip(pm, clip);
     hpe_fill_rect(pm, clip, page_background);
     if (root) {
-        ctx.dev_x = 0.0f;
-        ctx.dev_y = origin_y;
-        ctx.group_depth = 0;
+        paint_ctx_init(&ctx, origin_y);
         paint_box(&ctx, pm, root, scroll_y);
     }
     hpe_pixmap_reset_clip(pm);

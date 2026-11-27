@@ -1,0 +1,670 @@
+{
+  "eval_call": {
+    "brief": "求值一次函数调用表达式 / Evaluate a call expression",
+    "details": "若被调节点是 `super(...)` 则转交 `super_call`；否则先由 `eval_callee` 解析出被调值与 `this`，再以第 1 个子节点起的实参调用 `call_value`。| When the callee node is a `super(...)` call it is delegated to `super_call`; otherwise `eval_callee` resolves the callee and `this`, after which `call_value` is invoked with the arguments starting at child 1.",
+    "return": "调用的结果值 / The result value of the call",
+    "note": "`eval_callee` 解析失败时返回 `undefined` / Returns `undefined` when `eval_callee` cannot resolve the callee",
+    "see": "eval_callee call_value eval_new"
+  },
+  "eval_new": {
+    "brief": "求值 `new` 构造表达式 / Evaluate a `new` construction expression",
+    "details": "被调节点是 `JS_N_CALL` 时按 `new X(args)` 解析被调值与实参；否则被调值直接取自成员表达式或普通表达式，且不带实参调用 `js_construct`。| When the callee node is a `JS_N_CALL` it is treated as `new X(args)`; otherwise the callee comes from a member or plain expression and `js_construct` is called with no arguments.",
+    "return": "构造出的对象值 / The constructed object value",
+    "see": "js_construct eval_call"
+  },
+  "typeof_name": {
+    "brief": "把运行时值映射为 `typeof` 结果名 / Map a runtime value to its `typeof` result name",
+    "return": "类型名字符串 / The type-name string",
+    "retval": {
+      "\"undefined\"": "`JS_UNDEF` 或未知类型 / `JS_UNDEF` or an unknown type",
+      "\"object\"": "`JS_NULL` 或非可调用对象 / `JS_NULL` or a non-callable object",
+      "\"boolean\"": "布尔值 / A boolean value",
+      "\"number\"": "数值 / A number",
+      "\"string\"": "字符串 / A string",
+      "\"function\"": "可调用对象（函数）/ A callable object (function)"
+    },
+    "note": "`null` 按 JS 语义返回 `\"object\"` / `null` yields `\"object\"` per JS semantics"
+  },
+  "eval_delete": {
+    "brief": "求值 `delete` 操作符 / Evaluate the `delete` operator",
+    "details": "成员形式 `obj.prop` / `obj[key]` 会先求基对象再删除属性；标识符形式 `delete someVar` 把当前绑定的槽位置为 `undefined`。| The member form `obj.prop` / `obj[key]` evaluates the base and removes the property; the identifier form `delete someVar` overwrites the found binding slot with `undefined`.",
+    "params": {
+      "target": "被删除目标节点（成员或标识符）/ The delete target node (member or identifier)"
+    },
+    "return": "始终返回 `true` / Always returns `true`",
+    "note": "删除不可配置属性的失败被报告为成功，符合解释器假定的非严格模式行为 / A failed delete of a non-configurable property is reported as success, matching the sloppy-mode behaviour assumed by the interpreter"
+  },
+  "eval_unary_arithmetic": {
+    "brief": "求值 `!`、`void`、`-`、`+`、`~` 一元运算 / Evaluate the `!`, `void`, `-`, `+` and `~` unary operators",
+    "params": {
+      "n": "承载运算符的一元节点 / The unary node carrying the operator",
+      "v": "运算数 / The operand"
+    },
+    "return": "一元运算结果 / The unary operation result",
+    "note": "`void` 丢弃操作数并返回 `undefined`；`~` 先转 32 位有符号整数再取反 / `void` discards the operand and returns `undefined`; `~` converts to a 32-bit signed integer before complementing"
+  },
+  "eval_array_literal": {
+    "brief": "求值数组字面量（含展开元素）/ Evaluate an array literal including spread elements",
+    "details": "逐个子节点求值推入新数组；空槽位（`NULL` 子节点）推入 `undefined`，`JS_N_SPREAD` 子节点对其操作数迭代后逐项展开推入。| Each child is evaluated and pushed into a new array; a hole (`NULL` child) pushes `undefined`, while a `JS_N_SPREAD` child iterates its operand and spreads the items.",
+    "return": "新建的数组对象 / The newly created array object"
+  },
+  "eval_await": {
+    "brief": "求值 `await` 表达式 / Evaluate an `await` expression",
+    "details": "先求子表达式；若结果是 promise 则先泵空微任务作业队列，失败态（state 为 2）抛出其值，否则返回其兑现值。| The operand is evaluated first; when the result is a promise the microtask queue is drained, its value is thrown when rejected (state 2), and its fulfilment value is returned otherwise.",
+    "return": "兑现值或原值 / The fulfilment value or the operand itself",
+    "note": "非 promise 值原样返回 / A non-promise value is returned unchanged",
+    "see": "eval_yield"
+  },
+  "eval_yield": {
+    "brief": "求值 `yield` / `yield*` / Evaluate `yield` / `yield*`",
+    "details": "先求操作数（无操作数则取 `undefined`）；写入 `js->yield_sink`：委托形式迭代操作数逐项追加，非委托形式追加单个值。| The operand is evaluated (`undefined` when absent); the value is written to `js->yield_sink`: the delegate form iterates the operand and appends each item, the plain form appends the single value.",
+    "params": {
+      "delegate": "非 0 表示 `yield*` 委托迭代 / Non-zero for `yield*` delegation"
+    },
+    "return": "恒为 `undefined` / Always `undefined`",
+    "see": "eval_yield_node eval_await"
+  },
+  "eval_ident": {
+    "brief": "解析标识符引用 / Resolve an identifier reference",
+    "details": "先在词法环境中查找最近绑定；未命中再查全局对象属性（使 `Math`、`undefined` 等可解析）；都没有则抛出 ReferenceError。| The innermost lexical binding is looked up first; on a miss the global object's properties are consulted (so `Math`, `undefined` etc. resolve); when both fail a ReferenceError is raised.",
+    "return": "绑定的值 / The bound value",
+    "see": "eval_this"
+  },
+  "eval_this": {
+    "brief": "解析 `this` / Resolve `this`",
+    "details": "沿环境链向上找到最近绑定过 `this` 的环境；到顶仍未找到时回退为全局对象。| The environment chain is walked up to the nearest environment that bound `this`; falling off the top falls back to the global object.",
+    "return": "当前 `this` 值 / The current `this` value",
+    "see": "eval_this_node"
+  },
+  "eval_seq": {
+    "brief": "求值逗号表达式 / Evaluate the comma operator",
+    "details": "从左到右依次求值每个子节点，返回最后一个的值（此前的副作用生效）。| Each child is evaluated left to right and the last value is returned (earlier side effects take effect).",
+    "return": "最后一个子表达式的值 / The value of the last sub-expression"
+  },
+  "eval_update": {
+    "brief": "求值 `++` / `--` 自增自减 / Evaluate `++` / `--`",
+    "details": "读取目标旧值、按运算符加减 1、写回目标；前缀返回新值，后缀返回旧值。| The old target value is read, +/- 1 applied, and written back; prefix forms return the new value and postfix forms the old one.",
+    "return": "前缀为新值、后缀为旧值 / The new value for prefix forms, the old value for postfix forms",
+    "see": "read_target write_target"
+  },
+  "eval_unary": {
+    "brief": "一元运算分派（`delete` / `typeof` 及其余）/ Dispatch the unary operators (`delete` / `typeof` and the rest)",
+    "details": "`delete` 转 `eval_delete`；`typeof` 求值操作数后经 `typeof_name` 转字符串；其余运算符求值操作数后交 `eval_unary_arithmetic`。| `delete` goes to `eval_delete`; `typeof` evaluates the operand and stringifies it through `typeof_name`; the remaining operators evaluate the operand and defer to `eval_unary_arithmetic`.",
+    "return": "一元表达式结果 / The unary expression result",
+    "see": "eval_delete typeof_name eval_unary_arithmetic"
+  },
+  "eval_literal": {
+    "brief": "求值字面量节点 / Evaluate a literal node",
+    "details": "按节点种类构造：字符串取 `s`（`NULL` 视为空串）、数值取 `n->num`、`true`/`false` 取布尔，其余（`null`）返回 `null`。| Constructs by node kind: a string takes `s` (`NULL` treated as empty), a number takes `n->num`, `true`/`false` yield booleans, and anything else (`null`) yields `null`.",
+    "params": {
+      "n": "字面量节点 / The literal node",
+      "s": "字符串字面量内容（可为 `NULL`）/ The string literal content (may be `NULL`)"
+    },
+    "return": "构造出的字面量值 / The constructed literal value"
+  },
+  "eval_this_node": {
+    "brief": "`this` 节点的求值入口 / Evaluator entry for a `this` node",
+    "params": {
+      "n": "被忽略的节点（仅为签名一致）/ The ignored node (kept for signature uniformity)"
+    },
+    "return": "当前 `this` 值 / The current `this` value",
+    "see": "eval_this"
+  },
+  "eval_ternary": {
+    "brief": "求值三元条件表达式 / Evaluate a ternary conditional expression",
+    "details": "以第 0 个子节点作条件，真则取第 1 个子节点、假则取第 2 个子节点。| Child 0 is the condition; child 1 is taken when truthy and child 2 otherwise.",
+    "return": "所选分支的值 / The value of the selected branch"
+  },
+  "eval_regex_node": {
+    "brief": "求值正则字面量节点 / Evaluate a regex literal node",
+    "details": "解析器把模式与其标志打包进同一缓冲：模式起始于 `n->str`，标志串位于 `pat + strlen(pat) + 1`。| The parser packs the pattern and its flags into one buffer: the pattern starts at `n->str` and the flag string sits at `pat + strlen(pat) + 1`.",
+    "return": "新建的正则对象 / The newly created regex object",
+    "see": "js_regex_new"
+  },
+  "eval_spread": {
+    "brief": "求值展开节点（取内层表达式）/ Evaluate a spread node (evaluates the inner expression)",
+    "details": "展开语义由外层容器处理，此处只求值其唯一子表达式。| Spread semantics are handled by the enclosing container, so only the single sub-expression is evaluated here.",
+    "return": "被展开表达式的值 / The value of the spread operand"
+  },
+  "eval_yield_node": {
+    "brief": "`yield` 节点的求值入口 / Evaluator entry for a `yield` node",
+    "details": "以 `n->op == 1` 判定是否为 `yield*` 委托形式并转交 `eval_yield`。| Whether the node is the `yield*` delegate form is decided by `n->op == 1` and forwarded to `eval_yield`.",
+    "return": "恒为 `undefined` / Always `undefined`",
+    "see": "eval_yield"
+  },
+  "eval_empty_expr": {
+    "brief": "空表达式求值，返回 `undefined` / Evaluate an empty expression, yielding `undefined`",
+    "details": "所有入参均被忽略，用于表达空语句体。| All inputs are ignored; used to represent an empty statement body.",
+    "return": "恒为 `undefined` / Always `undefined`"
+  },
+  "eval_expr": {
+    "brief": "表达式求值总入口 / General entry for expression evaluation",
+    "details": "字面量节点（数值/字符串/真/假/空）统一由 `eval_literal` 处理，其余按 `k_eval_table` 按种类分派到相应求值函数。| Literal nodes (number/string/true/false/null) all go through `eval_literal`; the rest are dispatched by kind through `k_eval_table` to their evaluator.",
+    "return": "表达式结果值 / The expression result value",
+    "note": "`n` 为 `NULL` 时返回 `undefined`；无匹配节点种类时报错 / Returns `undefined` when `n` is `NULL`; raises an error when no node kind matches"
+  },
+  "hoist_decls": {
+    "brief": "提升函数声明与 `var` 绑定到函数/程序作用域 / Hoist function declarations and `var` bindings into the function/program scope",
+    "details": "函数声明直接定义为其求值结果；`var` 仅提取其中的标识符并预置为 `undefined`；块、标签、循环、try、switch、export 等容器节点递归下探。| Function declarations are defined outright to their evaluated result; `var` only extracts the identifiers and pre-defines them as `undefined`; container nodes such as blocks, labels, loops, try, switch and export are descended recursively.",
+    "note": "使声明之前的调用可工作（函数作用域提升）/ Enables calls before the declaration (function-scoped hoisting）"
+  },
+  "exec_var_decl": {
+    "brief": "执行变量声明语句 / Execute a variable declaration statement",
+    "details": "逐项处理声明：有初始化表达式则求值，标识符声明调用 `js_env_declare`，解构模式交 `bind_pattern`。| Each declarator is processed: the initialiser is evaluated when present, an identifier declaration calls `js_env_declare`, and a destructuring pattern is delegated to `bind_pattern`.",
+    "note": "源码中 `var` 与非 `var` 分支当前都调用 `js_env_declare`（行为一致）/ In the source both the `var` and non-`var` branches currently call `js_env_declare` (behaviour is identical)"
+  },
+  "exec_block": {
+    "brief": "顺序执行语句块 / Execute a block of statements in order",
+    "details": "逐条执行子语句，一旦产生非 `FLOW_NONE` 的控制流立即返回该流。| Children are executed one by one and control flow that is not `FLOW_NONE` is returned immediately.",
+    "return": "块结束或中断时的控制流 / The control flow at block end or on interruption"
+  },
+  "is_loop_node": {
+    "brief": "判断节点是否为循环语句 / Test whether a node is a loop statement",
+    "return": "是 `WHILE`/`DO`/`FOR`/`FOROF`/`FORIN` 之一返回 1 / 1 for one of `WHILE`/`DO`/`FOR`/`FOROF`/`FORIN`",
+    "note": "`n` 为 `NULL` 时返回 0 / Returns 0 when `n` is `NULL`"
+  },
+  "label_matches": {
+    "brief": "在标签名数组中查找匹配 / Look for a matching name in a label array",
+    "params": {
+      "labels": "标签名数组 / Array of label names",
+      "nlabels": "标签个数 / Number of labels",
+      "name": "要匹配的标签名 / Label name to match"
+    },
+    "return": "找到返回 1，否则 0 / 1 when found, 0 otherwise",
+    "note": "`name` 为 `NULL` 时直接返回 0 / Returns 0 immediately when `name` is `NULL`"
+  },
+  "loop_flow": {
+    "brief": "把循环体内产生的控制流折算为循环动作码 / Reduce control flow produced in a loop body to a loop action code",
+    "details": "`FLOW_NONE` 返回 0；`FLOW_RETURN` 原样写入 `*out` 并返回 2；`FLOW_BREAK` 无标签或标签匹配本循环时消费为 `flow_none` 并返回 1，否则写 `*out` 返回 2；`FLOW_CONTINUE` 匹配时返回 0 继续迭代，否则写 `*out` 返回 2。| `FLOW_NONE` yields 0; `FLOW_RETURN` is copied to `*out` as 2; `FLOW_BREAK` is consumed (yielding `flow_none`) as 1 when unlabelled or matching this loop, otherwise written to `*out` as 2; `FLOW_CONTINUE` yields 0 while matching and otherwise writes `*out` as 2.",
+    "params": {
+      "f": "循环体执行产生的控制流 / Control flow produced by the loop body",
+      "out": "out:需向调用者传播的控制流 / Control flow to propagate to the caller"
+    },
+    "return": "动作码 / The action code",
+    "retval": {
+      "0": "继续迭代 / Keep iterating",
+      "1": "离开本循环 / Leave this loop",
+      "2": "把 `*out` 传播给调用者 / Propagate `*out` to the caller"
+    }
+  },
+  "loop_bind": {
+    "brief": "为一次循环迭代绑定循环变量 / Bind the loop variable for one iteration",
+    "details": "目标为 `let`/`const` 声明时新建迭代环境并写入 `*iter_env`；`var` 或裸赋值目标直接写透到外层作用域。| When the target is a `let`/`const` declaration a fresh iteration environment is created and written to `*iter_env`; a `var` or bare assignment target writes through to the enclosing scope.",
+    "params": {
+      "target": "循环头目标（声明或绑定模式）/ The loop-head target (declaration or binding pattern)",
+      "iter_env": "out:仅供每次迭代使用的环境（仅限 `let`/`const`）/ out: Per-iteration environment (only for `let`/`const`)"
+    },
+    "see": "loop_body_step bind_pattern"
+  },
+  "loop_body_step": {
+    "brief": "绑定循环变量并执行一次循环体 / Bind the loop variable and run one loop body iteration",
+    "details": "有循环头目标时先经 `loop_bind` 绑定值，再以所得迭代环境执行循环体语句，最后把其控制流经 `loop_flow` 折算。| When a loop-head target exists it is bound through `loop_bind`, the body statement is then executed in the resulting iteration environment, and its control flow is finally reduced through `loop_flow`.",
+    "params": {
+      "target": "循环头目标（可为 `NULL`）/ The loop-head target (may be `NULL`)",
+      "v": "本次迭代要绑定的值 / The value to bind for this iteration",
+      "body": "循环体语句节点 / The loop body statement node",
+      "out": "out:需向调用者传播的控制流 / Control flow to propagate to the caller"
+    },
+    "return": "循环动作码（0 继续、1 跳出、2 传播）/ The loop action code (0 keep, 1 break, 2 propagate)",
+    "see": "loop_bind loop_flow"
+  },
+  "exec_while": {
+    "brief": "执行 `while` 循环 / Execute a `while` loop",
+    "details": "先求条件子节点（kid 0），为真则执行循环体（kid 1）；动作码 1 结束、2 向上传播。| Child 0 is the condition; while truthy the body (child 1) runs, with action code 1 ending the loop and 2 propagating upward.",
+    "params": {
+      "labels": "本循环挂载的标签名数组 / Label names attached to this loop",
+      "out": "out:需向调用者传播的控制流 / Control flow to propagate to the caller"
+    },
+    "return": "循环结束或传播的控制流 / The control flow at loop end or to propagate",
+    "see": "exec_loop"
+  },
+  "exec_do": {
+    "brief": "执行 `do...while` 循环 / Execute a `do...while` loop",
+    "details": "先执行循环体（kid 0），再求条件（kid 1）决定是否继续；动作码 1 结束、2 向上传播。| The body (child 0) runs first, then the condition (child 1) decides whether to continue; action code 1 ends the loop and 2 propagates upward.",
+    "params": {
+      "labels": "本循环挂载的标签名数组 / Label names attached to this loop",
+      "out": "out:需向调用者传播的控制流 / Control flow to propagate to the caller"
+    },
+    "return": "循环结束或传播的控制流 / The control flow at loop end or to propagate",
+    "see": "exec_loop"
+  },
+  "exec_for": {
+    "brief": "执行 `for` 循环 / Execute a `for` loop",
+    "details": "子节点依次为初始化、条件、更新与循环体；当初始化是 `let`/`const` 声明时新建作用域使每次迭代闭包各自持有副本，`var` 与裸表达式留在外层；每轮先测条件，执行循环体并折算控制流，再执行更新。| Children are init, test, update and body; when init is a `let`/`const` declaration a fresh scope is created so each iteration closes over its own copy, while `var` and bare expressions stay outer; each round tests the condition, runs the body, reduces its flow, then runs the update.",
+    "params": {
+      "labels": "本循环挂载的标签名数组 / Label names attached to this loop",
+      "out": "out:需向调用者传播的控制流 / Control flow to propagate to the caller"
+    },
+    "return": "循环结束或传播的控制流 / The control flow at loop end or to propagate",
+    "see": "exec_loop exec_var_decl"
+  },
+  "exec_forof": {
+    "brief": "执行 `for...of` 循环 / Execute a `for...of` loop",
+    "details": "对第 1 个子节点求值得到可迭代表，取其长度后按“绑定循环变量 + 执行循环体（kid 2）”逐项迭代。| Child 1 is evaluated into an iterable, its length taken, and the loop iterates item by item while binding the loop variable and running the body (child 2).",
+    "params": {
+      "labels": "本循环挂载的标签名数组 / Label names attached to this loop",
+      "out": "out:需向调用者传播的控制流 / Control flow to propagate to the caller"
+    },
+    "return": "循环结束或传播的控制流 / The control flow at loop end or to propagate",
+    "see": "exec_loop loop_body_step"
+  },
+  "exec_forin_string": {
+    "brief": "对字符串执行 `for...in`（枚举字符下标）/ Run `for...in` over a string (enumerates character indices)",
+    "details": "以字符串长度为界逐项迭代，把下标格式化为十进制字符串后作为键绑定循环变量并执行循环体。| Iterates up to the string length, formatting each index as a decimal string that is bound as the key before running the body.",
+    "params": {
+      "obj": "被枚举的字符串值 / The string value being enumerated",
+      "labels": "本循环挂载的标签名数组 / Label names attached to this loop",
+      "out": "out:需向调用者传播的控制流 / Control flow to propagate to the caller"
+    },
+    "return": "循环结束或传播的控制流 / The control flow at loop end or to propagate",
+    "see": "exec_forin"
+  },
+  "exec_forin_object": {
+    "brief": "对对象执行 `for...in`（遍历自身可枚举键）/ Run `for...in` over an object (walks own enumerable keys)",
+    "details": "取对象自身可枚举键数组后逐键绑定并执行循环体；键数组在每条退出路径（含提前 break/return）都会释放。| After fetching the object's own enumerable keys, each key is bound and the body run; the key array is freed on every exit path, including an early break/return.",
+    "params": {
+      "obj": "被枚举的对象值 / The object value being enumerated",
+      "labels": "本循环挂载的标签名数组 / Label names attached to this loop",
+      "out": "out:需向调用者传播的控制流 / Control flow to propagate to the caller"
+    },
+    "return": "循环结束或传播的控制流 / The control flow at loop end or to propagate",
+    "see": "exec_forin"
+  },
+  "exec_forin": {
+    "brief": "分派 `for...in` 到字符串或对象实现 / Dispatch `for...in` to the string or object implementation",
+    "details": "第 1 个子节点求值后：字符串转 `exec_forin_string`，对象转 `exec_forin_object`，其余返回空控制流。| After evaluating child 1, strings go to `exec_forin_string`, objects to `exec_forin_object`, and anything else returns an empty flow.",
+    "params": {
+      "labels": "本循环挂载的标签名数组 / Label names attached to this loop",
+      "out": "out:需向调用者传播的控制流 / Control flow to propagate to the caller"
+    },
+    "return": "循环结束或传播的控制流 / The control flow at loop end or to propagate",
+    "see": "exec_forin_string exec_forin_object"
+  },
+  "exec_loop": {
+    "brief": "统一循环执行器 / Unified loop executor",
+    "details": "按节点种类把 `WHILE`/`DO`/`FOR`/`FOROF`/`FORIN` 分派到各自实现，并携带本循环的标签链供 `break`/`continue` 消费。| Dispatches `WHILE`/`DO`/`FOR`/`FOROF`/`FORIN` to their respective implementations by node kind, carrying this loop's label chain for `break`/`continue` to consume.",
+    "params": {
+      "labels": "本循环挂载的标签名数组 / Label names attached to this loop"
+    },
+    "return": "循环结束或传播的控制流 / The control flow at loop end or to propagate",
+    "note": "无法识别的节点种类返回空控制流 / An unrecognised node kind returns an empty flow",
+    "see": "exec_while exec_do exec_for exec_forof exec_forin"
+  },
+  "exec_try_guard": {
+    "brief": "在自带着陆点下执行 `try` 块 / Run the `try` block under its own landing pad",
+    "details": "把新 `JsTryFrame` 压入 `js->try_top`；`setjmp` 返回 0 时执行块语句并把其控制流写入 `*flow`，否则置 `*pending` 为 1 并通过 `*thrown` 取回 `js->thrown`（同时复位）。| A new `JsTryFrame` is pushed onto `js->try_top`; when `setjmp` returns 0 the block runs and its flow is written to `*flow`, otherwise `*pending` is set to 1 and `js->thrown` is retrieved through `*thrown` (and reset).",
+    "params": {
+      "block_env": "执行块所用的环境（为 `NULL` 时用 `env`）/ The environment used for the block (`env` when `NULL`)",
+      "flow": "out:块正常完成时的控制流 / Control flow when the block completes normally",
+      "pending": "out:置 1 表示捕获到抛出 / Set to 1 when a throw was caught",
+      "thrown": "out:捕获到的抛出值 / The caught thrown value"
+    },
+    "note": "`setjmp` 保留在本帧内，使 `longjmp` 能落回此处 / `setjmp` is kept inside this frame so that `longjmp` can land here",
+    "see": "exec_try_catch exec_try_finally"
+  },
+  "exec_try_catch": {
+    "brief": "执行 `catch` 处理块 / Run the `catch` handler",
+    "details": "新建捕获作用域，把抛出值绑定到 catch 模式（若有），并在 `js->in_catch` 计数内执行处理体；若处理体内又抛出则 `*pending` 置 1 并通过 `*rethrown` 取回。| A catch scope is created, the thrown value is bound to the catch pattern (when present), and the handler body runs with `js->in_catch` incremented; a throw inside the handler sets `*pending` to 1 and retrieves the value through `*rethrown`.",
+    "params": {
+      "cc": "catch 子句节点 `[pattern, body]` / The catch clause node `[pattern, body]`",
+      "thrown": "由 `try` 块抛出的值 / The value thrown by the `try` block",
+      "flow": "out:处理体正常完成时的控制流 / Control flow when the handler completes normally",
+      "pending": "out:置 1 表示处理体内再次抛出 / Set to 1 when the handler throws again",
+      "rethrown": "out:处理体重新抛出的值 / The value re-thrown by the handler"
+    },
+    "see": "exec_try_guard"
+  },
+  "exec_try_finally": {
+    "brief": "执行 `finally` 块 / Run the `finally` block",
+    "details": "正常完成时仅当 `finally` 自身产生非 `FLOW_NONE` 的突然完成才覆盖 `*flow` 并清除 `*pending`；若 `finally` 内抛出则置 `*pending` 为 1 并通过 `*rethrown` 取回，从而取消在途抛出。| On normal completion the pending flow is overridden and `*pending` cleared only when `finally` itself completes abruptly with a non-`FLOW_NONE` action; a throw inside `finally` sets `*pending` to 1 and retrieves the value through `*rethrown`, cancelling an in-flight throw.",
+    "params": {
+      "fb": "`finally` 块节点 / The `finally` block node",
+      "flow": "inout:待覆盖的控制流 / Control flow that may be overridden",
+      "pending": "out:置 1 表示 `finally` 内抛出 / Set to 1 when `finally` throws",
+      "rethrown": "out:`finally` 内抛出的值 / The value thrown inside `finally`"
+    },
+    "see": "exec_try_guard exec_try"
+  },
+  "exec_try": {
+    "brief": "执行 `try` / `catch` / `finally` 语句 / Execute a `try` / `catch` / `finally` statement",
+    "details": "先在着陆点下执行 `try` 块；有待处理抛出且有 catch 子句时执行 catch；有 finally 时执行 finally；最后若仍待处理则经 `js_throw_value` 重新抛出。| The `try` block runs under a landing pad first; when a throw is pending and a catch clause exists the handler runs; a `finally` block runs when present; anything still pending is re-thrown through `js_throw_value`.",
+    "return": "语句完成后的控制流 / The control flow after the statement completes",
+    "see": "exec_try_guard exec_try_catch exec_try_finally"
+  },
+  "exec_switch": {
+    "brief": "执行 `switch` 语句 / Execute a `switch` statement",
+    "details": "以严格相等（`js_values_equal` 最后参数为 1）在 `switch` 作用域中定位入口子句，未命中则用 `default`；随后从入口子句起顺序执行、向后贯穿，直到无标签 `break` 或 `return`/`throw`。| The entry clause is located with strict equality (`js_values_equal` with last argument 1) inside a `switch` scope, falling back to `default`; execution then proceeds from that clause and falls through until an unlabelled `break` or a `return`/`throw`.",
+    "return": "语句完成后的控制流 / The control flow after the statement completes",
+    "note": "带标签的 `break` 会向外传播，而非终止本 `switch` / A labelled `break` propagates outward instead of ending this `switch`"
+  },
+  "exec_label": {
+    "brief": "执行带标签的语句 / Execute a labelled statement",
+    "details": "内层为循环节点时，向上收集整条标签链（至多 32 个）并把该链交给 `exec_loop`，使内层 `continue 标签`/`break 标签` 正确定位；否则执行内层语句，并把指定本标签的 `break` 就地消费。| When the inner statement is a loop node the whole label chain is collected upward (up to 32) and handed to `exec_loop`, letting an inner `continue label`/`break label` target that loop; otherwise the inner statement runs and a `break` naming this label is consumed here.",
+    "return": "语句完成后的控制流 / The control flow after the statement completes",
+    "see": "is_loop_node exec_loop"
+  },
+  "exec_return": {
+    "brief": "执行 `return` 语句 / Execute a `return` statement",
+    "details": "构造 `FLOW_RETURN` 控制流并求值返回表达式（缺省为 `undefined`）；若返回值是 promise 则泵空作业队列，使观察该 promise 的 `.then` 回调先运行。| A `FLOW_RETURN` flow is built with the return expression evaluated (`undefined` when absent); when the result is a promise the job queue is drained so `.then` callbacks observing it run first.",
+    "return": "承载返回值的 `FLOW_RETURN` 控制流 / The `FLOW_RETURN` flow carrying the return value"
+  },
+  "exec_if": {
+    "brief": "执行 `if` 语句 / Execute an `if` statement",
+    "details": "条件（kid 0）为真执行 then 分支（kid 1），否则在存在 else 分支（kid 2）时执行之。| The then branch (child 1) runs when the condition (child 0) is truthy, otherwise the else branch (child 2) runs when present.",
+    "return": "所选分支的控制流，无分支时为空控制流 / The selected branch's flow, or an empty flow when no branch runs"
+  },
+  "exec_throw": {
+    "brief": "执行 `throw` 语句 / Execute a `throw` statement",
+    "details": "求值抛出表达式后经 `js_throw_value` 抛向最近的活跃 try 帧，并用 `longjmp` 展开。| The thrown expression is evaluated and raised through `js_throw_value` to the nearest active try frame, unwinding with `longjmp`.",
+    "return": "恒为空控制流（不会正常返回）/ Always an empty flow (never returns normally)",
+    "see": "exec_try_guard"
+  },
+  "exec_expr_stmt": {
+    "brief": "执行表达式语句 / Execute an expression statement",
+    "details": "求值子表达式；若结果为 promise 则泵空作业队列以促使处理器落定。| The sub-expression is evaluated; when the result is a promise the job queue is drained so its handlers settle.",
+    "return": "恒为空控制流 / Always an empty flow"
+  },
+  "exec_break": {
+    "brief": "执行 `break` / `continue`，构造对应控制流 / Execute `break` / `continue` by building the corresponding flow",
+    "params": {
+      "action": "控制流动作（`FLOW_BREAK` 或 `FLOW_CONTINUE`）/ The flow action (`FLOW_BREAK` or `FLOW_CONTINUE`)"
+    },
+    "return": "带动作码与标签的控制流 / The flow carrying the action code and label",
+    "note": "`js` 参数未被使用 / The `js` parameter is unused"
+  },
+  "exec_noop": {
+    "brief": "空语句执行器，返回空控制流 / No-op statement executor returning an empty flow",
+    "return": "恒为空控制流 / Always an empty flow"
+  },
+  "exec_stmt": {
+    "brief": "语句执行总入口 / General entry for statement execution",
+    "details": "块语句新建块级环境并先提升声明；`var`/函数/类各自处理；循环统一转 `exec_loop`；`break`/`continue` 构造控制流；其余按 `k_stmt_table` 按种类分派。| Block statements create a block scope and hoist declarations first; `var`/function/class are handled individually; loops all go through `exec_loop`; `break`/`continue` build flows; the rest are dispatched by kind through `k_stmt_table`.",
+    "return": "语句执行产生的控制流 / The control flow produced by the statement",
+    "note": "`n` 为 `NULL` 或无匹配种类时返回空控制流 / Returns an empty flow when `n` is `NULL` or no kind matches"
+  },
+  "module_find": {
+    "brief": "按路径查找已登记的模块 / Find an already registered module by path",
+    "details": "线性遍历 `js->modules` 链表，比较 `path` 字段。| The `js->modules` list is walked linearly comparing the `path` field.",
+    "return": "命中的模块记录，未找到为 `NULL` / The matching module record, or `NULL` when not found",
+    "see": "module_load"
+  },
+  "module_load": {
+    "brief": "解析模块说明符并返回模块记录 / Resolve a module specifier and return its module record",
+    "details": "安装了宿主加载器（`js->loader.load`）时优先由它解析路径与源码，否则从本地文件系统读取：以 `/` 开头为绝对路径，相对说明符与 `from_dir` 拼接，裸说明符报错；命中已登记模块则直接复用。| When a host loader is installed (`js->loader.load`) it resolves the path and source first; otherwise the module is read from the local filesystem: a leading `/` is absolute, a relative specifier is joined with `from_dir`, and a bare specifier is an error; an already registered module is reused directly.",
+    "params": {
+      "spec": "模块说明符 / Module specifier",
+      "from_dir": "发起导入的模块所在目录 / Directory of the importing module"
+    },
+    "return": "模块记录 / The module record",
+    "note": "无法解析时经 `js_error` 报错（不返回）/ Raises through `js_error` when resolution fails (does not return)",
+    "see": "module_find module_run"
+  },
+  "module_run": {
+    "brief": "求值模块体（仅一次）并返回其命名空间对象 / Evaluate a module body (once) and return its namespace object",
+    "details": "以 `MOD_RUNNING`/`MOD_DONE` 状态防止重复求值；解析源码后建立严格模式环境与命名空间对象，切换 `current_module`/`current_dir`，先执行所有 `import`，再提升声明，随后顺序执行其余语句，最后经 `module_fill_ns` 填充命名空间。| The `MOD_RUNNING`/`MOD_DONE` states prevent re-evaluation; after parsing the source a strict-mode environment and namespace object are created, `current_module`/`current_dir` are switched, all `import`s are executed first, declarations are hoisted, the remaining statements are executed in order, and the namespace is finally populated through `module_fill_ns`.",
+    "params": {
+      "m": "模块记录 / Module record"
+    },
+    "return": "已完成求值的模块记录 / The fully evaluated module record",
+    "note": "模块恒为严格模式；执行到 `FLOW_NONE` 之外的控制流即中止 / Modules are always strict; execution stops at any flow other than `FLOW_NONE`",
+    "see": "module_load module_fill_ns import_stmt"
+  },
+  "ns_define": {
+    "brief": "在模块命名空间对象上定义导出 / Define an export on the module namespace object",
+    "params": {
+      "m": "模块记录 / Module record",
+      "name": "导出名 / Export name",
+      "v": "导出值 / Export value"
+    },
+    "see": "ns_fill_local ns_fill_default"
+  },
+  "ns_define_local_decl": {
+    "brief": "把单个本地声明的绑定发布到命名空间 / Publish one local declaration's binding into the namespace",
+    "details": "函数/类声明按名字在环境中取槽位写入；`var` 声明则逐项提取标识符并写入各自的槽位值。| A function/class declaration looks its name up in the environment and writes the slot value; a `var` declaration extracts each identifier and writes its slot value.",
+    "params": {
+      "m": "模块记录 / Module record",
+      "env": "模块作用域环境 / The module scope environment",
+      "d": "声明节点（函数/类/`var`）/ The declaration node (function/class/`var`)"
+    },
+    "see": "ns_fill_local"
+  },
+  "ns_fill_local": {
+    "brief": "处理 `export <declaration>` 并发布本地导出 / Handle `export <declaration>` and publish the local export",
+    "details": "op==0 形式：取第 0 个子节点交 `ns_define_local_decl`，把其中声明的名字从环境复制进命名空间。| The op==0 form: child 0 is passed to `ns_define_local_decl`, copying each declared name from the environment into the namespace.",
+    "params": {
+      "m": "模块记录 / Module record",
+      "env": "模块作用域环境 / The module scope environment",
+      "ex": "导出节点 / The export node"
+    },
+    "see": "ns_define_local_decl module_fill_ns"
+  },
+  "ns_fill_default": {
+    "brief": "处理 `export default`，从 `*default*` 槽位取值 / Handle `export default` by reading the `*default*` slot",
+    "details": "op==1 形式：读取合成绑定 `*default*`，写入命名空间的 `default` 键。| The op==1 form: the synthetic `*default*` binding is read and written to the namespace's `default` key.",
+    "params": {
+      "m": "模块记录 / Module record",
+      "env": "模块作用域环境 / The module scope environment"
+    },
+    "see": "export_stmt module_fill_ns"
+  },
+  "ns_fill_reexport": {
+    "brief": "处理 `export { a, b as c } [from \"src\"]` 再导出 / Handle `export { a, b as c } [from \"src\"]` re-exports",
+    "details": "op==2 形式：若带来源字符串则先运行源模块；随后逐对处理，导出名取对的第 0 个子节点名（缺省用对名），值来自源模块命名空间的原始名或本环境绑定。| The op==2 form: when a source string is present its module is run first; each pair is then processed with the export name taken from the pair's child 0 (falling back to the pair name), and the value taken from the source namespace's original name or a local binding.",
+    "params": {
+      "m": "模块记录 / Module record",
+      "env": "模块作用域环境 / The module scope environment",
+      "ex": "导出节点 / The export node"
+    },
+    "see": "ns_fill_star module_fill_ns"
+  },
+  "ns_fill_star": {
+    "brief": "处理 `export * from \"src\"`（透传除 `default` 外的所有键）/ Handle `export * from \"src\"` (re-exports every key except `default`)",
+    "details": "op==3 形式：运行源模块后遍历其命名空间自身键，当 `ex->num` 非零时跳过 `default`，其余逐个写入本命名空间。| The op==3 form: the source module is run, its namespace's own keys are enumerated, `default` is skipped when `ex->num` is non-zero, and the rest are written into this namespace.",
+    "params": {
+      "m": "模块记录 / Module record",
+      "ex": "导出节点 / The export node"
+    },
+    "note": "源模块不可解析时直接返回不导出任何键 / Returns without exporting any key when the source cannot be resolved",
+    "see": "ns_fill_reexport"
+  },
+  "module_fill_ns": {
+    "brief": "把各 `export` 节点分派到对应的命名空间填充器 / Dispatch each `export` node to its kind-specific namespace filler",
+    "details": "遍历程序子节点，按 `ex->op`（0 本地、1 默认、2 再导出、3 星号）选择 `ns_fill_*`。| Program children are walked and `ns_fill_*` is selected by `ex->op` (0 local, 1 default, 2 re-export, 3 star).",
+    "params": {
+      "m": "模块记录 / Module record",
+      "prog": "程序根节点 / Program root node"
+    },
+    "see": "ns_fill_local ns_fill_default ns_fill_reexport ns_fill_star"
+  },
+  "export_stmt": {
+    "brief": "执行 `export` 语句 / Execute an `export` statement",
+    "details": "op==0 转交内层声明语句执行；op==1 求值默认导出（函数直接建函数对象并绑定名字、类走 `class_eval`、其余求值）后写入 `*default*` 槽位；op==2/3 迁入按需运行来源模块。| op==0 forwards to the inner declaration statement; op==1 evaluates the default export (functions are turned into function objects and bound by name, classes go through `class_eval`, everything else is evaluated) and writes it to the `*default*` slot; op==2/3 additionally run the source module on demand.",
+    "return": "语句完成后的控制流（通常为空）/ The control flow after the statement completes (usually empty)",
+    "see": "module_fill_ns ns_fill_default"
+  },
+  "import_stmt": {
+    "brief": "执行 `import` 语句 / Execute an `import` statement",
+    "details": "op==1 为副作用导入，仅运行来源模块；否则解析来源说明符后运行该模块，并逐项绑定：命名空间导入（op 2）绑整个 `ns`、默认导入（op 1）取 `default`、具名导入取原始名（缺省用本地名）。| op==1 is a side-effect import that only runs the source module; otherwise the source module is run and each item is bound: a namespace import (op 2) binds the whole `ns`, a default import (op 1) takes `default`, and a named import takes the original name (falling back to the local name).",
+    "return": "语句完成后的控制流（通常为空）/ The control flow after the statement completes (usually empty)",
+    "see": "module_run module_load"
+  },
+  "mk_native": {
+    "brief": "把原生函数指针包装成 JS 值 / Wrap a native function pointer into a JS value",
+    "params": {
+      "fn": "原生函数指针 / Native function pointer",
+      "ud": "透传给宿主的用户数据 / Opaque user data passed through to the host"
+    },
+    "return": "承载该原生函数的 JS 值 / The JS value carrying the native function",
+    "see": "def_method"
+  },
+  "arg_at": {
+    "brief": "按下标取实参，越界返回 `undefined` / Fetch the argument at an index, yielding `undefined` when out of range",
+    "params": {
+      "args": "实参数组 / Actual argument array",
+      "argc": "实参个数 / Number of actual arguments",
+      "i": "实参下标 / Argument index"
+    },
+    "return": "该位置的实参或 `undefined` / The argument at that position, or `undefined`"
+  },
+  "def_method": {
+    "brief": "在目标对象上定义原生方法 / Define a native method on the target object",
+    "details": "先用 `mk_native` 包装原生函数，再以 `name` 为键写入 `target`。| The native function is wrapped with `mk_native` and written to `target` under `name`.",
+    "params": {
+      "target": "目标对象 / Target object",
+      "name": "方法名 / Method name",
+      "fn": "原生函数指针 / Native function pointer",
+      "ud": "透传给宿主的用户数据 / Opaque user data passed through to the host"
+    },
+    "see": "mk_native def_value"
+  },
+  "def_value": {
+    "brief": "在目标对象上定义取值 / Define a value on the target object",
+    "params": {
+      "target": "目标对象 / Target object",
+      "name": "属性名 / Property name",
+      "v": "属性值 / Property value"
+    },
+    "see": "def_method"
+  },
+  "arg_cstr": {
+    "brief": "读取字符串实参，缺失时返回回退值 / Read a string argument, returning a fallback when absent",
+    "details": "下标越界直接返回 `fallback`，否则以 `js_to_string` 转换该实参。| An out-of-range index returns `fallback` directly; otherwise the argument is converted with `js_to_string`.",
+    "params": {
+      "args": "实参数组 / Actual argument array",
+      "argc": "实参个数 / Number of actual arguments",
+      "i": "实参下标 / Argument index",
+      "fallback": "缺失时的回退字符串 / The fallback string when absent"
+    },
+    "return": "参数字符串或回退值 / The argument string or the fallback"
+  },
+  "list_of": {
+    "brief": "把值数组打包成 JS 数组 / Pack a value array into a JS array",
+    "params": {
+      "v": "值数组 / Value array",
+      "n": "元素个数 / Number of elements"
+    },
+    "return": "新建的 JS 数组 / The newly created JS array",
+    "see": "array_of"
+  },
+  "this_like": {
+    "brief": "取得 `Array.prototype` 方法的接收者（须类数组）/ Get the receiver of an `Array.prototype` method (must be array-like)",
+    "details": "接收者为对象时返回该对象；为字符串时返回 `NULL`（调用方另行处理）；其余返回 `NULL`。| Returns the object when the receiver is an object, `NULL` when it is a string (handled separately by the caller), and `NULL` otherwise.",
+    "return": "接收对象，或 `NULL` / The receiver object, or `NULL`"
+  },
+  "native_console": {
+    "brief": "实现 `console.log` 等输出 / Implement `console.log` and friends",
+    "details": "按 `ud` 选择输出流（非 `NULL` 写 `stderr`，否则 `stdout`），实参以空格分隔打印后补换行。| The output stream is chosen by `ud` (`stderr` when non-`NULL`, `stdout` otherwise); arguments are printed space-separated followed by a newline.",
+    "return": "恒为 `undefined` / Always `undefined`",
+    "note": "`this` 未被使用 / `this` is unused"
+  },
+  "native_alert": {
+    "brief": "实现 `alert`（委托给 console 输出）/ Implement `alert` (delegates to the console output)",
+    "details": "以 `ud` 为 `NULL` 调用 `native_console`，即写入 `stdout`。| Calls `native_console` with a `NULL` `ud`, i.e. writing to `stdout`.",
+    "return": "恒为 `undefined` / Always `undefined`",
+    "see": "native_console"
+  },
+  "math_round": {
+    "brief": "实现 `Math.round` / Implement `Math.round`",
+    "details": "按 JS 语义把 `.5` 向 +∞ 取整；`NaN` 与 `±Infinity` 原样返回。| Rounds `.5` towards +∞ per JS semantics; `NaN` and `±Infinity` are returned unchanged.",
+    "return": "取整后的数值 / The rounded number"
+  },
+  "math_pow": {
+    "brief": "实现 `Math.pow`（底数、指数）/ Implement `Math.pow` (base and exponent)",
+    "return": "幂运算结果 / The power result"
+  },
+  "math_atan2": {
+    "brief": "实现 `Math.atan2`（y, x）/ Implement `Math.atan2` (y, x)",
+    "return": "反正切角度（弧度）/ The arc-tangent angle in radians"
+  },
+  "math_hypot": {
+    "brief": "实现 `Math.hypot`（各实参平方和的平方根）/ Implement `Math.hypot` (square root of the sum of squared arguments)",
+    "details": "逐个实参转数值后累加其平方，最后开方。| Each argument is converted to a number, its square accumulated, and the square root taken at the end.",
+    "return": "欧氏范数 / The Euclidean norm"
+  },
+  "math_minmax": {
+    "brief": "实现 `Math.max` / `Math.min` / Implement `Math.max` / `Math.min`",
+    "details": "`ud` 非 `NULL` 时为取最大（初值 -∞），否则取最小（初值 +∞）；任一实参为 `NaN` 立即返回 `NaN`。| A non-`NULL` `ud` selects the maximum (initial -∞), otherwise the minimum (initial +∞); any `NaN` argument returns `NaN` immediately.",
+    "params": {
+      "ud": "非 `NULL` 取最大、`NULL` 取最小 / Non-`NULL` for maximum, `NULL` for minimum"
+    },
+    "return": "极值 / The extreme value"
+  },
+  "math_random": {
+    "brief": "实现 `Math.random`（xorshift64 伪随机）/ Implement `Math.random` (xorshift64 pseudo-random)",
+    "details": "首次调用以挂钟毫秒种下静态状态（或 1 保证非零），随后做 xorshift64 并用高 53 位映射到 `[0,1)`。| The first call seeds the static state from epoch milliseconds (OR-ed with 1 to stay non-zero); a xorshift64 step then maps its top 53 bits into `[0,1)`.",
+    "return": "`[0, 1)` 区间内的随机数 / A random number in `[0, 1)`",
+    "note": "不用全局 `rand()`，避免干扰其他调用方；所有入参均被忽略 / Uses no global `rand()` so other callers are undisturbed; all inputs are ignored"
+  },
+  "math_clz32": {
+    "brief": "实现 `Math.clz32`（32 位前导零计数）/ Implement `Math.clz32` (32-bit leading-zero count)",
+    "params": {
+      "a": "实参数组 / Actual argument array"
+    },
+    "return": "前导零个数；入参为 0 时返回 32 / The leading-zero count; 32 when the argument is 0"
+  },
+  "math_imul": {
+    "brief": "实现 `Math.imul`（32 位有符号整数乘法）/ Implement `Math.imul` (32-bit signed integer multiplication)",
+    "details": "把两个实参先截为 32 位无符号相乘，再按 32 位有符号解释结果。| Both arguments are truncated to 32-bit unsigned values for the multiply, and the product is reinterpreted as 32-bit signed.",
+    "params": {
+      "a": "实参数组 / Actual argument array"
+    },
+    "return": "32 位有符号乘积 / The 32-bit signed product"
+  },
+  "math_fround": {
+    "brief": "实现 `Math.fround`（舍入为单精度）/ Implement `Math.fround` (round to single precision)",
+    "params": {
+      "a": "实参数组 / Actual argument array"
+    },
+    "return": "单精度舍入后的数值 / The value rounded to single precision"
+  },
+  "math_extra": {
+    "brief": "`log1p`/`expm1`/`acosh`/`asinh`/`atanh` 共用实现 / Shared implementation for `log1p`/`expm1`/`acosh`/`asinh`/`atanh`",
+    "details": "由 `ud` 选择算法，对第 0 个实参求值；`log1p` 对零保留符号（±0）。| The algorithm is selected by `ud` and applied to argument 0; `log1p` preserves the sign of zero (±0).",
+    "params": {
+      "a": "实参数组 / Actual argument array",
+      "ud": "算法选择子 / The algorithm selector"
+    },
+    "return": "所选函数的结果 / The result of the selected function",
+    "note": "选择子无法识别时返回 `NaN` / Returns `NaN` for an unrecognised selector"
+  },
+  "radix_digit": {
+    "brief": "把字符转换为进制数字值 / Convert a character to its radix digit value",
+    "details": "`0`-`9`、`a`-`z`、`A`-`Z` 分别映射为 0-35 的对应值。| `0`-`9`, `a`-`z` and `A`-`Z` map to their corresponding values in 0-35.",
+    "return": "数字值；非法字符返回 -1 / The digit value; -1 for a non-digit",
+    "see": "native_parse_int uri_hex"
+  },
+  "native_parse_int": {
+    "brief": "实现全局 `parseInt` / Implement the global `parseInt`",
+    "details": "跳过前导空白与正负号；进制为 0 或 16 且带 `0x`/`0X` 前缀时按 16 处理；进制为 0 时默认 10；进制不在 2..36 返回 `NaN`；按进制累加直至首个非法字符，无任何数字则返回 `NaN`。| Leading whitespace and a sign are skipped; a `0x`/`0X` prefix with radix 0 or 16 is treated as base 16; a radix of 0 defaults to 10; a radix outside 2..36 yields `NaN`; digits are accumulated until the first invalid character, and `NaN` is returned when no digit was seen.",
+    "return": "解析出的整数（可能为负）或 `NaN` / The parsed integer (possibly negative), or `NaN`"
+  },
+  "native_parse_float": {
+    "brief": "实现全局 `parseFloat` / Implement the global `parseFloat`",
+    "details": "跳过前导空白；识别 `Infinity`/`+Infinity`/`-Infinity` 与 `0x` 十六进制形式，否则用 `strtod` 解析，未消费任何字符则返回 `NaN`。| Leading whitespace is skipped; `Infinity`/`+Infinity`/`-Infinity` and `0x` hexadecimal forms are recognised, otherwise `strtod` parses the number and `NaN` is returned when nothing was consumed.",
+    "return": "解析出的浮点数或 `NaN` / The parsed floating-point number, or `NaN`"
+  },
+  "native_is_nan": {
+    "brief": "实现全局 `isNaN` / Implement the global `isNaN`",
+    "details": "把第 0 个实参转为数值后判断其是否等于自身。| Argument 0 is converted to a number and tested for self-inequality.",
+    "return": "为 `NaN` 返回 `true`，否则 `false` / `true` for `NaN`, otherwise `false`"
+  },
+  "native_is_finite": {
+    "brief": "实现全局 `isFinite` / Implement the global `isFinite`",
+    "details": "转为数值后判断其既非 `NaN` 也非无穷。| After conversion the number is tested for being neither `NaN` nor infinite.",
+    "return": "有限返回 `true`，否则 `false` / `true` for a finite number, otherwise `false`"
+  },
+  "native_encode_uri_component": {
+    "brief": "实现 `encodeURIComponent` / Implement `encodeURIComponent`",
+    "details": "逐字节处理：未保留字符原样输出，其余编码为 `%XX`；当 `ud` 非 `NULL`（`encodeURI` 模式）时另将 `;/?:@&=+$,#` 与 `!` 视作可保留。| Bytes are processed one by one: unreserved characters pass through and the rest become `%XX`; when `ud` is non-`NULL` (`encodeURI` mode) `;/?:@&=+$,#` and `!` are also treated as unreserved.",
+    "params": {
+      "ud": "非 `NULL` 采用 `encodeURI` 的保留集 / Non-`NULL` selects the `encodeURI` reserved set"
+    },
+    "return": "百分号编码后的字符串 / The percent-encoded string"
+  },
+  "uri_hex": {
+    "brief": "把十六进制字符转换为数值 / Convert a hexadecimal character to its value",
+    "details": "`0`-`9`、`a`-`f`、`A`-`F` 分别映射为 0-15。| `0`-`9`, `a`-`f` and `A`-`F` map to 0-15.",
+    "return": "十六进制数值；非法字符返回 -1 / The hexadecimal value; -1 for a non-hex character",
+    "see": "native_decode_uri_component radix_digit"
+  }
+}

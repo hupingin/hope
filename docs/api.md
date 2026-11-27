@@ -1,21 +1,22 @@
 # Hope UI 引擎 API 参考文档
 
-本文档由 `tools/gen_api_docs.py` 从 `src/` 下的头文件自动抽取生成，共覆盖 20 个头文件、363 个函数、98 个类型定义。内容以各声明上方的 Doxygen 注释（`@brief`/`@details`/`@param`/`@return`/`@retval`/`@note`/`@see`）为准，仅保留中文部分。重复运行脚本会整体覆盖本文件。
+本文档由 `tools/gen_api_docs.py` 从 `src/` 下的头文件自动抽取生成，共覆盖 29 个头文件、436 个函数、123 个类型定义。内容以各声明上方的 Doxygen 注释（`@brief`/`@details`/`@param`/`@return`/`@retval`/`@note`/`@see`）为准，仅保留中文部分。重复运行脚本会整体覆盖本文件。
 
 > 标注「内部」的章节属于引擎内部实现接口（`*_internal.h`），不作为对外 API 使用。
 
 ## 目录
 
 - [src/base（基础类型与工具）](#srcbase基础类型与工具) —— 31 个函数 / 5 个类型
-- [src/css（CSS 解析与样式）](#srccsscss-解析与样式) —— 12 个函数 / 38 个类型
+- [src/canvas（）](#srccanvas) —— 0 个函数 / 0 个类型
+- [src/css（CSS 解析与样式）](#srccsscss-解析与样式) —— 27 个函数 / 51 个类型
 - [src/dom（DOM 树）](#srcdomdom-树) —— 21 个函数 / 4 个类型
 - [src/html（HTML 解析）](#srchtmlhtml-解析) —— 3 个函数 / 1 个类型
-- [src/js（JavaScript 引擎）](#srcjsjavascript-引擎) —— 161 个函数 / 30 个类型
-- [src/layout（布局）](#srclayout布局) —— 4 个函数 / 7 个类型
-- [src/paint（绘制）](#srcpaint绘制) —— 5 个函数 / 0 个类型
-- [src/platform（平台层）](#srcplatform平台层) —— 29 个函数 / 5 个类型
-- [src/render（渲染与资源）](#srcrender渲染与资源) —— 45 个函数 / 6 个类型
-- [src（引擎入口）](#src引擎入口) —— 52 个函数 / 2 个类型
+- [src/js（JavaScript 引擎）](#srcjsjavascript-引擎) —— 162 个函数 / 30 个类型
+- [src/layout（布局）](#srclayout布局) —— 5 个函数 / 7 个类型
+- [src/paint（绘制）](#srcpaint绘制) —— 12 个函数 / 2 个类型
+- [src/platform（平台层）](#srcplatform平台层) —— 34 个函数 / 7 个类型
+- [src/render（渲染与资源）](#srcrender渲染与资源) —— 50 个函数 / 7 个类型
+- [src（引擎入口）](#src引擎入口) —— 91 个函数 / 9 个类型
 
 ## src/base（基础类型与工具）
 
@@ -681,11 +682,267 @@ typedef struct HpeLength {
 } HpeLength;
 ```
 
+## src/canvas（）
+
+### hpe_canvas.h
+
+0 个函数，0 个类型。
+
+**函数**
+
+无。
+
+**类型**
+
+无。
+
 ## src/css（CSS 解析与样式）
+
+### hpe_anim.h
+
+13 个函数，0 个类型。
+
+**函数**
+
+#### `hpe_anim_parse_transition_shorthand`
+
+```c
+void hpe_anim_parse_transition_shorthand(const char *value, HpeStyle *d);
+```
+
+解析 transition 简写
+
+**详细说明**：按顶层逗号切分列表，逐项扫描 token：时间 token 第一个为 duration、第二个为 delay；缓动关键字（含 `cubic-bezier(...)` / `steps(...)` 括号组）为 timing function；可插值属性名为 property；`none` 清空列表。每项写入 `d->transitions` 并置位 `HPE_PROP2_TRANSITION`。 The list is split on top-level commas; per item the first time token is the duration and the second the delay, easing keywords (including the `cubic-bezier(...)` / `steps(...)` parenthesised groups) set the timing function and an interpolable property name sets the property. `none` clears the list. Each item is stored in `d->transitions` and `HPE_PROP2_TRANSITION` is set.
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `value` | in | 声明值 |
+| `d` | in,out | 目标样式 |
+
+**参见**：`hpe_anim_parse_transition_longhand`
+
+#### `hpe_anim_parse_transition_longhand`
+
+```c
+void hpe_anim_parse_transition_longhand(const char *prop, const char *value, HpeStyle *d);
+```
+
+解析 transition 长属性
+
+**详细说明**：`prop` 取 "transition-property" / "transition-duration" / "transition-timing-function" / "transition-delay" 之一，值按逗号列表写入 `d->transitions[i]` 对应字段并置位 `HPE_PROP2_TRANSITION`。 `prop` is one of "transition-property" / "transition-duration" / "transition-timing-function" / "transition-delay"; the comma list fills the matching field of `d->transitions[i]` and sets `HPE_PROP2_TRANSITION`.
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `prop` | in | 长属性名 |
+| `value` | in | 声明值 |
+| `d` | in,out | 目标样式 |
+
+#### `hpe_anim_parse_animation_shorthand`
+
+```c
+void hpe_anim_parse_animation_shorthand(const char *value, HpeStyle *d);
+```
+
+解析 animation 简写
+
+**详细说明**：按顶层逗号切分，逐项按 CSS Animations §3 顺序无关规则识别：时间 token 第一个为 duration、第二个为 delay；缓动关键字为 timing function； `infinite` 或纯数字为迭代次数；direction / fill-mode 关键字各归其位； 余下的标识符为 @keyframes 名。`none` 清空列表。 The list is split on top-level commas; per item, in the order-free manner of CSS Animations §3: the first time token is the duration and the second the delay, easing keywords set the timing function, `infinite` or a plain number is the iteration count, direction / fill-mode keywords slot in, and the remaining identifier is the @keyframes name. `none` clears the list.
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `value` | in | 声明值 |
+| `d` | in,out | 目标样式 |
+
+**参见**：`hpe_anim_parse_animation_longhand`
+
+#### `hpe_anim_parse_animation_longhand`
+
+```c
+void hpe_anim_parse_animation_longhand(const char *prop, const char *value, HpeStyle *d);
+```
+
+解析 animation 长属性
+
+**详细说明**：`prop` 取 "animation-name" / "animation-duration" / "animation-timing-function" / "animation-delay" / "animation-iteration-count" / "animation-direction" / "animation-fill-mode" 之一，值写入 `d->anims[i]` 对应字段并置位 `HPE_PROP2_ANIMATION`。 `prop` is one of "animation-name" / "animation-duration" / "animation-timing-function" / "animation-delay" / "animation-iteration-count" / "animation-direction" / "animation-fill-mode"; the value fills the matching field of `d->anims[i]` and sets `HPE_PROP2_ANIMATION`.
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `prop` | in | 长属性名 |
+| `value` | in | 声明值 |
+| `d` | in,out | 目标样式 |
+
+#### `hpe_anim_parse_time`
+
+```c
+void hpe_anim_parse_time(const char *v, float *out);
+```
+
+把时间值解析成秒
+
+**详细说明**：接受 `<number>s` 与 `<number>ms`，无单位数字按秒处理；解析失败写 0。 Accepts `<number>s` and `<number>ms`; a bare number counts as seconds and a failed parse writes 0.
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `v` | in | 声明值 token |
+| `out` | out | 接收秒数 |
+
+#### `hpe_anim_parse_easing`
+
+```c
+void hpe_anim_parse_easing(const char *v, HpeEasing *out);
+```
+
+解析缓动函数
+
+**详细说明**：关键字 `linear` / `ease` / `ease-in` / `ease-out` / `ease-in-out`、 `cubic-bezier(x1, y1, x2, y2)` 与 `steps(n, start|end)`；未知值回退 `ease`。 Keywords `linear` / `ease` / `ease-in` / `ease-out` / `ease-in-out`, `cubic-bezier(x1, y1, x2, y2)` and `steps(n, start|end)`; unknown values fall back to `ease`.
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `v` | in | 声明值 token |
+| `out` | out | 接收解析结果 |
+
+#### `hpe_anim_find_keyframes`
+
+```c
+HpeKeyframes *hpe_anim_find_keyframes(HpeStylesheet *sheet, const char *name);
+```
+
+按名查找样式表中的 @keyframes
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `sheet` | in | 样式表 |
+| `name` | in | 动画名 |
+
+**返回**：命中的规则，未找到返回 `NULL`
+
+#### `hpe_anim_sheet_keyframes_slot`
+
+```c
+HpeKeyframes *hpe_anim_sheet_keyframes_slot(HpeStylesheet *sheet, const char *name);
+```
+
+按名找（或新建）一条空的 @keyframes
+
+**详细说明**：已有同名规则时清空其 stops（后定义整体替换先定义）；否则追加一条空规则。 An existing rule with the same name has its stops cleared (a later definition replaces an earlier one wholesale); otherwise an empty rule is appended.
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `sheet` | in,out | 目标样式表 |
+| `name` | in | 动画名（不含空白） |
+
+**返回**：命中的规则；容量耗尽返回 `NULL`
+
+#### `hpe_anim_value_get`
+
+```c
+int hpe_anim_value_get(const HpeStyle *s, int prop, HpeAnimValue *out);
+```
+
+从计算样式取一个可插值属性的当前值
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `s` | in | 计算样式 |
+| `prop` | in | `HpeAnimProp` / An `HpeAnimProp` id |
+| `out` | out | 接收值快照 |
+
+**返回**：属性可参与插值返回 1（`out->valid` 同步置位），否则 0
+
+#### `hpe_anim_value_set`
+
+```c
+void hpe_anim_value_set(HpeStyle *s, int prop, const HpeAnimValue *v);
+```
+
+把插值结果写回计算样式
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `s` | in,out | 目标样式 |
+| `prop` | in | `HpeAnimProp` / An `HpeAnimProp` id |
+| `v` | in | 值快照 |
+
+#### `hpe_anim_value_lerp`
+
+```c
+int hpe_anim_value_lerp(const HpeAnimValue *a, const HpeAnimValue *b, float t, HpeAnimValue *out);
+```
+
+在两个值之间插值
+
+**详细说明**：同类且单位一致时线性插值；颜色按 sRGB 通道插值；transform 做分解 （平移/旋转/缩放）插值，含倾斜或行列式退化时按 50% 离散切换。 Linear interpolation when both sides share type and unit; colours lerp per sRGB channel; transforms interpolate as decomposed (translation / rotation / scale) and fall back to a 50% discrete swap when skew is present or the determinant degenerates.
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `a` | in | 起点值 |
+| `b` | in | 终点值 |
+| `t` | in | 进度 0..1 |
+| `out` | out | 接收插值结果 |
+
+**返回**：可插值返回 1，类型不兼容返回 0（调用方应走离散）
+
+#### `hpe_easing_solve`
+
+```c
+float hpe_easing_solve(const HpeEasing *e, float t);
+```
+
+求缓动函数在 t 处的进度
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `e` | in | 缓动函数 |
+| `t` | in | 归一化时间 0..1 |
+
+**返回**：缓动后的进度（通常仍在 0..1，bezier 允许越界）
+
+#### `hpe_anim_prop_is_layout`
+
+```c
+int hpe_anim_prop_is_layout(int prop);
+```
+
+判断属性是否影响几何（决定动画刷新级别）
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `prop` | in | `HpeAnimProp` / An `HpeAnimProp` id |
+
+**返回**：需要重新布局返回 1，仅需重算样式返回 0
+
+**类型**
+
+无。
 
 ### hpe_css.h
 
-12 个函数，38 个类型。
+14 个函数，51 个类型。
 
 **函数**
 
@@ -829,6 +1086,25 @@ void hpe_css_parse_declarations(const char *text, size_t length, HpeStyle *decl)
 
 **参见**：`apply_property`、`strip_important`
 
+#### `hpe_css_style_custom_value`
+
+```c
+int hpe_css_style_custom_value(const HpeStyle *style, const char *name, char *out, size_t n);
+```
+
+读取计算样式中的自定义属性值
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `style` | in | 计算样式 |
+| `name` | in | 属性名（可带或不带 `--`） |
+| `out` | out | 接收值的缓冲 |
+| `n` | in | 缓冲容量 |
+
+**返回**：找到返回 1，否则 0
+
 #### `hpe_css_compute`
 
 ```c
@@ -936,6 +1212,25 @@ int hpe_css_inline_get(const HpeDomNode *node, const char *prop, char *out, size
 **注意**：属性值以去空白后的文本原样返回，不做规范化
 
 **参见**：`hpe_css_inline_set`
+
+#### `hpe_css_set_anim_hook`
+
+```c
+void hpe_css_set_anim_hook(HpeCssAnimHook fn, void *ud);
+```
+
+注册层叠后的动画覆盖钩子
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `fn` | in | 钩子函数，`NULL` 表示注销 |
+| `ud` | in | 透传给钩子的用户数据 |
+
+**注意**：`hpe_css_compute` 在元素节点层叠完成后调用钩子，供动画时钟把插值结果写进计算样式； 由引擎在创建时注册（见 hope_anim.c）
+
+**参见**：`hpe_css_compute`
 
 **类型**
 
@@ -1260,6 +1555,151 @@ typedef enum HpeCombinator {
 #### `HpeStyle`
 
 ```c
+typedef struct HpeStyle HpeStyle; /* HpeKeyframeStop below holds one by pointer */
+```
+
+#### `HpeAnimProp`
+
+```c
+typedef enum HpeAnimProp {
+    HPE_AP_NONE = 0,
+    HPE_AP_COLOR,
+    HPE_AP_BACKGROUND_COLOR,
+    HPE_AP_BORDER_COLOR, /* 四边一起插值 / all four sides together */
+    HPE_AP_OPACITY,
+    HPE_AP_WIDTH,
+    HPE_AP_HEIGHT,
+    HPE_AP_MARGIN_TOP, HPE_AP_MARGIN_RIGHT, HPE_AP_MARGIN_BOTTOM, HPE_AP_MARGIN_LEFT,
+    HPE_AP_PADDING_TOP, HPE_AP_PADDING_RIGHT, HPE_AP_PADDING_BOTTOM, HPE_AP_PADDING_LEFT,
+    HPE_AP_INSET_TOP, HPE_AP_INSET_RIGHT, HPE_AP_INSET_BOTTOM, HPE_AP_INSET_LEFT,
+    HPE_AP_FONT_SIZE,
+    HPE_AP_LETTER_SPACING,
+    HPE_AP_LINE_HEIGHT,
+    HPE_AP_FONT_WEIGHT,
+    HPE_AP_BORDER_RADIUS,
+    HPE_AP_TRANSFORM,
+    HPE_AP_ALL, /* 仅 `transition-property` 使用 / `transition-property` only */
+    HPE_AP_COUNT
+} HpeAnimProp;
+```
+
+#### `HpeAnimValue`
+
+```c
+typedef struct HpeAnimValue {
+    int prop;  /* HpeAnimProp */
+    int type;  /* HPE_AV_* */
+    int valid; /* 0 when the property holds no interpolable value (e.g. auto) */
+    HpeLength len;
+    HpeColor color;
+    HpeColor colors[4];
+    float f;
+    HpeTransform tf;
+} HpeAnimValue;
+```
+
+#### `HpeEasingKind`
+
+```c
+typedef enum HpeEasingKind {
+    HPE_EASING_LINEAR = 0,
+    HPE_EASING_EASE,
+    HPE_EASING_EASE_IN,
+    HPE_EASING_EASE_OUT,
+    HPE_EASING_EASE_IN_OUT,
+    HPE_EASING_CUBIC,
+    HPE_EASING_STEPS
+} HpeEasingKind;
+```
+
+#### `HpeEasing`
+
+```c
+typedef struct HpeEasing {
+    int kind; /* HpeEasingKind */
+    float x1, y1, x2, y2; /* HPE_EASING_CUBIC control points */
+    int steps;            /* HPE_EASING_STEPS interval count */
+    int steps_start;      /* 1 = steps(n, start) */
+} HpeEasing;
+```
+
+#### `HpeTransition`
+
+```c
+typedef struct HpeTransition {
+    int prop; /* HpeAnimProp, or HPE_AP_ALL */
+    float duration, delay; /* 秒 / seconds */
+    HpeEasing easing;
+} HpeTransition;
+```
+
+#### `HpeAnimDecl`
+
+```c
+typedef struct HpeAnimDecl {
+    char name[HPE_ANIM_NAME_MAX]; /* @keyframes 名（"" = 未声明）/ keyframes name */
+    float duration, delay;        /* 秒 / seconds */
+    float iter_count;             /* 次数；`iter_infinite` 时忽略 / loop count */
+    int iter_infinite;            /* `infinite` */
+    int direction;                /* HPE_ANIM_DIR_* */
+    int fill;                     /* HPE_ANIM_FILL_* */
+    HpeEasing easing;
+} HpeAnimDecl;
+```
+
+#### `HpeKeyframeStop`
+
+```c
+typedef struct HpeKeyframeStop {
+    float pct; /* 0..100 */
+    HpeStyle *decl;
+} HpeKeyframeStop;
+```
+
+#### `HpeKeyframes`
+
+```c
+typedef struct HpeKeyframes {
+    char name[HPE_ANIM_NAME_MAX];
+    HpeKeyframeStop stops[HPE_KF_STOPS_MAX];
+    int stop_count;
+} HpeKeyframes;
+```
+
+#### `HpeCustomProp`
+
+```c
+typedef struct HpeCustomProp {
+    char name[HPE_CUSTOM_NAME_MAX];  /* name without the leading `--` */
+    char value[HPE_CUSTOM_VALUE_MAX]; /* raw token stream, may itself contain var() */
+    int important;
+    int declared; /* set by this element's cascade, 0 when merely inherited */
+} HpeCustomProp;
+```
+
+#### `HpeVarDecl`
+
+```c
+typedef struct HpeVarDecl {
+    char prop[HPE_CUSTOM_NAME_MAX];   /* property name receiving the var() value */
+    char value[HPE_CUSTOM_VALUE_MAX]; /* raw value containing var() */
+} HpeVarDecl;
+```
+
+#### `HpePropertyReg`
+
+```c
+typedef struct HpePropertyReg {
+    char name[HPE_CUSTOM_NAME_MAX];
+    char syntax[48];
+    char initial[HPE_CUSTOM_VALUE_MAX];
+    int inherits;
+} HpePropertyReg;
+```
+
+#### `HpeStyle`
+
+```c
 typedef struct HpeStyle {
     uint64_t set;
     uint64_t set2; /* second property word, see HPE_PROP2_* */
@@ -1315,8 +1755,12 @@ typedef struct HpeStyle {
     HpeShadow box_shadow;
     HpeShadow text_shadow;
     HpeTransform transform;
-    int has_transition; /* parsed presence only; no interpolation clock yet */
-    int has_animation;
+    /* transition declarations (comma list, HPE_TRANS_MAX entries) */
+    HpeTransition transitions[HPE_TRANS_MAX];
+    int transition_count;
+    /* animation declarations (comma list, HPE_ANIM_MAX entries) */
+    HpeAnimDecl anims[HPE_ANIM_MAX];
+    int anim_count;
     /* generated content, resolved to text for ::before / ::after */
     char content[HPE_CONTENT_MAX];
     char attr_content[96]; /* `attr(name)` argument of `content`, resolved at box build */
@@ -1352,6 +1796,14 @@ typedef struct HpeStyle {
     HpeObjectFit object_fit;
     HpeBgPos object_pos; /* `object-position`, shares HpeBgPos' px / % form */
     HpeBgRepeat bg_repeat;
+    /* vertical text (CSS Writing Modes): 0 = horizontal-tb, 1 = vertical-rl,
+     * 2 = vertical-lr / 竖排文本：0 横排，1 从右向左竖排，2 从左向右竖排 */
+    int writing_mode;
+    /* CSS custom properties and pending var() declarations (v0.23) */
+    HpeCustomProp custom[HPE_CUSTOM_PROP_MAX];
+    int custom_count;
+    HpeVarDecl vars[HPE_VAR_DECL_MAX];
+    int var_count;
 } HpeStyle;
 ```
 
@@ -1470,7 +1922,21 @@ typedef struct HpeStylesheet {
     int next_order;
     float vw; /* viewport width/height used to evaluate @media at cascade time */
     float vh;
+    /* @keyframes store (heap, grown on demand; freed by hpe_css_free) */
+    HpeKeyframes *kf;
+    int kf_count;
+    size_t kf_cap;
+    /* @property registrations (heap, grown on demand; freed by hpe_css_free) */
+    HpePropertyReg *props;
+    int prop_count;
+    size_t prop_cap;
 } HpeStylesheet;
+```
+
+#### `HpeCssAnimHook`
+
+```c
+typedef void (*HpeCssAnimHook)(void *ud, const HpeDomNode *node, HpeStyle *style);
 ```
 
 ## src/dom（DOM 树）
@@ -2298,9 +2764,21 @@ typedef struct HpeJsModuleLoader {
 } HpeJsModuleLoader;
 ```
 
+### hpe_js_canvas.h
+
+0 个函数，0 个类型。
+
+**函数**
+
+无。
+
+**类型**
+
+无。
+
 ### hpe_js_dom.h
 
-6 个函数，1 个类型。
+7 个函数，1 个类型。
 
 **函数**
 
@@ -2387,6 +2865,28 @@ int hpe_js_dom_dispatch_ex(HpeJs *js, HpeDomNode *target, const char *type, cons
 
 **参见**：`hpe_js_dom_dispatch`
 
+#### `hpe_js_dom_dispatch_cancelable`
+
+```c
+int hpe_js_dom_dispatch_cancelable(HpeJs *js, HpeDomNode *target, const char *type, const HpeJsEventInit *init, int *prevented);
+```
+
+派发一个可取消事件并回报默认行为是否被阻止
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `js` | in,out | JS 运行时上下文 |
+| `target` | in,out | 事件目标节点 |
+| `type` | in | 事件类型名（如 `submit` / `reset`） |
+| `init` | in | 附加数据；传 `NULL` 表示全默认 |
+| `prevented` | out | 处理函数调用 `preventDefault` 时置 1，可为 `NULL` |
+
+**返回**：有处理函数被调用返回 1
+
+**注意**：事件对象带真正生效的 `preventDefault()`；嵌套的取消派发共享同一回报槽
+
 #### `hpe_js_dom_dispatch_self`
 
 ```c
@@ -2444,6 +2944,7 @@ typedef struct HpeJsEventInit {
     int no_bubble;       /* 1 to keep the event on its target only (a `bubbles: false` Event) */
     const char *key;     /* keyboard: the printable key name (`a`, `Enter`) */
     const char *code;    /* keyboard: the physical key code (`KeyA`) */
+    const char *new_state; /* toggle/beforetoggle: `"open"` or `"closed"` */
     HpeDomNode *related; /* mouseover/mouseout: where the pointer came from or went to */
 } HpeJsEventInit;
 ```
@@ -5196,11 +5697,23 @@ typedef struct HpeJsMutationState {
 } HpeJsMutationState;
 ```
 
+### hpe_js_selection.h
+
+0 个函数，0 个类型。
+
+**函数**
+
+无。
+
+**类型**
+
+无。
+
 ## src/layout（布局）
 
 ### hpe_layout.h
 
-4 个函数，7 个类型。
+5 个函数，7 个类型。
 
 **函数**
 
@@ -5278,6 +5791,22 @@ float hpe_layout_content_height(HpeBox *root);
 
 **返回**：根盒边框盒底边的文档 y；root 为 `NULL` 时返回 0
 
+#### `form_is_replaced_control`
+
+```c
+int form_is_replaced_control(const HpeDomNode *node);
+```
+
+判断一个元素是否按替换盒处理的表单控件
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `node` | in | 目标元素 |
+
+**返回**：input（button 型除外）与 select / progress / meter 返回 1
+
 **类型**
 
 #### `HpeBoxKind`
@@ -5319,6 +5848,11 @@ typedef struct HpeLine {
     float height;
     float baseline;
     float y;
+    /* vertical writing mode reinterprets this line as a text column:
+     * `col_x` is the column's left offset relative to the content box,
+     * `width` is the column width, and each run's `x`/`width` become the
+     * vertical start offset and vertical length. */
+    float col_x;
     /* per-line fragments of the inline boxes that contribute content: one
      * entry per still-open inline box when the line ends or closes */
     struct HpeInlineFrag *frags;
@@ -5410,9 +5944,25 @@ typedef struct HpeBox {
 
 ### hpe_paint.h
 
-3 个函数，0 个类型。
+4 个函数，2 个类型。
 
 **函数**
+
+#### `hpe_paint_set_selection`
+
+```c
+void hpe_paint_set_selection(const HpePaintSel *sel);
+```
+
+设置绘制阶段的选区描述（下一帧起生效）
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `sel` | in | 选区描述，NULL 清除 |
+
+**注意**：指针由调用方持有且须在绘制期间保持有效；引擎在每次重绘前重建并传入
 
 #### `hpe_paint_document`
 
@@ -5482,6 +6032,141 @@ void hpe_paint_page_scrollbar(HpePixmap *pm, float view_top, float view_h, float
 
 **类型**
 
+#### `HpePaintSelEntry`
+
+```c
+typedef struct HpePaintSelEntry {
+    const struct HpeBox *box; /* 选区命中的文本盒 / The selected text box */
+    int start, end;           /* box->text 内的选中字节区间 [start, end) / Byte range within box->text */
+} HpePaintSelEntry;
+```
+
+一个文本盒的选中字节区间
+
+#### `HpePaintSel`
+
+```c
+typedef struct HpePaintSel {
+    const HpePaintSelEntry *entries; /* 区间表，可为 NULL / Range table, may be NULL */
+    int count;                       /* 区间个数 / Number of entries */
+} HpePaintSel;
+```
+
+本帧选区描述：文档序排列的逐盒区间表
+
+### hpe_paint_details.h
+
+4 个函数，0 个类型。
+
+**函数**
+
+#### `hpe_paint_set_modal_dialog`
+
+```c
+void hpe_paint_set_modal_dialog(HpeDomNode *node);
+```
+
+记录当前模态 `<dialog>` 节点供绘制使用
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `node` | in | 模态对话框节点或 `NULL` |
+
+**注意**：引擎在每帧绘制前调用；指针只在本帧读取
+
+#### `hpe_paint_modal_dialog`
+
+```c
+HpeDomNode *hpe_paint_modal_dialog(void);
+```
+
+读取当前登记的模态 `<dialog>`
+
+**返回**：模态对话框节点，无则 `NULL`
+
+#### `hpe_paint_summary_marker`
+
+```c
+void hpe_paint_summary_marker(HpePixmap *pm, const HpeBox *box, HpeRect bb, int open);
+```
+
+绘制 `<summary>` 的展开指示三角
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `pm` | in,out | 目标像素缓冲 |
+| `box` | in | summary 盒 |
+| `bb` | in | 设备坐标边框盒 |
+| `open` | in | 所属 details 是否展开 |
+
+**注意**：三角画在 `padding-left` 预留的左侧空档
+
+#### `hpe_paint_dialog_backdrop`
+
+```c
+void hpe_paint_dialog_backdrop(HpePixmap *pm, float y);
+```
+
+绘制模态 `<dialog>` 的背景遮罩
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `pm` | in,out | 目标像素缓冲 |
+| `y` | in | 视口内容区顶边的设备 y |
+
+**注意**：半透明黑色覆盖整个内容区；在非模态绘制阶段之前调用
+
+**类型**
+
+无。
+
+### hpe_paint_form.h
+
+2 个函数，0 个类型。
+
+**函数**
+
+#### `hpe_paint_form_set_focus`
+
+```c
+void hpe_paint_form_set_focus(const HpeDomNode *node, int caret);
+```
+
+记录当前聚焦的可编辑控件与插入符位置（绘制插入符用）
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `node` | in | 焦点控件，`NULL` 表示无 |
+| `caret` | in | 插入符在值内的字节偏移 |
+
+**注意**：引擎在每帧绘制前调用；指针只在本帧读取
+
+#### `hpe_paint_form_control`
+
+```c
+void hpe_paint_form_control(HpePixmap *pm, const HpeBox *box, HpeRect bb);
+```
+
+绘制一个替换型表单控件的控件内容
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `pm` | in,out | 目标像素缓冲 |
+| `box` | in | 控件盒 |
+| `bb` | in | 设备坐标边框盒 |
+
+**类型**
+
 无。
 
 ### hpe_svg.h
@@ -5536,7 +6221,7 @@ struct HpeDomNode *hpe_svg_hit_test(struct HpeBox *box, float x, float y);
 
 ### hpe_platform.h
 
-29 个函数，5 个类型。
+34 个函数，7 个类型。
 
 **函数**
 
@@ -6031,6 +6716,107 @@ int hpe_plat_font_mask(HpePlatFont *font, const char *utf8, int len, float dx, H
 
 **参见**：`hpe_text_mask_free`
 
+#### `hpe_plat_font_covers`
+
+```c
+int hpe_plat_font_covers(HpePlatFont *font, uint32_t codepoint);
+```
+
+判断字体是否覆盖某个码点
+
+**详细说明**：对每个码点做一次字形索引查询并标记不存在的字形；结果由调用方缓存。 Each query maps the code point to a glyph index marking non-existing glyphs; the caller is expected to cache the result.
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `font` | in,out | 字体对象 |
+| `codepoint` | in | Unicode 码点 |
+
+**返回**：覆盖返回 1，未覆盖或字体为空返回 0
+
+**参见**：`hpe_plat_font_create`
+
+#### `hpe_plat_font_create_face`
+
+```c
+HpePlatFont *hpe_plat_font_create_face(float pixel_size, int weight, const char *face_utf8);
+```
+
+用显式字体名创建平台字体对象
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `pixel_size` | in | 字号（像素） |
+| `weight` | in | 字重 |
+| `face_utf8` | in | 字体名（UTF-8），NULL 时按字体族映射 |
+
+**返回**：新字体对象，失败返回 NULL
+
+**注意**：供字形回退链按具体字体名创建后备字体
+
+**参见**：`hpe_plat_font_create`、`hpe_plat_font_destroy`
+
+#### `hpe_plat_emoji_font_create`
+
+```c
+HpePlatEmojiFont *hpe_plat_emoji_font_create(float pixel_size);
+```
+
+打开彩色 emoji 字体（按字号）
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `pixel_size` | in | 字号（像素） |
+
+**返回**：新对象，系统无彩色 emoji 字体时返回 NULL
+
+**注意**：Win32 后端使用 `Segoe UI Emoji`；对象只承载 DC 与字体句柄
+
+**参见**：`hpe_plat_emoji_font_destroy`
+
+#### `hpe_plat_emoji_glyph`
+
+```c
+int hpe_plat_emoji_glyph(HpePlatEmojiFont *font, uint32_t glyph_id, HpeGlyphOutline *out);
+```
+
+按字形索引取抗锯齿覆盖率轮廓
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `font` | in,out | emoji 字体对象 |
+| `glyph_id` | in | 字形索引 |
+| `out` | out | 接收轮廓的结构，coverage 由调用方 `hpe_free` |
+
+**返回**：成功返回 1，空字形或失败返回 0
+
+**注意**：内部使用 `GetGlyphOutlineW` 的 `GGO_GLYPH_INDEX|GGO_GRAY8_BITMAP` 形式
+
+**参见**：`hpe_plat_emoji_font_create`
+
+#### `hpe_plat_emoji_font_destroy`
+
+```c
+void hpe_plat_emoji_font_destroy(HpePlatEmojiFont *font);
+```
+
+关闭彩色 emoji 字体并释放资源
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `font` | in,out | emoji 字体对象，NULL 时无操作 |
+
+**参见**：`hpe_plat_emoji_font_create`
+
 #### `hpe_text_mask_free`
 
 ```c
@@ -6072,6 +6858,12 @@ typedef struct HpeWindowCallbacks {
      * by the Win32 backend). Used by the address bar for path entry and by
      * pages as the source of `keypress`. */
     void (*on_char)(void *user, int codepoint);
+    /* IME composition updated: `utf8` is the in-progress string ("" when the
+     * composition was cleared or ended without a result). May be NULL. */
+    void (*on_ime_compose)(void *user, const char *utf8);
+    /* IME composition committed: `utf8` is the final string to insert. May be
+     * NULL. */
+    void (*on_ime_commit)(void *user, const char *utf8);
     /* mouse: x,y are viewport (client) coords; button 0 = left; down: 1 = pressed, 0 = released;
      * button -1 = pointer move (no button state change). `mods` is a mask of
      * HPE_MOD_* captured with the event (Shift+click extends a text selection).
@@ -6112,11 +6904,133 @@ typedef struct HpeTextMask {
 } HpeTextMask;
 ```
 
+#### `HpePlatEmojiFont`
+
+```c
+typedef struct HpePlatEmojiFont HpePlatEmojiFont;
+```
+
+#### `HpeGlyphOutline`
+
+```c
+typedef struct HpeGlyphOutline {
+    unsigned char *coverage;
+    int w, h;
+    int left;      /* box left offset from the pen x / 盒左缘相对笔位 x 的偏移 */
+    int baseline;  /* row index of the baseline inside the box / 盒内基线所在行 */
+    float advance; /* cell increment x / 水平步进宽度 */
+} HpeGlyphOutline;
+```
+
 ## src/render（渲染与资源）
+
+### hpe_emoji.h
+
+4 个函数，1 个类型。
+
+**函数**
+
+#### `hpe_emoji_seq_len`
+
+```c
+int hpe_emoji_seq_len(const char *utf8, int max_len);
+```
+
+判断文本开头是否为彩色 emoji 序列
+
+**详细说明**：序列 = emoji 基字符 + 可选的 VS16（`U+FE0F`）/ 肤色修饰符（`U+1F3FB`..`U+1F3FF`）/ 区域指示符对（旗帜）。ZWJ 链不并入序列（无 GSUB 连字支持，各分量独立渲染）。 A sequence = one emoji base plus an optional VS16 (`U+FE0F`) / skin-tone modifiers (`U+1F3FB`..`U+1F3FF`) / a regional-indicator pair (flags). ZWJ chains are not merged (no GSUB ligature support; parts render separately).
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `utf8` | in | UTF-8 文本 |
+| `max_len` | in | 参与扫描的最大字节数 |
+
+**返回**：序列的字节长度；不是彩色序列返回 0
+
+**注意**：仅默认彩色呈现或带 VS16 的字符才算；纯文本呈现符号交给单色掩码路径
+
+#### `hpe_emoji_sprite`
+
+```c
+int hpe_emoji_sprite(float pixel_size, const char *seq, int len, HpeColor fg, HpeGlyphSprite *out);
+```
+
+取（并缓存）一个彩色 emoji 序列的精灵
+
+**详细说明**：读取系统 emoji 字体（`seguiemj.ttf`）的 cmap/COLRv0/CPAL 表，逐层取字形 覆盖率并用调色板色合成 RGBA 精灵；结果按「序列内容 + 字号 + 前景色」缓存。 The cmap/COLRv0/CPAL tables of the system emoji font (`seguiemj.ttf`) are parsed, each layer's glyph coverage is fetched and composited with its palette colour into an RGBA sprite; results are cached per sequence, pixel size and foreground colour.
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `pixel_size` | in | 字号（像素） |
+| `seq` | in | UTF-8 序列（`hpe_emoji_seq_len` 的输入） |
+| `len` | in | 序列字节长度 |
+| `fg` | in | 前景色（调色板索引 `0xFFFF` 的层使用） |
+| `out` | out | 接收精灵 |
+
+**返回**：成功返回 1；无 COLR 数据、字体缺失或序列非法返回 0
+
+**注意**：返回的像素由缓存持有，勿释放；调用 `hpe_emoji_shutdown` 后全部失效
+
+**参见**：`hpe_emoji_seq_len`、`hpe_emoji_shutdown`
+
+#### `hpe_emoji_blit`
+
+```c
+void hpe_emoji_blit(HpePixmap *pm, const HpeGlyphSprite *sp, int x, int y);
+```
+
+按直通 alpha 把精灵混合到像素缓冲
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `pm` | in,out | 目标像素缓冲 |
+| `sp` | in | 精灵 |
+| `x` | in | 精灵盒左缘的设备 x |
+| `y` | in | 精灵盒顶缘的设备 y |
+
+**注意**：裁剪范围外的像素跳过；结果像素始终不透明（与文本掩码绘制一致）
+
+**参见**：`hpe_emoji_sprite`
+
+#### `hpe_emoji_shutdown`
+
+```c
+void hpe_emoji_shutdown(void);
+```
+
+释放 emoji 模块的全部缓存
+
+**详细说明**：丢弃精灵缓存并关闭所有已打开的 emoji 字体对象。 The sprite cache is dropped and every opened emoji font object is closed.
+
+**注意**：应在引擎退出时调用一次
+
+**参见**：`hpe_emoji_sprite`
+
+**类型**
+
+#### `HpeGlyphSprite`
+
+```c
+typedef struct HpeGlyphSprite {
+    int w, h;
+    int left;          /* box left offset from the pen x / 盒左缘相对笔位 x 的偏移 */
+    int baseline;      /* rows above the baseline / 基线之上的行数 */
+    uint32_t *pixels;  /* straight-alpha 0xAARRGGBB pixels / 直通 alpha 像素
+                        * (cache-owned; freed by sprite_flush, non-const so the
+                        * owner can hpe_free it / 缓存持有，由 sprite_flush 释放，
+                        * 非 const 以便持有方直接释放) */
+} HpeGlyphSprite;
+```
 
 ### hpe_font.h
 
-11 个函数，1 个类型。
+12 个函数，1 个类型。
 
 **函数**
 
@@ -6313,6 +7227,29 @@ const HpeTextMask *hpe_font_mask_phase(HpeFont *font, const char *text, int len,
 **返回**：缓存持有的掩码指针（借出，勿释放）；失败返回 `NULL`
 
 **参见**：`hpe_font_mask`
+
+#### `hpe_font_resolve`
+
+```c
+HpeFont *hpe_font_resolve(HpeFont *font, uint32_t codepoint);
+```
+
+解析某码点真正使用的字体（含回退链）
+
+**详细说明**：主字体覆盖该码点时返回主字体本身；否则按字体族的硬编码回退链 （Segoe UI Symbol → Segoe UI Emoji → SimSun）逐个验证覆盖并返回第一个 覆盖的后备字体。结果按码点缓存在主字体上。 When the primary font covers the code point the primary itself is returned; otherwise the family's hardcoded fallback chain (Segoe UI Symbol → Segoe UI Emoji → SimSun) is probed and the first covering fallback is returned. Results are cached per code point.
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `font` | in,out | 主字体对象 |
+| `codepoint` | in | Unicode 码点 |
+
+**返回**：服务该码点的字体；`font` 为 `NULL` 返回 `NULL`
+
+**注意**：彩色 emoji 序列的步进也经此解析到 emoji 字体
+
+**参见**：`hpe_font_advance`
 
 #### `hpe_font_shutdown`
 
@@ -7098,7 +8035,7 @@ typedef struct HpeRasterStop {
 
 ### hope.h
 
-39 个函数，2 个类型。
+44 个函数，2 个类型。
 
 **函数**
 
@@ -7416,6 +8353,42 @@ void hpe_engine_render(HpeEngine *engine);
 
 **参见**：`hpe_engine_pixmap`、`hpe_engine_scroll_by`
 
+#### `hpe_engine_ime_compose`
+
+```c
+void hpe_engine_ime_compose(HpeEngine *engine, const char *utf8);
+```
+
+更新输入法组合串的内联显示
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in,out | 引擎实例 |
+| `utf8` | in | 组合中的字符串（"" 表示清除） |
+
+**注意**：组合串画在插入符处并带下划线，不改动地址文本；空串清除显示并恢复插入符
+
+#### `hpe_engine_ime_commit`
+
+```c
+int hpe_engine_ime_commit(HpeEngine *engine, const char *utf8);
+```
+
+提交输入法组合串（插入插入符处）
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in,out | 引擎实例 |
+| `utf8` | in | 最终字符串 |
+
+**返回**：插入成功返回 1，否则 0
+
+**注意**：等价于在插入符处插入文本并清除组合显示；未聚焦或空串时忽略
+
 #### `hpe_engine_enable_chrome`
 
 ```c
@@ -7433,6 +8406,57 @@ void hpe_engine_enable_chrome(HpeEngine *engine);
 **注意**：启用后视口变窄，页面在地址栏下方排版并接收相对自身的鼠标坐标；已排版则重排以重新夹紧滚动，否则标记整帧重绘
 
 **参见**：`hpe_engine_chrome_height`
+
+#### `hpe_engine_tab_count`
+
+```c
+int hpe_engine_tab_count(HpeEngine *engine);
+```
+
+取当前打开的标签数
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in | 引擎实例 |
+
+**返回**：标签数，`engine` 为 NULL 时返回 0
+
+#### `hpe_engine_tab_active`
+
+```c
+int hpe_engine_tab_active(HpeEngine *engine);
+```
+
+取当前活动标签下标
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in | 引擎实例 |
+
+**返回**：活动标签下标，`engine` 为 NULL 时返回 -1
+
+#### `hpe_engine_tab_switch`
+
+```c
+int hpe_engine_tab_switch(HpeEngine *engine, int index);
+```
+
+切换到指定下标的标签
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in,out | 引擎实例 |
+| `index` | in | 目标标签下标 |
+
+**返回**：成功返回 1，下标非法或已是当前标签返回 0
+
+**注意**：切换会保存当前标签的路径/历史/滚动，重载目标标签的文档并恢复其滚动
 
 #### `hpe_engine_chrome_height`
 
@@ -7899,9 +8923,278 @@ typedef struct HpeEngine HpeEngine;
 typedef struct HpeDomNode HpeDomNode;
 ```
 
+### hope_details.h
+
+0 个函数，0 个类型。
+
+**函数**
+
+无。
+
+**类型**
+
+无。
+
+### hope_form.h
+
+14 个函数，1 个类型。
+
+**函数**
+
+#### `hpe_form_kind`
+
+```c
+HpeFormKind hpe_form_kind(const HpeDomNode *node);
+```
+
+按标签与 type 属性归类控件
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `node` | in | 目标元素 |
+
+**返回**：控件类别；非控件元素返回 `HPE_FK_OTHER`
+
+#### `hpe_form_value_get`
+
+```c
+void hpe_form_value_get(const HpeDomNode *node, char *out, int cap);
+```
+
+读控件当前值
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `node` | in | 目标控件 |
+| `out` | out | 接收缓冲 |
+| `cap` | in | 缓冲容量 |
+
+#### `hpe_form_value_set`
+
+```c
+void hpe_form_value_set(HpeDomNode *node, const char *v);
+```
+
+写控件当前值（不派发事件）
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `node` | in,out | 目标控件 |
+| `v` | in | 新值 |
+
+#### `hpe_form_checked_get`
+
+```c
+int hpe_form_checked_get(const HpeDomNode *node);
+```
+
+读控件勾选状态
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `node` | in | 目标控件 |
+
+**返回**：`checked` 属性存在返回 1
+
+#### `hpe_form_checked_set`
+
+```c
+void hpe_form_checked_set(HpeDomNode *node, int on);
+```
+
+写控件勾选状态
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `node` | in,out | 目标控件 |
+| `on` | in | 1 勾选 |
+
+#### `hpe_form_owner`
+
+```c
+HpeDomNode *hpe_form_owner(const HpeDomNode *node);
+```
+
+找控件所属的 `<form>`
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `node` | in | 目标控件 |
+
+**返回**：最近的 form 祖先，无则 `NULL`
+
+#### `hpe_form_record_defaults`
+
+```c
+void hpe_form_record_defaults(HpeDomNode *doc);
+```
+
+文档加载后为全部控件记录默认值快照
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `doc` | in,out | 文档节点 |
+
+**注意**：快照存于保留属性 `data-defval` / `data-defchk` / `data-defsel`， 供 reset 恢复
+
+#### `hpe_form_reset`
+
+```c
+void hpe_form_reset(HpeDomNode *doc, HpeDomNode *form);
+```
+
+重置一个 form 的全部控件
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `doc` | in,out | 文档节点（按全树找该 form 的控件） |
+| `form` | in,out | 目标 form，`NULL` 表示整份文档 |
+
+#### `hpe_form_click`
+
+```c
+int hpe_form_click(HpeEngine *engine, HpeDomNode *node, int x, int y);
+```
+
+处理一次页面点击的控件默认行为
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in,out | 引擎实例 |
+| `node` | in,out | 点击命中的元素 |
+| `x` | in | 窗口 X 坐标 |
+| `y` | in | 窗口 Y 坐标 |
+
+**返回**：控件状态被改变返回 1（调用方须 flush）
+
+**注意**：复选框翻转、单选钮组互斥、submit/reset、select 换选项、label 转发、 range 落点取值、文本控件聚焦；点击非可编辑控件时使文本控件失焦（触发 change）
+
+#### `hpe_form_key`
+
+```c
+int hpe_form_key(HpeEngine *engine, int vk, int printable, int mods);
+```
+
+处理一次键盘事件的控件默认行为
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in,out | 引擎实例 |
+| `vk` | in | 虚拟键码 |
+| `printable` | in | 可打印码点（0 表示非打印键） |
+| `mods` | in | 修饰键掩码 |
+
+**返回**：控件状态被改变返回 1（调用方须 flush）
+
+**注意**：仅作用于获得焦点的可编辑控件：打印字符插入、退格/删除、方向/Home/End 移动插入符； 每次编辑派发 `input`
+
+#### `hpe_form_blur`
+
+```c
+void hpe_form_blur(HpeEngine *engine);
+```
+
+使当前编辑控件失焦（值有变则派发 `change`）
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in,out | 引擎实例 |
+
+#### `hpe_form_focus_notify`
+
+```c
+void hpe_form_focus_notify(HpeEngine *engine, HpeDomNode *node);
+```
+
+JS `focus()`/`blur()` 后同步表单编辑状态
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in,out | 引擎实例 |
+| `node` | in,out | 新焦点元素，`NULL` 表示失焦 |
+
+#### `hpe_form_install`
+
+```c
+void hpe_form_install(HpeEngine *engine);
+```
+
+文档加载后安装表单控件（默认值快照 + 按钮标签注入）
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in,out | 引擎实例 |
+
+**注意**：记录全部控件的默认值快照（供 `reset()` 恢复），并给仅以 `value` 声明标签的 按钮注入文本子节点
+
+#### `hpe_form_shutdown`
+
+```c
+void hpe_form_shutdown(HpeEngine *engine);
+```
+
+释放表单编辑状态（引擎销毁时调用）
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in,out | 引擎实例 |
+
+**类型**
+
+#### `HpeFormKind`
+
+```c
+typedef enum HpeFormKind {
+    HPE_FK_OTHER = 0,   /* 非控件 / not a control */
+    HPE_FK_FIELD,       /* 单行文本族（text/search/email/url/tel/number/date…）/ one-line text family */
+    HPE_FK_PASSWORD,    /* 密码（显示圆点）/ password (dots) */
+    HPE_FK_CHECKBOX,    /* 复选框 / checkbox */
+    HPE_FK_RADIO,       /* 单选钮 / radio button */
+    HPE_FK_RANGE,       /* 滑杆 / range slider */
+    HPE_FK_COLOR,       /* 颜色样本 / colour swatch */
+    HPE_FK_FILE,        /* 文件选择 / file picker */
+    HPE_FK_BUTTON,      /* 按钮（button/submit/reset）/ button family */
+    HPE_FK_SELECT,      /* 下拉选择 / dropdown select */
+    HPE_FK_TEXTAREA,    /* 多行文本 / multi-line text */
+    HPE_FK_PROGRESS,    /* 进度条 / progress bar */
+    HPE_FK_METER,       /* 度量条 / meter bar */
+    HPE_FK_OUTPUT       /* 输出（只读文本）/ output (read-only text) */
+} HpeFormKind;
+```
+
+表单控件类别
+
 ### hope_internal.h（内部）
 
-13 个函数，0 个类型。
+33 个函数，6 个类型。
 
 **函数**
 
@@ -7999,6 +9292,340 @@ int hpe_engine_view_height(HpeEngine *engine);
 **返回**：视口高度（像素），不小于 0；`engine` 为 NULL 时返回 0
 
 **注意**：实现位于 `hope.c`
+
+#### `hpe_sel_has`
+
+```c
+int hpe_sel_has(const HpeEngine *engine);
+```
+
+查询是否存在非折叠的页面选区
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in | 引擎实例 |
+
+**返回**：有选区返回 1，否则 0
+
+#### `hpe_sel_mouse_down`
+
+```c
+int hpe_sel_mouse_down(HpeEngine *engine, int x, int y, int mods);
+```
+
+处理页面上的指针按下（开始/扩展/双击选词）
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in,out | 引擎实例 |
+| `x` | in | X 坐标（窗口坐标） |
+| `y` | in | Y 坐标（窗口坐标） |
+| `mods` | in | 修饰键掩码，`HPE_MOD_SHIFT` 扩展既有选区 |
+
+**返回**：选区状态发生变化返回 1，否则 0
+
+**注意**：命中非文本区域时折叠既有选区；双击选中光标处的词
+
+#### `hpe_sel_mouse_move`
+
+```c
+int hpe_sel_mouse_move(HpeEngine *engine, int x, int y);
+```
+
+拖选进行中处理指针移动（扩展焦点端点）
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in,out | 引擎实例 |
+| `x` | in | X 坐标（窗口坐标） |
+| `y` | in | Y 坐标（窗口坐标） |
+
+**返回**：选区变化返回 1，否则 0
+
+#### `hpe_sel_mouse_up`
+
+```c
+void hpe_sel_mouse_up(HpeEngine *engine);
+```
+
+结束拖选
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in,out | 引擎实例 |
+
+#### `hpe_sel_copy`
+
+```c
+int hpe_sel_copy(HpeEngine *engine);
+```
+
+把选区文本写入剪贴板
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in,out | 引擎实例 |
+
+**返回**：写入成功返回 1，无选区或文本为空返回 0
+
+**注意**：区块盒之间补换行符，与浏览器复制行为一致
+
+#### `hpe_sel_select_all`
+
+```c
+int hpe_sel_select_all(HpeEngine *engine);
+```
+
+全选文档文本
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in,out | 引擎实例 |
+
+**返回**：文档含文本且选区变化返回 1，否则 0
+
+#### `hpe_sel_clear`
+
+```c
+int hpe_sel_clear(HpeEngine *engine);
+```
+
+清除页面选区
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in,out | 引擎实例 |
+
+**返回**：原有选区被清除返回 1，本无选区返回 0
+
+#### `hpe_sel_prepare`
+
+```c
+void hpe_sel_prepare(HpeEngine *engine);
+```
+
+重建逐盒选区区间表并交给绘制模块
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in,out | 引擎实例 |
+
+**注意**：每次重绘页面前调用；选区失效（节点被移除）时自然产生空表
+
+#### `hpe_sel_reset`
+
+```c
+void hpe_sel_reset(HpeEngine *engine);
+```
+
+无条件丢弃选区状态（换页时调用，不触发重绘）
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in,out | 引擎实例 |
+
+**注意**：旧文档的 DOM 节点即将销毁，端点引用必须清空；释放区间表缓冲由 hpe_sel_shutdown 负责
+
+**参见**：`hpe_sel_shutdown`
+
+#### `hpe_sel_shutdown`
+
+```c
+void hpe_sel_shutdown(HpeEngine *engine);
+```
+
+释放选区模块的缓冲
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in,out | 引擎实例 |
+
+#### `hpe_anim_install`
+
+```c
+void hpe_anim_install(HpeEngine *engine);
+```
+
+注册层叠钩子并重置动画世界
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in,out | 引擎实例 |
+
+**注意**：在引擎创建时调用；时钟归零、节点状态表清空
+
+#### `hpe_anim_tick`
+
+```c
+int hpe_anim_tick(HpeEngine *engine);
+```
+
+推进动画时钟并求值所有运行项
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in,out | 引擎实例 |
+
+**返回**：仍有进行中的过渡或动画返回 1，否则 0
+
+**注意**：`HOPE_TEST_ANIM_STEP=秒` 时每 tick 固定推进该秒数（无头回归用确定性时钟），否则按墙钟差推进（截断到 0.25s）；活动项所需重排级别写入 `engine->anim.reflow_need`
+
+#### `hpe_anim_reset`
+
+```c
+void hpe_anim_reset(HpeEngine *engine);
+```
+
+换页时重置动画世界
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in,out | 引擎实例 |
+
+**注意**：时钟归零、节点状态表清空；缓冲保留复用
+
+#### `hpe_anim_shutdown`
+
+```c
+void hpe_anim_shutdown(HpeEngine *engine);
+```
+
+释放动画世界缓冲
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in,out | 引擎实例 |
+
+#### `hpe_anim_snapshot_dump`
+
+```c
+void hpe_anim_snapshot_dump(HpeEngine *engine, const char *id);
+```
+
+打印某元素当前动画/过渡后的计算值快照
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in | 引擎实例 |
+| `id` | in | 目标元素的 id 属性 |
+
+**注意**：`HOPE_TEST_ANIM_SNAPSHOT=id` 测试钩子使用；输出 `ANIM-SNAP <id> ...` 行，值取该元素盒树的最新级叠结果
+
+#### `hpe_engine_tab_new`
+
+```c
+int hpe_engine_tab_new(HpeEngine *engine);
+```
+
+新建一个空白标签并切换过去
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in,out | 引擎实例 |
+
+**返回**：成功返回 1，已达上限返回 0
+
+#### `hpe_engine_tab_close`
+
+```c
+int hpe_engine_tab_close(HpeEngine *engine, int index);
+```
+
+关闭指定下标的标签
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in,out | 引擎实例 |
+| `index` | in | 待关闭的标签下标 |
+
+**返回**：成功返回 1，下标非法返回 0
+
+**注意**：关闭最后一个标签会重置为空白页而不是关闭
+
+#### `hpe_engine_tab_switch`
+
+```c
+int hpe_engine_tab_switch(HpeEngine *engine, int index);
+```
+
+切换到指定下标的标签
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in,out | 引擎实例 |
+| `index` | in | 目标标签下标 |
+
+**返回**：成功返回 1，下标非法或已是当前标签返回 0
+
+**注意**：切换会保存当前标签的路径/历史/滚动，重载目标标签的文档并恢复其滚动
+
+#### `hpe_engine_tab_count`
+
+```c
+int hpe_engine_tab_count(HpeEngine *engine);
+```
+
+取当前打开的标签数
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in | 引擎实例 |
+
+**返回**：标签数，`engine` 为 NULL 时返回 0
+
+#### `hpe_engine_tab_active`
+
+```c
+int hpe_engine_tab_active(HpeEngine *engine);
+```
+
+取当前活动标签下标
+
+**参数**：
+
+| 名称 | 方向 | 说明 |
+| --- | --- | --- |
+| `engine` | in | 引擎实例 |
+
+**返回**：活动标签下标，`engine` 为 NULL 时返回 -1
 
 #### `hpe_chrome_set_text`
 
@@ -8167,4 +9794,78 @@ int hpe_chrome_navigate(HpeEngine *engine);
 
 **类型**
 
-无。
+#### `HpeSelPos`
+
+```c
+typedef struct HpeSelPos {
+    HpeDomNode *node; /* 所属文本节点 / Owning DOM text node */
+    int off;          /* 节点文本内的字节偏移 / Byte offset within the node's text */
+} HpeSelPos;
+```
+
+#### `HpeTab`
+
+```c
+typedef struct HpeTab {
+    int used;                                 /* 槽位在用 / Slot in use */
+    char path[HPE_MAX_PATH];                  /* 当前文档路径（""=空白页）/ Current document path (""=blank) */
+    char nav[HPE_NAV_MAX][HPE_MAX_PATH];      /* 每标签历史环 / Per-tab history ring */
+    int nav_count;                            /* 历史项数 / History entry count */
+    int nav_pos;                              /* 当前历史下标 / Current history index */
+    float scroll_y;                           /* 切走时的滚动偏移 / Scroll offset when last left */
+} HpeTab;
+```
+
+#### `HpeAnimRun`
+
+```c
+typedef struct HpeAnimRun {
+    int used;
+    char name[HPE_ANIM_NAME_MAX];
+    double start;         /* 引擎动画时钟下的起始时刻 / Start on the engine's animation clock */
+    HpeAnimDecl decl;     /* 声明快照（direction/fill/迭代等）/ Declaration snapshot */
+} HpeAnimRun;
+```
+
+#### `HpeAnimTransRun`
+
+```c
+typedef struct HpeAnimTransRun {
+    int used;
+    int prop;             /* HpeAnimProp */
+    double start;
+    float duration;
+    HpeEasing easing;
+    HpeAnimValue from, to;
+} HpeAnimTransRun;
+```
+
+#### `HpeAnimNodeState`
+
+```c
+typedef struct HpeAnimNodeState {
+    HpeDomNode *node;
+    int used;
+    HpeAnimValue prev[HPE_AP_COUNT]; /* 上次层叠的目标值（用于变化检测）/ Last cascade's target values */
+    int has_prev;
+    HpeAnimRun runs[HPE_ANIM_MAX];
+    HpeAnimTransRun trans[HPE_TRANS_MAX];
+} HpeAnimNodeState;
+```
+
+#### `HpeAnimWorld`
+
+```c
+typedef struct HpeAnimWorld {
+    double clock;      /* 动画时钟（秒）/ Animation clock in seconds */
+    double last_real;  /* 上次推进的墙钟 / Wall-clock time of the last advance */
+    int active;        /* 尚有进行中的过渡或动画 / A transition or animation is in flight */
+    int reflow_need;   /* 当前活动项所需的重排级别 / Reflow level the active items need */
+    int layout_sticky; /* 活动项触几何属性：本段活动期内每次 flush 都要重建盒树 / An active
+                          item hits layout properties: every flush of this active period
+                          must rebuild the box tree */
+    HpeAnimNodeState *nodes;
+    int count;
+    size_t cap;
+} HpeAnimWorld;
+```

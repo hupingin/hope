@@ -1,0 +1,463 @@
+{
+  "sb_init": {
+    "brief": "初始化一个小型字符串缓冲 / Initialise a small string builder",
+    "params": { "sb": "inout:待初始化的字符串缓冲 / String builder to initialise" },
+    "note": "初始容量 256 字节，调用方随后须用 `sb_free` 释放 / Starts at 256 bytes; release it later with `sb_free`",
+    "see": "sb_add, sb_free"
+  },
+  "sb_add": {
+    "brief": "向字符串缓冲追加 n 字节 / Append n bytes to the string builder",
+    "params": {
+      "s": "in:源字节 / Source bytes",
+      "n": "in:追加的字节数 / Number of bytes to append"
+    },
+    "note": "容量不足时反复翻倍并 realloc / Capacity is doubled (via realloc) until it fits"
+  },
+  "sb_free": {
+    "brief": "释放字符串缓冲 / Free the string builder",
+    "params": { "sb": "inout:待释放的字符串缓冲 / String builder to release" },
+    "note": "释放后把内部指针置 `NULL` / The internal pointer is set to `NULL`"
+  },
+  "node_value": {
+    "brief": "把 DOM 节点包装成宿主值 / Wrap a DOM node in a host value",
+    "params": { "node": "要包装的节点 / Node to wrap" },
+    "return": "包装该节点的 JsValue；`node` 为 `NULL` 时返回 `null` / A JsValue wrapping the node; `null` when `node` is `NULL`",
+    "note": "DocumentFragment 用 fragment 虚表，其余用 element 虚表 / A fragment uses the fragment vtable, everything else the element vtable",
+    "see": "arg_node"
+  },
+  "arg_node": {
+    "brief": "从实参解包出 DOM 节点 / Unwrap a DOM node from an argument",
+    "params": { "v": "待解包的 JS 值 / JS value to unwrap" },
+    "return": "节点指针（element 或 fragment 宿主），否则 `NULL` / The node pointer (element or fragment host), or `NULL`",
+    "see": "node_value"
+  },
+  "hpe_js_dom_node_value": {
+    "brief": "node_value 的公开包装，供 MutationObserver 复用 / Public wrapper over node_value, reused by the MutationObserver bridge",
+    "params": { "node": "要包装的节点 / Node to wrap" },
+    "return": "包装该节点的 JsValue；`node` 为 `NULL` 时返回 `null` / A JsValue wrapping the node; `null` when `node` is `NULL`",
+    "see": "node_value"
+  },
+  "arg_string": {
+    "brief": "取第 idx 个实参并转成字符串 / Convert the idx-th argument to a string",
+    "params": {
+      "idx": "实参下标 / Argument index"
+    },
+    "return": "新分配的字符串；下标越界时返回 `NULL` / Newly allocated string, or `NULL` when the index is out of range"
+  },
+  "css_name_from_js": {
+    "brief": "把 camelCase 的 JS 属性名转成连字符小写的 CSS 名 / Convert a camelCase JS property name to a dashed lowercase CSS name",
+    "params": {
+      "jsname": "JS 侧属性名 / Property name on the JS side",
+      "out": "out:目标缓冲区 / Destination buffer"
+    },
+    "note": "每个大写字母展开为 `-` 加小写；输出始终以 NUL 结尾 / Each uppercase letter becomes `-` plus its lowercase; the output is NUL-terminated"
+  },
+  "collect_text": {
+    "brief": "递归收集子树中的文本 / Recursively collect the text of a subtree",
+    "params": { "node": "子树根节点 / Subtree root node" },
+    "note": "只拼接文本节点，仅对元素节点递归 / Only text nodes are appended, and only elements are recursed"
+  },
+  "serialize_node": {
+    "brief": "把节点序列化成 HTML 文本 / Serialise a node as HTML text",
+    "note": "文本节点原样输出；元素输出开始/结束标签与全部属性（属性值不转义）/ Text nodes are emitted verbatim; elements emit their open/close tags and every attribute (values are not escaped)"
+  },
+  "element_get_text": {
+    "brief": "取元素的 textContent / Read an element's `textContent`",
+    "return": "子树文本拼接成的 JS 字符串 / A JS string holding the concatenated subtree text",
+    "see": "collect_text"
+  },
+  "element_get_html": {
+    "brief": "取元素子树的 innerHTML / Read an element's `innerHTML`",
+    "return": "子节点序列化后的 JS 字符串 / A JS string holding the serialised child nodes",
+    "note": "不含元素自身的标签 / The element's own tag is not included",
+    "see": "serialize_node"
+  },
+  "node_replace_children_with_text": {
+    "brief": "删除全部子节点并追加一个文本节点 / Replace every child with a single text node",
+    "params": { "text": "新文本；`NULL` 按空串处理 / New text; `NULL` is treated as empty" },
+    "note": "逐个 detach 子节点，使 MutationObserver 与引擎脏标记能看到删除 / Children are detached one by one so the mutation sink sees the removals"
+  },
+  "node_set_inner_html": {
+    "brief": "解析 HTML 片段并替换元素的子节点 / Parse an HTML fragment and replace the element's children",
+    "params": { "html": "HTML 文本；`NULL` 按空串处理 / HTML text; `NULL` is treated as empty" },
+    "note": "先清空原有子节点，再把解析结果体节点的子节点搬入 / Existing children are cleared first, then the parsed body's children are moved in",
+    "see": "node_replace_children_with_text"
+  },
+  "collect_elements": {
+    "brief": "按文档顺序收集子树中的元素 / Collect the elements of a subtree in document order",
+    "params": {
+      "out": "可增长的元素数组 / Growable element array",
+      "cap": "inout:数组当前容量 / Current array capacity",
+      "count": "in:已收集的元素个数 / Number of elements already collected"
+    },
+    "return": "收集到的元素总数 / Total number of elements collected",
+    "note": "不含 `node` 自身；数组按需倍增 / `node` itself is excluded; the array doubles on demand"
+  },
+  "query_selector_impl": {
+    "brief": "querySelector/querySelectorAll 的共用实现 / Shared implementation of querySelector and querySelectorAll",
+    "params": { "all": "非 0 时返回全部匹配 / Non-zero to return every match" },
+    "return": "`all` 非 0 时返回匹配元素数组，否则返回首个匹配元素或 `null` / An array of matches when `all` is set, else the first match or `null`",
+    "note": "选择器为空时：`all` 返回空数组，否则返回 `null` / On an empty selector: an empty array when `all`, otherwise `null`",
+    "see": "dm_query_selector, dm_query_selector_all"
+  },
+  "dom_find_by_id": {
+    "brief": "广度优先查找指定 id 的首个元素 / Breadth-first search for the first element with the given id",
+    "return": "匹配的元素，未找到时返回 `NULL` / The matching element, or `NULL` when none is found"
+  },
+  "dm_get_element_by_id": {
+    "brief": "`getElementById` 的实现 / Implementation of `getElementById`",
+    "return": "找到的元素宿主值，否则 `null` / The element host value, else `null`",
+    "see": "dom_find_by_id"
+  },
+  "dm_create_element": {
+    "brief": "`createElement` 的实现 / Implementation of `createElement`",
+    "return": "新元素的宿主值；标签为空时返回 `null` / Host value of the new element, or `null` for an empty tag"
+  },
+  "dm_create_element_ns": {
+    "brief": "`createElementNS` 的实现 / Implementation of `createElementNS`",
+    "return": "新元素的宿主值；标签为空时返回 `null` / Host value of the new element, or `null` for an empty tag",
+    "note": "命名空间被忽略，只取标签名（SVG 子元素按标签绘制）/ The namespace is ignored; only the tag name matters (SVG children are drawn by tag name)"
+  },
+  "dm_create_fragment": {
+    "brief": "`createDocumentFragment` 的实现 / Implementation of `createDocumentFragment`",
+    "return": "新文档片段的宿主值 / Host value of the new document fragment"
+  },
+  "dm_remove_child": {
+    "brief": "`removeChild` 的实现 / Implementation of `removeChild`",
+    "return": "总是返回 `undefined` / Always returns `undefined`",
+    "note": "仅当子节点确属该父节点时才 detach / The child is detached only when it really belongs to this parent"
+  },
+  "dm_clone_node": {
+    "brief": "`cloneNode` 的实现 / Implementation of `cloneNode`",
+    "return": "克隆出的节点宿主值 / Host value of the cloned node",
+    "params": { "js": "JS 运行时上下文 / JS runtime context" }
+  },
+  "dm_has_child_nodes": {
+    "brief": "`hasChildNodes` 的实现 / Implementation of `hasChildNodes`",
+    "return": "存在子节点返回 `true`，否则 `false` / `true` when a child exists, otherwise `false`"
+  },
+  "dm_insert_before": {
+    "brief": "`insertBefore` 的实现 / Implementation of `insertBefore`",
+    "return": "插入的子节点宿主值；子节点为空时返回 `null` / Host value of the inserted child, or `null` when the child is absent"
+  },
+  "dm_replace_child": {
+    "brief": "`replaceChild` 的实现 / Implementation of `replaceChild`",
+    "return": "被替换掉的旧节点宿主值；旧节点为空时返回 `null` / Host value of the replaced old node, or `null` when it is absent"
+  },
+  "dm_get_attribute": {
+    "brief": "`getAttribute` 的实现 / Implementation of `getAttribute`",
+    "return": "属性值字符串，不存在时返回 `null` / The attribute value string, or `null` when absent"
+  },
+  "dm_set_attribute": {
+    "brief": "`setAttribute` 的实现 / Implementation of `setAttribute`",
+    "return": "总是返回 `undefined` / Always returns `undefined`",
+    "note": "属性值缺失时写入空串 / An absent value is stored as the empty string"
+  },
+  "dm_remove_attribute": {
+    "brief": "`removeAttribute` 的实现 / Implementation of `removeAttribute`",
+    "return": "总是返回 `undefined` / Always returns `undefined`"
+  },
+  "dm_has_attribute": {
+    "brief": "`hasAttribute` 的实现 / Implementation of `hasAttribute`",
+    "return": "属性存在返回 `true`，否则 `false` / `true` when the attribute exists, otherwise `false`"
+  },
+  "dm_append_child": {
+    "brief": "`appendChild` 的实现 / Implementation of `appendChild`",
+    "return": "追加的子节点宿主值；子节点为空时返回 `null` / Host value of the appended child, or `null` when the child is absent"
+  },
+  "dm_remove_self": {
+    "brief": "`remove` 的实现：把自己从父节点上摘除 / Implementation of `remove`: detach this node from its parent",
+    "return": "总是返回 `undefined` / Always returns `undefined`"
+  },
+  "dm_query_selector": {
+    "brief": "`querySelector` 的实现 / Implementation of `querySelector`",
+    "return": "首个匹配元素的宿主值，无匹配或空选择器时返回 `null` / Host value of the first match, or `null` when nothing matches or the selector is empty",
+    "see": "query_selector_impl"
+  },
+  "dm_query_selector_all": {
+    "brief": "`querySelectorAll` 的实现 / Implementation of `querySelectorAll`",
+    "return": "匹配元素组成的数组 / An array of the matching elements",
+    "see": "query_selector_impl"
+  },
+  "dm_add_event_listener": {
+    "brief": "`addEventListener` 的实现 / Implementation of `addEventListener`",
+    "return": "总是返回 `undefined` / Always returns `undefined`",
+    "note": "事件类型为空时不注册 / Nothing is registered for an empty event type",
+    "see": "listener_append"
+  },
+  "dom_method_dispatch": {
+    "brief": "DOM 方法绑定对象的统一入口 / Common entry point for bound DOM method objects",
+    "params": {
+      "thisv": "调用时的 this（未使用）/ The `this` value (unused)",
+      "ud": "指向 DomMth 的绑定信息 / Binding info pointing at the `DomMth`"
+    },
+    "return": "查表命中的方法返回值；未命中时返回 `undefined` / The matched method's result, or `undefined` when the name is unknown",
+    "note": "纯查表分派，新增方法只需在表中加一行 / Dispatch is a pure table lookup, so adding a method is a one-line table edit",
+    "see": "bind_dom_method, method_is"
+  },
+  "bind_dom_method": {
+    "brief": "把某个 DOM 方法绑定成原生函数对象 / Bind one DOM method as a native function object",
+    "params": {
+      "method": "方法名 / Method name"
+    },
+    "return": "绑定到该节点的方法函数值 / A function value bound to this node",
+    "note": "绑定信息从 js arena 分配 / The binding info is allocated from the JS arena",
+    "see": "dom_method_dispatch"
+  },
+  "method_is": {
+    "brief": "判断属性名是否是受支持的 DOM 方法 / Test whether a property name is a supported DOM method",
+    "params": { "prop": "属性名 / Property name" },
+    "return": "是方法名返回 1，否则 0 / 1 when it is a method name, otherwise 0",
+    "see": "dom_method_dispatch"
+  },
+  "on_prop_event": {
+    "brief": "把 `on*` 属性名映射成事件类型名 / Map an `on*` property name to its event type name",
+    "params": { "prop": "属性名 / Property name" },
+    "return": "对应的事件类型串（如 `click`）；否则 `NULL` / The matching event type (e.g. `click`), or `NULL`",
+    "note": "当前支持 `onclick` / `onmousedown` / `onmouseup` / Currently recognises `onclick`, `onmousedown` and `onmouseup`"
+  },
+  "node_listeners": {
+    "brief": "取节点上的监听器链表头 / Get the head of a node's listener list",
+    "return": "监听器链表头，可能为 `NULL` / The listener list head, possibly `NULL`"
+  },
+  "listener_append": {
+    "brief": "在节点上登记一个事件监听器 / Store an event listener on a node",
+    "params": {
+      "type": "事件类型 / Event type",
+      "handler": "处理函数 / Handler function",
+      "via_on": "经 `on*` 属性登记为 1 / 1 when added through an `on*` property"
+    },
+    "note": "`via_on` 会替换同类型的旧监听；handler 为 `null`/`undefined` 时只做删除 / A `via_on` handler replaces any previous one of the same type; a `null`/`undefined` handler only removes",
+    "see": "on_handler_get, dm_add_event_listener"
+  },
+  "on_handler_get": {
+    "brief": "取某类型经 `on*` 登记的监听器 / Read the `on*` handler registered for a type",
+    "params": { "type": "事件类型 / Event type" },
+    "return": "对应的处理函数；没有时返回 `null` / The handler function, or `null` when none is set"
+  },
+  "native_noop": {
+    "brief": "什么都不做的原生函数 / A native function that does nothing",
+    "return": "总是返回 `undefined` / Always returns `undefined`",
+    "note": "用作 `reload`/`scrollTo` 等空实现 / Used as the empty implementation for `reload`, `scrollTo` and friends"
+  },
+  "native_stop_propagation": {
+    "brief": "在事件对象上记录停止传播标志 / Record a stop-propagation flag on the event object",
+    "params": { "thisv": "事件对象 / The event object" },
+    "return": "总是返回 `undefined` / Always returns `undefined`",
+    "note": "`stopPropagation` 与 `stopImmediatePropagation` 共用此实现 / Both `stopPropagation` and `stopImmediatePropagation` share this implementation",
+    "see": "propagation_stopped"
+  },
+  "propagation_stopped": {
+    "brief": "检查事件对象是否已请求停止传播 / Test whether the event object asked to stop propagation",
+    "params": { "ev": "事件对象 / Event object" },
+    "return": "已停止返回 1，否则 0 / 1 when stopped, otherwise 0",
+    "see": "native_stop_propagation"
+  },
+  "event_object": {
+    "brief": "构造一个事件对象 / Build an event object",
+    "params": {
+      "type": "事件类型 / Event type",
+      "x": "客户端 X 坐标 / Client X coordinate",
+      "y": "客户端 Y 坐标 / Client Y coordinate",
+      "target": "事件目标节点 / Event target node"
+    },
+    "return": "带有 type/clientX/clientY/target 及方法的事件对象 / An event object carrying type/clientX/clientY/target plus methods",
+    "note": "同时挂上 `preventDefault`（空实现）与两个停止传播方法 / Also attaches `preventDefault` (a no-op) and the two stop-propagation methods"
+  },
+  "hpe_js_dom_dispatch": {
+    "brief": "从目标节点向上冒泡派发事件 / Dispatch an event by bubbling from the target upwards",
+    "params": {
+      "target": "事件目标节点 / Event target node",
+      "type": "事件类型 / Event type"
+    },
+    "return": "至少调用过一个处理函数时返回 1，否则 0 / 1 when at least one handler ran, otherwise 0",
+    "note": "每层更新 `currentTarget`；处理函数调用 `stopPropagation` 后立即停止 / `currentTarget` is updated per level; dispatch stops as soon as a handler requests it",
+    "see": "event_object, listener_append"
+  },
+  "element_upper_tag": {
+    "brief": "取元素标签名并转成大写 / Read an element's tag name uppercased",
+    "return": "大写标签名的 JS 字符串 / A JS string holding the uppercased tag name",
+    "note": "模拟 HTML 文档中浏览器报告大写元素名的行为 / Mimics how browsers uppercase element names in HTML documents"
+  },
+  "element_attr_str": {
+    "brief": "取属性值，缺失时返回空串 / Read an attribute value, falling back to the empty string",
+    "params": { "attr": "属性名 / Attribute name" },
+    "return": "属性值的 JS 字符串；缺失时为空串 / A JS string with the attribute value, or the empty string when absent"
+  },
+  "element_client_size": {
+    "brief": "取元素的 clientWidth/clientHeight / Read an element's `clientWidth`/`clientHeight`",
+    "params": { "prop": "`clientWidth` 或 `clientHeight` / Either `clientWidth` or `clientHeight`" },
+    "return": "布局后的内容区宽度或高度；无盒时返回 0 / The laid-out content width or height, or 0 without a box",
+    "note": "浏览器在此会强制布局；本引擎用元素到盒的反向指针取已布局尺寸 / Browsers force layout here; the engine reads the laid-out size via the element-to-box back pointer"
+  },
+  "eg_node_type": {
+    "brief": "`nodeType` 读取器，元素固定返回 1 / `nodeType` getter, always 1 for elements",
+    "return": "数值 1（ELEMENT_NODE）/ The number 1 (ELEMENT_NODE)"
+  },
+  "eg_tag_name": {
+    "brief": "`tagName`/`nodeName` 读取器 / `tagName`/`nodeName` getter",
+    "return": "大写标签名的 JS 字符串 / A JS string with the uppercased tag name",
+    "see": "element_upper_tag"
+  },
+  "eg_id": {
+    "brief": "`id` 读取器 / `id` getter",
+    "return": "`id` 属性值的 JS 字符串 / A JS string with the `id` attribute"
+  },
+  "eg_class_name": {
+    "brief": "`className` 读取器 / `className` getter",
+    "return": "`class` 属性值的 JS 字符串 / A JS string with the `class` attribute"
+  },
+  "eg_text_content": {
+    "brief": "`textContent` 读取器 / `textContent` getter",
+    "return": "子树文本拼接成的 JS 字符串 / A JS string holding the concatenated subtree text"
+  },
+  "eg_inner_html": {
+    "brief": "`innerHTML` 读取器 / `innerHTML` getter",
+    "return": "子节点序列化后的 JS 字符串 / A JS string holding the serialised children"
+  },
+  "eg_style": {
+    "brief": "`style` 读取器，返回样式宿主对象 / `style` getter, returning a style host object",
+    "return": "绑定到该节点的 style 宿主值 / A style host value bound to this node"
+  },
+  "eg_first_child": {
+    "brief": "`firstChild` 读取器 / `firstChild` getter",
+    "return": "首个子节点的宿主值，没有时返回 `null` / Host value of the first child, or `null` when there is none"
+  },
+  "eg_next_sibling": {
+    "brief": "`nextSibling` 读取器 / `nextSibling` getter",
+    "return": "下一个兄弟节点的宿主值，没有时返回 `null` / Host value of the next sibling, or `null` when there is none"
+  },
+  "eg_parent_node": {
+    "brief": "`parentNode` 读取器 / `parentNode` getter",
+    "return": "父节点的宿主值，没有时返回 `null` / Host value of the parent, or `null` when there is none"
+  },
+  "eg_client_size": {
+    "brief": "`clientWidth`/`clientHeight` 读取器 / `clientWidth`/`clientHeight` getter",
+    "return": "布局后的内容区尺寸 / The laid-out content size",
+    "see": "element_client_size"
+  },
+  "element_vt_get": {
+    "brief": "元素宿主的属性读取虚函数 / Property-get virtual for element hosts",
+    "params": {
+      "target": "in:元素宿主逐个的 DOM 节点指针 / DOM node behind the element host",
+      "prop": "属性名 / Property name",
+      "out": "out:接收读取结果的值 / Receives the read value"
+    },
+    "return": "已处理返回 1，未识别返回 0 / 1 when handled, 0 when the property is unknown",
+    "note": "顺序为 `<template>.content`、属性表、方法绑定、`on*` 处理函数 / Order: `<template>.content`, the property table, method binding, then `on*` handlers",
+    "see": "element_vt_set, bind_dom_method"
+  },
+  "element_vt_set": {
+    "brief": "元素宿主的属性写入虚函数 / Property-set virtual for element hosts",
+    "params": {
+      "target": "in:元素宿主背后的 DOM 节点指针 / DOM node behind the element host",
+      "prop": "属性名 / Property name",
+      "value": "待写入的值 / Value to write"
+    },
+    "return": "已处理返回 1，未识别返回 0 / 1 when handled, 0 when the property is unknown",
+    "note": "处理 `textContent`/`innerHTML`/`style`/`id`/`className` 与 `on*` 属性 / Handles `textContent`, `innerHTML`, `style`, `id`, `className` and `on*` properties"
+  },
+  "fragment_vt_get": {
+    "brief": "文档片段宿主的属性读取虚函数 / Property-get virtual for document-fragment hosts",
+    "params": {
+      "target": "in:片段宿主背后的 DOM 节点指针 / DOM node behind the fragment host",
+      "prop": "属性名 / Property name",
+      "out": "out:接收读取结果的值 / Receives the read value"
+    },
+    "return": "已处理返回 1，未识别返回 0 / 1 when handled, 0 when the property is unknown",
+    "note": "`nodeType` 为 11；`childNodes`/`children` 每次读取都构造一次快照 / `nodeType` is 11; `childNodes`/`children` build a snapshot on each read",
+    "see": "fragment_vt_set"
+  },
+  "fragment_vt_set": {
+    "brief": "文档片段宿主的属性写入虚函数 / Property-set virtual for document-fragment hosts",
+    "params": {
+      "target": "in:片段宿主背后的 DOM 节点指针 / DOM node behind the fragment host",
+      "prop": "属性名 / Property name",
+      "value": "待写入的值 / Value to write"
+    },
+    "return": "已处理返回 1，未识别返回 0 / 1 when handled, 0 when the property is unknown",
+    "note": "仅处理 `textContent` 与 `innerHTML` / Only `textContent` and `innerHTML` are handled"
+  },
+  "style_vt_get": {
+    "brief": "style 宿主的属性读取虚函数 / Property-get virtual for style hosts",
+    "params": {
+      "target": "in:样式宿主背后的 DOM 节点指针 / DOM node behind the style host",
+      "prop": "属性名 / Property name",
+      "out": "out:接收读取结果的值 / Receives the read value"
+    },
+    "return": "始终返回 1 / Always returns 1",
+    "note": "camelCase 属性名转成 CSS 名后查内联样式，缺失返回空串 / The camelCase name is converted to a CSS name and looked up in the inline style; absent values give the empty string",
+    "see": "style_vt_set, css_name_from_js"
+  },
+  "style_vt_set": {
+    "brief": "style 宿主的属性写入虚函数 / Property-set virtual for style hosts",
+    "params": {
+      "target": "in:样式宿主背后的 DOM 节点指针 / DOM node behind the style host",
+      "prop": "属性名 / Property name",
+      "value": "待写入的值 / Value to write"
+    },
+    "return": "节点为空返回 0，否则返回 1 / 0 when the node is absent, otherwise 1",
+    "note": "写入内联样式表 / Writes into the inline style table"
+  },
+  "document_vt_get": {
+    "brief": "document 宿主的属性读取虚函数 / Property-get virtual for the document host",
+    "params": {
+      "target": "in:文档根节点指针 / Document root node",
+      "prop": "属性名 / Property name",
+      "out": "out:接收读取结果的值 / Receives the read value"
+    },
+    "return": "已处理返回 1，未识别返回 0 / 1 when handled, 0 when the property is unknown",
+    "note": "`body`/`head`/`documentElement` 按标签查找；随后是方法绑定与 `on*` / `body`/`head`/`documentElement` are looked up by tag, followed by method binding and `on*`",
+    "see": "document_vt_set"
+  },
+  "document_vt_set": {
+    "brief": "document 宿主的属性写入虚函数 / Property-set virtual for the document host",
+    "params": {
+      "target": "in:文档根节点指针 / Document root node",
+      "prop": "属性名 / Property name",
+      "value": "待写入的值 / Value to write"
+    },
+    "return": "已处理返回 1，未识别返回 0 / 1 when handled, 0 when the property is unknown",
+    "note": "`title` 写入 head 中的 title 元素；`on*` 登记监听 / `title` writes into the title element within head; `on*` registers a listener"
+  },
+  "loc_toString": {
+    "brief": "`location.toString` 实现，返回 `href` / Implementation of `location.toString`, returning `href`",
+    "return": "`href` 字段的字符串形式 / The `href` field as a string"
+  },
+  "dom_style_stub": {
+    "brief": "`getComputedStyle` 的空实现 / Empty implementation of `getComputedStyle`",
+    "return": "一个新的空对象 / A fresh empty object",
+    "note": "引擎不计算样式，仅让守卫代码不报错 / The engine does not compute styles; this only keeps guarding scripts from failing"
+  },
+  "dom_raf": {
+    "brief": "`requestAnimationFrame` 的空实现 / Empty implementation of `requestAnimationFrame`",
+    "return": "句柄 0 / The handle 0",
+    "note": "回调不会被调度 / The callback is never scheduled"
+  },
+  "set_prop": {
+    "brief": "往对象上设置一个属性 / Set one property on an object",
+    "params": {
+      "o": "目标对象 / Target object",
+      "k": "属性键 / Property key",
+      "v": "属性值 / Property value"
+    },
+    "note": "`js_obj_set` 的薄封装 / A thin wrapper over `js_obj_set`"
+  },
+  "nat": {
+    "brief": "把原生函数指针包成 JS 函数值 / Wrap a native function pointer as a JS function value",
+    "params": {
+      "fn": "原生函数指针 / Native function pointer"
+    },
+    "return": "包好的函数值 / The wrapped function value"
+  },
+  "install_window_builtins": {
+    "brief": "注册 location/navigator/window 等浏览器全局对象 / Register browser globals such as `location`, `navigator` and `window`",
+    "note": "引擎无网络也无导航，所有网络类方法都是空实现；只让检测这些对象的页面脚本继续运行 / The engine has no network or navigation, so network-ish methods are no-ops; this only keeps scripts that probe them running",
+    "see": "hpe_js_dom_install, set_prop, nat"
+  },
+  "hpe_js_dom_install": {
+    "brief": "安装 DOM 绑定、浏览器全局、定时器与 MutationObserver / Install the DOM bridge, browser globals, timers and the MutationObserver",
+    "note": "把 `document` 注册为全局宿主，随后依次安装 window 内建、定时器与变更通知 / `document` is registered as a global host, then window builtins, timers and change notification are installed",
+    "see": "install_window_builtins"
+  }
+}

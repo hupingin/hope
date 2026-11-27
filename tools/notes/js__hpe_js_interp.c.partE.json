@@ -1,0 +1,371 @@
+{
+ "string_includes": {
+  "brief": "String.prototype.includes：判断从 pos 起是否包含子串 / `String.prototype.includes`: test whether the string contains the substring from `pos` on",
+  "params": {
+   "a": "实参数组：`a[0]` 为查找子串，`a[1]` 为起始位置 / Argument array: `a[0]` is the search substring, `a[1]` the start position",
+   "argc": "实参个数 / Argument count"
+  },
+  "return": "包含返回 true、否则 false / `true` when found, `false` otherwise",
+  "note": "起始位置按码点计算并夹到 [0,total]；超过总长直接返回 false / The start index is in code points, clamped to [0,total]; past the end it returns `false`"
+ },
+ "string_starts_with": {
+  "brief": "String.prototype.startsWith：判断从 pos 起是否以子串开头 / `String.prototype.startsWith`: test whether the string starts with the substring at `pos`",
+  "params": {
+   "a": "实参数组：`a[0]` 为前缀子串，`a[1]` 为起始位置 / Argument array: `a[0]` is the prefix, `a[1]` the start position"
+  },
+  "return": "是指定前缀返回 true、否则 false / `true` when it is the given prefix, `false` otherwise",
+  "note": "起始位置为负时按 0 处理；比较按字节长度进行 / A negative start is clamped to 0; comparison uses the byte length"
+ },
+ "string_ends_with": {
+  "brief": "String.prototype.endsWith：判断指定结尾位置之前是否以子串结尾 / `String.prototype.endsWith`: test whether the string ends with the substring before the given end index",
+  "params": {
+   "a": "实参数组：`a[0]` 为后缀子串，`a[1]` 为结尾位置（缺省为串长）/ Argument array: `a[0]` is the suffix, `a[1]` the end position (defaults to the length)"
+  },
+  "return": "以指定子串结尾返回 true、否则 false / `true` when it ends with the given suffix, `false` otherwise",
+  "note": "结尾位置按码点计算并夹到 [0,total]；不足子串长度时返回 false / The end index is in code points, clamped to [0,total]; `false` when shorter than the suffix"
+ },
+ "string_at": {
+  "brief": "String.prototype.at：按下标返回一个码点字符 / `String.prototype.at`: return one code-point character by index",
+  "params": {
+   "a": "实参数组：`a[0]` 为下标 / Argument array: `a[0]` is the index"
+  },
+  "return": "该位置的字符；越界返回 undefined / The character at that position, or `undefined` when out of range",
+  "note": "负下标从串尾回绕；下标按码点计算 / A negative index counts from the end; indices are in code points"
+ },
+ "object_is_value": {
+  "brief": "Object.is：按 SameValue 语义比较两个值 / `Object.is`: compare two values with SameValue semantics",
+  "params": {
+   "a": "实参数组：`a[0]`、`a[1]` 为待比较的两个值 / Argument array: `a[0]` and `a[1]` are the two values to compare"
+  },
+  "return": "相同返回 true、否则 false / `true` when the two values are the same, `false` otherwise",
+  "note": "NaN 视为相等，+0 与 -0 视为不等，其余按严格相等 / `NaN` equals `NaN`, `+0` differs from `-0`, everything else uses strict equality"
+ },
+ "native_regexp_ctor": {
+  "brief": "RegExp 构造器：新建正则对象 / The `RegExp` constructor: create a regular-expression object",
+  "params": {
+   "a": "实参数组：`a[0]` 为模式（可为已有正则），`a[1]` 为标志串 / Argument array: `a[0]` is the pattern (may be an existing regex), `a[1]` the flag string"
+  },
+  "return": "新的正则对象；传入正则且未给标志时原样返回 / The new regex object; when given a regex and no flags, that same object"
+ },
+ "set_key": {
+  "brief": "把值转成 Set 内部使用的字符串键 / Convert a value into the string key used inside a `Set`",
+  "params": {
+   "v": "待转换的值 / Value to convert"
+  },
+  "return": "堆分配的键字符串 / A heap-allocated key string",
+  "note": "按类型加前缀以避免冲突（如布尔 `b:true`、对象按指针 `o:%p`）；字符串与数字直接用其字符串形式 / A per-type prefix avoids collisions (`b:true` for booleans, `o:%p` for objects); strings and numbers use their string form"
+ },
+ "native_set_ctor": {
+  "brief": "Set 构造器：新建 Set（可选从可迭代对象初始化）/ The `Set` constructor: create a `Set`, optionally seeded from an iterable",
+  "params": {
+   "a": "实参数组：`a[0]` 为初始可迭代对象 / Argument array: `a[0]` is the initial iterable"
+  },
+  "return": "新的 Set 对象 / The new `Set` object",
+  "note": "内部用普通对象（`payload_obj`）以字符串键存储成员 / Members are stored in a plain object (`payload_obj`) keyed by string"
+ },
+ "set_add": {
+  "brief": "Set.prototype.add：向集合加入一个值 / `Set.prototype.add`: add a value to the set",
+  "params": {
+   "a": "实参数组：`a[0]` 为待加入的值 / Argument array: `a[0]` is the value to add"
+  },
+  "return": "返回 this（集合本身），便于链式调用 / Returns `this` (the set itself) for chaining",
+  "note": "已存在则不改动；无有效集合时原样返回 this / An existing member is left untouched; with no valid set, `this` is returned as-is"
+ },
+ "set_has": {
+  "brief": "Set.prototype.has：判断集合是否含某值 / `Set.prototype.has`: test whether the set contains a value",
+  "params": {
+   "a": "实参数组：`a[0]` 为待查询的值 / Argument array: `a[0]` is the value to look up"
+  },
+  "return": "包含返回 true、否则 false / `true` when present, `false` otherwise"
+ },
+ "set_delete": {
+  "brief": "Set.prototype.delete：从集合删除某值 / `Set.prototype.delete`: remove a value from the set",
+  "params": {
+   "a": "实参数组：`a[0]` 为待删除的值 / Argument array: `a[0]` is the value to remove"
+  },
+  "return": "确实删除返回 true、否则 false / `true` when a member was removed, `false` otherwise"
+ },
+ "set_clear": {
+  "brief": "Set.prototype.clear：清空集合 / `Set.prototype.clear`: remove all members from the set",
+  "return": "返回 undefined / Returns `undefined`",
+  "note": "实现上是更换一个新的空存储数组 / Implemented by swapping in a fresh empty backing array"
+ },
+ "set_values": {
+  "brief": "Set.prototype.values/keys：返回成员值的可迭代对象 / `Set.prototype.values`/`keys`: return an iterable over member values",
+  "return": "含全部成员值的可迭代对象 / An iterable over all member values",
+  "note": "按内部键顺序遍历；无有效集合时返回空迭代器 / Walks the internal key order; an empty iterator when there is no valid set"
+ },
+ "map_size_fn": {
+  "brief": "Map/Set 的 size 取值器：返回元素个数 / The `size` getter for `Map`/`Set`: return the element count",
+  "return": "元素个数（数字）/ The element count as a number",
+  "note": "Set 数键个数，Map 数存储数组长度 / For a `Set` it counts the keys, for a `Map` the backing array length"
+ },
+ "map_kind": {
+  "brief": "校验 thisv 是否为 Map/Set 对象并取出对象指针 / Validate that `thisv` is a `Map`/`Set` object and hand back its object pointer",
+  "params": {
+   "thisv": "调用时的 this 值 / The `this` value of the call",
+   "out": "out:成功后接收对象指针 / On success receives the object pointer"
+  },
+  "return": "是 Map/Set 返回 1、否则 0 / 1 when it is a `Map`/`Set`, otherwise 0"
+ },
+ "map_keys": {
+  "brief": "Map.prototype.keys：返回键的可迭代对象 / `Map.prototype.keys`: return an iterable over the keys",
+  "return": "键的可迭代对象 / An iterable over the keys",
+  "note": "从存储数组按下标取键；非 Map 返回空迭代器 / Keys are read by index from the backing array; an empty iterator for non-maps"
+ },
+ "map_values": {
+  "brief": "Map.prototype.values：返回值的可迭代对象 / `Map.prototype.values`: return an iterable over the values",
+  "return": "值的可迭代对象 / An iterable over the values",
+  "note": "按内部 `v<i>` 属性取各值；非 Map 返回空迭代器 / Values are read via the internal `v<i>` members; an empty iterator for non-maps"
+ },
+ "map_entries": {
+  "brief": "Map.prototype.entries：返回 [键,值] 二元组的可迭代对象 / `Map.prototype.entries`: return an iterable of `[key, value]` pairs",
+  "return": "二元组数组的可迭代对象 / An iterable of two-element arrays",
+  "note": "每项为 `[k, v]`；非 Map 返回空迭代器 / Each item is `[k, v]`; an empty iterator for non-maps"
+ },
+ "set_entries": {
+  "brief": "Set.prototype.entries：返回 [值,值] 二元组的可迭代对象 / `Set.prototype.entries`: return an iterable of `[value, value]` pairs",
+  "return": "二元组数组的可迭代对象 / An iterable of two-element arrays",
+  "note": "按规范每项的两元素相同；非 Set 返回空迭代器 / Per spec both elements of each pair are the same value; an empty iterator for non-sets"
+ },
+ "map_set_iter_self": {
+  "brief": "Map/Set 的 `[Symbol.iterator]`：返回对象自身 / `[Symbol.iterator]` for `Map`/`Set`: return the object itself",
+  "return": "调用时的 this 值原样返回 / The `this` value is returned unchanged",
+  "note": "迭代行为由 `js_iter_len`/`js_iter_at` 提供，共享的 `next` 遍历器驱动它 / Iterator behaviour is supplied by `js_iter_len`/`js_iter_at` and driven by the shared `next` walker"
+ },
+ "string_iter": {
+  "brief": "字符串的 `[Symbol.iterator]`：按码点遍历 / `[Symbol.iterator]` on a string: iterate by code point",
+  "return": "各码点字符的可迭代对象 / An iterable over the per-code-point characters"
+ },
+ "fresh_proto": {
+  "brief": "创建一个挂到指定原型下的新原型对象 / Create a new prototype object chained under the given prototype",
+  "params": {
+   "cls": "原型对象的类名（如 `Array`）/ Class name of the prototype object, e.g. `Array`",
+   "object_proto": "该原型的父原型（可为 NULL）/ Parent prototype, may be `NULL`"
+  },
+  "return": "新建的原型对象 / The newly created prototype object"
+ },
+ "make_ctor": {
+  "brief": "创建原生构造器并注册为全局 / Create a native constructor and register it as a global",
+  "params": {
+   "name": "构造器名（同时用作全局属性名）/ Constructor name (also used as the global property name)",
+   "fn": "原生函数实现 / Native function implementation",
+   "ud": "透传给原生函数的用户数据 / User data passed through to the native function",
+   "proto": "构造器的 `prototype` 指向的原型对象（可为 NULL）/ The prototype object the constructor's `prototype` points at, may be `NULL`"
+  },
+  "return": "新建的构造器函数值 / The newly created constructor function value",
+  "note": "同时设置函数的 `name`，并在提供 proto 时设置 `prototype` 属性 / Also sets the function's `name` and, when a prototype is given, its `prototype` property"
+ },
+ "init_prototypes": {
+  "brief": "创建各内建类型的原型对象并接好原型链 / Create the prototype objects of the builtin types and wire up the prototype chain",
+  "note": "内建原型的父原型为 `Object.prototype`，三个错误原型继承 `Error.prototype` / Builtin prototypes inherit from `Object.prototype`; the three error prototypes inherit from `Error.prototype`"
+ },
+ "install_object_proto": {
+  "brief": "给 `Object.prototype` 安装方法 / Install the methods on `Object.prototype`",
+  "note": "安装 `toString`、`valueOf`、`hasOwnProperty`、`propertyIsEnumerable` / Installs `toString`, `valueOf`, `hasOwnProperty` and `propertyIsEnumerable`"
+ },
+ "install_function_proto": {
+  "brief": "给 `Function.prototype` 安装方法 / Install the methods on `Function.prototype`",
+  "note": "安装 `call`、`apply`、`bind`、`toString` / Installs `call`, `apply`, `bind` and `toString`"
+ },
+ "install_array_proto": {
+  "brief": "给 `Array.prototype` 安装全部数组方法 / Install all array methods on `Array.prototype`",
+  "note": "覆盖增删改、遍历、查找、排序与 `keys`/`values`/`entries`，并设置 `Symbol.iterator` 为自迭代 / Covers mutation, iteration, searching, sorting plus `keys`/`values`/`entries`, and sets `Symbol.iterator` to self-iteration"
+ },
+ "install_string_proto": {
+  "brief": "给 `String.prototype` 安装全部字符串方法 / Install all string methods on `String.prototype`",
+  "note": "包含大小写、修剪、填充、分割替换、匹配与 `includes`/`startsWith`/`endsWith`/`at`，并设置 `Symbol.iterator` 为按码点迭代 / Includes case conversion, trimming, padding, split/replace, matching and `includes`/`startsWith`/`endsWith`/`at`, and sets `Symbol.iterator` to code-point iteration"
+ },
+ "install_number_proto": {
+  "brief": "给 `Number.prototype` 安装方法 / Install the methods on `Number.prototype`",
+  "note": "安装 `toString`、`valueOf`、`toFixed`、`toPrecision`、`toExponential`、`toLocaleString` / Installs `toString`, `valueOf`, `toFixed`, `toPrecision`, `toExponential` and `toLocaleString`"
+ },
+ "install_bool_proto": {
+  "brief": "给 `Boolean.prototype` 安装方法 / Install the methods on `Boolean.prototype`",
+  "note": "安装 `toString` 与 `valueOf` / Installs `toString` and `valueOf`"
+ },
+ "install_regex_proto": {
+  "brief": "给 `RegExp.prototype` 安装方法 / Install the methods on `RegExp.prototype`",
+  "note": "安装 `test`、`exec`、`toString` / Installs `test`, `exec` and `toString`"
+ },
+ "install_error_protos": {
+  "brief": "给错误原型族安装方法与 `name`/`message` 默认值 / Install methods and default `name`/`message` on the error prototype family",
+  "note": "`Error.prototype` 得到 `toString`；各子错误原型设置各自的 `name` / `Error.prototype` gains `toString`; each derived error prototype gets its own `name`"
+ },
+ "install_promise_proto": {
+  "brief": "给 `Promise.prototype` 安装方法 / Install the methods on `Promise.prototype`",
+  "note": "安装 `then`、`catch`、`finally` / Installs `then`, `catch` and `finally`"
+ },
+ "install_map_proto": {
+  "brief": "给 `Map.prototype` 与 `Set.prototype` 安装方法与 size 取值器 / Install methods and the `size` getter on `Map.prototype` and `Set.prototype`",
+  "note": "两者均设 `Symbol.iterator` 为自迭代；Set 的 `keys`/`values` 共用值迭代器 / Both get `Symbol.iterator` set to self-iteration; the `Set` `keys`/`values` share the value iterator"
+ },
+ "ctor_of": {
+  "brief": "从全局对象按名取回构造器对象 / Look up a constructor object on the global object by name",
+  "params": {
+   "name": "构造器名 / Constructor name"
+  },
+  "return": "全局对象上该名的对象指针，不存在则为 NULL / The object pointer stored under that global name, or `NULL`"
+ },
+ "install_object_ctor": {
+  "brief": "安装 `Object` 构造器与其静态方法 / Install the `Object` constructor and its static methods",
+  "note": "静态方法含 `keys`/`values`/`entries`/`assign`/`create`/`defineProperty` 等，`is` 单独用 `object_is_value` 注册 / Statics include `keys`/`values`/`entries`/`assign`/`create`/`defineProperty` etc.; `is` is registered separately with `object_is_value`"
+ },
+ "install_array_ctor": {
+  "brief": "安装 `Array` 构造器与其静态方法 / Install the `Array` constructor and its static methods",
+  "note": "安装 `from`、`of`、`isArray` / Installs `from`, `of` and `isArray`"
+ },
+ "install_string_ctor": {
+  "brief": "安装 `String` 构造器与其静态方法 / Install the `String` constructor and its static methods",
+  "note": "安装 `fromCharCode` 与 `fromCodePoint` / Installs `fromCharCode` and `fromCodePoint`"
+ },
+ "install_number_ctor": {
+  "brief": "安装 `Number` 构造器、静态方法与常量 / Install the `Number` constructor, its static methods and constants",
+  "note": "含 `isInteger`/`isFinite`/`isNaN`/`isSafeInteger`、`parseInt`/`parseFloat` 及 `MAX_SAFE_INTEGER`/`NaN` 等常量 / Includes `isInteger`/`isFinite`/`isNaN`/`isSafeInteger`, `parseInt`/`parseFloat` and constants such as `MAX_SAFE_INTEGER`/`NaN`"
+ },
+ "install_error_ctors": {
+  "brief": "安装 `Error` 及其子类构造器 / Install the `Error` constructor and its subclasses",
+  "note": "含 `Error`、`TypeError`、`RangeError`、`SyntaxError`、`ReferenceError`，均用 `error_ctor` 并以名字作 `ud` / Covers `Error`, `TypeError`, `RangeError`, `SyntaxError` and `ReferenceError`, all using `error_ctor` with the name as `ud`"
+ },
+ "install_promise_ctor": {
+  "brief": "安装 `Promise` 构造器与其静态方法 / Install the `Promise` constructor and its static methods",
+  "note": "安装 `resolve`、`reject`、`all`、`race`、`allSettled` / Installs `resolve`, `reject`, `all`, `race` and `allSettled`"
+ },
+ "install_set_statics": {
+  "brief": "在 `Set` 构造器对象上安装静态方法 / Install static methods on the `Set` constructor object",
+  "note": "按规范 `values`/`keys`/`entries` 均指向值迭代器 / Per spec `values`/`keys`/`entries` all point at the value iterator"
+ },
+ "install_map_set_ctors": {
+  "brief": "安装 `Map` 与 `Set` 构造器 / Install the `Map` and `Set` constructors",
+  "note": "随后调用 `install_set_statics` 补上 Set 的静态方法 / Followed by `install_set_statics` to add the `Set` statics"
+ },
+ "install_symbol_ctor": {
+  "brief": "安装 `Symbol` 构造器、内置符号与方法 / Install the `Symbol` constructor, well-known symbols and methods",
+  "note": "注册 `iterator`/`toStringTag`/`asyncIterator` 内置符号，并把 `for` 与原型 `toString` 接上 / Registers the `iterator`/`toStringTag`/`asyncIterator` symbols and wires up `for` and the prototype `toString`"
+ },
+ "install_math_fn_table": {
+  "brief": "按表把 Math 函数安装到 Math 对象上 / Install the `Math` functions onto the math object from a table",
+  "params": {
+   "math": "目标 `Math` 对象 / Target `Math` object"
+  },
+  "note": "表中最后一项 `ud` 用来区分 `Math.max`/`Math.min`；`log1p` 等扩展函数用 `MF_*` 选择码作 `ud` / The trailing `ud` distinguishes `Math.max`/`Math.min`; extra functions like `log1p` carry an `MF_*` selector as `ud`"
+ },
+ "install_math_consts": {
+  "brief": "把数学常量安装到 Math 对象上 / Install the mathematical constants onto the math object",
+  "params": {
+   "math": "目标 `Math` 对象 / Target `Math` object"
+  },
+  "note": "含 `PI`、`E`、`LN2`、`LN10`、`SQRT2`、`SQRT1_2` / Includes `PI`, `E`, `LN2`, `LN10`, `SQRT2` and `SQRT1_2`"
+ },
+ "install_math": {
+  "brief": "创建并注册全局 `Math` 对象 / Create and register the global `Math` object",
+  "note": "先建对象并设类名，再装函数表与常量 / Builds the object, sets its class name, then installs the function table and constants"
+ },
+ "install_json": {
+  "brief": "创建并注册全局 `JSON` 对象 / Create and register the global `JSON` object",
+  "note": "安装 `stringify` 与 `parse` / Installs `stringify` and `parse`"
+ },
+ "install_global_functions": {
+  "brief": "在全局对象上安装全局函数与常量 / Install the global functions and constants on the global object",
+  "note": "含 `parseInt`/`parseFloat`/`isNaN`/`isFinite`、URI 编解码、`NaN`/`Infinity`/`undefined`；`encodeURI` 复用组件编解码并带保留字符标志 / Includes `parseInt`/`parseFloat`/`isNaN`/`isFinite`, the URI codecs and `NaN`/`Infinity`/`undefined`; `encodeURI` reuses the component codec with the reserved-chars flag"
+ },
+ "install_console": {
+  "brief": "创建并注册全局 `console` 对象 / Create and register the global `console` object",
+  "note": "各方法共用 `native_console`，`ud` 非空表示写到 stderr / All methods share `native_console`; a non-NULL `ud` selects stderr"
+ },
+ "install_global_object": {
+  "brief": "把全部内建构造函数与对象装到全局对象上 / Install all builtin constructors and objects onto the global object",
+  "note": "含各构造器、`Math`/`JSON`/`console`、`alert` 与 `globalThis`；日期由 `hpe_js_date_install` 单独安装 / Covers the constructors, `Math`/`JSON`/`console`, `alert` and `globalThis`; `Date` is installed separately by `hpe_js_date_install`"
+ },
+ "hpe_js_create": {
+  "brief": "创建并初始化一个 JS 运行时实例 / Create and initialise a JS runtime instance",
+  "return": "成功返回新实例；内存分配失败返回 NULL / The new instance, or `NULL` when allocation fails",
+  "note": "依次初始化各原型、全局对象/环境、内建对象与定时器 / Initialises the prototypes, global object/environment, builtins and timers in order",
+  "see": "hpe_js_destroy"
+ },
+ "hpe_js_destroy": {
+  "brief": "销毁 JS 运行时并释放其资源 / Destroy a JS runtime and release its resources",
+  "note": "先卸载 DOM 变更监听，再释放块、定时器与模块链表；`js` 为 NULL 时直接返回 / Uninstalls the DOM mutation sink first, then frees blocks, timers and the module list; returns immediately when `js` is `NULL`",
+  "see": "hpe_js_create"
+ },
+ "hpe_js_set_global_host": {
+  "brief": "把宿主对象暴露为全局变量 / Expose a host object as a global",
+  "params": {
+   "name": "全局变量名（如 `document`）/ Global variable name, e.g. `document`",
+   "ptr": "宿主对象指针 / Host object pointer",
+   "type": "宿主对象类型标记 / Host object type tag",
+   "vt": "宿主对象虚表 / Host object vtable"
+  },
+  "note": "以宿主值形式写入全局对象 / Writes a host value onto the global object"
+ },
+ "eval_common": {
+  "brief": "`hpe_js_eval`/`hpe_js_eval_module` 的公共实现 / Shared implementation behind `hpe_js_eval` and `hpe_js_eval_module`",
+  "params": {
+   "module": "非 0 时按 ES 模块解析执行 / Non-zero parses and runs the source as an ES module",
+   "errbuf": "out:失败时的错误信息缓冲区 / Error-message buffer filled on failure",
+   "errbuf_size": "错误缓冲区容量 / Error buffer capacity"
+  },
+  "return": "成功返回 0、失败返回 -1 / 0 on success, -1 on failure",
+  "note": "用 try 帧捕获异常并写入 errbuf；模块模式下先建立模块环境与命名空间，执行后统一抽取微任务 / Uses a try frame to catch exceptions into `errbuf`; in module mode it builds the module environment and namespace first, then drains microtasks after execution"
+ },
+ "hpe_js_eval": {
+  "brief": "以脚本方式执行一段源码 / Execute a piece of source as a script",
+  "params": {
+   "errbuf": "out:失败时的错误信息缓冲区 / Error-message buffer filled on failure",
+   "errbuf_size": "错误缓冲区容量 / Error buffer capacity"
+  },
+  "return": "成功返回 0、失败返回 -1 / 0 on success, -1 on failure",
+  "note": "等价于以非模块方式调用 `eval_common` / Equivalent to calling `eval_common` in non-module mode",
+  "see": "eval_common"
+ },
+ "hpe_js_eval_module": {
+  "brief": "以 ES 模块方式执行一段源码 / Execute a piece of source as an ES module",
+  "params": {
+   "dir": "解析相对导入的基准目录（可为空）/ Base directory for resolving relative imports, may be empty",
+   "errbuf": "out:失败时的错误信息缓冲区 / Error-message buffer filled on failure",
+   "errbuf_size": "错误缓冲区容量 / Error buffer capacity"
+  },
+  "return": "成功返回 0、失败返回 -1 / 0 on success, -1 on failure",
+  "note": "`dir` 非空时先更新当前目录，再以模块方式调用 `eval_common`；命名空间可经 import 访问 / When `dir` is non-empty it is set as the current directory first; the namespace is reachable through imports",
+  "see": "eval_common"
+ },
+ "hpe_js_call": {
+  "brief": "从 C 侧按值调用一个可调用对象 / Call a callable value from C",
+  "params": {
+   "callee": "被调用的可调用值（如事件处理函数）/ The callable value to call, e.g. an event handler",
+   "thisv": "调用时的 this 值 / The `this` value of the call",
+   "args": "实参数组 / Actual argument array",
+   "argc": "实参个数 / Argument count"
+  },
+  "return": "成功返回 0、运行时错误返回 -1 / 0 on success, -1 on runtime error",
+  "note": "运行时错误打印到 stderr；`argc` 为 0 时 `thisv`/`args` 可为 NULL；调用后抽取微任务 / Runtime errors go to stderr; `thisv`/`args` may be `NULL` when `argc` is 0; microtasks are drained after the call"
+ },
+ "hpe_js_call_value": {
+  "brief": "从 C 侧调用可调用对象并返回其结果值 / Call a callable value from C and return its result value",
+  "params": {
+   "callee": "被调用的可调用值 / The callable value to call",
+   "thisv": "调用时的 this 值 / The `this` value of the call",
+   "args": "实参数组 / Actual argument array",
+   "argc": "实参个数 / Argument count"
+  },
+  "return": "调用结果值；`js` 为空或 `callee` 不可调用时返回 undefined / The call result, or `undefined` when `js` is `NULL` or `callee` is not callable",
+  "note": "不捕获异常，与 `hpe_js_call` 不同 / Unlike `hpe_js_call`, it does not catch exceptions"
+ },
+ "hpe_js_set_module_loader": {
+  "brief": "注册用于解析 `import` 的模块加载器 / Register the module loader used to resolve `import` specifiers",
+  "params": {
+   "loader": "模块加载器回调（为 NULL 时清除并置零）/ Module loader callback; `NULL` clears it"
+  }
+ },
+ "hpe_js_set_current_dir": {
+  "brief": "设置解析相对模块说明符的基准目录 / Set the base directory relative module specifiers resolve against",
+  "params": {
+   "dir": "基准目录 / Base directory"
+  },
+  "note": "仅保存指针，不复制字符串 / Only the pointer is stored, the string is not copied"
+ },
+ "hpe_js_global_object": {
+  "brief": "取回全局对象的原始对象指针 / Get the raw object pointer of the global object",
+  "return": "全局对象指针；`js` 为空时返回 NULL / The global object, or `NULL` when `js` is `NULL`"
+ }
+}

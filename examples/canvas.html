@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>canvas 2d</title>
+<style>
+body { font: 13px sans-serif; margin: 16px; }
+#out { font: 12px monospace; white-space: pre; }
+.ok { color: #0a7a0a; font-weight: bold; }
+.fail { color: #d93025; font-weight: bold; }
+</style>
+</head>
+<body>
+<h3>Canvas 2D</h3>
+<canvas id="c" width="120" height="80"></canvas>
+<div id="out"></div>
+
+<script>
+var lines = [], total = 0, passCount = 0;
+function ck(name, got, want) {
+  var ok = got === want;
+  total++;
+  lines.push((ok ? "  ok  " : "  FAIL") + " " + name +
+             (ok ? "" : " (got " + JSON.stringify(got) + ", want " + JSON.stringify(want) + ")"));
+  if (ok) passCount++;
+  return ok;
+}
+function px(ctx, x, y) {
+  var d = ctx.getImageData(x, y, 1, 1).data;
+  return d[0] + "," + d[1] + "," + d[2] + "," + d[3];
+}
+
+var canvas = document.getElementById("c");
+var ctx = canvas.getContext("2d");
+ck("getContext returns object", typeof ctx, "object");
+ck("getContext null for 3d", canvas.getContext("webgl"), null);
+ck("initial pixel clear", px(ctx, 5, 5), "0,0,0,0");
+
+/* opaque red fill */
+ctx.fillStyle = "#ff0000";
+ck("fillStyle getter", ctx.fillStyle, "#ff0000");
+ctx.fillRect(10, 10, 20, 20);
+ck("fillRect centre pixel", px(ctx, 20, 20), "255,0,0,255");
+ck("fillRect outside pixel", px(ctx, 5, 5), "0,0,0,0");
+
+/* clearRect */
+ctx.clearRect(10, 10, 8, 8);
+ck("clearRect pixel", px(ctx, 14, 14), "0,0,0,0");
+ck("clearRect leaves rest", px(ctx, 25, 25), "255,0,0,255");
+
+/* green fill via named colour */
+ctx.fillStyle = "lime";
+ctx.fillRect(40, 10, 10, 10);
+ck("named colour lime", px(ctx, 45, 15), "0,255,0,255");
+
+/* triangle path fill (blue) */
+ctx.fillStyle = "#0000ff";
+ctx.beginPath();
+ctx.moveTo(70, 10);
+ctx.lineTo(90, 10);
+ctx.lineTo(80, 30);
+ctx.closePath();
+ctx.fill();
+ck("path fill inside", px(ctx, 80, 15), "0,0,255,255");
+ck("path fill outside", px(ctx, 70, 28), "0,0,0,0");
+
+/* strokeRect */
+ctx.strokeStyle = "#ffffff";
+ctx.lineWidth = 1;
+ctx.strokeRect(100, 10, 15, 15);
+ck("strokeRect top edge", px(ctx, 107, 10), "255,255,255,255");
+
+/* transform: translate then fill */
+ctx.fillStyle = "#ffff00";
+ctx.save();
+ctx.translate(0, 40);
+ctx.fillRect(10, 10, 5, 5);
+ck("translate fill", px(ctx, 12, 52), "255,255,0,255");
+ctx.restore();
+ctx.fillStyle = "#00ffff";
+ctx.fillRect(10, 10, 5, 5);
+ck("restore transform", px(ctx, 12, 12), "0,255,255,255");
+
+/* putImageData round-trip */
+var img = ctx.getImageData(40, 10, 1, 1);
+ck("getImageData dims", img.width + "x" + img.height, "1x1");
+img.data[0] = 128; img.data[1] = 64; img.data[2] = 32; img.data[3] = 255;
+ctx.putImageData(img, 40, 10);
+ck("putImageData round-trip", px(ctx, 40, 10), "128,64,32,255");
+
+lines.unshift((passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total + " checks");
+var cls = passCount === total ? "ok" : "fail";
+var el = document.getElementById("out");
+for (var li = 0; li < lines.length; li++) {
+  var row = document.createElement("div");
+  row.className = "row " + (li === 0 ? cls : "");
+  row.textContent = lines[li];
+  el.appendChild(row);
+}
+document.title = (passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total;
+</script>
+</body>
+</html>

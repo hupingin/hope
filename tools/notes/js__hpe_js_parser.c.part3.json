@@ -1,0 +1,200 @@
+{
+  "p_var_decl": {
+    "brief": "解析变量声明列表 / Parse a variable declaration list",
+    "params": {
+      "decl": "inout:`JS_N_VAR` 节点 / The `JS_N_VAR` node",
+      "kind": "声明关键字（`var`/`let`/`const`）/ The declaration keyword (`var`/`let`/`const`)"
+    },
+    "note": "每项是可省初值的 `JS_N_ASSIGN`（`op` 为 `JS_OP_SET`）/ Each item is a `JS_N_ASSIGN` (`op` = `JS_OP_SET`) with an optional initialiser",
+    "see": "p_var_stmt, p_for_classic"
+  },
+  "p_block": {
+    "brief": "解析 `{ … }` 语句块 / Parse a `{ … }` statement block",
+    "return": "`JS_N_BLOCK` 节点 / A `JS_N_BLOCK` node",
+    "warning": "块内出现 `T_EOF` 时报错 / Errors when `T_EOF` appears inside the block"
+  },
+  "p_function_body": {
+    "brief": "解析函数体 / Parse a function body",
+    "return": "函数体块节点 / The body block node",
+    "note": "等同于 `p_block` / Equivalent to `p_block`",
+    "see": "p_block"
+  },
+  "p_for_each": {
+    "brief": "解析 `for (… of …)` / `for (… in …)` 头 / Parse a `for (… of …)` / `for (… in …)` head",
+    "params": {
+      "decl_off": "目标前有 var/let/const 关键字时为 1 / 1 when a var/let/const keyword precedes the target",
+      "is_async_iter": "for await 为 1 / 1 for `for await`"
+    },
+    "return": "`JS_N_FORIN` 或 `JS_N_FOROF` 节点 / A `JS_N_FORIN` or `JS_N_FOROF` node",
+    "note": "`decl_off` 非 0 时把绑定目标包进 `JS_N_VAR` / A non-zero `decl_off` wraps the binding target in a `JS_N_VAR`",
+    "see": "p_for"
+  },
+  "p_for_classic": {
+    "brief": "解析经典三段式 `for (;;)` 头 / Parse the classic three-part `for (;;)` head",
+    "return": "`JS_N_FOR` 节点 / A `JS_N_FOR` node",
+    "note": "init/cond/update 各段缺失时放入 `NULL` / Missing init/cond/update parts are stored as `NULL`",
+    "see": "p_for"
+  },
+  "p_for": {
+    "brief": "解析 `for` 语句（含 `for await`）/ Parse a `for` statement (including `for await`)",
+    "return": "经典 `for`、`for-of` 或 `for-in` 节点 / A classic `for`, `for-of` or `for-in` node",
+    "note": "按头部形态分派给 `p_for_each` 或 `p_for_classic` / Dispatches to `p_for_each` or `p_for_classic` based on the head",
+    "see": "p_for_each, p_for_classic"
+  },
+  "p_switch": {
+    "brief": "解析 `switch (expr) { … }` / Parse `switch (expr) { … }`",
+    "return": "`JS_N_SWITCH` 节点 / A `JS_N_SWITCH` node",
+    "note": "每个 case/default 子句是一个 `JS_N_BLOCK`，首子节点为测试表达式或 `NULL` / Each case/default clause is a `JS_N_BLOCK` whose first child is the test expression or `NULL`",
+    "warning": "非 case/default 开始子句时报错 / Errors when a clause does not start with case/default"
+  },
+  "p_try": {
+    "brief": "解析 `try/catch/finally` / Parse `try/catch/finally`",
+    "return": "`JS_N_TRY` 节点（kids: try 块、catch 子句/`NULL`、finally 块/`NULL`）/ A `JS_N_TRY` node (kids: try block, catch clause/`NULL`, finally block/`NULL`)",
+    "note": "catch 子句的 kids[0] 为绑定目标（可为 `NULL`）/ The catch clause's kids[0] is the binding target (may be `NULL`)"
+  },
+  "p_export_list": {
+    "brief": "解析 `export { a, b as c } [from \"src\"]` / Parse `export { a, b as c } [from \"src\"]`",
+    "params": { "ex": "inout:导出节点 / The export node" },
+    "note": "置 `ex->op=2`；kids[0] 为重导出列表，kids[1] 为来源模块或 `NULL` / Sets `ex->op=2`; kids[0] is the re-export list and kids[1] the source module or `NULL`",
+    "see": "p_export"
+  },
+  "p_export_default": {
+    "brief": "解析 `export default <function|class|expr>` / Parse `export default <function|class|expr>`",
+    "params": { "ex": "inout:导出节点 / The export node" },
+    "note": "置 `ex->op=1`；kids[0] 为被导出的值/声明 / Sets `ex->op=1`; kids[0] holds the exported value or declaration",
+    "see": "p_export"
+  },
+  "p_export_star": {
+    "brief": "解析 `export * [as ns] from \"src\"` / Parse `export * [as ns] from \"src\"`",
+    "params": { "ex": "inout:导出节点 / The export node" },
+    "note": "置 `ex->op=3`；带 `as ns` 时 `ex->num=1` 且 `ex->str` 为命名空间 / Sets `ex->op=3`; with `as ns`, `ex->num=1` and `ex->str` is the namespace",
+    "warning": "缺少 `from` 时报错 / Errors when `from` is missing",
+    "see": "p_export"
+  },
+  "p_export": {
+    "brief": "解析一条 `export` 声明 / Parse one `export` declaration",
+    "return": "`JS_N_EXPORT` 节点 / A `JS_N_EXPORT` node",
+    "note": "按后续形态分派给 `{` 列表/`default`/`*` 或普通语句 / Dispatches on what follows to the `{` list, `default`, `*` or a plain statement",
+    "see": "p_export_list, p_export_default, p_export_star"
+  },
+  "p_import_namespace": {
+    "brief": "解析 `* as ns` 命名空间导入绑定 / Parse a `* as ns` namespace import binding",
+    "params": { "list": "inout:导入绑定列表 / The import binding list" },
+    "note": "绑定项 `op` 为 2 / The binding's `op` is 2",
+    "warning": "缺少 `as` 时报错 / Errors when `as` is missing",
+    "see": "p_import_decl"
+  },
+  "p_import_named": {
+    "brief": "解析 `{ a, b as c }` 具名导入绑定 / Parse `{ a, b as c }` named import bindings",
+    "params": { "list": "inout:导入绑定列表 / The import binding list" },
+    "note": "绑定项 `op` 为 0，`str` 为本地名，kids[0] 为来源名 / The binding's `op` is 0, `str` is the local name and kids[0] the imported name",
+    "see": "p_import_decl"
+  },
+  "p_import_default": {
+    "brief": "解析 `import name` 默认导入绑定 / Parse an `import name` default binding",
+    "params": { "list": "inout:导入绑定列表 / The import binding list" },
+    "note": "无默认导入时静默返回；绑定项 `op` 为 1 / Silently returns when there is no default; the binding's `op` is 1",
+    "see": "p_import_decl"
+  },
+  "p_import_decl": {
+    "brief": "解析一条 `import` 声明 / Parse one `import` declaration",
+    "return": "`JS_N_IMPORT` 节点 / A `JS_N_IMPORT` node",
+    "note": "支持 `import \"x\"` 副作用导入（`op=1`）与默认/命名空间/具名组合 / Supports `import \"x\"` side-effect imports (`op=1`) and default/namespace/named combinations",
+    "warning": "缺少 `from` 时报错 / Errors when `from` is missing",
+    "see": "p_import_default, p_import_namespace, p_import_named"
+  },
+  "p_var_stmt": {
+    "brief": "解析 `var`/`let`/`const` 声明语句 / Parse a `var`/`let`/`const` declaration statement",
+    "return": "`JS_N_VAR` 节点 / A `JS_N_VAR` node",
+    "warning": "缺少 `;` 时报错 / Errors when `;` is missing",
+    "see": "p_var_decl"
+  },
+  "p_if_stmt": {
+    "brief": "解析 `if (cond) stmt [else stmt]` / Parse `if (cond) stmt [else stmt]`",
+    "return": "`JS_N_IF` 节点（kids: 条件、then、可选 else）/ A `JS_N_IF` node (kids: condition, then-branch, optional else-branch)"
+  },
+  "p_while_stmt": {
+    "brief": "解析 `while (cond) stmt` / Parse `while (cond) stmt`",
+    "return": "`JS_N_WHILE` 节点 / A `JS_N_WHILE` node"
+  },
+  "p_do_stmt": {
+    "brief": "解析 `do stmt while (cond);` / Parse `do stmt while (cond);`",
+    "return": "`JS_N_DO` 节点 / A `JS_N_DO` node",
+    "note": "结尾分号可省 / The trailing semicolon is optional",
+    "warning": "缺少 `while` 时报错 / Errors when `while` is missing"
+  },
+  "p_throw_stmt": {
+    "brief": "解析 `throw expr;` / Parse `throw expr;`",
+    "return": "`JS_N_THROW` 节点 / A `JS_N_THROW` node",
+    "warning": "`throw` 后出现换行是语法错误 / A line terminator after `throw` is a syntax error"
+  },
+  "p_return_stmt": {
+    "brief": "解析 `return [expr];` / Parse `return [expr];`",
+    "return": "`JS_N_RETURN` 节点 / A `JS_N_RETURN` node",
+    "note": "下一词法单元换行时按自动分号插入处理，省略返回值 / Automatic semicolon insertion applies when the next token is on a new line, omitting the value"
+  },
+  "p_break_stmt": {
+    "brief": "解析 `break [label];` / `continue [label];` / Parse `break [label];` / `continue [label];`",
+    "return": "`JS_N_BREAK` 或 `JS_N_CONTINUE` 节点 / A `JS_N_BREAK` or `JS_N_CONTINUE` node",
+    "note": "标签须与关键字同行 / The label must be on the same line as the keyword"
+  },
+  "p_debugger_stmt": {
+    "brief": "解析 `debugger;` / Parse `debugger;`",
+    "return": "一个 `JS_N_EMPTY` 占位节点 / A `JS_N_EMPTY` placeholder node"
+  },
+  "p_label_stmt": {
+    "brief": "解析带标签语句 `ident: stmt` / Parse a labelled statement `ident: stmt`",
+    "return": "`JS_N_LABEL` 节点 / A `JS_N_LABEL` node",
+    "note": "调用方已排除 `default:` 与 `case:` / The caller has already excluded `default:` and `case:`",
+    "see": "p_statement"
+  },
+  "p_function_stmt": {
+    "brief": "解析 `function` / `async function` 声明 / Parse a `function` / `async function` declaration",
+    "params": { "is_async": "async 声明为 1 / 1 for an async declaration" },
+    "return": "`JS_N_FUNC` 节点 / A `JS_N_FUNC` node",
+    "see": "p_function"
+  },
+  "p_keyword_stmt": {
+    "brief": "解析由关键字开头的语句 / Resolve statements that begin with a keyword",
+    "return": "对应的语句节点；普通表达式开头时返回 `NULL` / The matching statement node, or `NULL` when the token is an ordinary expression start",
+    "note": "分派到 var/function/class/if/while/do/for/switch/try/throw/return/break/debugger/export/import / Dispatches to var/function/class/if/while/do/for/switch/try/throw/return/break/debugger/export/import",
+    "see": "p_statement"
+  },
+  "p_statement": {
+    "brief": "解析一条语句 / Parse one statement",
+    "return": "块、空语句、标签、关键字语句或表达式语句节点 / A block, empty, labelled, keyword or expression statement node",
+    "note": "`{` 后跟标识符加 `:`（非 default/case）视为标签语句 / `{` is a block; an identifier followed by `:` (other than default/case) is a label",
+    "see": "p_keyword_stmt, p_label_stmt, p_expr"
+  },
+  "parse_common": {
+    "brief": "词法分析与解析的共用入口 / Shared entry point for lexing and parsing",
+    "params": {
+      "source": "源文本 / Source text",
+      "module": "按 ES 模块标记为 1 / 1 to mark the program as an ES module"
+    },
+    "return": "语句块根节点（`op` 标记是否模块）/ The statement-block root node (`op` marks module mode)",
+    "note": "先 `lex_all` 再循环 `p_statement` 直到 `T_EOF` / Runs `lex_all` then loops `p_statement` until `T_EOF`",
+    "see": "js_parse_program, js_parse_module"
+  },
+  "js_parse_program": {
+    "brief": "把脚本文本解析成程序 AST / Parse script text into a program AST",
+    "params": { "source": "源文本 / Source text" },
+    "return": "程序语句块根节点（脚本模式）/ The program statement-block root (script mode)",
+    "note": "等价于 `parse_common(js, source, 0)` / Equivalent to `parse_common(js, source, 0)`",
+    "see": "parse_common"
+  },
+  "js_parse_module": {
+    "brief": "把模块文本解析成模块 AST / Parse module text into a module AST",
+    "params": { "source": "源文本 / Source text" },
+    "return": "程序语句块根节点（模块模式）/ The program statement-block root (module mode)",
+    "note": "等价于 `parse_common(js, source, 1)` / Equivalent to `parse_common(js, source, 1)`",
+    "see": "parse_common"
+  },
+  "js_parse_expression": {
+    "brief": "把独立表达式源码解析成 AST / Parse a standalone expression source into an AST",
+    "params": { "source": "源文本 / Source text" },
+    "return": "表达式根节点 / The expression root node",
+    "note": "供模块加载器与 DOM 桥复用 / Exported for the module loader and the DOM bridge",
+    "see": "p_expr"
+  }
+}

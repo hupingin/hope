@@ -340,6 +340,148 @@ typedef enum HpeCombinator {
  * legal value, so the default cannot double as a "not set" sentinel. */
 #define HPE_SCROLLBAR_WIDTH_AUTO 12.0f
 
+/* ---------------- transitions & animations ----------------
+ * CSS Transitions / CSS Animations subset: declarations parsed into the style,
+ * `@keyframes` stored in the stylesheet and the interpolation clock driven by
+ * the engine (see hope_anim.c / hope.c). 可插值子集见 HpeAnimProp。 */
+
+typedef struct HpeStyle HpeStyle; /* HpeKeyframeStop below holds one by pointer */
+
+/* one animatable longhand; `get`/`set`/`lerp` dispatch on this id */
+typedef enum HpeAnimProp {
+    HPE_AP_NONE = 0,
+    HPE_AP_COLOR,
+    HPE_AP_BACKGROUND_COLOR,
+    HPE_AP_BORDER_COLOR, /* 四边一起插值 / all four sides together */
+    HPE_AP_OPACITY,
+    HPE_AP_WIDTH,
+    HPE_AP_HEIGHT,
+    HPE_AP_MARGIN_TOP, HPE_AP_MARGIN_RIGHT, HPE_AP_MARGIN_BOTTOM, HPE_AP_MARGIN_LEFT,
+    HPE_AP_PADDING_TOP, HPE_AP_PADDING_RIGHT, HPE_AP_PADDING_BOTTOM, HPE_AP_PADDING_LEFT,
+    HPE_AP_INSET_TOP, HPE_AP_INSET_RIGHT, HPE_AP_INSET_BOTTOM, HPE_AP_INSET_LEFT,
+    HPE_AP_FONT_SIZE,
+    HPE_AP_LETTER_SPACING,
+    HPE_AP_LINE_HEIGHT,
+    HPE_AP_FONT_WEIGHT,
+    HPE_AP_BORDER_RADIUS,
+    HPE_AP_TRANSFORM,
+    HPE_AP_ALL, /* 仅 `transition-property` 使用 / `transition-property` only */
+    HPE_AP_COUNT
+} HpeAnimProp;
+
+/* value categories stored in HpeAnimValue, one per HpeAnimProp */
+#define HPE_AV_LEN       1 /* HpeLength (same-unit interpolation) */
+#define HPE_AV_COLOR     2 /* one HpeColor */
+#define HPE_AV_COLOR4    3 /* border_colors[4] */
+#define HPE_AV_FLOAT     4 /* opacity / font-weight / line-height */
+#define HPE_AV_TRANSFORM 5 /* HpeTransform (decomposed interpolation) */
+
+/* a snapshot of one animatable property's current computed value */
+typedef struct HpeAnimValue {
+    int prop;  /* HpeAnimProp */
+    int type;  /* HPE_AV_* */
+    int valid; /* 0 when the property holds no interpolable value (e.g. auto) */
+    HpeLength len;
+    HpeColor color;
+    HpeColor colors[4];
+    float f;
+    HpeTransform tf;
+} HpeAnimValue;
+
+/* timing function: keywords, cubic-bezier(x1,y1,x2,y2) and steps(n, pos) */
+typedef enum HpeEasingKind {
+    HPE_EASING_LINEAR = 0,
+    HPE_EASING_EASE,
+    HPE_EASING_EASE_IN,
+    HPE_EASING_EASE_OUT,
+    HPE_EASING_EASE_IN_OUT,
+    HPE_EASING_CUBIC,
+    HPE_EASING_STEPS
+} HpeEasingKind;
+
+typedef struct HpeEasing {
+    int kind; /* HpeEasingKind */
+    float x1, y1, x2, y2; /* HPE_EASING_CUBIC control points */
+    int steps;            /* HPE_EASING_STEPS interval count */
+    int steps_start;      /* 1 = steps(n, start) */
+} HpeEasing;
+
+/* one entry of the comma list in `transition-*` */
+#define HPE_TRANS_MAX 8
+typedef struct HpeTransition {
+    int prop; /* HpeAnimProp, or HPE_AP_ALL */
+    float duration, delay; /* 秒 / seconds */
+    HpeEasing easing;
+} HpeTransition;
+
+/* animation-direction values */
+#define HPE_ANIM_DIR_NORMAL 0
+#define HPE_ANIM_DIR_REVERSE 1
+#define HPE_ANIM_DIR_ALTERNATE 2
+#define HPE_ANIM_DIR_ALTERNATE_REVERSE 3
+
+/* animation-fill-mode values */
+#define HPE_ANIM_FILL_NONE 0
+#define HPE_ANIM_FILL_FORWARDS 1
+#define HPE_ANIM_FILL_BACKWARDS 2
+#define HPE_ANIM_FILL_BOTH 3
+
+/* one entry of the comma list in `animation-*` */
+#define HPE_ANIM_MAX 4
+#define HPE_ANIM_NAME_MAX 64
+typedef struct HpeAnimDecl {
+    char name[HPE_ANIM_NAME_MAX]; /* @keyframes 名（"" = 未声明）/ keyframes name */
+    float duration, delay;        /* 秒 / seconds */
+    float iter_count;             /* 次数；`iter_infinite` 时忽略 / loop count */
+    int iter_infinite;            /* `infinite` */
+    int direction;                /* HPE_ANIM_DIR_* */
+    int fill;                     /* HPE_ANIM_FILL_* */
+    HpeEasing easing;
+} HpeAnimDecl;
+
+/* one stop of an @keyframes block: a percentage plus its declarations
+ * (heap-owned style, freed with the stylesheet) */
+#define HPE_KF_STOPS_MAX 16
+typedef struct HpeKeyframeStop {
+    float pct; /* 0..100 */
+    HpeStyle *decl;
+} HpeKeyframeStop;
+
+/* one named @keyframes rule; later definitions with the same name replace it */
+typedef struct HpeKeyframes {
+    char name[HPE_ANIM_NAME_MAX];
+    HpeKeyframeStop stops[HPE_KF_STOPS_MAX];
+    int stop_count;
+} HpeKeyframes;
+
+/* CSS custom properties (`--name`) and var() declarations (v0.23).
+ * Both live inline in HpeStyle so the whole style stays trivially copyable;
+ * the caps are deliberately modest (a page rarely needs more than a handful). */
+#define HPE_CUSTOM_PROP_MAX 8
+#define HPE_VAR_DECL_MAX 8
+#define HPE_CUSTOM_NAME_MAX 32
+#define HPE_CUSTOM_VALUE_MAX 192
+
+typedef struct HpeCustomProp {
+    char name[HPE_CUSTOM_NAME_MAX];  /* name without the leading `--` */
+    char value[HPE_CUSTOM_VALUE_MAX]; /* raw token stream, may itself contain var() */
+    int important;
+    int declared; /* set by this element's cascade, 0 when merely inherited */
+} HpeCustomProp;
+
+typedef struct HpeVarDecl {
+    char prop[HPE_CUSTOM_NAME_MAX];   /* property name receiving the var() value */
+    char value[HPE_CUSTOM_VALUE_MAX]; /* raw value containing var() */
+} HpeVarDecl;
+
+/* Registration subset: syntax / inherits / initial-value. */
+typedef struct HpePropertyReg {
+    char name[HPE_CUSTOM_NAME_MAX];
+    char syntax[48];
+    char initial[HPE_CUSTOM_VALUE_MAX];
+    int inherits;
+} HpePropertyReg;
+
 /* A fully resolved (or partially, via `set`) inline style.
  * `line_height` <= 0 means "auto", a negative value -n means the n-multiple of font-size.
  * `border_w[]` is ordered top, right, bottom, left — the same order as margin/padding.
@@ -400,8 +542,12 @@ typedef struct HpeStyle {
     HpeShadow box_shadow;
     HpeShadow text_shadow;
     HpeTransform transform;
-    int has_transition; /* parsed presence only; no interpolation clock yet */
-    int has_animation;
+    /* transition declarations (comma list, HPE_TRANS_MAX entries) */
+    HpeTransition transitions[HPE_TRANS_MAX];
+    int transition_count;
+    /* animation declarations (comma list, HPE_ANIM_MAX entries) */
+    HpeAnimDecl anims[HPE_ANIM_MAX];
+    int anim_count;
     /* generated content, resolved to text for ::before / ::after */
     char content[HPE_CONTENT_MAX];
     char attr_content[96]; /* `attr(name)` argument of `content`, resolved at box build */
@@ -440,6 +586,11 @@ typedef struct HpeStyle {
     /* vertical text (CSS Writing Modes): 0 = horizontal-tb, 1 = vertical-rl,
      * 2 = vertical-lr / 竖排文本：0 横排，1 从右向左竖排，2 从左向右竖排 */
     int writing_mode;
+    /* CSS custom properties and pending var() declarations (v0.23) */
+    HpeCustomProp custom[HPE_CUSTOM_PROP_MAX];
+    int custom_count;
+    HpeVarDecl vars[HPE_VAR_DECL_MAX];
+    int var_count;
 } HpeStyle;
 
 typedef struct HpeAttrSel {
@@ -577,7 +728,20 @@ typedef struct HpeStylesheet {
     int next_order;
     float vw; /* viewport width/height used to evaluate @media at cascade time */
     float vh;
+    /* @keyframes store (heap, grown on demand; freed by hpe_css_free) */
+    HpeKeyframes *kf;
+    int kf_count;
+    size_t kf_cap;
+    /* @property registrations (heap, grown on demand; freed by hpe_css_free) */
+    HpePropertyReg *props;
+    int prop_count;
+    size_t prop_cap;
 } HpeStylesheet;
+
+/* engine-side hook applied after every element cascade so the animation clock
+ * can overlay interpolated values onto the freshly computed style (set by
+ * hope.c, see hope_anim.c; runs only for element nodes) */
+typedef void (*HpeCssAnimHook)(void *ud, const HpeDomNode *node, HpeStyle *style);
 
 /**
  * @brief 初始化样式表并载入内置 UA 样式 / Initialise a stylesheet and load the built-in UA stylesheet
@@ -681,6 +845,18 @@ HpeStyle hpe_style_default(void);
 void hpe_css_parse_declarations(const char *text, size_t length, HpeStyle *decl);
 
 /**
+ * @brief 读取计算样式中的自定义属性值 / Read a custom property from a computed style
+ *
+ * @param[in]  style 计算样式 / Computed style
+ * @param[in]  name 属性名（可带或不带 `--`）/ Property name, with or without `--`
+ * @param[out] out 接收值的缓冲 / Buffer receiving the value
+ * @param[in]  n 缓冲容量 / Buffer capacity
+ *
+ * @return 找到返回 1，否则 0 / 1 when found, 0 otherwise
+ */
+int hpe_css_style_custom_value(const HpeStyle *style, const char *name, char *out, size_t n);
+
+/**
  * @brief 计算节点的最终样式（两趟层叠）/ Compute a node's final style with a two-pass cascade
  *
  * @details 第一趟从 `hpe_style_default` 出发并按 `parent` 继承可继承属性，收集所有媒体条件通过且选择器匹配的规则，按（specificity, 源码顺序）排序后依次应用，最后叠加内联 `style=""`（胜过普通样式表声明）。
@@ -765,5 +941,20 @@ void hpe_css_inline_set(HpeDomNode *node, const char *prop, const char *value);
  * @see hpe_css_inline_set
  */
 int hpe_css_inline_get(const HpeDomNode *node, const char *prop, char *out, size_t out_size);
+
+/**
+ * @brief 注册层叠后的动画覆盖钩子 / Register the post-cascade animation override hook
+ *
+ * @param[in] fn 钩子函数，`NULL` 表示注销 / Hook function, `NULL` unregisters
+ * @param[in] ud 透传给钩子的用户数据 / Opaque data passed through to the hook
+ *
+ * @note `hpe_css_compute` 在元素节点层叠完成后调用钩子，供动画时钟把插值结果写进计算样式；
+ *       由引擎在创建时注册（见 hope_anim.c）/ `hpe_css_compute` invokes the hook after an
+ *       element's cascade so the animation clock can overlay interpolated values onto the
+ *       computed style; the engine registers it at creation (see hope_anim.c)
+ *
+ * @see hpe_css_compute
+ */
+void hpe_css_set_anim_hook(HpeCssAnimHook fn, void *ud);
 
 #endif /* HPE_CSS_H */

@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>scroll &amp; navigation</title>
+<style>
+body { font: 13px sans-serif; margin: 8px; }
+#out { font: 12px monospace; white-space: pre; }
+.ok { color: #0a7a0a; font-weight: bold; }
+.fail { color: #d93025; font-weight: bold; }
+.spacer { height: 1600px; }
+#scroller { height: 60px; overflow: auto; border: 1px solid #888; }
+#scroller .inner { height: 400px; }
+</style>
+</head>
+<body>
+<h3>Scroll API &amp; Navigation Events</h3>
+<div id="scroller"><div class="inner">scrollable content</div></div>
+<div class="spacer"></div>
+<div id="target">target near bottom</div>
+<div id="out"></div>
+
+<script>
+var lines = [], total = 0, passCount = 0;
+function ck(name, got, want) {
+  var ok = got === want;
+  total++;
+  lines.push((ok ? "  ok  " : "  FAIL") + " " + name +
+             (ok ? "" : " (got " + JSON.stringify(got) + ", want " + JSON.stringify(want) + ")"));
+  if (ok) passCount++;
+  return ok;
+}
+function finish() {
+  lines.unshift((passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total + " checks");
+  var cls = passCount === total ? "ok" : "fail";
+  var el = document.getElementById("out");
+  for (var i = 0; i < lines.length; i++) {
+    var row = document.createElement("div");
+    row.className = "row " + (i === 0 ? cls : "");
+    row.textContent = lines[i];
+    el.appendChild(row);
+  }
+  document.title = (passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total;
+}
+
+/* ---- listener flags ---- */
+var scrollFired = 0, dclFired = 0, hashFired = 0, popFired = 0;
+window.addEventListener("scroll", function () { scrollFired++; });
+window.addEventListener("DOMContentLoaded", function () { dclFired++; });
+window.addEventListener("hashchange", function () { hashFired++; });
+window.addEventListener("popstate", function () { popFired++; });
+
+/* ---- scrollTo / scrollBy / scrollY ---- */
+ck("initial scrollY", window.scrollY, 0);
+window.scrollTo(0, 200);
+ck("scrollTo sets scrollY", window.scrollY, 200);
+ck("pageYOffset mirrors", window.pageYOffset, 200);
+ck("scrollX stays 0", window.scrollX, 0);
+window.scrollBy(0, 50);
+ck("scrollBy adds", window.scrollY, 250);
+window.scrollTo(0, 0);
+ck("scrollTo back to 0", window.scrollY, 0);
+
+/* ---- scrollIntoView ---- */
+document.getElementById("target").scrollIntoView();
+ck("scrollIntoView scrolled down", window.scrollY > 0, true);
+window.scrollTo(0, 0);
+
+/* ---- element.scrollTop ---- */
+var sc = document.getElementById("scroller");
+sc.scrollTop = 40;
+ck("element scrollTop set", sc.scrollTop, 40);
+sc.scrollTop = 0;
+
+/* ---- hashchange ---- */
+location.hash = "#one";
+ck("hashchange fired", hashFired, 1);
+ck("hash value", location.hash, "#one");
+
+/* ---- popstate ---- */
+history.pushState({a: 1}, "", "#two");
+history.back();
+ck("popstate fired", popFired, 1);
+
+/* scroll events dispatched by scrollTo */
+ck("scroll event fired", scrollFired > 0, true);
+
+/* finish after DOMContentLoaded so the flag is settled */
+setTimeout(function () {
+  ck("DOMContentLoaded fired", dclFired, 1);
+  finish();
+}, 10);
+</script>
+</body>
+</html>

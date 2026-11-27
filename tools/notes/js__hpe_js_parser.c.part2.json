@@ -1,0 +1,442 @@
+{
+  "chunk_read_hex": {
+    "brief": "从模板文本块读取 `\\xHH`（maxk=2）或 `\\uXXXX`（maxk=4）/ Read `\\xHH` (maxk=2) or `\\uXXXX` (maxk=4) from a template chunk",
+    "params": {
+      "i": "inout:读取游标 / Read cursor",
+      "maxk": "最多读取的数位个数 / Maximum number of digits to read"
+    },
+    "return": "读到的码点 / The accumulated code point",
+    "see": "decode_chunk"
+  },
+  "chunk_read_hex_braced": {
+    "brief": "读取 `\\u{XXXXX}` 花括号形式 / Read the braced `\\u{XXXXX}` form",
+    "params": { "i": "inout:读取游标 / Read cursor" },
+    "return": "读到的码点 / The accumulated code point",
+    "note": "闭合花括号在此一并消费 / The closing brace is consumed here"
+  },
+  "chunk_out_cp": {
+    "brief": "把一个码点以 UTF-8 追加到输出 / Append one code point to the output in UTF-8",
+    "params": {
+      "cap": "输出缓冲区容量 / Output buffer capacity",
+      "o": "inout:已写出的字节数 / Bytes already written",
+      "cp": "待写入的码点 / Code point to write"
+    },
+    "note": "ASCII 直接写一字节；其余走 `hpe_utf8_encode`，空间不足时丢弃 / ASCII is written directly; others go through `hpe_utf8_encode` and are dropped when the buffer is full"
+  },
+  "chunk_escape": {
+    "brief": "解码模板文本块中的一个转义序列 / Decode one escape sequence in a template chunk",
+    "params": {
+      "i": "inout:读取游标 / Read cursor",
+      "cap": "输出缓冲区容量 / Output buffer capacity",
+      "o": "inout:已写出的字节数 / Bytes already written"
+    },
+    "note": "前导反斜杠已消费；`\\n` 续行不输出任何字符 / The leading backslash is consumed; a `\\n` line continuation emits nothing",
+    "see": "chunk_read_hex, chunk_out_cp"
+  },
+  "decode_chunk": {
+    "brief": "解码一个模板文本块的全部转义 / Decode all escapes of one template chunk",
+    "return": "写出的字节数 / The number of bytes written",
+    "note": "输出始终以 NUL 结尾 / The output is always NUL-terminated",
+    "see": "chunk_escape"
+  },
+  "parse_sub_expression": {
+    "brief": "把独立表达式源码解析成 AST / Parse a standalone expression source into an AST",
+    "params": {
+      "len": "源码长度 / Source length"
+    },
+    "return": "表达式根节点 / The expression root node",
+    "note": "用于 `${...}` 替换体；末尾若还有词法单元则报错 / Used for `${...}` substitutions; leftover tokens raise an error"
+  },
+  "p_template_add_chunk": {
+    "brief": "向模板节点的 cooked 块列表追加一块 / Append one cooked chunk to a template node",
+    "params": {
+      "node": "模板节点 / The template node",
+      "start": "块起始下标 / Chunk start offset",
+      "end": "块结束下标 / Chunk end offset"
+    },
+    "note": "偏移相对 `s`；解码转义后作为 `JS_N_STR` 加入 `node->kids[0]` / Offsets are relative to `s`; the decoded text is added as a `JS_N_STR` into `node->kids[0]`",
+    "see": "decode_chunk"
+  },
+  "p_template_scan_sub": {
+    "brief": "越过 `${ … }` 替换体（跳过嵌套花括号/模板/字符串）/ Advance past a `${ … }` substitution, skipping nested braces, templates and strings",
+    "params": {
+      "es": "替换体起始下标（`${` 之后）/ Substitution start offset (past `${`)"
+    },
+    "return": "越过闭合 `}` 的下标 / The index just past the closing `}`",
+    "see": "p_template"
+  },
+  "p_template": {
+    "brief": "把 `T_TEMPLATE` 词法单元展开为模板节点 / Expand a `T_TEMPLATE` token into a template node",
+    "return": "`JS_N_TEMPLATE` 节点（cooked 块 + 各替换表达式）/ A `JS_N_TEMPLATE` node (cooked chunks plus substitution expressions)",
+    "note": "kids[0] 为 cooked 块列表，其后为每个 `${}` 的表达式 / `kids[0]` is the cooked-chunk list, followed by one expression per `${}`",
+    "see": "p_template_add_chunk, p_template_scan_sub, parse_sub_expression"
+  },
+  "p_function": {
+    "brief": "解析 `function [name](params) { body }` / Parse `function [name](params) { body }`",
+    "params": {
+      "need_name": "必须有名返回 1 / 1 when a name is required",
+      "is_async": "async 函数为 1 / 1 for an async function",
+      "is_gen": "生成器为 1 / 1 for a generator"
+    },
+    "return": "`JS_N_FUNC` 节点（op 为 `FN_*` 标志，kids[0] 参数、kids[1] 函数体）/ A `JS_N_FUNC` node (op holds `FN_*` flags; kids[0] params, kids[1] body)",
+    "note": "调用时当前词法单元须为 `function` / The current token must be `function`",
+    "see": "p_arrow_from_params"
+  },
+  "p_arrow_from_params": {
+    "brief": "由已解析的参数构造箭头函数 / Build an arrow function from already-parsed parameters",
+    "params": {
+      "is_async": "async 箭头为 1 / 1 for an async arrow"
+    },
+    "return": "`JS_N_FUNC` 节点（带 `FN_ARROW`）/ A `JS_N_FUNC` node carrying `FN_ARROW`",
+    "note": "当前词法单元须为 `=>`；非块体转为 `return expr` / The current token must be `=>`; a non-block body becomes `return expr`",
+    "see": "p_function"
+  },
+  "p_paren_arrow": {
+    "brief": "判断 pos 处的 `(` 是否为箭头函数参数表 / Test whether the `(` at `pos` introduces arrow parameters",
+    "params": { "pos": "`(` 所在词法单元下标 / Token index of the `(`" },
+    "return": "是箭头参数表返回 1，否则 0 / 1 when it is an arrow parameter list, otherwise 0",
+    "note": "用配对扫描做前瞻 / Uses a balanced-scan lookahead"
+  },
+  "p_arrow_params": {
+    "brief": "解析 `(params)` 箭头参数表 / Parse a `(params)` arrow parameter list",
+    "return": "参数块节点（`JS_N_BLOCK`）/ A parameter block node (`JS_N_BLOCK`)",
+    "see": "p_arrow_from_params"
+  },
+  "p_private_name": {
+    "brief": "解析类私有名 `#name` / Parse a private class name `#name`",
+    "params": { "out": "out:接收 `#name` 字符串 / Receives the `#name` string" },
+    "return": "匹配并消费返回 1，否则 0 / 1 when matched and consumed, otherwise 0",
+    "note": "结果从 arena 分配 / The result is allocated from the arena"
+  },
+  "p_property_name": {
+    "brief": "解析一个属性名（含计算名与私有名）/ Parse a property name (computed and private included)",
+    "params": {
+      "out": "out:接收静态属性名字符串 / Receives the static property name string",
+      "computed": "out:接收 `[expr]` 计算名节点，无则置 `NULL` / Receives the `[expr]` computed node, set to `NULL` when absent"
+    },
+    "return": "解析成功返回 1，否则 0 / 1 on success, otherwise 0",
+    "note": "覆盖标识符/字符串/数字键、`[expr]` 与 `#private` / Covers identifier/string/number keys, `[expr]` and `#private`"
+  },
+  "p_obj_accessor_flags": {
+    "brief": "识别对象方法的 `get`/`set` 前缀 / Recognise the `get`/`set` prefixes of an object method",
+    "params": { "f": "inout:成员标志 / Member flags" },
+    "note": "仅当后面跟着名字（非 `:`/`,`/`}`/`(`）才生效，使 `{get: 1}`、`{get}` 保持普通属性 / Only applies when a name follows (not `:`/`,`/`}`/`(`), keeping `{get: 1}` and `{get}` plain properties",
+    "see": "p_obj_member_prefix"
+  },
+  "p_obj_async_prefix": {
+    "brief": "识别对象方法的 `async` / `async *` 前缀 / Recognise the `async` / `async *` prefixes of an object method",
+    "params": { "f": "inout:成员标志 / Member flags" },
+    "see": "p_obj_member_prefix"
+  },
+  "p_obj_member_prefix": {
+    "brief": "识别一个对象属性前的全部成员修饰前缀 / Detect all member-modifier prefixes of one object property",
+    "params": { "f": "out:成员标志 / Member flags" },
+    "note": "依次处理 `async`、`get`/`set` 与 `*` / Handles `async`, `get`/`set` and `*` in order",
+    "see": "p_obj_async_prefix, p_obj_accessor_flags"
+  },
+  "p_obj_method": {
+    "brief": "解析 `key(...) { … }` 方法简写 / Parse the `key(...) { … }` method shorthand",
+    "params": {
+      "obj": "inout:对象节点 / The object node",
+      "key": "属性名 / Property name",
+      "computed": "计算名节点，可为 `NULL` / Computed-name node, may be `NULL`"
+    },
+    "note": "访问器/方法标志写入 `pair->op` 与函数 op / Accessor/method flags go into `pair->op` and the function's op",
+    "see": "p_object_props"
+  },
+  "p_obj_colon_prop": {
+    "brief": "解析 `key: value` 数据属性 / Parse a `key: value` data property",
+    "params": {
+      "obj": "inout:对象节点 / The object node",
+      "key": "属性名 / Property name",
+      "computed": "计算名节点，可为 `NULL` / Computed-name node, may be `NULL`"
+    },
+    "note": "字面量 `__proto__` 被识别为原型属性 / A literal `__proto__` is recognised as a prototype property"
+  },
+  "p_obj_shorthand_prop": {
+    "brief": "解析 `key` 或 `key = default` 简写属性 / Parse a `key` or `key = default` shorthand property",
+    "params": {
+      "obj": "inout:对象节点 / The object node",
+      "key": "属性名 / Property name"
+    },
+    "note": "带默认值的形式仅用于解构 / The defaulted form is only valid in destructuring"
+  },
+  "p_object_props": {
+    "brief": "解析对象字面量的成员列表 / Parse the member list of an object literal",
+    "params": { "obj": "inout:对象节点 / The object node" },
+    "note": "支持 `...spread`、方法、访问器、简写与计算名；`{` 已被消费 / Supports `...spread`, methods, accessors, shorthands and computed names; the `{` is already consumed",
+    "see": "p_obj_method, p_obj_colon_prop, p_obj_shorthand_prop"
+  },
+  "p_next_ends_member": {
+    "brief": "判断下一个词法单元是否结束成员名 / Test whether the next token ends a member name",
+    "return": "下一词法单元为 `(`、`=` 或 `;` 返回 1，否则 0 / 1 when the next token is `(`, `=` or `;`, otherwise 0",
+    "note": "若是，则前面的单词是普通字段名而非修饰关键字 / If so, the preceding word is a plain field name rather than a modifier keyword"
+  },
+  "p_class_static_prefix": {
+    "brief": "识别类成员的 `static` 前缀 / Recognise the `static` prefix of a class member",
+    "params": { "f": "inout:成员标志 / Member flags" },
+    "note": "`static` 后面为 `(`/`=` 时不当作前缀 / `static` followed by `(`/`=` is not treated as a prefix",
+    "see": "p_class_member_prefix"
+  },
+  "p_class_member_prefix": {
+    "brief": "收集一个类成员前的全部修饰前缀 / Collect all modifier prefixes preceding one class member",
+    "params": { "f": "out:成员标志 / Member flags" },
+    "note": "处理 `static`、`async`、`*` 与 `get`/`set` / Handles `static`, `async`, `*` and `get`/`set`",
+    "see": "p_class_static_prefix"
+  },
+  "p_class_static_block": {
+    "brief": "解析 `static { … }` 类静态初始化块 / Parse a `static { … }` class initialiser block",
+    "params": { "members": "inout:类成员列表 / The class member list" },
+    "note": "语句被加入以 `JS_STATIC_BLOCK` 标记的块节点 / Statements go into a block node flagged `JS_STATIC_BLOCK`"
+  },
+  "p_class_method_kind": {
+    "brief": "判定类成员的方法种类标签 / Compute the method-kind tag of a class member",
+    "params": {
+      "key": "成员名 / Member name",
+      "f": "成员标志 / Member flags",
+      "computed": "计算名节点，可为 `NULL` / Computed-name node, may be `NULL`"
+    },
+    "return": "`JS_METHOD_GET`/`SET`/`STATIC`/`CTOR` 或 `JS_METHOD` / One of `JS_METHOD_GET`/`SET`/`STATIC`/`CTOR` or `JS_METHOD`",
+    "note": "非计算名且名字为 `constructor` 视为构造器 / A `constructor` name that is not computed counts as the constructor"
+  },
+  "p_class_method": {
+    "brief": "解析 `name(params) { … }` 类方法（或构造器）/ Parse a `name(params) { … }` class method (or constructor)",
+    "params": {
+      "members": "inout:类成员列表 / The class member list",
+      "key": "方法名 / Method name",
+      "computed": "计算名节点，可为 `NULL` / Computed-name node, may be `NULL`",
+      "f": "成员标志 / Member flags"
+    },
+    "note": "构造器叠加 `FN_CTOR`；方法种类写入 `fn->num` / The constructor adds `FN_CTOR`; the method kind lands in `fn->num`",
+    "see": "p_class_body, p_class_method_kind"
+  },
+  "p_class_field": {
+    "brief": "解析 `name = value;` 类字段（值可省）/ Parse a `name = value;` class field (value optional)",
+    "params": {
+      "members": "inout:类成员列表 / The class member list",
+      "key": "字段名 / Field name",
+      "computed": "计算名节点，可为 `NULL` / Computed-name node, may be `NULL`",
+      "f": "成员标志 / Member flags"
+    },
+    "note": "静态字段用 `JS_MEMBER_STATIC_FIELD`，实例字段用 `JS_MEMBER_FIELD` / Static fields use `JS_MEMBER_STATIC_FIELD`, instance fields `JS_MEMBER_FIELD`",
+    "see": "p_class_body"
+  },
+  "p_class_body": {
+    "brief": "解析类体（`{` 为当前词法单元）/ Parse a class body (the `{` is current)",
+    "params": { "cls": "inout:类节点 / The class node" },
+    "note": "成员列表加入 `cls`；`;` 空成员被跳过 / The member list is added to `cls`; empty `;` members are skipped",
+    "see": "p_class_method, p_class_field, p_class_static_block"
+  },
+  "p_class": {
+    "brief": "解析 `class [name] [extends expr] { body }` / Parse `class [name] [extends expr] { body }`",
+    "return": "`JS_N_CLASS` 节点 / A `JS_N_CLASS` node",
+    "note": "调用时当前词法单元须为 `class`；kids[0] 为父类或 `NULL` / The current token must be `class`; kids[0] holds the superclass or `NULL`",
+    "see": "p_class_body"
+  },
+  "p_call_args": {
+    "brief": "解析 CallExpression 的 `(arg, ...spread)` 实参表 / Parse the `(arg, ...spread)` argument list of a call",
+    "params": { "call": "inout:调用节点 / The call node" },
+    "note": "实参逐个加入 `call`；`...spread` 包成 `JS_N_SPREAD` / Arguments are added to `call`; `...spread` becomes a `JS_N_SPREAD`",
+    "see": "p_member_tail, p_super_expr"
+  },
+  "p_member_dot": {
+    "brief": "解析 `.name` / `.#private` 成员访问 / Parse a `.name` / `.#private` member access",
+    "params": { "base": "被访问的基础表达式 / The base expression" },
+    "return": "`JS_N_MEMBER` 节点 / A `JS_N_MEMBER` node",
+    "note": "调用时当前词法单元须为 `.` 且属性名紧随 / The current token must be `.` with the property name right after"
+  },
+  "p_member_index": {
+    "brief": "解析 `[expr]` 下标访问 / Parse a `[expr]` index access",
+    "params": {
+      "base": "被访问的基础表达式 / The base expression",
+      "optional": "可选链访问为 1 / 1 for an optional-chain access"
+    },
+    "return": "`JS_N_MEMBER` 节点 / A `JS_N_MEMBER` node"
+  },
+  "p_member_optional": {
+    "brief": "解析 `?.` 可选访问（调用/下标/点名）/ Parse a `?.` optional access (call, index or dotted name)",
+    "params": {
+      "base": "被访问的基础表达式 / The base expression",
+      "allow_call": "允许调用为 1 / 1 to allow a call"
+    },
+    "return": "可选调用、可选下标或可选成员节点 / An optional call, optional index or optional member node",
+    "note": "调用时当前词法单元须为 `?.` / The current token must be `?.`"
+  },
+  "p_member_tail": {
+    "brief": "解析 MemberExpression 的尾部链 / Parse the tail chain of a MemberExpression",
+    "params": {
+      "base": "基础表达式 / The base expression",
+      "allow_call": "允许 `(args)` 调用为 1 / 1 to allow `(args)` calls"
+    },
+    "return": "链接完成后的表达式节点 / The fully chained expression node",
+    "note": "`new` 以 allow_call=0 解析被调者，使 `new Date(0).getTime()` 绑定为 `(new Date(0)).getTime()` / `new` parses its callee with calls disabled so `new Date(0).getTime()` binds as `(new Date(0)).getTime()`",
+    "see": "p_member_dot, p_member_index, p_member_optional"
+  },
+  "p_super_expr": {
+    "brief": "解析 `super` 后的 `(args)`、`.name` 或 `[expr]` / Parse `super` followed by `(args)`, `.name` or `[expr]`",
+    "return": "`JS_N_SUPER_CALL` 或 `JS_N_SUPER_MEMBER` 节点 / A `JS_N_SUPER_CALL` or `JS_N_SUPER_MEMBER` node",
+    "warning": "`super` 后不是 `(`/`.`/`[` 时报错 / Errors when `super` is not followed by `(`, `.` or `[`"
+  },
+  "p_async_expr": {
+    "brief": "解析 async 函数/箭头形式 / Parse the async function or async arrow forms",
+    "return": "`JS_N_FUNC` 节点；不是 async 形式时返回 `NULL` / A `JS_N_FUNC` node, or `NULL` when it is not an async form",
+    "note": "覆盖 `async function`、`async x =>` 与 `async (…) =>` / Covers `async function`, `async x =>` and `async (…) =>`",
+    "see": "p_ident_primary"
+  },
+  "p_import_meta": {
+    "brief": "解析 `import.meta` / Parse `import.meta`",
+    "return": "一个 `JS_N_OBJECT` 节点（占位对象）/ A `JS_N_OBJECT` node (a placeholder object)",
+    "note": "动态 `import()` 不受支持 / Dynamic `import()` is not supported"
+  },
+  "p_single_arrow": {
+    "brief": "构造单参数箭头 `name => ...` / Build a single-parameter arrow `name => ...`",
+    "params": {
+      "name": "参数名 / Parameter name",
+      "is_async": "async 箭头为 1 / 1 for an async arrow"
+    },
+    "return": "`JS_N_FUNC` 节点 / A `JS_N_FUNC` node",
+    "see": "p_arrow_from_params"
+  },
+  "p_ident_primary": {
+    "brief": "解析由关键字引导的初级表达式 / Resolve keyword-led primary expressions",
+    "return": "字面量、super、function/class、箭头等节点；普通标识符返回 `NULL` / A literal, `super`, function/class or arrow node; `NULL` means a plain identifier",
+    "note": "覆盖 `true`/`false`/`null`/`this`/`super`/`function`/`async`/`class`/`new`/`import.meta` 与单参箭头 / Covers `true`/`false`/`null`/`this`/`super`/`function`/`async`/`class`/`new`/`import.meta` and single-parameter arrows",
+    "see": "p_primary"
+  },
+  "p_array_literal": {
+    "brief": "解析带空位与展开的 `[…]` 数组字面量 / Parse a `[…]` array literal with holes and spread",
+    "return": "`JS_N_ARRAY` 节点 / A `JS_N_ARRAY` node"
+  },
+  "p_paren_expr": {
+    "brief": "解析 `(expr)` 或括号化箭头参数表 / Parse `(expr)` or a parenthesised arrow parameter list",
+    "return": "括起的表达式节点，或箭头函数节点 / The parenthesised expression, or an arrow function node",
+    "see": "p_paren_arrow, p_arrow_params"
+  },
+  "p_primary": {
+    "brief": "解析初级表达式 / Parse a primary expression",
+    "return": "数字、字符串、正则、模板、标识符、括号、数组或对象字面量节点 / A number, string, regex, template, identifier, parenthesised, array or object literal node",
+    "warning": "遇到 `T_EOF` 或意外词法单元时报错 / Errors on `T_EOF` or an unexpected token",
+    "see": "p_ident_primary, p_paren_expr, p_array_literal"
+  },
+  "p_postfix": {
+    "brief": "解析后缀 `++`/`--` 表达式 / Parse a postfix `++`/`--` expression",
+    "return": "更新表达式节点或初级表达式结果 / An update-expression node, or the primary result",
+    "note": "仅当运算符与操作数同行时才算后缀更新 / Only counts as a postfix update when the operator is on the same line as its operand"
+  },
+  "p_unwrap_prefix": {
+    "brief": "构造包裹操作数的前缀一元节点 / Build a prefix unary node wrapping its operand",
+    "params": {
+      "kind": "节点种类（`JS_N_UN`、`JS_N_AWAIT` 等）/ Node kind (`JS_N_UN`, `JS_N_AWAIT`, …)",
+      "op": "运算符码 / Operator code"
+    },
+    "return": "新建的一元节点 / The new unary node"
+  },
+  "p_yield": {
+    "brief": "解析 `yield [*] [expr]` / Parse `yield [*] [expr]`",
+    "return": "`JS_N_YIELD` 节点 / A `JS_N_YIELD` node",
+    "note": "`yield*` 置 `op=1`；其后为终止符或换行时省略操作数 / `yield*` sets `op=1`; the operand is omitted when a terminator or a newline follows"
+  },
+  "p_new_expr": {
+    "brief": "解析 `new` 表达式（被调者、实参与方法尾）/ Parse a `new` expression (callee, arguments and method tail)",
+    "return": "`JS_N_NEW` 或更外层的成员/调用节点 / A `JS_N_NEW` node, possibly wrapped by further member/call nodes",
+    "note": "以 allow_call=0 解析被调者，使后续 `(...)` 归属于 `new` / The callee is parsed with calls disabled so a following `(...)` belongs to `new`",
+    "see": "p_member_tail"
+  },
+  "p_unary": {
+    "brief": "解析一元表达式 / Parse a unary expression",
+    "return": "一元、更新、`yield`、`new` 或后缀表达式的结果节点 / The result of a unary, update, `yield`, `new` or postfix expression",
+    "note": "覆盖 `! - + ~ typeof void delete await yield new` 与前置 `++`/`--` / Covers `! - + ~ typeof void delete await yield new` and prefix `++`/`--`",
+    "see": "p_unwrap_prefix, p_yield, p_new_expr, p_postfix"
+  },
+  "p_bin_make": {
+    "brief": "构造一个二元运算节点 / Build a binary-operation node",
+    "params": {
+      "code": "运算符码 / Operator code",
+      "l": "左操作数 / Left operand",
+      "r": "右操作数 / Right operand"
+    },
+    "return": "`JS_N_BIN` 节点 / A `JS_N_BIN` node"
+  },
+  "p_exp": {
+    "brief": "解析指数运算 `**`（右结合）/ Parse the exponentiation operator `**` (right-associative)",
+    "return": "一元表达式或指数节点 / A unary expression or an exponentiation node",
+    "see": "p_unary"
+  },
+  "p_mul": {
+    "brief": "解析乘性运算 `* / %` / Parse the multiplicative operators `* / %`",
+    "return": "乘法层的表达式节点 / The multiplicative-level expression node",
+    "see": "p_exp"
+  },
+  "p_add": {
+    "brief": "解析加减运算 `+ -` / Parse the additive operators `+ -`",
+    "return": "加法层的表达式节点 / The additive-level expression node",
+    "see": "p_mul"
+  },
+  "p_shift": {
+    "brief": "解析移位运算 `<< >> >>>` / Parse the shift operators `<< >> >>>`",
+    "return": "移位层的表达式节点 / The shift-level expression node",
+    "see": "p_add"
+  },
+  "p_rel": {
+    "brief": "解析关系与成员运算 `< > <= >= instanceof in` / Parse relational and membership operators `< > <= >= instanceof in`",
+    "return": "关系层的表达式节点 / The relational-level expression node",
+    "see": "p_shift"
+  },
+  "p_eq": {
+    "brief": "解析相等运算 `== != === !==` / Parse the equality operators `== != === !==`",
+    "return": "相等层的表达式节点 / The equality-level expression node",
+    "see": "p_rel"
+  },
+  "p_band": {
+    "brief": "解析按位与 `&` / Parse bitwise AND, `&`",
+    "return": "按位与层的表达式节点 / The bitwise-AND-level expression node",
+    "see": "p_eq"
+  },
+  "p_bxor": {
+    "brief": "解析按位异或 `^` / Parse bitwise XOR, `^`",
+    "return": "按位异或层的表达式节点 / The bitwise-XOR-level expression node",
+    "see": "p_band"
+  },
+  "p_bor": {
+    "brief": "解析按位或 `|` / Parse bitwise OR, `|`",
+    "return": "按位或层的表达式节点 / The bitwise-OR-level expression node",
+    "see": "p_bxor"
+  },
+  "p_and": {
+    "brief": "解析逻辑与 `&&` / Parse logical AND, `&&`",
+    "return": "逻辑与层的表达式节点 / The logical-AND-level expression node",
+    "see": "p_bor"
+  },
+  "p_or": {
+    "brief": "解析逻辑或 `||` / Parse logical OR, `||`",
+    "return": "逻辑或层的表达式节点 / The logical-OR-level expression node",
+    "see": "p_and"
+  },
+  "p_nullish": {
+    "brief": "解析空值合并 `??`（右结合）/ Parse the nullish-coalescing operator `??` (right-associative)",
+    "return": "空值合并层的表达式节点 / The nullish-coalescing-level expression node",
+    "see": "p_or"
+  },
+  "p_ternary": {
+    "brief": "解析条件（三元）表达式 `?:` / Parse the conditional (ternary) expression `?:`",
+    "return": "`JS_N_TERNARY` 节点或条件表达式 / A `JS_N_TERNARY` node or the condition expression",
+    "see": "p_nullish, p_assignment"
+  },
+  "p_assignment": {
+    "brief": "解析赋值表达式 / Parse an assignment expression",
+    "return": "`JS_N_ASSIGN` 节点或三元表达式 / A `JS_N_ASSIGN` node or the ternary expression",
+    "note": "覆盖 `=` 与全部复合赋值（含 `&&=`/`||=`/`??=`）；右结合 / Covers `=` and every compound assignment (including `&&=`, `||=`, `??=`); right-associative",
+    "see": "p_ternary"
+  },
+  "p_expr": {
+    "brief": "解析（逗号）表达式 / Parse a (comma) expression",
+    "return": "`JS_N_SEQ` 序列节点，或单个赋值表达式 / A `JS_N_SEQ` sequence node, or a single assignment expression",
+    "see": "p_assignment"
+  },
+  "p_assign_target": {
+    "brief": "解析 for 头部的赋值目标 / Parse the target of a `for` head",
+    "return": "表达式节点 / The expression node",
+    "note": "当前等同于 `p_expr`，形参与解构在 `p_binding_target` 处理 / Currently equivalent to `p_expr`; destructuring is handled by `p_binding_target`",
+    "see": "p_expr"
+  }
+}

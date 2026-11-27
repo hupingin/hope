@@ -1211,3 +1211,4 @@ int hpe_color_parse(const char *s, HpeColor *out)
         return color_parse_hsl(s, out);
     return color_parse_named(s, len, out);
 }
+

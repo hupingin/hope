@@ -6,19 +6,40 @@
 #include <string.h>
 
 #include "base/hpe_util.h"
+#include "canvas/hpe_canvas.h"
 #include "css/hpe_css.h"
 #include "dom/hpe_dom.h"
 #include "hope_internal.h"
+#include "hope_form.h"
+#include "hope_details.h"
 #include "html/hpe_encoding.h"
 #include "paint/hpe_svg.h"
 #include "html/hpe_html.h"
 #include "js/hpe_js.h"
 #include "js/hpe_js_dom.h"
+#include "js/hpe_js_selection.h"
 #include "layout/hpe_layout.h"
 #include "paint/hpe_paint.h"
+#include "paint/hpe_paint_form.h"
+#include "paint/hpe_paint_details.h"
 #include "platform/hpe_platform.h"
 #include "render/hpe_emoji.h"
 #include "render/hpe_image.h"
+
+static void hope_form_hook(void *ud, HpeDomNode *form, int kind);
+static void hope_dialog_hook(void *ud, HpeDomNode *dialog, int kind);
+static void hope_scroll_hook(void *ud, HpeDomNode *node, int kind, float x, float y);
+static float hope_scroll_getter(void *ud, HpeDomNode *node, int axis);
+static void hope_canvas_invalidate(void);
+static void hope_sel_get(void *ud, HpeDomNode **anchor, int *anchor_off, HpeDomNode **focus,
+                         int *focus_off);
+static void hope_sel_set(void *ud, HpeDomNode *anchor, int anchor_off, HpeDomNode *focus,
+                         int focus_off);
+static void hope_sel_clear(void *ud);
+static void type_into_by_id(HpeEngine *engine, const char *spec);
+static void form_snap_by_id(HpeEngine *engine, const char *id);
+/* the engine instance canvas invalidation marks dirty (single-instance API) */
+static HpeEngine *g_canvas_engine = NULL;
 
 #define HPE_MAX_SCRIPTS 64
 
@@ -229,7 +250,7 @@ static int is_style_host(HpeDomNode *n)
         return 0;
     if (n->type == HPE_NODE_ELEMENT)
         return strcmp(n->tag, "style") == 0 || strcmp(n->tag, "link") == 0;
-    if (n->type == HPE_NODE_TEXT && n->parent)
+    if (n->type == HPE_NODE_TEXT && n->parent && n->parent->tag)
         return strcmp(n->parent->tag, "style") == 0;
     return 0;
 }
@@ -339,6 +360,10 @@ static int reflow_for_attr(HpeDomNode *target, const char *name, const char *old
         return reflow_for_inline_style(old_value, new_value);
     }
     if (hpe_str_ieq(name, "class") || hpe_str_ieq(name, "id"))
+        return HPE_REFLOW_LAYOUT;
+    /* `open` drives <details> child visibility and <dialog> display via the
+     * `dialog[open]` UA rule, so it changes geometry. */
+    if (hpe_str_ieq(name, "open"))
         return HPE_REFLOW_LAYOUT;
     return HPE_REFLOW_NONE;
 }
@@ -878,6 +903,38 @@ static void run_one_script(HpeEngine *engine, HpeDomNode *node, const char *dir)
 }
 
 /**
+ * @brief 把 DOM/表单/滚动/canvas 等钩子接入新建的 JS 上下文 / Wire DOM, form, scroll and canvas hooks into the fresh JS context
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ *
+ * @note 在 `hpe_js_dom_install` 之后调用；脚本里的 focus/layout/form/dialog/scroll/canvas/选区操作据此回传引擎 / Called after `hpe_js_dom_install`; script-side focus/layout/form/dialog/scroll/canvas/selection calls route back into the engine through these
+ */
+static void install_script_hooks(HpeEngine *engine)
+{
+    static HpeJsSelApi sel_api;
+    /* `el.focus()` / `el.blur()` keep `:focus` and relayout in sync */
+    hpe_js_dom_set_focus_hook(engine->js, hope_focus_hook, engine);
+    /* geometry getters (offsetWidth & friends) force a layout, like browsers */
+    hpe_js_dom_set_layout_hook(engine->js, hope_layout_hook, engine);
+    /* `getBoundingClientRect` needs the viewport size and scroll offsets */
+    hpe_js_dom_set_viewport_hook(engine->js, hope_viewport_hook, engine);
+    /* `form.submit()` / `form.reset()` route into the engine form world */
+    hpe_js_dom_set_form_hook(hope_form_hook, engine);
+    /* `dialog.show()` / `showModal()` / `close()` drive the modal top layer */
+    hpe_js_dom_set_dialog_hook(hope_dialog_hook, engine);
+    /* scrollTo/scrollBy/scrollIntoView/scrollTop route back into the engine */
+    hpe_js_dom_set_scroll_hook(hope_scroll_hook, engine);
+    hpe_js_dom_set_scroll_getter(hope_scroll_getter, engine);
+    /* 2D canvas drawing marks the frame dirty even without a DOM mutation */
+    hpe_canvas_set_invalidate(hope_canvas_invalidate);
+    sel_api.ud = engine;
+    sel_api.get = hope_sel_get;
+    sel_api.set = hope_sel_set;
+    sel_api.clear = hope_sel_clear;
+    hpe_js_sel_set_api(&sel_api);
+}
+
+/**
  * @brief 重建 JS 上下文并执行文档内全部脚本 / Rebuild the JS context and run every script in the document
  *
  * @param[in,out] engine 引擎实例 / Engine instance
@@ -904,13 +961,7 @@ static void run_scripts(HpeEngine *engine)
 
     engine->js = hpe_js_create();
     hpe_js_dom_install(engine->js, engine->doc);
-    /* `el.focus()` / `el.blur()` from script route back into the engine so the
-     * `:focus` selector and the relayout stay in sync with the script view */
-    hpe_js_dom_set_focus_hook(engine->js, hope_focus_hook, engine);
-    /* geometry getters (offsetWidth & friends) force a layout, like browsers */
-    hpe_js_dom_set_layout_hook(engine->js, hope_layout_hook, engine);
-    /* `getBoundingClientRect` needs the viewport size and scroll offsets */
-    hpe_js_dom_set_viewport_hook(engine->js, hope_viewport_hook, engine);
+    install_script_hooks(engine);
 
     hpe_path_dir(engine->path ? engine->path : ".", dir, sizeof(dir));
     hpe_js_set_current_dir(engine->js, dir);
@@ -920,6 +971,9 @@ static void run_scripts(HpeEngine *engine)
 
     for (i = 0; i < count; i++)
         run_one_script(engine, scripts[i], dir);
+    /* the document and its scripts are parsed: fire DOMContentLoaded on the
+     * document node (window listeners share it) as browsers do */
+    hpe_js_dom_dispatch_self(engine->js, engine->doc, "DOMContentLoaded", NULL);
 }
 
 /**
@@ -991,6 +1045,8 @@ HpeEngine *hpe_engine_create(int width, int height)
     engine->chrome_hover_btn = -1;
     engine->tab_count = 1; /* the start document lives in tab 0 */
     engine->tabs[0].used = 1;
+    hpe_anim_install(engine); /* register the post-cascade animation hook */
+    g_canvas_engine = engine;
     hpe_pixmap_init(&engine->pm, engine->width, engine->height);
     snprintf(engine->status, sizeof(engine->status), "hope: ready");
     return engine;
@@ -1010,6 +1066,8 @@ void hpe_engine_destroy(HpeEngine *engine)
     if (!engine)
         return;
     hpe_dom_clear_mutation_sinks();
+    hpe_canvas_shutdown();
+    g_canvas_engine = NULL;
     if (engine->root)
         hpe_layout_free(engine->root);
     if (engine->doc)
@@ -1026,6 +1084,8 @@ void hpe_engine_destroy(HpeEngine *engine)
     hpe_font_shutdown();
     hpe_emoji_shutdown();
     hpe_sel_shutdown(engine);
+    hpe_anim_shutdown(engine);
+    hpe_form_shutdown(engine);
     hpe_free(engine);
 }
 
@@ -1061,6 +1121,247 @@ static void reset_document(HpeEngine *engine, const char *path)
     hpe_css_init(&engine->sheet); /* user agent styles */
     /* the old DOM is about to be freed: drop the selection that references it */
     hpe_sel_reset(engine);
+    /* the old DOM goes with it: zero the animation clock and its node states */
+    hpe_anim_reset(engine);
+    /* drop the form editing state and the value snapshot it holds */
+    if (engine->form_value0) {
+        hpe_free(engine->form_value0);
+        engine->form_value0 = NULL;
+    }
+    engine->form_focus = NULL;
+    engine->form_caret = 0;
+    /* a modal <dialog> belongs to the old document */
+    hpe_dialog_set_modal(NULL);
+    /* canvas surfaces belong to the old document's DOM nodes */
+    hpe_canvas_shutdown();
+}
+
+/**
+ * @brief `form.submit()` / `form.reset()` 的引擎侧回调 / Engine-side callback for `form.submit()` / `form.reset()`
+ *
+ * @param[in,out] ud 引擎实例 / Engine instance
+ * @param[in,out] form 目标 form 元素 / The target form element
+ * @param[in]     kind 0 = `submit`（绕过事件跳转 `action`），1 = `reset`（恢复默认值）/ 0 = `submit` (navigate to `action` bypassing events), 1 = `reset` (restore defaults)
+ */
+static void hope_form_hook(void *ud, HpeDomNode *form, int kind)
+{
+    HpeEngine *engine = (HpeEngine *)ud;
+    const char *action;
+
+    if (!engine || !form)
+        return;
+    if (kind == 0) {
+        action = hpe_dom_attr(form, "action");
+        if (action && *action)
+            hpe_engine_load_file(engine, action);
+    } else if (kind == 1) {
+        hpe_form_reset(engine->doc, form);
+    }
+}
+
+/**
+ * @brief 2D canvas 绘制后的重绘通知 / Repaint notification after 2D canvas drawing
+ */
+static void hope_canvas_invalidate(void)
+{
+    if (g_canvas_engine)
+        g_canvas_engine->dirty = HPE_DIRTY_FULL;
+}
+
+/**
+ * @brief `<dialog>` show/showModal/close 的引擎侧实现 / Engine-side behaviour for `<dialog>` show/showModal/close
+ *
+ * @param[in,out] ud 引擎实例 / Engine instance
+ * @param[in,out] dialog 目标 `<dialog>` / The target `<dialog>`
+ * @param[in]     kind 0 = show（非模态），1 = showModal（模态），2 = close / 0 = show, 1 = showModal, 2 = close
+ *
+ * @note 模态状态由 `hpe_dialog_set_modal` 记录，绘制层据此画遮罩；close 派发 `close` 事件 / Modal state is tracked by `hpe_dialog_set_modal` for the backdrop; close fires a `close` event
+ */
+static void hope_dialog_hook(void *ud, HpeDomNode *dialog, int kind)
+{
+    HpeEngine *engine = (HpeEngine *)ud;
+    HpeJsEventInit init;
+
+    if (!engine || !dialog)
+        return;
+    if (kind == 2) {
+        if (hpe_dialog_modal() == dialog)
+            hpe_dialog_set_modal(NULL);
+        if (engine->js) {
+            memset(&init, 0, sizeof(init));
+            hpe_js_dom_dispatch_ex(engine->js, dialog, "close", &init);
+        }
+    } else {
+        hpe_dialog_set_modal(kind == 1 ? dialog : NULL);
+    }
+    engine->dirty = HPE_DIRTY_FULL;
+}
+
+/* ---------------- scroll API (v0.28) ---------------- */
+
+/**
+ * @brief 在盒树中查找 DOM 节点对应的盒 / Find the box generated for a DOM node
+ */
+static HpeBox *hope_box_for_node(HpeBox *root, const HpeDomNode *node)
+{
+    while (root) {
+        HpeBox *hit;
+        if (root->node == node)
+            return root;
+        if (root->first_child) {
+            hit = hope_box_for_node(root->first_child, node);
+            if (hit)
+                return hit;
+        }
+        root = root->next;
+    }
+    return NULL;
+}
+
+/**
+ * @brief 设置页面滚动偏移并派发 scroll 事件 / Set the page scroll offset and dispatch a scroll event
+ */
+static void hope_page_scroll_to(HpeEngine *engine, float y)
+{
+    float before = engine->scroll_y;
+    engine->scroll_y = y;
+    clamp_scroll(engine);
+    engine->scroll_y = floorf(engine->scroll_y + 0.5f);
+    if (engine->scroll_y == before)
+        return;
+    if (engine->dirty == HPE_DIRTY_NONE)
+        engine->dirty = HPE_DIRTY_SCROLL;
+    hpe_engine_refresh_status(engine);
+    hpe_engine_scroll_event(engine, NULL);
+}
+
+/**
+ * @brief 设置元素滚动容器的垂直偏移 / Set an element scroll container's vertical offset
+ */
+static void hope_element_scroll_to(HpeEngine *engine, HpeDomNode *node, float value)
+{
+    HpeBox *box = hope_box_for_node(engine->root, node);
+    float before;
+    if (!box || !box->is_scroll_container)
+        return;
+    if (value < 0.0f)
+        value = 0.0f;
+    if (value > box->scroll_max)
+        value = box->scroll_max;
+    value = floorf(value + 0.5f);
+    before = box->scroll_y;
+    box->scroll_y = value;
+    if (box->scroll_y == before)
+        return;
+    engine->dirty = HPE_DIRTY_FULL;
+    hpe_engine_scroll_event(engine, node);
+}
+
+/**
+ * @brief 把元素滚入视口 / Scroll an element into view
+ */
+static void hope_scroll_into_view(HpeEngine *engine, HpeDomNode *node)
+{
+    HpeBox *box = hope_box_for_node(engine->root, node);
+    float view_h, top, bottom;
+    if (!box)
+        return;
+    view_h = (float)hpe_engine_view_height(engine);
+    top = box->border_box.y;
+    bottom = top + box->border_box.h;
+    if (top < engine->scroll_y)
+        hope_page_scroll_to(engine, top);
+    else if (bottom > engine->scroll_y + view_h)
+        hope_page_scroll_to(engine, bottom - view_h);
+}
+
+/**
+ * @brief JS 滚动 API 回传引擎的入口 / Entry point for JS scroll API calls into the engine
+ */
+static void hope_scroll_hook(void *ud, HpeDomNode *node, int kind, float x, float y)
+{
+    HpeEngine *engine = (HpeEngine *)ud;
+    if (!engine)
+        return;
+    switch (kind) {
+    case 0: /* scrollTo */
+        hope_page_scroll_to(engine, y);
+        break;
+    case 1: /* scrollBy */
+        hope_page_scroll_to(engine, engine->scroll_y + y);
+        break;
+    case 2: /* scrollIntoView */
+        hope_scroll_into_view(engine, node);
+        break;
+    case 3: /* element.scrollTop = y */
+        hope_element_scroll_to(engine, node, y);
+        break;
+    case 4: /* element.scrollLeft = x (no horizontal scroll containers yet) */
+        HPE_UNUSED(x);
+        break;
+    default:
+        break;
+    }
+}
+
+/**
+ * @brief JS 读取滚动偏移的引擎回调 / Engine callback for JS scroll offset reads
+ */
+static float hope_scroll_getter(void *ud, HpeDomNode *node, int axis)
+{
+    HpeEngine *engine = (HpeEngine *)ud;
+    HpeBox *box;
+    if (!engine)
+        return 0.0f;
+    if (!node)
+        return axis == 1 ? engine->scroll_y : 0.0f;
+    box = hope_box_for_node(engine->root, node);
+    if (box && box->is_scroll_container && axis == 1)
+        return box->scroll_y;
+    return 0.0f;
+}
+
+/**
+ * @brief 把引擎页面选区读给 JS Selection / Read the engine's page selection for JS
+ */
+static void hope_sel_get(void *ud, HpeDomNode **anchor, int *anchor_off, HpeDomNode **focus,
+                         int *focus_off)
+{
+    HpeEngine *engine = (HpeEngine *)ud;
+    if (!engine)
+        return;
+    *anchor = engine->sel_anchor.node;
+    *anchor_off = engine->sel_anchor.off;
+    *focus = engine->sel_focus.node;
+    *focus_off = engine->sel_focus.off;
+}
+
+/**
+ * @brief 把 JS Selection 写回引擎页面选区 / Write a JS selection back into the engine
+ */
+static void hope_sel_set(void *ud, HpeDomNode *anchor, int anchor_off, HpeDomNode *focus,
+                         int focus_off)
+{
+    HpeEngine *engine = (HpeEngine *)ud;
+    if (!engine)
+        return;
+    engine->sel_anchor.node = anchor;
+    engine->sel_anchor.off = anchor_off;
+    engine->sel_focus.node = focus;
+    engine->sel_focus.off = focus_off;
+    engine->dirty = HPE_DIRTY_FULL;
+}
+
+/**
+ * @brief 清空引擎页面选区 / Clear the engine's page selection
+ */
+static void hope_sel_clear(void *ud)
+{
+    HpeEngine *engine = (HpeEngine *)ud;
+    if (engine) {
+        hpe_sel_clear(engine);
+        engine->dirty = HPE_DIRTY_FULL;
+    }
 }
 
 /**
@@ -1178,7 +1479,7 @@ static void debug_dump_document(HpeEngine *engine)
  *
  * @param[in,out] engine 引擎实例 / Engine instance
  *
- * @note 读取环境变量：`HOPE_TEST_CLICK`（按 id 点击）、`HOPE_TEST_HOVER`（`x,y` 悬停）、`HOPE_TEST_WAIT`（在给定秒数内跑 tick）、`HOPE_TEST_TEXT`（按 id 打印文本）；在排版后调用一次，供无头 `--dump` 验证交互页 / Reads env vars: `HOPE_TEST_CLICK` (click by id), `HOPE_TEST_HOVER` (`x,y` hover), `HOPE_TEST_WAIT` (tick for the given seconds), `HOPE_TEST_TEXT` (print text by id); runs once after layout so headless `--dump` can verify interactive pages
+ * @note 读取环境变量：`HOPE_TEST_CLICK`（按 id 点击）、`HOPE_TEST_HOVER`（`x,y` 悬停）、`HOPE_TEST_WAIT`（在给定秒数内跑 tick）、`HOPE_TEST_TICKS`（精确泵 N 个 tick，配 `HOPE_TEST_ANIM_STEP` 得到确定性动画时钟）、`HOPE_TEST_TEXT`（按 id 打印文本）、`HOPE_TEST_ANIM_SNAPSHOT`（按 id 打印动画后的计算值）；在排版后调用一次，供无头 `--dump` 验证交互页与动画 / Reads env vars: `HOPE_TEST_CLICK` (click by id), `HOPE_TEST_HOVER` (`x,y` hover), `HOPE_TEST_WAIT` (tick for the given seconds), `HOPE_TEST_TICKS` (pump exactly N ticks; pair with `HOPE_TEST_ANIM_STEP` for a deterministic animation clock), `HOPE_TEST_TEXT` (print text by id), `HOPE_TEST_ANIM_SNAPSHOT` (print the post-animation computed values by id); runs once after layout so headless `--dump` can verify interactive pages and animations
  *
  * @see click_element_by_id print_text_by_id
  */
@@ -1188,13 +1489,33 @@ static void run_test_hooks(HpeEngine *engine)
     const char *test_hover = getenv("HOPE_TEST_HOVER");
     const char *test_wait = getenv("HOPE_TEST_WAIT");
     const char *test_text = getenv("HOPE_TEST_TEXT");
+    const char *test_ticks = getenv("HOPE_TEST_TICKS");
+    const char *test_anim_snap = getenv("HOPE_TEST_ANIM_SNAPSHOT");
+    const char *test_form_type = getenv("HOPE_TEST_FORM_TYPE");
+    const char *test_form_snap = getenv("HOPE_TEST_FORM_SNAP");
 
-    if (test_click && *test_click)
-        click_element_by_id(engine, test_click);
+    if (test_click && *test_click) {
+        /* one or more ids, semicolon-separated, clicked in order */
+        char ids[512];
+        char *tok;
+        snprintf(ids, sizeof(ids), "%s", test_click);
+        for (tok = strtok(ids, ";"); tok; tok = strtok(NULL, ";"))
+            click_element_by_id(engine, tok);
+    }
+    if (test_form_type && *test_form_type)
+        type_into_by_id(engine, test_form_type);
     if (test_hover && *test_hover) {
         int hx, hy;
         if (sscanf(test_hover, "%d,%d", &hx, &hy) == 2)
             hpe_engine_mouse_move(engine, hx, hy);
+    }
+    if (test_ticks && *test_ticks) {
+        /* pump exactly N ticks: together with HOPE_TEST_ANIM_STEP this gives a
+         * deterministic animation time for headless dumps and assertions */
+        int n = atoi(test_ticks);
+        int i;
+        for (i = 0; i < n; i++)
+            hpe_engine_tick(engine);
     }
     if (test_wait && *test_wait) {
         double wait = atof(test_wait);
@@ -1204,6 +1525,10 @@ static void run_test_hooks(HpeEngine *engine)
     }
     if (test_text && *test_text)
         print_text_by_id(engine, test_text);
+    if (test_anim_snap && *test_anim_snap)
+        hpe_anim_snapshot_dump(engine, test_anim_snap);
+    if (test_form_snap && *test_form_snap)
+        form_snap_by_id(engine, test_form_snap);
 }
 
 /**
@@ -1225,12 +1550,19 @@ static int load_source(HpeEngine *engine, char *src, size_t size, const char *pa
     double t0 = hpe_time_seconds();
 
     engine->error[0] = '\0'; /* a new document clears the previous load error */
+    /* a new document is about to replace the old one: give page scripts a
+     * beforeunload chance while the previous JS context is still alive */
+    if (engine->js && engine->doc)
+        hpe_js_dom_dispatch_self(engine->js, engine->doc, "beforeunload", NULL);
     reset_document(engine, path);
     parse_document(engine, src, size, path);
     install_styles(engine, path);
     debug_dump_document(engine);
 
     engine->scroll_y = 0.0f;
+    /* form fixup: default-value snapshots + button label injection, before the
+     * first layout so buttons render their labels */
+    hpe_form_install(engine);
     /* lay out once before running page scripts: they read clientWidth /
      * clientHeight (which force a layout in browsers) to size their output.
      * The second layout below picks up whatever the script changed. */
@@ -1828,7 +2160,12 @@ int hpe_engine_key_event(HpeEngine *engine, int vk, int printable, int mods, int
     init.key = key;
     init.code = code;
     init.repeat = repeat;
-    return hpe_js_dom_dispatch_ex(engine->js, node, names[phase], &init);
+    hpe_js_dom_dispatch_ex(engine->js, node, names[phase], &init);
+    /* the focused text control consumes printable/editing keys as its default
+     * action after `keydown` (firing `input` on every edit) */
+    if (phase == 0 && hpe_form_key(engine, vk, printable, mods))
+        return 1;
+    return 0;
 }
 
 /**
@@ -1846,11 +2183,8 @@ int hpe_engine_scroll_event(HpeEngine *engine, HpeDomNode *target)
     HpeDomNode *node = target;
     if (!engine || !engine->js)
         return 0;
-    if (!node) {
-        node = engine->doc;
-        while (node && node->type != HPE_NODE_ELEMENT)
-            node = node->first_child;
-    }
+    if (!node)
+        node = engine->doc; /* page scroll: document-level target */
     if (!node)
         return 0;
     return hpe_js_dom_dispatch_self(engine->js, node, "scroll", NULL);
@@ -2129,6 +2463,10 @@ void hpe_engine_render(HpeEngine *engine)
     t0 = hpe_time_seconds();
     /* refresh the paint-time selection map (box pointers may have changed) */
     hpe_sel_prepare(engine);
+    /* the caret of the focused form control (box pointers may have changed) */
+    hpe_paint_form_set_focus(engine->form_focus, engine->form_caret);
+    /* the modal <dialog> whose backdrop must be painted this frame */
+    hpe_paint_set_modal_dialog(hpe_dialog_modal());
     if (engine->dirty == HPE_DIRTY_CHROME && engine->painted)
         hpe_chrome_paint(engine);
     else if (engine->dirty == HPE_DIRTY_SCROLL && engine->root && !dirty_disabled())
@@ -2198,7 +2536,11 @@ float hpe_engine_scroll_offset(HpeEngine *engine)
  */
 static void hope_focus_hook(void *ud, HpeDomNode *node)
 {
+    HpeEngine *engine = (HpeEngine *)ud;
+
     hpe_engine_set_focus((HpeEngine *)ud, node);
+    /* keep the form editing state (caret + change-on-blur snapshot) in sync */
+    hpe_form_focus_notify(engine, node);
 }
 
 /**
@@ -2254,8 +2596,23 @@ static void hope_viewport_hook(void *ud, float *w, float *h, float *sx, float *s
  *
  * @see hpe_engine_focused_node
  */
+/**
+ * @brief 派发 `focus`/`blur` 事件（焦点变化时）/ Dispatch `focus`/`blur` events on a focus change
+ */
+static void focus_fire_events(HpeEngine *engine, HpeDomNode *old, HpeDomNode *node)
+{
+    if (!engine->js)
+        return;
+    if (old)
+        hpe_js_dom_dispatch(engine->js, old, "blur", 0, 0);
+    if (node)
+        hpe_js_dom_dispatch(engine->js, node, "focus", 0, 0);
+}
+
 void hpe_engine_set_focus(HpeEngine *engine, HpeDomNode *node)
 {
+    HpeDomNode *old;
+
     if (!engine)
         return;
     if (engine->focus_node == node) {
@@ -2263,11 +2620,13 @@ void hpe_engine_set_focus(HpeEngine *engine, HpeDomNode *node)
             node->focused = 1;
         return;
     }
-    if (engine->focus_node)
-        engine->focus_node->focused = 0;
+    old = engine->focus_node;
+    if (old)
+        old->focused = 0;
     engine->focus_node = node;
     if (node)
         node->focused = 1;
+    focus_fire_events(engine, old, node);
     hpe_engine_relayout(engine);
     hpe_engine_refresh_status(engine);
 }
@@ -2660,29 +3019,37 @@ int hpe_engine_caret_advance(HpeEngine *engine)
  *
  * @param[in,out] engine 引擎实例，NULL 时返回 0 / Engine instance, returns 0 when NULL
  *
- * @return 有回调运行或插入符闪烁相位翻转返回 1（页面应重绘），否则 0 / 1 when a callback ran or the caret blink phase flipped (the page should be repainted), otherwise 0
+ * @return 有回调运行、动画在途或插入符闪烁相位翻转返回 1（页面应重绘），否则 0 / 1 when a callback ran, an animation is in flight or the caret blink phase flipped (the page should be repainted), otherwise 0
  *
- * @note 有回调时惰性 flush 并刷新状态；插入符时钟独立于 JS 上下文，在无脚本时同样工作 / Lazily flushes and refreshes the status when a callback ran; the caret clock runs independently of the JS context, so blinking works without scripts
+ * @note 有回调或动画活动时惰性 flush 并刷新状态；动画时钟与插入符时钟均独立于 JS 上下文，无脚本时同样工作 / Lazily flushes and refreshes the status when a callback ran or an animation is in flight; both the animation clock and the caret clock run independently of the JS context, so they work without scripts
  *
- * @see hpe_engine_flush hpe_engine_caret_advance
+ * @see hpe_engine_flush hpe_engine_caret_advance hpe_anim_tick
  */
 int hpe_engine_tick(HpeEngine *engine)
 {
     int fired = 0;
     int caret_repaint;
+    int anim_active;
     if (!engine)
         return 0;
     caret_repaint = hpe_engine_caret_advance(engine);
     if (caret_repaint && engine->dirty == HPE_DIRTY_NONE)
         engine->dirty = HPE_DIRTY_CHROME;
+    anim_active = hpe_anim_tick(engine);
+    if (anim_active && engine->reflow_need < engine->anim.reflow_need)
+        engine->reflow_need = engine->anim.reflow_need;
+    if (anim_active) {
+        hpe_engine_flush(engine, 0);
+        hpe_engine_refresh_status(engine);
+    }
     if (!engine->js)
-        return caret_repaint;
+        return caret_repaint || anim_active;
     hpe_js_run_timers(engine->js, hpe_time_seconds(), &fired);
     if (fired) {
         hpe_engine_flush(engine, 0); /* only relayout if a timer touched the DOM */
         hpe_engine_refresh_status(engine);
     }
-    return fired || caret_repaint;
+    return fired || caret_repaint || anim_active;
 }
 
 /**
@@ -2742,17 +3109,52 @@ static int mouse_track_active(HpeEngine *engine, HpeDomNode *node, int down)
     return 0;
 }
 
-/* Press dispatches `mousedown`; release dispatches `mouseup` then `click`. */
+/**
+ * @brief 点击 `<summary>` 时切换所属 `<details>` 并派发 toggle 事件 / Toggle the owning `<details>` on a summary click and fire toggle events
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in,out] node 被点击的节点 / The clicked node
+ *
+ * @return 有默认行为发生返回 1（调用方据此 flush）/ 1 when a default action ran (so the caller flushes)
+ */
+static int details_click(HpeEngine *engine, HpeDomNode *node)
+{
+    HpeDomNode *details = hpe_details_owner(node);
+    HpeJsEventInit init;
+    int prevented = 0, was_open;
+
+    if (!details || !engine->js)
+        return 0;
+    was_open = hpe_details_is_open(details);
+    memset(&init, 0, sizeof(init));
+    init.new_state = was_open ? "closed" : "open";
+    hpe_js_dom_dispatch_cancelable(engine->js, details, "beforetoggle", &init, &prevented);
+    if (prevented)
+        return 1; /* a handler ran (even though it vetoed the state change) */
+    hpe_details_toggle(details);
+    memset(&init, 0, sizeof(init));
+    init.new_state = was_open ? "closed" : "open";
+    hpe_js_dom_dispatch_ex(engine->js, details, "toggle", &init);
+    return 1;
+}
+
+/* Press dispatches `mousedown`; release dispatches `mouseup` then `click`.
+ * The click's form-control default behaviour (toggle, radio group, submit /
+ * reset, select cycling, label forwarding) runs after the event dispatch. */
 static int mouse_dispatch_events(HpeEngine *engine, HpeDomNode *node, int x, int py, int down)
 {
     int fired = 0;
+    int form_changed = 0;
     if (down)
         return hpe_js_dom_dispatch(engine->js, node, "mousedown", x, py);
     if (hpe_js_dom_dispatch(engine->js, node, "mouseup", x, py))
         fired = 1;
     if (hpe_js_dom_dispatch(engine->js, node, "click", x, py))
         fired = 1;
-    return fired;
+    form_changed = hpe_form_click(engine, node, x, py);
+    if (details_click(engine, node))
+        fired = 1;
+    return fired || form_changed;
 }
 
 /**
@@ -2884,9 +3286,107 @@ static int click_element_by_id(HpeEngine *engine, const char *id)
     hpe_js_dom_dispatch(engine->js, found, "mousedown", 0, 0);
     hpe_js_dom_dispatch(engine->js, found, "mouseup", 0, 0);
     hpe_js_dom_dispatch(engine->js, found, "click", 0, 0);
+    /* the click's form-control default behaviour runs on the same path the
+     * real mouse takes (toggle, radio group, select cycling, submit / reset) */
+    hpe_form_click(engine, found, 0, 0);
+    details_click(engine, found);
     hpe_engine_flush(engine, 0);
     hpe_engine_refresh_status(engine);
     return 1;
+}
+
+/**
+ * @brief 按广度优先遍历找 id 元素 / Find an element by id with a breadth-first walk
+ */
+static HpeDomNode *find_element_by_id(HpeEngine *engine, const char *id)
+{
+    HpeDomNode **queue;
+    int qh = 0, qt = 0, qcap = 1024;
+    HpeDomNode *found = NULL;
+    HpeDomNode *n = engine->doc;
+
+    if (!id || !*id)
+        return NULL;
+    queue = (HpeDomNode **)malloc(sizeof(HpeDomNode *) * (size_t)qcap);
+    if (!queue)
+        return NULL;
+    queue[qt++] = n;
+    while (qh < qt) {
+        HpeDomNode *cur = queue[qh++];
+        HpeDomNode *c;
+        for (c = cur->first_child; c; c = c->next_sibling) {
+            if (c->type == HPE_NODE_ELEMENT) {
+                const char *aid = hpe_dom_attr(c, "id");
+                if (aid && strcmp(aid, id) == 0) {
+                    found = c;
+                    break;
+                }
+                if (qt < qcap)
+                    queue[qt++] = c;
+            }
+        }
+        if (found)
+            break;
+    }
+    free(queue);
+    return found;
+}
+
+/**
+ * @brief 测试钩子：聚焦控件并逐字符输入 / Test hook: focus a control and type text
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     spec `id:text`（text 为 UTF-8 文本）/ `id:text` (text is UTF-8)
+ *
+ * @note 由 `HOPE_TEST_FORM_TYPE` 使用；聚焦后把每个码点作为可打印键事件喂给引擎，
+ *       走真实编辑路径（插入 + `input` 事件）/ Used by `HOPE_TEST_FORM_TYPE`; after
+ *       focusing, every code point is fed to the engine as a printable key event,
+ *       exercising the real edit path (insert plus `input` events)
+ */
+static void type_into_by_id(HpeEngine *engine, const char *spec)
+{
+    char id[128];
+    const char *text;
+    HpeDomNode *node;
+    const char *p;
+
+    if (!engine->js || !spec || !(text = strchr(spec, ':')))
+        return;
+    snprintf(id, sizeof(id), "%.*s", (int)(text - spec), spec);
+    node = find_element_by_id(engine, id);
+    if (!node)
+        return;
+    hpe_form_focus_notify(engine, node);
+    for (p = text + 1; *p;) {
+        uint32_t cp;
+        int n = hpe_utf8_next(p, &cp);
+        if (n <= 0)
+            break;
+        hpe_engine_key_event(engine, 0, (int)cp, 0, 0, 0);
+        p += n;
+    }
+}
+
+/**
+ * @brief 测试钩子：打印控件状态快照 / Test hook: print a control state snapshot
+ *
+ * @param[in,out] engine 引擎实例 / Engine instance
+ * @param[in]     id 目标控件 id / id of the target control
+ *
+ * @note 由 `HOPE_TEST_FORM_SNAP` 使用；输出 `FORM-SNAP <id> value=<v> checked=<0|1>
+ *       disabled=<0|1>` 供无头断言 / Used by `HOPE_TEST_FORM_SNAP`; prints
+ *       `FORM-SNAP <id> value=<v> checked=<0|1> disabled=<0|1>` for headless asserts
+ */
+static void form_snap_by_id(HpeEngine *engine, const char *id)
+{
+    HpeDomNode *node = find_element_by_id(engine, id);
+    char val[256];
+
+    if (!node)
+        return;
+    hpe_form_value_get(node, val, (int)sizeof(val));
+    printf("FORM-SNAP %s value=%s checked=%d disabled=%d\n", id, val,
+           hpe_dom_attr(node, "checked") ? 1 : 0, hpe_dom_attr(node, "disabled") ? 1 : 0);
 }
 
 /**

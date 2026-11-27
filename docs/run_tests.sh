@@ -33,7 +33,7 @@ fail=0
 # `--dump` is headless and chrome-less, so identical geometry gives identical bytes.
 # A non-zero exit is a hard failure: the engine must tear down cleanly even on
 # pages that register timers (a bad free() there once corrupted the heap at exit).
-for f in boxes css css-cascade css-props dom-api dom-mutation event flex globals hello hover html-parse image inline-fx cursor js-arrow js-features js js-builtins grid layout scroll svg-shapes svg-text svg-fx stack table timers bfc js-gc vertical emoji; do
+for f in boxes css css-cascade css-props dom-api dom-mutation event flex globals hello hover html-parse image inline-fx cursor js-arrow js-features js js-builtins grid layout scroll svg-shapes svg-text svg-fx stack table timers bfc js-gc vertical emoji anim form css-vars sel-api details-dialog canvas; do
   html="examples/$f.html"
   [ -f "$html" ] || continue
   bmp="$OUT/$f.bmp"
@@ -164,6 +164,75 @@ else
   fail=1
 fi
 
+# ---------------- 3a2. form controls (v0.23) ----------------
+# Click hooks toggle controls / radio groups / select / label / submit / reset;
+# the page records states from listeners and prints assertions after the wait.
+formout="$(HOPE_TEST_CLICK="cb1;r2;sel;lbl2;subm;rset" HOPE_TEST_WAIT=0.4 \
+            HOPE_TEST_TEXT=out "$BIN" examples/form.html --width 500 --height 700 \
+            --dump "$OUT/form.bmp" 2>&1)"
+if printf '%s\n' "$formout" | grep -q 'PASS 24/24'; then
+  echo "  form         PASS 24/24"
+else
+  echo "  form         FAIL"
+  printf '%s\n' "$formout" | grep 'FAIL' | head -5
+  fail=1
+fi
+# keyboard editing: type two code points into the text input
+formout2="$(HOPE_TEST_FORM_TYPE="t1:XY" HOPE_TEST_FORM_SNAP=t1 \
+              "$BIN" examples/form.html --width 500 --height 700 \
+              --dump "$OUT/form.bmp" 2>&1)"
+if printf '%s\n' "$formout2" | grep -q 'FORM-SNAP t1 value=程序化XY'; then
+  echo "  form键入      OK"
+else
+  echo "  form键入      FAIL"
+  fail=1
+fi
+
+# ---------------- 3a3. CSS custom properties / var() (v0.24) ----------------
+varout="$(HOPE_TEST_TEXT=out "$BIN" examples/css-vars.html --width 500 --height 500 \
+          --dump "$OUT/css-vars.bmp" 2>&1)"
+if printf '%s\n' "$varout" | grep -q 'PASS 11/11'; then
+  echo "  css-vars     PASS 11/11"
+else
+  echo "  css-vars     FAIL"
+  printf '%s\n' "$varout" | grep 'FAIL' | head -5
+  fail=1
+fi
+
+# ---------------- 3a4. Selection / Range API (v0.25) ----------------
+selapiout="$(HOPE_TEST_TEXT=out "$BIN" examples/sel-api.html --width 500 --height 500 \
+             --dump "$OUT/sel-api.bmp" 2>&1)"
+if printf '%s\n' "$selapiout" | grep -q 'PASS 23/23'; then
+  echo "  sel-api      PASS 23/23"
+else
+  echo "  sel-api      FAIL"
+  printf '%s\n' "$selapiout" | grep 'FAIL' | head -5
+  fail=1
+fi
+
+# ---------------- 3a5. details / dialog (v0.26) ----------------
+ddout="$(HOPE_TEST_CLICK="sum1;sum2" HOPE_TEST_WAIT=0.4 HOPE_TEST_TEXT=out \
+         "$BIN" examples/details-dialog.html --width 500 --height 500 \
+         --dump "$OUT/details-dialog.bmp" 2>&1)"
+if printf '%s\n' "$ddout" | grep -q 'PASS 18/18'; then
+  echo "  details-dlg  PASS 18/18"
+else
+  echo "  details-dlg  FAIL"
+  printf '%s\n' "$ddout" | grep 'FAIL' | head -5
+  fail=1
+fi
+
+# ---------------- 3a6. canvas 2D (v0.27) ----------------
+canvout="$(HOPE_TEST_TEXT=out "$BIN" examples/canvas.html --width 500 --height 500 \
+           --dump "$OUT/canvas.bmp" 2>&1)"
+if printf '%s\n' "$canvout" | grep -q 'PASS 16/16'; then
+  echo "  canvas       PASS 16/16"
+else
+  echo "  canvas       FAIL"
+  printf '%s\n' "$canvout" | grep 'FAIL' | head -5
+  fail=1
+fi
+
 # ---------------- 3b. page text selection (drag + copy) ----------------
 # A synthetic drag over hello.html's h1 must copy exactly "pe — 希"; the
 # sentinel seed keeps a stale system clipboard from faking a pass.
@@ -191,6 +260,32 @@ else
   echo "  tabs         FAIL ($tabline)"
   fail=1
 fi
+
+# ---------------- 3d. css transitions + animation clock ----------------
+# HOPE_TEST_ANIM_STEP makes every tick advance the animation clock by a fixed
+# amount and HOPE_TEST_TICKS pumps exactly N ticks, so N*STEP seconds is the
+# deterministic animation time that HOPE_TEST_ANIM_SNAPSHOT prints.
+anim_fail=0
+anim_check() {
+  local step="$1" ticks="$2" ident="$3" want="$4" out
+  out="$(HOPE_TEST_ANIM_STEP="$step" HOPE_TEST_TICKS="$ticks" \
+          HOPE_TEST_ANIM_SNAPSHOT="$ident" "$BIN" examples/anim.html \
+          --width 400 --height 300 --dump "$OUT/anim.bmp" 2>&1)"
+  if [ $? = 0 ] && printf '%s' "$out" | grep -q "ANIM-SNAP $ident" \
+     && printf '%s' "$out" | grep -q "$want"; then
+    printf '  anim %-6s %ss x%-2s OK\n' "$ident" "$step" "$ticks"
+  else
+    printf '  anim %-6s %ss x%-2s FAIL (want %s)\n' "$ident" "$step" "$ticks" "$want"
+    printf '%s\n' "$out" | grep 'ANIM-SNAP' | head -2
+    fail=1
+  fi
+}
+anim_check 0.05  5  kf    'opacity=0.350'   # linear keyframes 25% in
+anim_check 0.1   5  tr    'width=150.00'    # inline-style transition, linear
+anim_check 0.1   15 slide  'ml=75.00'        # layout-property keyframes mid-flight
+anim_check 0.5   5  kf    'opacity=0.200'   # fill both after 2 alternate iterations
+anim_check 0.125 5  steps 'opacity=0.500'   # steps(4, end) quantisation
+anim_check 0.5   8  slide 'ml=0.00'         # fill none: back to the declared value
 
 # ---------------- 4. C unit tests ----------------
 # hope_tests covers base (utf8/string) + css parsing + html parsing + encoding.

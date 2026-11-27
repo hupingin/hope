@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>form controls</title>
+<style>
+body { font: 13px sans-serif; margin: 16px; }
+.row { margin: 6px 0; }
+fieldset { margin-bottom: 12px; }
+#out { font: 12px monospace; white-space: pre; }
+.ok { color: #0a7a0a; font-weight: bold; }
+.fail { color: #d93025; font-weight: bold; }
+</style>
+</head>
+<body>
+<h3>Form controls</h3>
+
+<form id="mainform" action="">
+  <fieldset>
+    <legend>文本</legend>
+    <div class="row"><label for="t1">名字：</label>
+      <input type="text" id="t1" value="张三" placeholder="请输入"></div>
+    <div class="row"><input type="password" id="pw" value="secret"></div>
+    <textarea id="ta">第一行
+第二行</textarea>
+  </fieldset>
+
+  <fieldset>
+    <legend>选择</legend>
+    <div class="row">
+      <input type="checkbox" id="cb1" checked> <label for="cb1">同意条款</label>
+      <input type="checkbox" id="cb2"> <label for="cb2" id="lbl2">订阅</label>
+    </div>
+    <div class="row">
+      <input type="radio" name="grp" id="r1" value="one" checked>一
+      <input type="radio" name="grp" id="r2" value="two">二
+      <input type="radio" name="grp" id="r3" value="three">三
+    </div>
+    <div class="row">
+      <select id="sel">
+        <option value="a">选项 A</option>
+        <option value="b" selected>选项 B</option>
+        <option value="c">选项 C</option>
+      </select>
+      <input type="range" id="rg" min="0" max="100" value="30">
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>按钮与显示</legend>
+    <button type="button" id="btn1" value="普通按钮">普通按钮</button>
+    <input type="submit" id="subm" value="提交">
+    <input type="reset" id="rset" value="重置">
+    <progress id="pg" value="30" max="100"></progress>
+    <meter id="mt" value="6" max="10"></meter>
+  </fieldset>
+</form>
+
+<div id="evlog"></div>
+<div id="out"></div>
+
+<script>
+var lines = [];
+var total = 0, passCount = 0;
+function ck(name, got, want) {
+  var ok = got === want;
+  total++;
+  lines.push((ok ? "  ok  " : "  FAIL") + " " + name +
+             (ok ? "" : " (got " + JSON.stringify(got) + ", want " + JSON.stringify(want) + ")"));
+  if (ok) passCount++;
+  return ok;
+}
+function logEv(e) {
+  var el = document.getElementById("evlog");
+  el.appendChild(document.createTextNode(e));
+  el.appendChild(document.createElement("br"));
+}
+
+/* ---- static API (run at load) ---- */
+ck("document.forms.length", document.forms.length, 1);
+ck("form.elements.length", document.forms[0].elements.length, 18);
+ck("input.value", document.getElementById("t1").value, "张三");
+ck("textarea.value", document.getElementById("ta").value, "第一行\n第二行");
+ck("select.value", document.getElementById("sel").value, "b");
+ck("checked getter", document.getElementById("cb1").checked, true);
+ck("unchecked getter", document.getElementById("cb2").checked, false);
+ck("radio checked getter", document.getElementById("r1").checked, true);
+ck("type getter", document.getElementById("pw").type, "password");
+ck("type default", document.getElementById("t1").type, "text");
+ck("disabled getter", document.getElementById("t1").disabled, false);
+ck("valid non-required", document.getElementById("t1").checkValidity(), true);
+ck("valid empty w/o required", document.getElementById("cb2").checkValidity(), true);
+
+/* programmatic setters fire no events */
+document.getElementById("t1").value = "程序化";
+ck("programmatic value set", document.getElementById("t1").value, "程序化");
+document.getElementById("sel").value = "c";
+ck("programmatic select set", document.getElementById("sel").value, "c");
+document.getElementById("cb2").checked = true;
+ck("programmatic checked set", document.getElementById("cb2").checked, true);
+
+/* ---- interaction state (engine hooks clicked before these run) ---- */
+setTimeout(function () {
+  /* interaction states were captured by listeners at click time, before the
+     final reset click: toggling, radio exclusivity, select cycling, label */
+  ck("interaction states", states.join("|"),
+     "cb1:false|r2:true|r1:false|r3:false|sel:a|cb2:false");
+  ck("reset restores", document.getElementById("t1").value, "张三");
+  ck("reset restores checked", document.getElementById("cb1").checked, true);
+  ck("reset restores select", document.getElementById("sel").value, "b");
+  /* events seen by listeners */
+  ck("input events", evCount.input, 4);
+  ck("change events", evCount.change, 4);
+  ck("reset was fired", evCount.reset, 1);
+  ck("submit was fired", evCount.submit, 1);
+
+  lines.unshift((passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total + " checks");
+  var cls = passCount === total ? "ok" : "fail";
+  var el = document.getElementById("out");
+  for (var li = 0; li < lines.length; li++) {
+    var row = document.createElement("div");
+    row.className = "row " + (li === 0 ? cls : "");
+    row.textContent = lines[li];
+    el.appendChild(row);
+  }
+  document.title = (passCount === total ? "PASS " : "FAIL ") + passCount + "/" + total;
+}, 120);
+
+/* ---- event listeners ---- */
+var evCount = { input: 0, change: 0, reset: 0, submit: 0 };
+var states = [];
+document.getElementById("mainform").addEventListener("input", function () { evCount.input++; });
+document.getElementById("cb1").addEventListener("change", function () {
+  evCount.change++; states.push("cb1:" + this.checked);
+});
+document.getElementById("sel").addEventListener("change", function () {
+  evCount.change++; states.push("sel:" + this.value);
+});
+document.getElementById("r2").addEventListener("change", function () {
+  evCount.change++; states.push("r2:" + this.checked);
+  states.push("r1:" + document.getElementById("r1").checked);
+  states.push("r3:" + document.getElementById("r3").checked);
+});
+document.getElementById("cb2").addEventListener("change", function () {
+  evCount.change++; states.push("cb2:" + this.checked);
+});
+document.getElementById("mainform").addEventListener("reset", function () { evCount.reset++; });
+document.getElementById("mainform").addEventListener("submit", function (e) { evCount.submit++; });
+</script>
+</body>
+</html>

@@ -1,0 +1,271 @@
+{
+  "lex_add": {
+    "brief": "向词法分析器追加一个词法单元 / Append one token to the lexer",
+    "params": {
+      "type": "词法单元类型（`T_*`）/ Token type (`T_*`)",
+      "num": "数值载荷（数字字面量用）/ Numeric payload (for number literals)",
+      "text": "词法单元文本；`NULL` 表示无文本 / Token text, or `NULL` for none",
+      "textlen": "文本长度 / Text length",
+      "line": "所在行号 / Source line"
+    },
+    "note": "文本被复制到 js arena；容量不足时表翻倍并复制旧内容 / The text is copied into the JS arena; the table doubles and copies when full",
+    "see": "lex_all"
+  },
+  "lex_ident_start": {
+    "brief": "判断字符能否作为标识符首字符 / Test whether a character can start an identifier",
+    "params": { "c": "待判断的字符 / Character to test" },
+    "return": "可作首字符返回 1，否则 0 / 1 when it may start an identifier, otherwise 0",
+    "note": "放行非 ASCII，使标识符可为中文 / Non-ASCII is allowed so identifiers may be Chinese"
+  },
+  "lex_ident_char": {
+    "brief": "判断字符能否作为标识符后续字符 / Test whether a character may continue an identifier",
+    "params": { "c": "待判断的字符 / Character to test" },
+    "return": "可作后续字符返回 1，否则 0 / 1 when it may continue an identifier, otherwise 0",
+    "see": "lex_ident_start"
+  },
+  "lex_hex_digit": {
+    "brief": "求十六进制数位的值 / Convert a hex digit to its value",
+    "params": { "c": "待转换的字符 / Character to convert" },
+    "return": "0..15 的数位值；非十六进制字符返回 -1 / The digit value 0..15, or -1 when `c` is not a hex digit"
+  },
+  "lex_read_hex": {
+    "brief": "从游标处读取至多 max 个十六进制数位 / Read up to `max` hex digits from the cursor",
+    "params": { "max": "最多读取的数位个数 / Maximum number of digits to read" },
+    "return": "读到的数值（无有效数位为 0）/ The accumulated value (0 when no digit is read)",
+    "note": "游标停在第一个非十六进制字符处 / The cursor stops at the first non-hex character"
+  },
+  "lex_escape_simple": {
+    "brief": "返回固定单字符转义对应的字符 / Map a fixed single-character escape to its character",
+    "params": { "e": "转义字母（反斜杠之后）/ The escape letter (after the backslash)" },
+    "return": "对应字符码；需要额外输入时返回 -1 / The character code, or -1 for escapes needing more input",
+    "note": "覆盖 `\\n \\t \\r \\b \\f \\v \\0` / Covers `\\n`, `\\t`, `\\r`, `\\b`, `\\f`, `\\v` and `\\0`"
+  },
+  "lex_unicode_escape": {
+    "brief": "解码 `\\uXXXX` 或 `\\u{XXXXX}` 转义 / Decode a `\\uXXXX` or `\\u{XXXXX}` escape",
+    "params": {
+      "buf": "out:接收 UTF-8 编码的缓冲区 / Buffer receiving the UTF-8 encoding",
+      "n": "inout:已写入的字节数 / Bytes already written",
+      "cap": "缓冲区容量 / Buffer capacity"
+    },
+    "note": "空间不足时静默丢弃；写入 `hpe_utf8_encode` 的结果 / Silently discards when the buffer is full; writes the output of `hpe_utf8_encode`"
+  },
+  "lex_escape": {
+    "brief": "解码一个转义序列 / Decode one escape sequence",
+    "params": {
+      "buf": "out:接收解码结果的缓冲区 / Buffer receiving the decoded bytes",
+      "n": "inout:已写入的字节数 / Bytes already written",
+      "cap": "缓冲区容量 / Buffer capacity"
+    },
+    "note": "前导反斜杠已由调用方消费；支持 `\\xHH`、`\\u` 与行续接 / The leading backslash is already consumed; supports `\\xHH`, `\\u` and line continuation",
+    "see": "lex_unicode_escape, lex_escape_simple"
+  },
+  "lex_string": {
+    "brief": "读取一个字符串字面量 / Scan a string literal",
+    "params": { "quote": "引号字符（`\"` 或 `'`）/ The quote character (`\"` or `'`)" },
+    "note": "结果作为 `T_STR` 词法单元加入；未闭合时报告语法错误 / The result is added as a `T_STR` token; an unterminated literal raises an error",
+    "see": "lex_escape, lex_add"
+  },
+  "lex_hex_number": {
+    "brief": "读取十六进制数字字面量 / Scan a hexadecimal numeric literal",
+    "params": {
+      "buf": "out:接收数字字符的缓冲区 / Buffer receiving the digit characters",
+      "cap": "缓冲区容量 / Buffer capacity",
+      "n": "inout:已写入的字符数 / Characters already written"
+    },
+    "return": "解析出的浮点数值 / The parsed floating-point value",
+    "note": "跳过 `_` 分隔符；`0x` 前缀由调用方消费 / `_` separators are skipped; the caller consumes the `0x` prefix"
+  },
+  "lex_radix_number": {
+    "brief": "读取二进制或八进制数字字面量 / Scan a binary or octal numeric literal",
+    "params": { "radix": "进制（2 或 8）/ The radix (2 or 8)" },
+    "return": "解析出的浮点数值 / The parsed floating-point value",
+    "note": "跳过 `_` 分隔符；`0b`/`0o` 前缀由本函数消费 / `_` separators are skipped; this function consumes the `0b`/`0o` prefix"
+  },
+  "lex_decimal_number": {
+    "brief": "读取十进制/小数/指数形式的数字 / Scan a decimal, fractional or exponent number",
+    "params": {
+      "buf": "out:接收数字字符的缓冲区 / Buffer receiving the digit characters",
+      "cap": "缓冲区容量 / Buffer capacity",
+      "n": "inout:已写入的字符数 / Characters already written"
+    },
+    "return": "解析出的浮点数值 / The parsed floating-point value",
+    "note": "跳过 `_` 分隔符；用 `strtod` 转换 / `_` separators are skipped; the value is parsed with `strtod`"
+  },
+  "lex_number": {
+    "brief": "读取任意形式的数字字面量 / Scan a numeric literal of any form",
+    "note": "按 `0x`/`0b`/`0o` 前缀分派；容忍 BigInt 后缀 `n`（仍按 double 存储）/ Dispatches on the `0x`/`0b`/`0o` prefix; tolerates a trailing BigInt `n` (still stored as a double)",
+    "see": "lex_hex_number, lex_radix_number, lex_decimal_number"
+  },
+  "lex_regex_allowed": {
+    "brief": "判断当前位置的 `/` 是否开启正则字面量 / Decide whether a `/` here starts a regex literal",
+    "return": "为正则返回 1，为除号返回 0 / 1 for a regex, 0 when it is a division operator",
+    "note": "依据上一词法单元判断：表达式结束处或 `)`/`]`/`}`/`++`/`--` 之后是除号，`return`/`typeof` 等关键字之后是正则 / Decides from the previous token: after an expression end or `)`/`]`/`}`/`++`/`--` it is division, after `return`/`typeof` and similar keywords it is a regex"
+  },
+  "lex_regex_body": {
+    "brief": "扫描 `/…/flags` 的正则体 / Scan the body of a `/…/flags` regex",
+    "params": { "start_line": "正则起始行号（用于报错）/ Line where the regex starts (for errors)" },
+    "return": "闭合 `/` 的下标；未闭合时报告错误并返回 `lx->len` / The index of the closing `/`, or reports an error and returns `lx->len`",
+    "note": "跟踪 `[...]` 字符类与 `\\` 转义 / Tracks `[...]` character classes and `\\` escapes"
+  },
+  "lex_regex_emit": {
+    "brief": "把正则的模式与标志存成一个词法单元 / Store a regex pattern and flags as one token",
+    "params": {
+      "end": "闭合 `/` 的下标 / Index of the closing `/`",
+      "start_line": "正则起始行号 / Line where the regex starts"
+    },
+    "note": "以 `pattern\\0flags` 形式存为 `T_REGEX`，并推进游标 / Stored as `T_REGEX` in the form `pattern\\0flags`; the cursor is advanced",
+    "see": "lex_regex_body"
+  },
+  "lex_regex": {
+    "brief": "读取一个正则字面量 / Scan a regex literal",
+    "note": "未闭合时直接返回而不产生词法单元 / Returns without emitting a token when unterminated",
+    "see": "lex_regex_body, lex_regex_emit"
+  },
+  "scan_skip_string": {
+    "brief": "跳过一段引号字符串并统计换行 / Skip a quoted string while counting newlines",
+    "params": {
+      "j": "起始下标（指向引号）/ Start index (pointing at the quote)",
+      "q": "引号字符 / The quote character",
+      "lines": "inout:累计的换行数 / Running newline count"
+    },
+    "return": "越过闭合引号的下标 / The index just past the closing quote"
+  },
+  "scan_skip_substitution": {
+    "brief": "越过一段 `${ … }` 替换体 / Advance past one `${ … }` substitution body",
+    "params": {
+      "j": "起始下标 / Start index",
+      "lines": "inout:累计的换行数 / Running newline count"
+    },
+    "return": "越过闭合 `}` 的下标 / The index just past the closing `}`",
+    "note": "处理嵌套花括号、字符串、模板与注释 / Handles nested braces, strings, templates and comments"
+  },
+  "scan_template": {
+    "brief": "扫描一个模板字面量 / Scan a template literal",
+    "params": {
+      "i": "起始下标（指向反引号）/ Start index (pointing at the backtick)",
+      "lines": "inout:累计的换行数 / Running newline count"
+    },
+    "return": "越过闭合反引号的下标（出错时为 `len`）/ The index just past the closing backtick (`len` on error)",
+    "note": "处理嵌套模板、`${}` 替换、字符串与注释 / Handles nested templates, `${}` substitutions, strings and comments",
+    "see": "scan_skip_substitution"
+  },
+  "lex_template": {
+    "brief": "读取一个模板字面量 / Scan a template literal",
+    "note": "整段源码存为一个 `T_TEMPLATE` 词法单元；未闭合时报错 / The whole source is stored as one `T_TEMPLATE` token; raises an error when unterminated",
+    "see": "scan_template"
+  },
+  "lex_skip_trivia": {
+    "brief": "跳过空白与注释 / Skip whitespace and comments",
+    "return": "消费了内容返回 1，否则 0 / 1 when something was consumed, otherwise 0",
+    "note": "处理 `//` 行注释与块注释，并统计换行 / Handles `//` line comments and block comments and keeps track of newlines"
+  },
+  "lex_match_punct": {
+    "brief": "尝试匹配一个标点词法单元 / Try to match a punctuation token",
+    "return": "匹配到的长度（4/3/2/1）；不匹配返回 0 / The matched length (4/3/2/1), or 0 when nothing matches",
+    "note": "按 4→1 从长到短尝试标点表；`?.` 后紧跟数字时按三元运算符处理 / Tries the tables longest-first; `?.` followed by a digit is treated as a ternary",
+    "see": "lex_all"
+  },
+  "lex_at_number": {
+    "brief": "判断游标处是否为数字字面量开头 / Test whether the cursor starts a numeric literal",
+    "return": "是数字返回 1，否则 0 / 1 for a number, otherwise 0",
+    "note": "同时识别 `123` 与 `.5` 形式 / Recognises both `123` and `.5`"
+  },
+  "lex_all": {
+    "brief": "把整段源码词法分析为词法单元序列 / Tokenise the whole source into the token list",
+    "note": "循环分派到字符串/模板/正则/数字/标识符/标点，末尾追加 `T_EOF` / Dispatches to string, template, regex, number, identifier and punctuation; appends a final `T_EOF`",
+    "see": "lex_skip_trivia, lex_match_punct"
+  },
+  "p_cur": {
+    "brief": "取当前词法单元 / Return the current token",
+    "return": "指向当前词法单元的指针 / Pointer to the current token"
+  },
+  "p_at": {
+    "brief": "取相对当前偏移 i 的词法单元 / Return the token at offset `i` from the cursor",
+    "params": { "i": "相对偏移 / Relative offset" },
+    "return": "指向该词法单元的指针；越界时钳到最后一个（`T_EOF`）/ Pointer to that token; clamped to the last one (`T_EOF`) when out of range"
+  },
+  "p_is": {
+    "brief": "判断当前词法单元是否为给定标点 / Test whether the current token is the given punctuation",
+    "params": { "punct": "标点串 / The punctuation string" },
+    "return": "匹配返回 1，否则 0 / 1 on a match, otherwise 0"
+  },
+  "p_is_ident": {
+    "brief": "判断当前词法单元是否为给定标识符 / Test whether the current token is the given identifier",
+    "params": { "word": "单词文本 / The word text" },
+    "return": "匹配返回 1，否则 0 / 1 on a match, otherwise 0"
+  },
+  "p_is_ident_at": {
+    "brief": "判断偏移 i 处的词法单元是否为给定标识符 / Test whether the token at offset `i` is the given identifier",
+    "params": {
+      "i": "相对偏移 / Relative offset",
+      "word": "单词文本 / The word text"
+    },
+    "return": "匹配返回 1，否则 0 / 1 on a match, otherwise 0"
+  },
+  "p_line": {
+    "brief": "取当前词法单元的行号 / Return the current token's line number",
+    "return": "当前行号 / The current line number"
+  },
+  "p_advance": {
+    "brief": "推进解析游标一个词法单元 / Advance the parse cursor by one token",
+    "note": "已到 `T_EOF` 时不再前进 / Stops advancing once at `T_EOF`"
+  },
+  "p_expect": {
+    "brief": "断言当前词法单元为指定标点并前进 / Assert the current token is `punct` and advance",
+    "params": { "punct": "期望的标点串 / The expected punctuation string" },
+    "warning": "不匹配时报告语法错误 / Reports a syntax error on mismatch"
+  },
+  "p_at_statement_end": {
+    "brief": "消费语句结束（`;` 或自动分号插入）/ Consume a statement end (`;` or automatic semicolon insertion)",
+    "return": "认为语句已结束返回 1，否则 0 / 1 when the statement is treated as ended, otherwise 0",
+    "note": "`;`、`}`、`T_EOF` 或下一词法单元换行时均视为结束 / `;`, `}`, `T_EOF` or a line break before the next token all count as an end"
+  },
+  "p_reserved": {
+    "brief": "判断单词是否为不可作绑定名的保留字 / Test whether a word is a reserved word that may not be a binding name",
+    "params": { "word": "待判断的单词 / Word to test" },
+    "return": "是保留字返回 1，否则 0 / 1 when reserved, otherwise 0"
+  },
+  "p_node": {
+    "brief": "在当前行新建一个 AST 节点 / Allocate a new AST node at the current line",
+    "params": { "kind": "节点种类（`JS_N_*`）/ Node kind (`JS_N_*`)" },
+    "return": "新建的 AST 节点（存于 arena）/ The new AST node (allocated from the arena)",
+    "see": "p_expr, p_assignment, p_block, p_statement"
+  },
+  "p_skip_balanced": {
+    "brief": "跳过从 start 开始的成对括号组 / Skip a balanced (), [] or {} group starting at `start`",
+    "params": { "start": "组起始词法单元下标 / Token index where the group starts" },
+    "return": "越过闭合符号的下标；不配对返回 -1 / The index just past the closing token, or -1 when unbalanced"
+  },
+  "p_pattern_start": {
+    "brief": "判断当前位置是否开始一个解构模式 / Test whether `[` or `{` here starts a destructuring pattern",
+    "return": "是模式开头返回 1，否则 0 / 1 when a pattern starts here, otherwise 0",
+    "note": "用于区分解构模式与数组/对象字面量 / Used to tell a destructuring pattern from an array/object literal"
+  },
+  "p_binding_array": {
+    "brief": "解析 `[a, b, ...rest]` 数组解构绑定 / Parse an `[a, b, ...rest]` array binding pattern",
+    "return": "`JS_N_PAT_ARR` 节点 / A `JS_N_PAT_ARR` node",
+    "note": "支持空位（hole）/ Supports holes"
+  },
+  "p_binding_obj_pair": {
+    "brief": "解析对象解构模式中的一项 / Parse one entry of an object binding pattern",
+    "params": { "obj": "inout:模式节点 / The pattern node" },
+    "note": "覆盖 `{key: target}`、`{key = default}` 与 `{key}` 三种形式 / Covers `{key: target}`, `{key = default}` and `{key}`",
+    "see": "p_binding_object"
+  },
+  "p_binding_object": {
+    "brief": "解析 `{a, b: c, ...rest}` 对象解构绑定 / Parse a `{a, b: c, ...rest}` object binding pattern",
+    "return": "`JS_N_PAT_OBJ` 节点 / A `JS_N_PAT_OBJ` node",
+    "see": "p_binding_obj_pair"
+  },
+  "p_binding_target": {
+    "brief": "解析一个绑定目标 / Parse a binding target",
+    "return": "标识符、数组或对象模式节点 / An identifier, array or object pattern node",
+    "note": "在非严格位置宽容接受保留字作名字 / Tolerates reserved words as names in non-strict positions"
+  },
+  "p_binding_element": {
+    "brief": "解析一个参数或数组元素 / Parse a parameter or an array element",
+    "return": "目标、带默认值的 `JS_N_PAT_DEFAULT` 或 `JS_N_PAT_REST` 节点 / A target, a `JS_N_PAT_DEFAULT`, or a `JS_N_PAT_REST` node",
+    "note": "覆盖 `target`、`target = default` 与 `...target` / Covers `target`, `target = default` and `...target`",
+    "see": "p_binding_target"
+  }
+}

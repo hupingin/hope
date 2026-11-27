@@ -416,6 +416,160 @@ static HpeBox *build_img_box(HpeDomNode *node, HpeStyle style)
 }
 
 /**
+ * @brief 判断一个元素是否按替换盒处理的表单控件 / Test whether an element is a replaced form control
+ *
+ * @details input 的 button 型（button/submit/reset）走普通盒（文本子节点排版）；
+ *          其余 input 与 select / progress / meter 是替换盒。
+ *          A button-type `input` (button/submit/reset) takes the ordinary box path
+ *          (its label text is laid out); the other input types plus `select`,
+ *          `progress` and `meter` are replaced boxes.
+ *
+ * @param[in] node 目标元素 / Target element
+ *
+ * @return 是替换型控件返回 1 / 1 when the element is a replaced control
+ */
+int form_is_replaced_control(const HpeDomNode *node)
+{
+    const char *tag = node && node->tag ? node->tag : NULL;
+    const char *type;
+
+    if (!tag)
+        return 0;
+    if (!strcmp(tag, "select") || !strcmp(tag, "progress") || !strcmp(tag, "meter"))
+        return 1;
+    if (strcmp(tag, "input"))
+        return 0;
+    type = hpe_dom_attr(node, "type");
+    if (!type || !*type)
+        return 1; /* the text default */
+    return strcmp(type, "button") && strcmp(type, "submit") && strcmp(type, "reset") &&
+           strcmp(type, "image") && strcmp(type, "hidden");
+}
+
+/**
+ * @brief 求替换型控件的固有尺寸 / Solve a replaced control's intrinsic size
+ *
+ * @details 尺寸表对齐 Chrome 默认：文本类 170x22、勾选类 13x13、滑杆 130x16、
+ *          颜色 44x23、文件 210x22、select 170x22、进度 160x16、度量 120x16；
+ *          文本类还吃 `size` 属性提示。
+ *          The table mirrors Chrome's defaults: 170x22 text-like, 13x13 checks,
+ *          130x16 range, 44x23 colour, 210x22 file, 170x22 select, 160x16 progress
+ *          and 120x16 meter; the `size` attribute is a hint for the text family.
+ */
+static void form_intrinsic_size(const HpeDomNode *node, int *w, int *h)
+{
+    const char *tag = node->tag;
+    const char *type = hpe_dom_attr(node, "type");
+
+    *w = 170;
+    *h = 22;
+    if (!strcmp(tag, "select"))
+        return;
+    if (!strcmp(tag, "progress")) {
+        *w = 160;
+        *h = 16;
+        return;
+    }
+    if (!strcmp(tag, "meter")) {
+        *w = 120;
+        *h = 16;
+        return;
+    }
+    if (!type || !*type)
+        return;
+    if (!strcmp(type, "checkbox") || !strcmp(type, "radio")) {
+        *w = 13;
+        *h = 13;
+    } else if (!strcmp(type, "range")) {
+        *w = 130;
+        *h = 16;
+    } else if (!strcmp(type, "color")) {
+        *w = 44;
+        *h = 23;
+    } else if (!strcmp(type, "file")) {
+        *w = 210;
+        *h = 22;
+    } else {
+        int size = atoi(hpe_dom_attr(node, "size") ? hpe_dom_attr(node, "size") : "");
+        if (size > 0 && size < 200)
+            *w = size * 9 + 17;
+    }
+}
+
+/**
+ * @brief 为替换型表单控件构建盒 / Build the box for a replaced form control
+ *
+ * @param[in]     node 控件元素 / The control element
+ * @param[in]     style 计算样式 / The computed style
+ *
+ * @return 替换盒 / The replaced box
+ *
+ * @note 与 `<img>` 相同的替换盒机制：固有尺寸 + 作者 CSS 尺寸解算使用尺寸 /
+ *       The same replaced-box mechanism as `<img>`: intrinsic size plus authored
+ *       CSS size solve for the used size
+ *
+ * @see build_img_box form_intrinsic_size
+ */
+static HpeBox *build_form_box(HpeDomNode *node, HpeStyle style)
+{
+    HpeBox *box;
+    int w = 0, h = 0;
+
+    if (style.position == HPE_POS_ABSOLUTE || style.position == HPE_POS_FIXED ||
+        style.display == HPE_DISPLAY_BLOCK || style.display == HPE_DISPLAY_FLEX ||
+        style.display == HPE_DISPLAY_GRID || style.display == HPE_DISPLAY_TABLE)
+        box = box_new(HPE_BOX_BLOCK);
+    else
+        box = box_new(HPE_BOX_INLINE_BLOCK);
+    box->node = node;
+    box->is_replaced = 1;
+    box->repl_css_w = style.width;
+    box->repl_css_h = style.height;
+    form_intrinsic_size(node, &w, &h);
+    box->repl_w = w;
+    box->repl_h = h;
+    box->style = style;
+    return box;
+}
+
+/**
+ * @brief 为 `<canvas>` 构造替换盒 / Build the replaced box for a `<canvas>`
+ *
+ * @param[in,out] node canvas DOM 节点 / The canvas DOM node
+ * @param[in]     style 计算样式 / Computed style
+ *
+ * @return 替换盒 / The replaced box
+ *
+ * @note 固有尺寸取 width/height 属性（默认 300×150），作者 CSS 尺寸优先 / Intrinsic size comes from width/height attributes (default 300x150), authored CSS wins
+ */
+static HpeBox *build_canvas_box(HpeDomNode *node, HpeStyle style)
+{
+    const char *aw = hpe_dom_attr(node, "width");
+    const char *ah = hpe_dom_attr(node, "height");
+    HpeBox *box;
+    int w = 300, h = 150;
+
+    if (style.position == HPE_POS_ABSOLUTE || style.position == HPE_POS_FIXED ||
+        style.display == HPE_DISPLAY_BLOCK || style.display == HPE_DISPLAY_FLEX ||
+        style.display == HPE_DISPLAY_GRID || style.display == HPE_DISPLAY_TABLE)
+        box = box_new(HPE_BOX_BLOCK);
+    else
+        box = box_new(HPE_BOX_INLINE_BLOCK);
+    if (aw && aw[0] && atoi(aw) > 0) w = atoi(aw);
+    if (ah && ah[0] && atoi(ah) > 0) h = atoi(ah);
+    if (w > 4096) w = 4096;
+    if (h > 4096) h = 4096;
+    box->node = node;
+    box->is_replaced = 1;
+    box->repl_css_w = style.width;
+    box->repl_css_h = style.height;
+    box->repl_w = w;
+    box->repl_h = h;
+    box->style = style;
+    return box;
+}
+
+/**
  * @brief 为一个元素的 `::before` / `::after` 生成内容盒 / Build the generated-content box for `::before` / `::after`
  *
  * @details 依次求值两份样式：先把父选择器链上的伪元素规则套用一次（`hpe_css_compute_pseudo`），仅当 `content` 非 `none` 时生成盒；`attr(name)` 形式的 `content` 在此时从节点属性解析为文本。
@@ -497,11 +651,16 @@ static void build_children(HpeBox *box, HpeDomNode *node, HpeStylesheet *sheet,
 {
     HpeDomNode *child;
     HpeBox *gen;
+    int closed_details = node->tag && !strcmp(node->tag, "details") &&
+                         !hpe_dom_attr(node, "open");
     gen = build_pseudo_box(node, sheet, style, HPE_PE_BEFORE);
     if (gen)
         box_append(box, gen);
     for (child = node->first_child; child; child = child->next_sibling) {
         HpeBox *cb = NULL;
+        /* a closed <details> exposes only its <summary> / 关闭的 details 只呈现 summary */
+        if (closed_details && !(child->tag && !strcmp(child->tag, "summary")))
+            continue;
         if (child->type == HPE_NODE_ELEMENT) {
             cb = build_element(child, sheet, style);
         } else if (child->type == HPE_NODE_TEXT) {
@@ -555,6 +714,10 @@ static HpeBox *build_element(HpeDomNode *node, HpeStylesheet *sheet, const HpeSt
         return build_svg_box(node, style);
     if (!strcmp(node->tag, "img"))
         return build_img_box(node, style);
+    if (!strcmp(node->tag, "canvas"))
+        return build_canvas_box(node, style);
+    if (form_is_replaced_control(node))
+        return build_form_box(node, style);
 
     /* absolutely / fixed positioned boxes blockify their display;
      * floated boxes are laid out as atomic inline-level (shrink-to-fit) boxes.
@@ -4160,6 +4323,8 @@ static void block_reset_lines(HpeBox *box)
     for (li = 0; li < box->line_count; li++) {
         if (box->lines[li].runs)
             hpe_free(box->lines[li].runs);
+        if (box->lines[li].frags)
+            hpe_free(box->lines[li].frags);
     }
     box->line_count = 0;
     box->floats.count = 0;
